@@ -1,6 +1,6 @@
 # @liuyera/dsh-chrome-browser
 
-Chrome 浏览器控制插件(host + composer UI):通过 Chrome DevTools Protocol (CDP) 控制一个**由插件启动的专用 Chrome**(推荐姿势)——列出标签页、读取网页内容、导航、新开标签页、截图、点击、输入文本、执行 JS;并在会话里提供「🌐 标签页」选择器,把它里的某个标签页发送给 AI,AI 就在那个标签页里工作。也可连接你**手动**带调试端口启动的 Chrome(user 模式)。零浏览器自动化运行时依赖(Node 内建 fetch / WebSocket / child_process)。
+Chrome 浏览器控制插件(host + 浏览器半边):通过 Chrome 扩展桥(默认)或 Chrome DevTools Protocol (CDP) 控制你的 Chrome——列出标签页、读取网页内容、导航、新开标签页、截图、点击、输入文本、执行 JS;`@` 菜单里列出实时标签页(标题 + URL),选中即把该标签页插进当前这条消息,AI 就在那个标签页里工作。零浏览器自动化运行时依赖(Node 内建 fetch / WebSocket / child_process)。
 
 ## 功能
 
@@ -14,7 +14,7 @@ Chrome 浏览器控制插件(host + composer UI):通过 Chrome DevTools Protocol
 | `chrome_click` | CSS 选择器 `element.click()`(可选 `all` 批量) |
 | `chrome_type` | 聚焦输入框并输入文本(默认先全选替换) |
 | `chrome_eval` | 在页面上下文执行 JS 表达式,按值返回(≤200k 字符) |
-| 「🌐 标签页」按钮 | composer 工具行左侧按钮 → 弹出你的实时标签页列表,点击即把该标签页绑定到本会话并发给 AI |
+| `@` 标签页分组 | 在输入框敲 `@` 时列出实时标签页(行内是「标题 + URL」),选中插入一个引用芯片;发送后消息里只有这个引用,标签页的 URL 与 tabId 由宿主注入一条上下文消息给模型 |
 
 ## 浏览器连接模式
 
@@ -47,7 +47,7 @@ Chrome 浏览器控制插件(host + composer UI):通过 Chrome DevTools Protocol
 dsh plugin --profile web add -w link:/Users/liyu/Documents/www/DeepSeek/deepseek-harness/deepseek-harness-plugin/chrome-browser
 ```
 
-重启 `dsh web` 后生效。
+重启 dsh 后生效(桌面应用退出重开;源码启动的则是重启 `pnpm dsh web`)。宿主半边(工具、路由、`agent/pre-step` 展开)只在启动时加载——改了 `src/` 或 `lib/index.js` 必须重启进程,浏览器里硬刷新只换得到 `lib/client.js`。
 
 ## 配置
 
@@ -73,7 +73,7 @@ dsh plugin --profile web add -w link:/Users/liyu/Documents/www/DeepSeek/deepseek
 
 ## Model Experience
 
-模型可见的输入/输出只有八个工具 JSON 结果:每次 `chrome_read` 最多携带约 `readTextLimit` 字符的页面文本;`chrome_screenshot` 只返回文件路径与元数据,页面视觉内容需通过 `read_image` 再读取;`chrome_eval` 结果上限 200k 字符。会话选择标签页时,客户端注入一条用户消息(含标题/URL 与「不传 tabId 默认就是它」提示),模型下一轮即可直接在该标签页工作。本插件不发任何 provider 请求,无 LLM/KV-cache 影响。
+模型可见的输入/输出只有八个工具 JSON 结果,加上被引用标签页的上下文:每次 `chrome_read` 最多携带约 `readTextLimit` 字符的页面文本;`chrome_screenshot` 只返回文件路径与元数据,页面视觉内容需通过 `read_image` 再读取;`chrome_eval` 结果上限 200k 字符。从 `@` 菜单选中标签页时,客户端在草稿里插入一个引用芯片,它序列化成 `@"标题"`——用户消息里只有这个引用(宿主按文本形状投影成引用芯片),宿主随后在用户消息后注入一条本插件的上下文消息(`## Referenced Chrome tabs`),逐个列出被引用标签页的 `tabId` 与 URL,模型照着 id 调 `chrome_*` 即可。同名标签页会列出全部候选并提示向用户确认;引用没有匹配到任何在开的标签页(已关闭,或那其实是带空格的文件路径)时不注入任何东西。插件不做会话级标签页绑定,一次选择只影响它所在的那条消息。本插件不发任何 provider 请求,无 LLM/KV-cache 影响。
 
 ## 开发
 
@@ -88,7 +88,14 @@ DSH_CHROME_SMOKE=1 npx vitest run tests/smoke.spec.ts   # headless Chrome 全链
 
 ## Known Limitations and Deferred Work
 
-- **owned 模式重启 dsh 后需首次调用恢复窗口**:专用 Chrome 的窗口在 dsh web 重启后不会自动弹出,第一次使用工具/选择器时拉起(profile 持久化,标签页都在)。
+- **composer 上方的标签页选择框已停用**:`@` 分组取代了它。组件与注册代码都留在原处(`src/client/TabPicker.tsx` 与 `src/client/index.ts` 的 `TAB_PICKER_VISIBLE`),把常量改成 `true` 即恢复那一行。
+- **选中标签页只插入一个引用,不做会话绑定**:`chrome_*` 省略 `tabId` 时不会自动落到这个标签页(原来的 `/chrome-browser/select` 绑定路由仍在,但已无调用方);模型用的是注入上下文里的 `tabId`。
+- **引用靠标题匹配**:注入的上下文按 `@"标题"` 去实时标签页里找同名标签页,同名多个时列出全部候选让模型确认;发送前被关掉的标签页不注入上下文(引用仍在,但模型需要自己调 `chrome_tabs`)。
+- **消息里的引用芯片由宿主按文本形状投影**:`@"名字"` 在宿主的消息投影(`projectUserText`)里是"文件型"引用——带文件图标,且在传了 `openFile` 的页面上可点击,点击会走宿主「打开文件」流程(找不到同名文件会报错)。这是宿主对任何 `@名字` 文本的通用规则,插件层没有别的形状可选。
+- **带空格的文件引用与本插件的引用同形**:两者都是 `@"…"`;匹配不到任何在开的标签页时本插件不注入任何东西,所以不会污染文件引用的消息。
+- **`@` 分组最多渲染 50 行标签页**,更靠后的标签页要靠输入关键词(标题或 URL 都能匹配)过滤出来。
+- **Chrome 未连接时 `@` 分组不出现**:扩展未安装/未打开时列表抓取失败,只在控制台留一条记录,不占菜单空间;原因查询走 `/chrome-browser/ext/status`。
+- **owned 模式重启 dsh 后需首次调用恢复窗口**:专用 Chrome 的窗口在 dsh 重启后不会自动弹出,第一次使用工具/选择器时拉起(profile 持久化,标签页都在)。
 - **user 模式只支持手动带调试端口启动的 Chrome**:插件不自动接管、不重启;`autoRelaunch` 打开时仍建议先把 dsh 界面移到别的浏览器再使用。
 - **点击/输入是 DOM 事件 + CDP Input**:不模拟真实指针/MIME 手势,对依赖真实 pointer 事件或 iframe/shadow DOM 深层结构的页面不完全可靠;这些场景可用 `chrome_eval` 绕过。
 - **文本读取只覆盖主框架**的 `innerText`(iframe 内容不在其中)。
