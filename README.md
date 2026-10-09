@@ -11,7 +11,7 @@
 | --- | --- | --- | --- |
 | [`ui-subagent-sidebar/`](ui-subagent-sidebar/) | `@liuyera/dsh-client-ui-subagent-sidebar` | ⏳ 未验 | 右下角 subagent 运行计数胶囊 + 右侧根分组概览面板 |
 | [`dev-dock/`](dev-dock/) | `@liyuera/dsh-dev-dock` | ✅ 已移植 | devDock v1.0.0：项目 = dsh 工作区；开始上班弹窗、会话头部 IDE/终端/启动（确定性桌面动作）、每工作区 IDE 偏好与编辑器检测（真实应用图标） |
-| [`chrome-browser/`](chrome-browser/) | `@liuyera/dsh-chrome-browser` | ✅ 已移植 | Chrome 浏览器控制:CDP 驱动你已打开的 Chrome(user 模式自动附加调试端口)——列标签页/读网页内容/导航/新开/截图/点击/输入/执行 JS;composer「🌐 标签页」选择器把选中标签页发送给 AI 在该页面工作 |
+| [`chrome-browser/`](chrome-browser/) | `@liuyera/dsh-chrome-browser` | ✅ 已移植 | Chrome 浏览器控制:扩展桥(默认)或 CDP 驱动你已打开的 Chrome——列标签页/读网页内容/导航/新开/截图/点击/输入/执行 JS;`@` 菜单列出实时标签页(标题 + URL),选中插入引用芯片,AI 在该页面工作 |
 | [`ui-favorite-prompts/`](ui-favorite-prompts/) | `@liyuera/dsh-favorite-prompts` | ✅ 已移植 | 消息下方一键收藏、`@` 拉出收藏并整段插入、设置页增删改 |
 | [`user-ds-balance/`](user-ds-balance/) | `@liyuera/dsh-user-ds-balance` | ✅ 无需改 | DeepSeek 账户余额读数:composer 工具行单元格,每 5 分钟轮询、点击刷新、loading 态(host 半边 `/ds-balance` 路由,API Key 现取现用) |
 
@@ -21,7 +21,7 @@
 dsh plugin --profile web add link:/绝对路径/deepseek-harness/deepseek-harness-plugin/ui-subagent-sidebar
 ```
 
-重启 `dsh web` 后生效。
+重启 dsh 后生效(桌面应用退出重开;源码启动的则是重启 `pnpm dsh web`)。
 
 ## 构建期依赖
 
