@@ -1,6 +1,6 @@
 {
   "name": "@liuyera/dsh-chrome-browser",
-  "description": "Chrome browser control for dsh: list the user's tabs, read page content, navigate, click/type, evaluate JS and capture screenshots through the Chrome DevTools Protocol, plus a composer tab picker that sends a selected tab to the agent",
+  "description": "Chrome browser control for dsh: list the user's tabs, read page content, navigate, click/type, evaluate JS and capture screenshots through the Chrome DevTools Protocol, plus an @ menu source listing the live tabs",
   "version": "0.2.0",
   "type": "module",
   "main": "lib/index.js",
@@ -28,6 +28,7 @@
     "client": {
       "inject": [
         "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-input-trigger",
         "@deepseek-ai/dsh-client-ui-renderer"
       ],
       "platform": "web"
@@ -50,6 +51,7 @@
     "access": "public"
   },
   "dependencies": {
+    "@deepseek-ai/dsh-llm": "^0.1.2-alpha.4",
     "@deepseek-ai/dsh-tools": "^0.1.2-alpha.4",
     "@deepseek-ai/schemastery": "^3.18.2"
   },
@@ -58,7 +60,9 @@
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-agent": "^0.1.2-alpha.4",
     "@deepseek-ai/dsh-client-ui-conversation": "^0.1.2-alpha.4",
+    "@deepseek-ai/dsh-client-ui-input-trigger": "^0.1.2-alpha.4",
     "@deepseek-ai/dsh-client-ui-primitives": "0.2.0-rc.2",
     "@deepseek-ai/dsh-client-ui-renderer": "^0.1.2-alpha.4",
     "@deepseek-ai/dsh-client-ui-slots": "^0.1.2-alpha.4",

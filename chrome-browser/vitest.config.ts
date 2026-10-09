@@ -17,6 +17,8 @@ const ALIASES: Array<[string, string]> = [
   ['@deepseek-ai/dsh-invariants$', 'packages/runtime-diagnostics/invariants/src/index.ts'],
   ['@deepseek-ai/dsh-tools$', 'packages/core/tools/src/index.ts'],
   ['@deepseek-ai/dsh-tools/', 'packages/core/tools/src/'],
+  // Browser-only package whose Node entry cannot load; see the stub's own note.
+  ['@deepseek-ai/dsh-client-ui-primitives$', 'deepseek-harness-plugin/chrome-browser/tests/support/ui-primitives.ts'],
 ]
 
 export default defineConfig({

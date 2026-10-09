@@ -19,6 +19,12 @@
       "@deepseek-ai/dsh-tools": [
         "./../../packages/core/tools/src/index.ts"
       ],
+      "@deepseek-ai/dsh-agent": [
+        "./../../packages/core/agent/src/index.ts"
+      ],
+      "@deepseek-ai/dsh-llm/message": [
+        "./../../packages/llm/llm/src/message.ts"
+      ],
       "@deepseek-ai/dsh-util-values": [
         "./../../packages/util/values/src/index.ts"
       ],
@@ -33,6 +39,9 @@
       ],
       "@deepseek-ai/dsh-client-ui-conversation/client": [
         "./../../packages/client/ui-conversation/src/client/index.ts"
+      ],
+      "@deepseek-ai/dsh-client-ui-input-trigger/client": [
+        "./../../packages/client/ui-input-trigger/src/client/index.ts"
       ]
     }
   },
@@ -53,6 +62,12 @@
       "path": "../../packages/core/tools"
     },
     {
+      "path": "../../packages/core/agent"
+    },
+    {
+      "path": "../../packages/llm/llm"
+    },
+    {
       "path": "../../packages/util/values"
     },
     {
@@ -63,6 +78,9 @@
     },
     {
       "path": "../../packages/client/ui-conversation"
+    },
+    {
+      "path": "../../packages/client/ui-input-trigger"
     }
   ]
 }

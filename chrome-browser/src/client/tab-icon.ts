@@ -1,0 +1,55 @@
+/**
+ * Favicon renderer for the `@` tab rows.
+ *
+ * The candidate icon seat takes a component, not an image URL, so each
+ * favicon needs one. Components are memoized by URL: a fresh component
+ * identity per candidate would remount every row's image on each menu render
+ * (every keystroke) and reload it.
+ * @module @liuyera/dsh-chrome-browser/client/tab-icon
+ */
+
+import type { ComponentType } from 'react'
+import type { IconProps } from '@deepseek-ai/dsh-client-ui-primitives'
+import React from 'react'
+import { CHROME_ICON_SRC } from './chrome-icon.ts'
+
+/** One favicon at menu-icon size; a URL that cannot load hides its own image. */
+function FaviconImage({ favicon, size }: { favicon: string; size: number }): React.ReactElement {
+  if (favicon === '') {
+    return React.createElement('img', {
+      src: CHROME_ICON_SRC,
+      width: size,
+      height: size,
+      alt: '',
+      'aria-hidden': true,
+      style: { borderRadius: 3, objectFit: 'contain' },
+    })
+  }
+  return React.createElement('img', {
+    src: favicon,
+    width: size,
+    height: size,
+    alt: '',
+    referrerPolicy: 'no-referrer',
+    // A dead favicon URL hides its own image; the row keeps its title and URL.
+    onError: (event: React.SyntheticEvent<HTMLImageElement>) => { event.currentTarget.style.display = 'none' },
+    style: { borderRadius: 3, objectFit: 'contain' },
+  })
+}
+
+/** Memoized per favicon URL, so one URL keeps one component identity. */
+const icons = new Map<string, ComponentType<IconProps>>()
+
+/**
+ * Icon component for one favicon.
+ * @param favicon - favicon URL, or '' when Chrome reported none.
+ * @returns the component handed to `InputTriggerCandidate.icon`.
+ */
+export function tabIcon(favicon: string): ComponentType<IconProps> {
+  const cached = icons.get(favicon)
+  if (cached !== undefined) return cached
+  const Icon = ({ size = 16 }: IconProps): React.ReactElement =>
+    React.createElement(FaviconImage, { favicon, size })
+  icons.set(favicon, Icon)
+  return Icon
+}

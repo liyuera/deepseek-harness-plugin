@@ -1,24 +1,37 @@
 /**
- * chrome-browser plugin, browser half: registers the composer dock entry (a
- * full-width row above the input card) holding the tab selector. The
- * selector lists the user's real Chrome tabs, supports multi-select, and
- * keeps the whole selection host-side per session (reported to the model
- * through chrome_tabs' `session` field) — it never touches the input box or
- * any message content.
+ * chrome-browser plugin, browser half.
+ *
+ * The composer dock used to carry a full-width tab selector above the input
+ * card; that row is retired and the live tab list now lives in the `@` menu,
+ * where a pick inserts a reference chip naming the tab. The dock registration
+ * and its component stay in the tree, switched off by {@link TAB_PICKER_VISIBLE}.
  * @module @liuyera/dsh-chrome-browser/client
  */
 import { TabPicker } from "./TabPicker.js";
-/** Required services for the slot contributions. */
-export const inject = ['slots'];
+import { listChromeTabs } from "./tab-catalog.js";
+import { createChromeTabSource } from "./tab-source.js";
+import { tabIcon } from "./tab-icon.js";
 /**
- * Client plugin body: register the composer dock tab selector.
+ * Whether the composer-dock tab selector registers. The `@` tab source
+ * replaced it, so the row stays hidden by default; flip this to true to bring
+ * the dock row back.
+ */
+const TAB_PICKER_VISIBLE = false;
+/** Required services for the slot contribution and the `@` source. */
+export const inject = ['slots', 'inputTriggers'];
+/**
+ * Client plugin body: register the `@` tab source, and the retired dock
+ * selector only while it is switched on.
  * @param ctx - client root context.
  */
 export function apply(ctx) {
-    ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({
-        name: 'conversation.input.dock',
-        id: 'chrome-browser-tab-select',
-        order: 5,
-    }, TabPicker));
+    if (TAB_PICKER_VISIBLE) {
+        ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({
+            name: 'conversation.input.dock',
+            id: 'chrome-browser-tab-select',
+            order: 5,
+        }, TabPicker));
+    }
+    ctx.effect(() => ctx.inputTriggers.registerSource(createChromeTabSource({ listTabs: listChromeTabs, iconFor: tabIcon })), 'chrome-browser: @ tab source');
 }
 //# sourceMappingURL=index.js.map
