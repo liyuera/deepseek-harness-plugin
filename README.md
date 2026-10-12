@@ -70,3 +70,7 @@ tsc -b && tsdown --config-loader tsx   # 重新构建（bin 解析自 harness �
 ```
 
 构建产物 `lib/`（含浏览器 bundle `lib/client.js`）提交进本仓库，安装即用，无需在目标机器构建。
+
+## 许可
+
+专有软件，保留所有权利。未经版权持有人书面许可，不得使用、复制、修改、分发或再许可本仓库的任何内容，详见 [LICENSE](LICENSE)。各插件 `package.json` 声明为 `UNLICENSED` 且 `private`，不从 npm 发布。

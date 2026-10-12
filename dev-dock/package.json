@@ -2,6 +2,7 @@
   "name": "@liyuera/dsh-dev-dock",
   "description": "Frontend project engineering management for dsh: project registry, editor detection, quick-start, open project in IDE or system terminal",
   "version": "1.0.3",
+  "private": true,
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -39,7 +40,7 @@
     "bundle": "tsdown --config-loader tsx",
     "watch": "tsdown --watch --config-loader tsx"
   },
-  "license": "MIT",
+  "license": "UNLICENSED",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/liyuera/deepseek-harness-plugin.git",

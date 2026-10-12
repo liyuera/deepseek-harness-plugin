@@ -2,6 +2,7 @@
   "name": "@liyuera/dsh-favorite-prompts",
   "description": "Saved prompts for dsh: bookmark a message, recall it with @ in the composer, manage the list in Settings",
   "version": "0.1.0",
+  "private": true,
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -43,7 +44,7 @@
     "lib/types/**/*.d.ts",
     "cordis.patch.yml"
   ],
-  "license": "MIT",
+  "license": "UNLICENSED",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/liyuera/deepseek-harness-plugin.git",

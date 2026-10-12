@@ -2,6 +2,7 @@
   "name": "@liyuera/dsh-client-ui-subagent-sidebar",
   "description": "Frame-wide subagent overview: a running-count capsule and a root-grouped, collapsible panel over the session-list catalog mirrors",
   "version": "0.1.0-rc.5",
+  "private": true,
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -39,7 +40,7 @@
     "bundle": "tsdown --config-loader tsx",
     "watch": "tsdown --watch --config-loader tsx"
   },
-  "license": "MIT",
+  "license": "UNLICENSED",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/liyuera/deepseek-harness-plugin.git",
