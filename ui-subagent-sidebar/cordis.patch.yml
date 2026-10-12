@@ -1,4 +1,0 @@
-# dsh bundle layer: mount the subagent-sidebar client plugin.
-- insert:
-    - id: ui-subagent-sidebar
-      name: '@liyuera/dsh-client-ui-subagent-sidebar'
