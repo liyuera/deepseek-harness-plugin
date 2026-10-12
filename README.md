@@ -1,6 +1,6 @@
 # deepseek-harness-plugin
 
-李煜（liyuera）的 DeepSeek Harness (dsh) 插件集。每个插件一个目录，目录名即插件名。
+李昱（liyuera）的 DeepSeek Harness (dsh) 插件集。每个插件一个目录，目录名即插件名。
 
 本仓库设计为放在 deepseek-harness 工作区根目录下（`deepseek-harness-plugin/`），
 构建时借用 harness 的客户端构建设施；插件代码与 fork 的版本库完全分离。
