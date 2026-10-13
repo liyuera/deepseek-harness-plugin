@@ -2,7 +2,7 @@
  * Runtime.evaluate expressions the tools run inside the page main frame.
  * Expressions are deliberately self-contained IIFEs so results survive
  * serialization and cannot leak page globals into the harness.
- * @module @liuyera/dsh-chrome-browser/expressions
+ * @module @liyuera/dsh-chrome-browser/expressions
  */
 /** Live page-facts expression: title, url, visible text, optional HTML. */
 export declare function readPageExpression(includeHtml: boolean): string;

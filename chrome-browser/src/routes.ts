@@ -4,7 +4,7 @@
  * upgrade and its status endpoint. Static client bundles have no
  * package-private RPC channel (host.call is a dynamic-plugin builtin), so the
  * client half reaches the host through these routes.
- * @module @liuyera/dsh-chrome-browser/routes
+ * @module @liyuera/dsh-chrome-browser/routes
  */
 
 import type { Context } from '@deepseek-ai/cordis'
@@ -15,6 +15,7 @@ import { ExtensionBackend } from './backend.ts'
 import type { SessionBindings } from './bindings.ts'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
+import { createExtensionZip, extensionDir } from './extension-package.ts'
 import { wsHandshake } from './ws.ts'
 
 /** Minimal web-server face (service type stays private, dev-dock pattern). */
@@ -259,6 +260,33 @@ export function registerChromeRoutes(ctx: Context, backend: BrowserBackend, bind
       })
     },
   }), 'chrome-browser: extension status route')
+
+  // The extension ships inside this package; an npm install leaves it beside
+  // the built host half, so the bridge's own server hands it out as a zip the
+  // user unpacks and loads from chrome://extensions.
+  ctx.effect(() => webServer.register({
+    kind: 'exact',
+    path: '/chrome-browser/extension.zip',
+    handler: (req, res) => {
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
+        writeJson(res, 405, { ok: false, error: 'method not allowed' })
+        return
+      }
+      let archive: Buffer
+      try {
+        archive = createExtensionZip(extensionDir(import.meta.url))
+      } catch (error) {
+        writeJson(res, 500, { ok: false, error: `extension package unavailable: ${String(error)}` })
+        return
+      }
+      res.writeHead(200, {
+        'content-type': 'application/zip',
+        'content-length': String(archive.length),
+        'content-disposition': 'attachment; filename="dsh-chrome-browser-extension.zip"',
+      })
+      res.end(req.method === 'HEAD' ? undefined : archive)
+    },
+  }), 'chrome-browser: extension download route')
 
   ctx.effect(() => webServer.registerUpgrade({
     path: '/chrome-browser/ext/ws',

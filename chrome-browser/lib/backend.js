@@ -6,7 +6,7 @@
  *   Chrome — no restarts, no profile copies.
  * - `CdpBackend`: the Chrome DevTools Protocol path (owned/user/attach modes)
  *   used as a fallback when config selects `cdp`.
- * @module @liuyera/dsh-chrome-browser/backend
+ * @module @liyuera/dsh-chrome-browser/backend
  */
 import { clickExpression, focusAndSelectExpression, focusExpression, readPageExpression, readyStateExpression, } from "./expressions.js";
 import { Chrome } from "./chrome.js";

@@ -1,8 +1,8 @@
 /**
- * Package-owned invariant companion for `@liuyera/dsh-chrome-browser`.
- * @module @liuyera/dsh-chrome-browser/invariant
+ * Package-owned invariant companion for `@liyuera/dsh-chrome-browser`.
+ * @module @liyuera/dsh-chrome-browser/invariant
  */
-const PACKAGE_NAME = '@liuyera/dsh-chrome-browser';
+const PACKAGE_NAME = '@liyuera/dsh-chrome-browser';
 /** Cordis companion plugin name. */
 export const name = 'chrome-browser-invariant';
 /** Service required before the companion can reserve package ownership. */

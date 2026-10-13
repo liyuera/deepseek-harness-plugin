@@ -5,7 +5,7 @@
  * card; that row is retired and the live tab list now lives in the `@` menu,
  * where a pick inserts a reference chip naming the tab. The dock registration
  * and its component stay in the tree, switched off by {@link TAB_PICKER_VISIBLE}.
- * @module @liuyera/dsh-chrome-browser/client
+ * @module @liyuera/dsh-chrome-browser/client
  */
 import type { Context as ClientContext } from '@deepseek-ai/cordis';
 export type { TabPickerProps } from './TabPicker.tsx';

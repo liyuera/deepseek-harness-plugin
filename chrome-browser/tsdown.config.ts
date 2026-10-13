@@ -8,4 +8,4 @@
  */
 import { clientBundleConfig } from '../build/client-bundle.ts'
 
-export default clientBundleConfig('@liuyera/dsh-chrome-browser', 'lib/client/index.js')
+export default clientBundleConfig('@liyuera/dsh-chrome-browser', 'lib/client/index.js')

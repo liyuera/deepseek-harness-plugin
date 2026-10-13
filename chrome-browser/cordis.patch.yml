@@ -1,4 +1,4 @@
 # dsh bundle layer: mount the chrome-browser plugin (host CDP tools).
 - insert:
     - id: chrome-browser
-      name: '@liuyera/dsh-chrome-browser'
+      name: '@liyuera/dsh-chrome-browser'

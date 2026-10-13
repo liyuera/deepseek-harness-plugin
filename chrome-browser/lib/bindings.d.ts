@@ -3,7 +3,7 @@
  * working on, in selection order (the first is the tool default). In-memory
  * only, bounded by an LRU cap — the binding is a transient working hint,
  * never durable state.
- * @module @liuyera/dsh-chrome-browser/bindings
+ * @module @liyuera/dsh-chrome-browser/bindings
  */
 /** Session-id → tab-id list bindings with an LRU cap. */
 export declare class SessionBindings {

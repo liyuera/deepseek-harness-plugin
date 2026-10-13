@@ -1,13 +1,13 @@
 /**
- * Package-owned invariant companion for `@liuyera/dsh-chrome-browser`.
- * @module @liuyera/dsh-chrome-browser/invariant
+ * Package-owned invariant companion for `@liyuera/dsh-chrome-browser`.
+ * @module @liyuera/dsh-chrome-browser/invariant
  */
 
 /* jscpd:ignore-start */
 import type { Context } from '@deepseek-ai/cordis'
 import type { InvariantInstaller } from '@deepseek-ai/dsh-invariants'
 
-const PACKAGE_NAME = '@liuyera/dsh-chrome-browser'
+const PACKAGE_NAME = '@liyuera/dsh-chrome-browser'
 
 /** Cordis companion plugin name. */
 export const name = 'chrome-browser-invariant'

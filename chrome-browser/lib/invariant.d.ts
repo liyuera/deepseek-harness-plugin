@@ -1,6 +1,6 @@
 /**
- * Package-owned invariant companion for `@liuyera/dsh-chrome-browser`.
- * @module @liuyera/dsh-chrome-browser/invariant
+ * Package-owned invariant companion for `@liyuera/dsh-chrome-browser`.
+ * @module @liyuera/dsh-chrome-browser/invariant
  */
 import type { Context } from '@deepseek-ai/cordis';
 /** Cordis companion plugin name. */

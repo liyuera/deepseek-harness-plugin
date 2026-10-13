@@ -1,8 +1,7 @@
 {
-  "name": "@liuyera/dsh-chrome-browser",
+  "name": "@liyuera/dsh-chrome-browser",
   "description": "Chrome browser control for dsh: list the user's tabs, read page content, navigate, click/type, evaluate JS and capture screenshots through the Chrome DevTools Protocol, plus an @ menu source listing the live tabs",
-  "version": "0.2.0",
-  "private": true,
+  "version": "0.3.0",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -51,13 +50,12 @@
   "publishConfig": {
     "access": "public"
   },
-  "dependencies": {
-    "@deepseek-ai/dsh-llm": "^0.1.2-alpha.4",
-    "@deepseek-ai/dsh-tools": "^0.1.2-alpha.4",
-    "@deepseek-ai/schemastery": "^3.18.2"
-  },
+  "dependencies": {},
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.2"
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-llm": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-tools": "^0.2.0-rc.2",
+    "@deepseek-ai/schemastery": "^3.18.2"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
@@ -68,7 +66,10 @@
     "@deepseek-ai/dsh-client-ui-renderer": "^0.1.2-alpha.4",
     "@deepseek-ai/dsh-client-ui-slots": "^0.1.2-alpha.4",
     "@deepseek-ai/dsh-invariants": "^0.1.2-alpha.4",
+    "@deepseek-ai/dsh-llm": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-tools": "^0.2.0-rc.2",
     "@deepseek-ai/dsh-util-values": "^0.1.2-alpha.4",
+    "@deepseek-ai/schemastery": "^3.18.2",
     "@types/react": "~18.3.1",
     "@types/react-dom": "~18.3.1",
     "react": "^18.2.0",

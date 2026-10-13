@@ -29,7 +29,7 @@
 
 | 决策点 | 结论 | 依据 |
 |---|---|---|
-| 插件位置与命名 | `deepseek-harness-plugin/chrome-browser/`，npm 包 `@liuyera/dsh-chrome-browser`，插件 id `chrome-browser` | 插件仓库 README「每个插件一个目录」；dev-dock 先例 |
+| 插件位置与命名 | `deepseek-harness-plugin/chrome-browser/`，npm 包 `@liyuera/dsh-chrome-browser`，插件 id `chrome-browser` | 插件仓库 README「每个插件一个目录」；dev-dock 先例 |
 | 实现机制 | 直接用 **Chrome DevTools Protocol (CDP)**，不用 Puppeteer/Playwright，零额外运行时依赖 | 浏览器控制的标准协议；本仓库插件是普通 Node 包（非动态插件 vm 沙箱），可直接用 Node 内建能力 | 
 | 网络栈 | Node 全局 `fetch`（HTTP 端点 `/json/list`、`/json/version`、`/json/new`）+ 全局 `WebSocket`（Page/Runtime/Input/Target 域） | 引擎要求 `node ^22.19 \|\| >=24`，WebSocket 客户端自 Node 22.4 起内建（undici） |
 | Chrome 启动 | `child_process.spawn` 带专用 `--user-data-dir`、`--remote-debugging-port=<port>`、`--remote-allow-origins=*`、`--no-first-run`、`--no-default-browser-check`；轮询 `/json/version` 就绪（≤15s） | `node:child_process` 直接使用有插件先例（dev-dock 用 node:fs/child_process）；`--remote-allow-origins` 避免 WebSocket 握手被拒 |
@@ -50,9 +50,9 @@
 ## 2. 仓库结构
 
 ```
-deepseek-harness-plugin/chrome-browser/     # @liuyera/dsh-chrome-browser
+deepseek-harness-plugin/chrome-browser/     # @liyuera/dsh-chrome-browser
 ├── package.json                 # dsh.bundle.patch + peerDeps + exports + main lib/index.js
-├── cordis.patch.yml             # insert: { id: chrome-browser, name: '@liuyera/dsh-chrome-browser' }
+├── cordis.patch.yml             # insert: { id: chrome-browser, name: '@liyuera/dsh-chrome-browser' }
 ├── tsconfig.json                # extends ../../tsconfig.base.json + paths（host 面）
 ├── vitest.config.ts             # alias 解析（复制 dev-dock 模式，删 React/client 面）
 ├── PLAN.md                      # 本文

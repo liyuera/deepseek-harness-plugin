@@ -3,7 +3,7 @@
  * text frames only (client frames arrive masked, server frames unmasked),
  * no extensions or subprotocols. Chrome's WebSocket client sends one
  * unfragmented text frame per message, which is all this needs.
- * @module @liuyera/dsh-chrome-browser/ws
+ * @module @liyuera/dsh-chrome-browser/ws
  */
 import { createHash } from 'node:crypto';
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';

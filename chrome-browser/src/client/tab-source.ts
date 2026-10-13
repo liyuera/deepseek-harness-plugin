@@ -13,7 +13,7 @@
  * The menu's own group title is owned by ui-input-trigger's dictionary, so
  * this source declares no group title and carries a section heading on every
  * row instead (the saved-prompt source does the same).
- * @module @liuyera/dsh-chrome-browser/client/tab-source
+ * @module @liyuera/dsh-chrome-browser/client/tab-source
  */
 
 import type { ComponentType } from 'react'

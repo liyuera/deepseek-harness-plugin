@@ -38,7 +38,7 @@ function loadPlugin(): { apply(ctx: unknown): void; inject: string[] } {
 
 describe('shipped client bundle', () => {
   it('registers under the package name the loader row expects', () => {
-    expect(loadBundle().id).toBe('@liuyera/dsh-chrome-browser')
+    expect(loadBundle().id).toBe('@liyuera/dsh-chrome-browser')
   })
 
   it('applies the @ tab source and no composer-dock row', async () => {

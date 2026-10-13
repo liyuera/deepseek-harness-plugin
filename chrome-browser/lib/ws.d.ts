@@ -3,7 +3,7 @@
  * text frames only (client frames arrive masked, server frames unmasked),
  * no extensions or subprotocols. Chrome's WebSocket client sends one
  * unfragmented text frame per message, which is all this needs.
- * @module @liuyera/dsh-chrome-browser/ws
+ * @module @liyuera/dsh-chrome-browser/ws
  */
 import type { IncomingMessage } from 'node:http';
 import type { Duplex } from 'node:stream';

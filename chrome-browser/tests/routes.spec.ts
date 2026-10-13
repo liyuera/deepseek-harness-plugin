@@ -35,9 +35,20 @@ function fakeCtx(webServer: unknown): { get(name: string): unknown; effect(callb
 }
 
 function fakeRes(): ServerResponse {
-  const response = { status: 0, body: '' } as ServerResponse & { status: number; body: string }
-  response.writeHead = ((status: number) => { response.status = status }) as unknown as ServerResponse['writeHead']
-  response.end = ((body?: unknown) => { response.body = String(body ?? '') }) as unknown as ServerResponse['end']
+  const response = {
+    status: 0,
+    body: '',
+    headers: {} as Record<string, string>,
+    raw: undefined as unknown,
+  } as ServerResponse & { status: number; body: string; headers: Record<string, string>; raw: unknown }
+  response.writeHead = ((status: number, headers?: Record<string, string>) => {
+    response.status = status
+    response.headers = headers ?? {}
+  }) as unknown as ServerResponse['writeHead']
+  response.end = ((body?: unknown) => {
+    response.raw = body
+    response.body = body === undefined ? '' : String(body)
+  }) as unknown as ServerResponse['end']
   return response
 }
 
@@ -172,5 +183,30 @@ describe('chrome-browser routes', () => {
     await handler(fakeReq('GET', '/chrome-browser/state?sessionId=s0'), boundRes)
     const body = JSON.parse(boundRes.body) as { selected: { tabId: string; title: string } | null }
     expect(body.selected).toMatchObject({ tabId: 't1', title: 'One' })
+  })
+
+  it('hands out the bundled extension as a zip (GET /chrome-browser/extension.zip)', async () => {
+    const server = fakeWebServer()
+    registerChromeRoutes(fakeCtx(server) as never, new CdpBackend(fakeChrome(TABS)), new SessionBindings())
+    const handler = server.routes['/chrome-browser/extension.zip'] as (req: IncomingMessage, res: ServerResponse) => void
+    const res = fakeRes()
+    handler(fakeReq('GET', '/chrome-browser/extension.zip'), res)
+    expect(res.status).toBe(200)
+    expect(res.headers['content-type']).toBe('application/zip')
+    expect(res.headers['content-disposition']).toContain('dsh-chrome-browser-extension.zip')
+    const archive = res.raw as Buffer
+    expect(archive.subarray(0, 4).toString('binary')).toBe('PK\u0003\u0004')
+    expect(archive.includes(Buffer.from('dsh-chrome-browser-extension/manifest.json'))).toBe(true)
+    expect(archive.includes(Buffer.from('dsh-chrome-browser-extension/service-worker.js'))).toBe(true)
+  })
+
+  it('rejects a non-GET request for the extension zip', async () => {
+    const server = fakeWebServer()
+    registerChromeRoutes(fakeCtx(server) as never, new CdpBackend(fakeChrome(TABS)), new SessionBindings())
+    const handler = server.routes['/chrome-browser/extension.zip'] as (req: IncomingMessage, res: ServerResponse) => void
+    const res = fakeRes()
+    handler(fakeReq('POST', '/chrome-browser/extension.zip'), res)
+    expect(res.status).toBe(405)
+    expect(JSON.parse(res.body) as { ok: boolean }).toMatchObject({ ok: false })
   })
 })

@@ -3,7 +3,7 @@
  * matching, timeouts, and teardown live here; the transport behind a
  * {@link CdpSocket} is injectable so framing logic is unit-testable without a
  * real WebSocket.
- * @module @liuyera/dsh-chrome-browser/cdp
+ * @module @liyuera/dsh-chrome-browser/cdp
  */
 /** Race `promise` against a deadline; the loser's timer is always cleared. */
 export async function withTimeout(promise, timeoutMs, message) {

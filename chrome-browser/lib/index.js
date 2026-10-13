@@ -6,7 +6,7 @@
  * same-origin routes the browser half uses to list tabs, bind them per
  * session, and serve the extension bridge WebSocket, and the pre-step hook
  * that expands a tab citation into a context message.
- * @module @liuyera/dsh-chrome-browser
+ * @module @liyuera/dsh-chrome-browser
  */
 import z from '@deepseek-ai/schemastery';
 import { buildBackend } from "./backend.js";

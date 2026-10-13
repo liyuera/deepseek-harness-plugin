@@ -4,7 +4,7 @@
  * `user` mode, spawn a dedicated instance in `owned` mode, list page
  * targets, and open a CDP endpoint on one tab. The plugin never terminates a
  * browser it did not spawn.
- * @module @liuyera/dsh-chrome-browser/chrome
+ * @module @liyuera/dsh-chrome-browser/chrome
  */
 
 import { execFile, execFileSync, spawn, type ChildProcess } from 'node:child_process'

@@ -1,5 +1,5 @@
 window.__ModuleLoader__.load({
-	id: "@liuyera/dsh-chrome-browser",
+	id: "@liyuera/dsh-chrome-browser",
 	factory: (require) => {
 		var module = { exports: {} };
 		var exports = module.exports;
@@ -43,7 +43,7 @@ window.__ModuleLoader__.load({
 		* modified: the whole selection is bound host-side per session and reported
 		* to the model through chrome_tabs (`session.tabs`); the tool default is the
 		* first selected tab.
-		* @module @liuyera/dsh-chrome-browser/client/tab-picker
+		* @module @liyuera/dsh-chrome-browser/client/tab-picker
 		*/
 		//#endregion
 		//#region lib/client/tab-catalog.js
@@ -54,7 +54,7 @@ window.__ModuleLoader__.load({
 		* keeps one typed word from becoming one host round-trip per character; a
 		* failed listing is held for the same window, so an unreachable browser costs
 		* one logged request instead of one per keystroke.
-		* @module @liuyera/dsh-chrome-browser/client/tab-catalog
+		* @module @liyuera/dsh-chrome-browser/client/tab-catalog
 		*/
 		/** How long one listing (successful or failed) stays fresh. */
 		const CACHE_MS = 2e3;
@@ -108,7 +108,7 @@ window.__ModuleLoader__.load({
 		* The menu's own group title is owned by ui-input-trigger's dictionary, so
 		* this source declares no group title and carries a section heading on every
 		* row instead (the saved-prompt source does the same).
-		* @module @liuyera/dsh-chrome-browser/client/tab-source
+		* @module @liyuera/dsh-chrome-browser/client/tab-source
 		*/
 		/** Source name: the `@` roster key and the reference owner a chip routes back through. */
 		const CHROME_TAB_SOURCE_NAME = "chrome-browser";
@@ -204,7 +204,7 @@ window.__ModuleLoader__.load({
 		* favicon needs one. Components are memoized by URL: a fresh component
 		* identity per candidate would remount every row's image on each menu render
 		* (every keystroke) and reload it.
-		* @module @liuyera/dsh-chrome-browser/client/tab-icon
+		* @module @liyuera/dsh-chrome-browser/client/tab-icon
 		*/
 		/** One favicon at menu-icon size; a URL that cannot load hides its own image. */
 		function FaviconImage({ favicon, size }) {

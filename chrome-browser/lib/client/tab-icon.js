@@ -5,7 +5,7 @@
  * favicon needs one. Components are memoized by URL: a fresh component
  * identity per candidate would remount every row's image on each menu render
  * (every keystroke) and reload it.
- * @module @liuyera/dsh-chrome-browser/client/tab-icon
+ * @module @liyuera/dsh-chrome-browser/client/tab-icon
  */
 import React from 'react';
 import { CHROME_ICON_SRC } from "./chrome-icon.js";

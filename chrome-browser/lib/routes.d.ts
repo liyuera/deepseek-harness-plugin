@@ -4,7 +4,7 @@
  * upgrade and its status endpoint. Static client bundles have no
  * package-private RPC channel (host.call is a dynamic-plugin builtin), so the
  * client half reaches the host through these routes.
- * @module @liuyera/dsh-chrome-browser/routes
+ * @module @liyuera/dsh-chrome-browser/routes
  */
 import type { Context } from '@deepseek-ai/cordis';
 import type { ServerResponse } from 'node:http';

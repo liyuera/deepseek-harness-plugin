@@ -6,7 +6,7 @@
  * scan skips it, and a turn cannot expand the same mention twice. The type-only
  * import is required: a merge declared without importing its target does not
  * resolve against the package graph.
- * @module @liuyera/dsh-chrome-browser/message-source
+ * @module @liyuera/dsh-chrome-browser/message-source
  */
 /**
  * Build the source of one injected context message.

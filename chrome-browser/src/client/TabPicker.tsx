@@ -7,7 +7,7 @@
  * modified: the whole selection is bound host-side per session and reported
  * to the model through chrome_tabs (`session.tabs`); the tool default is the
  * first selected tab.
- * @module @liuyera/dsh-chrome-browser/client/tab-picker
+ * @module @liyuera/dsh-chrome-browser/client/tab-picker
  */
 
 import React from 'react'

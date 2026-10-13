@@ -1,8 +1,7 @@
 {
   "name": "@liyuera/dsh-dev-dock",
   "description": "Frontend project engineering management for dsh: project registry, editor detection, quick-start, open project in IDE or system terminal",
-  "version": "1.0.3",
-  "private": true,
+  "version": "1.0.5",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",

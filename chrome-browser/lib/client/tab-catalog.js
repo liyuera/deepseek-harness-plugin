@@ -5,7 +5,7 @@
  * keeps one typed word from becoming one host round-trip per character; a
  * failed listing is held for the same window, so an unreachable browser costs
  * one logged request instead of one per keystroke.
- * @module @liuyera/dsh-chrome-browser/client/tab-catalog
+ * @module @liyuera/dsh-chrome-browser/client/tab-catalog
  */
 /** How long one listing (successful or failed) stays fresh. */
 const CACHE_MS = 2000;

@@ -1,7 +1,7 @@
 /**
  * Text shaping for page content: normalization, code-point-safe clipping, and
  * bounded JSON serialization of evaluate results.
- * @module @liuyera/dsh-chrome-browser/text
+ * @module @liyuera/dsh-chrome-browser/text
  */
 /** Collapse layout whitespace and repeated blank lines; trim the ends. */
 export function normalizePageText(text) {

@@ -9,7 +9,7 @@
  * the user's message growing a line of machine text. A quoted token that
  * matches no open tab — a file path with spaces, or a tab closed since the
  * pick — expands to nothing.
- * @module @liuyera/dsh-chrome-browser/mentions
+ * @module @liyuera/dsh-chrome-browser/mentions
  */
 
 import { createUserMessage, type UserMessage } from '@deepseek-ai/dsh-llm/message'

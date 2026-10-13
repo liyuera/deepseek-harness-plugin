@@ -1,8 +1,7 @@
 {
   "name": "@liyuera/dsh-user-ds-balance",
   "description": "User plugin: DeepSeek account balance readout in the composer tool row (5-minute polling, click-to-refresh, loading indicator)",
-  "version": "0.1.0",
-  "private": true,
+  "version": "0.1.2",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",

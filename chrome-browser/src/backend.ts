@@ -6,7 +6,7 @@
  *   Chrome — no restarts, no profile copies.
  * - `CdpBackend`: the Chrome DevTools Protocol path (owned/user/attach modes)
  *   used as a fallback when config selects `cdp`.
- * @module @liuyera/dsh-chrome-browser/backend
+ * @module @liyuera/dsh-chrome-browser/backend
  */
 
 import type { Duplex } from 'node:stream'
