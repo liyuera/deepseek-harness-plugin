@@ -6,6 +6,13 @@ documentation, and assets — may be used, copied, modified, merged,
 published, distributed, sublicensed, or sold in any form or by any means
 without the prior written permission of the copyright holder.
 
+Notwithstanding the preceding paragraph, the copyright holder publishes the
+packages under the `@liyuera` scope to the public npm registry. Downloading,
+installing and running those published packages — including through DeepSeek
+Harness — is permitted. Every other right stays reserved: the published
+packages grant no right to modify, redistribute, sublicense or sell the
+software, and no source code is licensed for reuse.
+
 The software is provided "as is", without warranty of any kind, express or
 implied, including but not limited to the warranties of merchantability,
 fitness for a particular purpose and noninfringement. In no event shall the

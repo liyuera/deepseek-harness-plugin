@@ -1,4 +1,4 @@
-# @liuyera/dsh-chrome-browser
+# @liyuera/dsh-chrome-browser
 
 Chrome 浏览器控制插件(host + 浏览器半边):通过 Chrome 扩展桥(默认)或 Chrome DevTools Protocol (CDP) 控制你的 Chrome——列出标签页、读取网页内容、导航、新开标签页、截图、点击、输入文本、执行 JS;`@` 菜单里列出实时标签页(标题 + URL),选中即把该标签页插进当前这条消息,AI 就在那个标签页里工作。零浏览器自动化运行时依赖(Node 内建 fetch / WebSocket / child_process)。
 
@@ -18,17 +18,11 @@ Chrome 浏览器控制插件(host + 浏览器半边):通过 Chrome 扩展桥(默
 
 ## 浏览器连接模式
 
-**默认 = 扩展后端(推荐)**:控制的就是你**日常运行的 Chrome 本身**——不重启、不复制 profile、无额外窗口。安装一次:
-
-1. Chrome 打开 `chrome://extensions` → 右上开启「开发者模式」;
-2. 点「加载已解压的扩展程序」→ 选择本插件目录下的 `extension/` 文件夹;
-3. 打开 dsh 页面。扩展会依次尝试 `ws://127.0.0.1:19387`(官方 APP 的 desktop profile)与
-   `ws://127.0.0.1:3080`(源码启动的 `pnpm dsh web`),哪个在跑连哪个,不用改代码;
-   两个都换了端口时,改 `extension/service-worker.js` 顶部的 `WS_URLS` 后重新加载扩展。
+**默认 = 扩展后端(推荐)**:控制的就是你**日常运行的 Chrome 本身**——不重启、不复制 profile、无额外窗口。扩展的获取与加载步骤见[安装 → 2. 装配套 Chrome 扩展](#2-装配套-chrome-扩展)。
 
 改了 `extension/` 里的文件后,必须在 `chrome://extensions` 点该扩展的「重新加载」才会生效——Chrome 不会自动重读已加载的解压扩展。
 
-之后扩展通过本地 WebSocket(`/chrome-browser/ext/ws`)与插件通信:列真实标签页(自带站点图标)、读取/点击/输入/求值/导航/新开/截图。没有安装在列表时会提示你怎么装。
+之后扩展通过本地 WebSocket(`/chrome-browser/ext/ws`)与插件通信:列真实标签页(自带站点图标)、读取/点击/输入/求值/导航/新开/截图。扩展没连上时 `@` 菜单不出现标签页分组,`/chrome-browser/ext/status` 会报 `connected:false`。
 
 **CDP 后端(可选,`backend: 'cdp'`)**——原有能力保留:
 
@@ -41,13 +35,56 @@ Chrome 浏览器控制插件(host + 浏览器半边):通过 Chrome 扩展桥(默
 
 ## 安装
 
-在 `deepseek-harness-plugin/` 所在工作区根执行:
+分两步:装宿主插件,再装一次配套的 Chrome 扩展。两步都做完重启 dsh 才会工作。
+
+### 1. 装插件
 
 ```sh
-dsh plugin --profile web add -w link:/Users/liyu/Documents/www/DeepSeek/deepseek-harness/deepseek-harness-plugin/chrome-browser
+dsh plugin --profile desktop add @liyuera/dsh-chrome-browser      # 从 npm(GUI:设置 → 插件 → 添加插件)
+dsh plugin --profile desktop add link:/绝对路径/deepseek-harness-plugin/chrome-browser   # 从本地目录
 ```
 
-重启 dsh 后生效(桌面应用退出重开;源码启动的则是重启 `pnpm dsh web`)。宿主半边(工具、路由、`agent/pre-step` 展开)只在启动时加载——改了 `src/` 或 `lib/index.js` 必须重启进程,浏览器里硬刷新只换得到 `lib/client.js`。
+`desktop` 是桌面应用独占的 profile(源码启动的 `pnpm dsh web` 用 `web`)。两种装法的产物都已构建好,目标机器不需要 `npm install` 或联网。
+
+宿主半边 import `@deepseek-ai/schemastery`、`@deepseek-ai/dsh-tools`、`@deepseek-ai/dsh-llm/message`,三者都声明在 `peerDependencies`:宿主从自己的安装目录提供,与装好的 dsh 版本一致。`dependencies` 里的包在 `link:` 安装下解析不到——运行时依赖一律写 `peerDependencies`(详见仓库根 README)。
+
+### 2. 装配套 Chrome 扩展
+
+宿主插件靠一条本地 WebSocket 桥(`/chrome-browser/ext/ws`)与 Chrome 通信,**扩展必须手动装一次**(它不在 Chrome 应用商店)。扩展文件随插件包一起发布,两种取法:
+
+**方式 A:从插件自己的下载路由(推荐)** —— 把当前 dsh 地址拼上下载路径,浏览器打开即下载(桌面应用默认 `http://127.0.0.1:19387`,源码启动默认 `http://127.0.0.1:3080`):
+
+```
+http://127.0.0.1:19387/chrome-browser/extension.zip
+```
+
+命令行等价:
+
+```sh
+curl -L -o dsh-chrome-browser-extension.zip http://127.0.0.1:19387/chrome-browser/extension.zip
+unzip dsh-chrome-browser-extension.zip     # 得到 dsh-chrome-browser-extension/ 目录
+```
+
+**方式 B:从插件安装目录直接取**
+
+```
+$DSH_HOME/profiles/<profile>/node_modules/@liyuera/dsh-chrome-browser/extension/
+```
+
+(`$DSH_HOME` 默认 `~/.dsh`;Windows 是 `%USERPROFILE%\.dsh`。)
+
+**然后在 Chrome 里加载**:
+
+1. 打开 `chrome://extensions`,右上角开启「开发者模式」;
+2. 点「加载已解压的扩展程序」,选择方式 A 解压出的 `dsh-chrome-browser-extension/` 目录(方式 B 就是那个 `extension/` 目录);
+3. 打开 dsh 页面。扩展会依次尝试 `ws://127.0.0.1:19387`(桌面应用)与 `ws://127.0.0.1:3080`(源码启动),哪个在跑连哪个,不用改代码;
+4. 核对连接:`http://127.0.0.1:19387/chrome-browser/ext/status` 返回 `{"ok":true,"backend":"extension","connected":true}` 即已连上。
+
+两个端口都不是默认值时,改扩展 `service-worker.js` 顶部的 `WS_URLS`,再到 `chrome://extensions` 点该扩展的「重新加载」——Chrome 不会自动重读已加载的解压扩展。
+
+### 3. 重启 dsh
+
+宿主半边(工具、路由、`agent/pre-step` 展开)只在启动时加载——桌面应用退出重开,源码启动则重启 `pnpm dsh web`;浏览器里硬刷新只换得到 `lib/client.js`。
 
 ## 配置
 
@@ -56,7 +93,7 @@ dsh plugin --profile web add -w link:/Users/liyu/Documents/www/DeepSeek/deepseek
 ```yaml
 - insert:
     - id: chrome-browser
-      name: '@liuyera/dsh-chrome-browser'
+      name: '@liyuera/dsh-chrome-browser'
       config:
         backend: extension    # extension(默认,真实 Chrome 通过扩展桥);cdp = DevTools 协议
         port: 9222            # DevTools 端口(cdp 后端)
@@ -103,3 +140,15 @@ DSH_CHROME_SMOKE=1 npx vitest run tests/smoke.spec.ts   # headless Chrome 全链
 - 截图默认写入系统临时目录,随系统清理。
 - 每次工具调用为每个标签页新建一次 CDP 会话(约数十毫秒开销),未做连接复用;需要高频操作时可后续加常驻会话层。
 - 会话标签页绑定是内存态(重启后清空),不做持久化。
+
+## 卸载
+
+```sh
+dsh plugin --profile desktop remove @liyuera/dsh-chrome-browser
+```
+
+再到 `chrome://extensions` 移除 `dsh Chrome Bridge` 扩展。卸载插件不会关闭你的 Chrome(CDP 的 owned 专用实例除外)。
+
+## 许可
+
+专有软件,`UNLICENSED`:允许通过 npm 安装并运行本包(全文见包内 `LICENSE`),不授予修改、再分发、再许可或销售的权利。

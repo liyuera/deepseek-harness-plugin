@@ -1,4 +1,4 @@
-# ui-favorite-prompts
+# @liyuera/dsh-favorite-prompts
 
 给 dsh Web GUI 的"收藏提示词"插件：在消息下方一键收藏自己发过的提示词，在输入框用 `@` 拉出收藏并整段插入，在设置里增删改。
 
@@ -9,10 +9,15 @@
 ## 安装
 
 ```sh
-dsh plugin --profile web add link:/绝对路径/deepseek-harness/deepseek-harness-plugin/ui-favorite-prompts
+dsh plugin --profile desktop add @liyuera/dsh-favorite-prompts    # 从 npm（GUI：设置 → 插件 → 添加插件）
+dsh plugin --profile desktop add link:/绝对路径/deepseek-harness-plugin/ui-favorite-prompts   # 从本地目录
 ```
 
-重启 `dsh web` 生效（profile 的 insert 行在启动时读取）。
+`desktop` 是桌面应用独占的 profile（源码启动的 `pnpm dsh web` 用 `web`）。重启 dsh 生效（profile 的 insert 行在启动时读取）。两种装法的产物都已构建好，目标机器不需要 `npm install` 或联网。
+
+宿主半边 import `@deepseek-ai/dsh-storage-domain`，它声明在 `peerDependencies`：宿主提供自己那份实例，`already-open` 重试里的 `error instanceof DomainError` 依赖这一点。`dependencies` 里的包在 `link:` 安装下解析不到（详见仓库根 README）。
+
+需要 dsh 0.2.x：`@deepseek-ai/dsh-*` 依赖声明在 `peerDependencies`（`^0.2.0-rc.2`），版本不匹配时 `dsh plugin add` 会拒绝安装。
 
 ## 三个入口
 
@@ -53,3 +58,15 @@ node ../../node_modules/vitest/vitest.mjs run  # 测试
 ### 收藏条的排序契约
 
 收藏条是自建 Chat 节点，靠节点 key 的字典序落在用户消息正下方：`key = ${kind.length}:${kind}${id}`，内置用户节点是 `13:input-message…`，本插件 `favorite-strip` 是 `14:favorite-strip…`。**改 kind 名长度或把 `anchorSeq` 从 `event.seq` 挪开，都会让收藏条跑到气泡上面或被折进"思考过程"折叠组。** 契约写在 `src/client/strip/definition.ts` 顶部，并有单测守着。
+
+## 卸载
+
+```sh
+dsh plugin --profile desktop remove @liyuera/dsh-favorite-prompts
+```
+
+已存的收藏留在 `$DSH_HOME/storages/favorite_prompts/`，重装后照常读回。
+
+## 许可
+
+专有软件，`UNLICENSED`：允许通过 npm 安装并运行本包（全文见包内 `LICENSE`），不授予修改、再分发、再许可或销售的权利。

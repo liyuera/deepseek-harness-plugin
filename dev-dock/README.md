@@ -5,10 +5,11 @@ Frontend project engineering management for DeepSeek Harness, v2: projects are d
 ## Install
 
 ```sh
-dsh plugin --profile web add link:/Users/liyu/Documents/www/DeepSeek/deepseek-harness/deepseek-harness-plugin/dev-dock
+dsh plugin --profile desktop add @liyuera/dsh-dev-dock        # from npm (GUI: Settings → Plugins → Add plugin)
+dsh plugin --profile desktop add link:/path/to/deepseek-harness-plugin/dev-dock   # from a local checkout
 ```
 
-Restart `dsh web`. The sidebar foot shows **开始上班** (start-work dialog) above a `devDock - N项目` row (N = workspace count); every session header gets **IDE / 终端 / 启动** actions for its workspace; the devDock settings page opens from **设置 → devDock**.
+`desktop` is the profile the desktop app owns; a source run (`pnpm dsh web`) uses `web`. Restart dsh after installing — the host half loads only at startup. The sidebar foot shows **开始上班** (start-work dialog) above a `devDock - N项目` row (N = workspace count); every session header gets **IDE / 终端 / 启动** actions for its workspace; the devDock settings page opens from **设置 → devDock**.
 
 ## UI surfaces
 
@@ -30,10 +31,10 @@ Restart `dsh web`. The sidebar foot shows **开始上班** (start-work dialog) a
 ## Build
 
 ```sh
-tsc -b && tsdown --env.DSH_BUILD_FACE=client   # bins resolve from the harness root node_modules
+tsc -b && tsdown --config-loader tsx   # bins resolve from the harness root node_modules
 ```
 
-The harness client-bundle preset only recognizes packages under `packages/*/*` (boundary gate since the harness `build(client): enforce client package boundaries` commit), so an out-of-tree build needs a transient manifest copy at `packages/litepack/dev-dock/package.json` during the tsdown step; remove it afterwards. `lib/` artifacts (including `lib/client.js`) are committed, install-and-go.
+The out-of-tree bundles (host halves plus `lib/client.js`) are built by this repo's shared helper, [`build/client-bundle.ts`](../build/client-bundle.ts). `lib/` artifacts are committed, install-and-go.
 
 ## Known limitations (v1)
 
@@ -41,3 +42,19 @@ The harness client-bundle preset only recognizes packages under `packages/*/*` (
 - Tests for v1 were removed with the v1 surface; host unit tests (editor merge, action command building) and client component specs are the next iteration item.
 - Windows detection and terminal fallback remain untested on real Windows hardware.
 - The HTTP action route is loopback-bound like the rest of the web server; the browser page is the only same-origin caller.
+
+## Configuration
+
+No plugin configuration options. Everything user-selectable (per-workspace editor, manual editor paths, terminal app, last start-work selection) lives in the `dev-dock` settings namespace and is edited from **设置 → devDock**. The host half declares `@deepseek-ai/cordis` as a peer dependency; `dsh plugin add` refuses to install this package on a dsh version outside that range.
+
+## Uninstall
+
+```sh
+dsh plugin --profile desktop remove @liyuera/dsh-dev-dock
+```
+
+The `dev-dock` settings namespace stays in storage; reinstalling restores the previous preferences.
+
+## License
+
+Proprietary, `UNLICENSED`: installing and running this package through npm is permitted (see the bundled `LICENSE` for the full text). Modifying, redistributing, sublicensing or selling it is not.
