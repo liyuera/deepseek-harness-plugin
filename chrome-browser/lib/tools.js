@@ -327,13 +327,26 @@ export function chromeToolDefinitions(backend, config, consoleLog, help) {
             parameters: {
                 tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the tab the user is looking at; omitting it means 'active' too." },
                 path: { type: 'string', description: 'Optional output file path; defaults to <screenshotDir>/<timestamp>-<tabId>.png.' },
+                fullPage: {
+                    type: 'boolean',
+                    description: 'Capture the whole scrollable page instead of the viewport. Use it when what you need may '
+                        + 'sit below the fold; the image can be very tall.',
+                },
+                selector: {
+                    type: 'string',
+                    description: 'Capture only the element matching this CSS selector, wherever it sits on the page. '
+                        + 'Takes precedence over fullPage.',
+                },
             },
             output: { schema: { type: 'json' }, render },
             presentCall: args => screenshotCall(args),
             presentResult: (_args, outcome) => screenshotResult(outcome),
             execute: async (args, _exec) => {
                 const tabId = await resolveTabId(backend, _exec, args.tabId);
-                const shot = await backend.screenshot(tabId);
+                const shot = await backend.screenshot(tabId, {
+                    fullPage: args.fullPage === true,
+                    ...(typeof args.selector === 'string' && args.selector !== '' ? { selector: args.selector } : {}),
+                });
                 const ext = shot.mime === 'image/jpeg' ? 'jpg' : 'png';
                 const path = typeof args.path === 'string' && args.path !== ''
                     ? imagePath(args.path, ext)

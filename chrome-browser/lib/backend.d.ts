@@ -13,6 +13,18 @@ import type { CapturedMessage } from './console-events.ts';
 import type { WaitState } from './expressions.ts';
 import { Chrome } from './chrome.ts';
 import type { ResolvedChromeConfig } from './chrome.ts';
+/**
+ * What a screenshot should cover.
+ *
+ * Absent fields mean "the visible viewport", which is what a caller who just
+ * wants the page as the user sees it needs.
+ */
+export interface ScreenshotOptions {
+    /** Capture the whole scrollable page rather than the viewport. */
+    fullPage?: boolean;
+    /** Capture one element instead, matched by CSS selector. */
+    selector?: string;
+}
 /** One tab as tools and the picker see it. */
 export interface BackendTab {
     id: string;
@@ -150,7 +162,7 @@ export interface BrowserBackend {
      */
     waitFor(tabId: string, selector: string, state: WaitState, timeoutMs: number): Promise<boolean>;
     type(tabId: string, selector: string, text: string, clear: boolean): Promise<void>;
-    screenshot(tabId: string): Promise<{
+    screenshot(tabId: string, options?: ScreenshotOptions): Promise<{
         data: string;
         path?: string;
         mime?: string;
@@ -223,6 +235,17 @@ export declare class ExtensionBackend implements BrowserBackend {
      * host process both settle.
      */
     private reloadAskedFor;
+    /**
+     * Set when a build the host already asked about came back unchanged.
+     *
+     * The reload usually works. When it does not, the extension is re-reading a
+     * DIFFERENT copy of its files than the one this plugin ships — which happens
+     * when the install method changes while the host is running, because the host
+     * keeps resolving its old module path while Chrome keeps serving the copy it
+     * loaded. No number of reloads can close that, so it is reported rather than
+     * retried.
+     */
+    private reloadIneffective;
     private seq;
     private readonly unacked;
     /**
@@ -277,6 +300,9 @@ export declare class ExtensionBackend implements BrowserBackend {
         expectedBuild: string;
         stale: boolean;
         autoReloadAsked: boolean;
+        reloadAskedFor: string;
+        reloadIneffective: boolean;
+        ops: string;
     };
     /**
      * Record the extension's self-report, and ask it to reload when it is running
@@ -334,11 +360,18 @@ export declare class CdpBackend implements BrowserBackend {
     select(tabId: string, selector: string, value: string): Promise<SelectOutcome>;
     waitFor(tabId: string, selector: string, state: WaitState, timeoutMs: number): Promise<boolean>;
     type(tabId: string, selector: string, text: string, clear: boolean): Promise<void>;
-    screenshot(tabId: string): Promise<{
+    screenshot(tabId: string, options?: ScreenshotOptions): Promise<{
         data: string;
         path?: string;
         mime?: string;
     }>;
+    /**
+     * One element's clip rectangle, or a failure naming the selector.
+     * @param endpoint - the tab's CDP endpoint.
+     * @param selector - CSS selector of the element to capture.
+     * @returns the clip rectangle in page coordinates.
+     */
+    private clipOf;
     startConsole(tabId: string): Promise<void>;
     stopConsole(tabId: string): Promise<void>;
     dispose(): void;

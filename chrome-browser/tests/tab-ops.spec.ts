@@ -176,7 +176,7 @@ describe('chrome_navigate URL scheme', () => {
   })
 })
 
-describe('the activity strip sees a close', () => {
+describe('the status chip sees a close', () => {
   it('reports the call while it runs', async () => {
     const activity = new ActivityTracker()
     const fixture = backend()
@@ -191,7 +191,7 @@ describe('the activity strip sees a close', () => {
       await original(tabId)
     })
     await wrapped.execute({ tabId: '9' }, {} as never)
-    expect(during).toMatchObject({ active: true, tool: 'chrome_close', tabId: '9' })
-    expect(activity.snapshot().active).toBe(false)
+    expect(during).toMatchObject({ phase: 'running', tool: 'chrome_close', tabId: '9' })
+    expect(activity.snapshot()).toMatchObject({ phase: 'done', tabId: '9' })
   })
 })

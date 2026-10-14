@@ -66,8 +66,10 @@ describe('shipped client bundle', () => {
     const plugin = loadPlugin()
     expect(plugin.inject).toEqual(['slots', 'inputTriggers'])
     plugin.apply(ctx)
-    // The dock carries the activity strip and nothing else.
-    expect(slots).toEqual(['conversation.input.dock', 'chrome-browser-activity'])
+    // The Session header's trailing utilities carry the status chip, and the
+    // composer dock is left to the harness: the chip has to stay on screen, and
+    // anything in that dock only exists while a call runs.
+    expect(slots).toEqual(['conversation.session.header.utilities', 'chrome-browser-activity'])
     expect(sources).toHaveLength(1)
     expect(sources[0]?.name).toBe('chrome-browser')
     expect(sources[0]?.trigger).toBe('@')

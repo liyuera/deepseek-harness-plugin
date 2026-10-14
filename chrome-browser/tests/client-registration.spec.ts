@@ -56,10 +56,10 @@ describe('chrome-browser browser half', () => {
     expect(inject).toEqual(['slots', 'inputTriggers'])
   })
 
-  it('registers the activity strip on the composer dock', async () => {
+  it('registers the status chip in the Session header utilities', async () => {
     const { contributions } = await bench()
     expect(contributions).toHaveLength(1)
-    expect(contributions[0]?.options.name).toBe('conversation.input.dock')
+    expect(contributions[0]?.options.name).toBe('conversation.session.header.utilities')
     expect(contributions[0]?.options.id).toBe('chrome-browser-activity')
   })
 

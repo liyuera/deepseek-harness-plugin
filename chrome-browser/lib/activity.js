@@ -1,20 +1,35 @@
 /**
- * What the plugin is doing right now, for the in-page status strip.
+ * What the plugin is doing right now, for the persistent header indicator.
  *
  * The host half is the only place that knows a call is in flight, so it records
  * every tool execution here and serves the snapshot over its own route; the
- * browser half polls that route and renders a strip only while something is
- * running. Nothing is persisted, and nothing crosses into the model's request.
+ * browser half polls that route and renders one chip in the Session header.
+ * Nothing is persisted, and nothing crosses into the model's request.
  * @module @liyuera/dsh-chrome-browser/activity
  */
 /**
- * In-flight and last-finished browser calls, keyed by session when the caller
- * has one. A session that has never called anything reports inactive, which is
- * what the strip needs: absence of a call, not absence of a plugin.
+ * How long a settled call stays on screen before the chip returns to idle.
+ * Short enough not to linger, long enough that a call finishing between two
+ * polls is still seen: the browser half polls at POLL_MS, so a hold shorter
+ * than one poll interval can be missed entirely.
+ */
+export const DONE_HOLD_MS = 2_500;
+/** How long a failure stays on screen. Longer: it asks to be read. */
+export const ERROR_HOLD_MS = 7_000;
+/** Longest failure text carried to the chip; the card holds the full one. */
+const DETAIL_LIMIT = 120;
+/**
+ * In-flight and recently finished browser calls, keyed by session when the
+ * caller has one.
+ *
+ * The tracker holds facts, not timers: `snapshot` decides whether a settled
+ * call is still worth showing from the clock alone. That keeps a host tick out
+ * of the loop and means a browser that polls late sees the same answer a
+ * host-side timer would have produced.
  */
 export class ActivityTracker {
     running = [];
-    finished = new Map();
+    settled = new Map();
     /** Session key for a caller with no session identity. */
     static ANONYMOUS = '';
     /**
@@ -22,7 +37,7 @@ export class ActivityTracker {
      * @param tool - the tool name.
      * @param tabId - the tab the call named, when it named one.
      * @param sessionId - the calling session, when the execution carried one.
-     * @returns the disposer that records the call as finished; idempotent.
+     * @returns the disposer that records how the call ended; idempotent.
      */
     begin(tool, tabId, sessionId) {
         const entry = {
@@ -33,20 +48,27 @@ export class ActivityTracker {
         };
         this.running.push(entry);
         let ended = false;
-        return () => {
+        return (ok, detail) => {
             if (ended)
                 return;
             ended = true;
             const at = this.running.indexOf(entry);
             if (at >= 0)
                 this.running.splice(at, 1);
-            this.finished.set(sessionId ?? ActivityTracker.ANONYMOUS, { tool, at: Date.now() });
+            const shortened = detail === undefined ? undefined : detail.slice(0, DETAIL_LIMIT);
+            this.settled.set(sessionId ?? ActivityTracker.ANONYMOUS, {
+                tool,
+                ok,
+                at: Date.now(),
+                ...(entry.tabId === undefined ? {} : { tabId: entry.tabId }),
+                ...(ok || shortened === undefined ? {} : { detail: shortened }),
+            });
         };
     }
     /**
      * The current state for one session.
      * @param sessionId - the session to report on; omit for the most recent call in any session.
-     * @returns the snapshot the strip renders from.
+     * @returns the snapshot the chip renders from.
      */
     snapshot(sessionId) {
         const key = sessionId ?? ActivityTracker.ANONYMOUS;
@@ -54,23 +76,33 @@ export class ActivityTracker {
         // one browser, so an unidentified call is still this caller's call.
         const running = [...this.running].reverse()
             .find(entry => entry.sessionId === undefined || sessionId === undefined || entry.sessionId === key);
-        const last = this.finished.get(key);
-        return {
-            active: running !== undefined,
-            ...(running === undefined
-                ? {}
-                : {
-                    tool: running.tool,
-                    startedAt: running.startedAt,
-                    ...(running.tabId === undefined ? {} : { tabId: running.tabId }),
-                }),
-            ...(last === undefined ? {} : { lastTool: last.tool, lastAt: last.at }),
-        };
+        if (running !== undefined) {
+            return {
+                phase: 'running',
+                tool: running.tool,
+                since: running.startedAt,
+                ...(running.tabId === undefined ? {} : { tabId: running.tabId }),
+            };
+        }
+        const settled = this.settled.get(key);
+        if (settled !== undefined) {
+            const hold = settled.ok ? DONE_HOLD_MS : ERROR_HOLD_MS;
+            if (Date.now() - settled.at < hold) {
+                return {
+                    phase: settled.ok ? 'done' : 'error',
+                    tool: settled.tool,
+                    since: settled.at,
+                    ...(settled.tabId === undefined ? {} : { tabId: settled.tabId }),
+                    ...(settled.detail === undefined ? {} : { detail: settled.detail }),
+                };
+            }
+        }
+        return { phase: 'ready', since: settled?.at ?? 0 };
     }
     /** Drop every record; the plugin calls this on unload. */
     clear() {
         this.running.length = 0;
-        this.finished.clear();
+        this.settled.clear();
     }
 }
 /** The tab a call named, as the tracker reads it from frozen arguments. */
@@ -84,8 +116,13 @@ function sessionIdOf(exec) {
     const id = session?.id;
     return typeof id === 'string' && id !== '' ? id : undefined;
 }
+/** A thrown value as one line of text for the chip. */
+function messageOf(error) {
+    const text = error instanceof Error ? error.message : String(error);
+    return text.replace(/\s+/gu, ' ').trim();
+}
 /**
- * Wrap one tool definition so its execution is visible to the status strip.
+ * Wrap one tool definition so its execution is visible to the header chip.
  *
  * Every other member is carried over untouched: this adds observation, it does
  * not change what the tool declares or returns.
@@ -100,10 +137,13 @@ export function withActivity(definition, activity) {
         async execute(args, exec) {
             const end = activity.begin(definition.name, tabIdOf(args), sessionIdOf(exec));
             try {
-                return await run(args, exec);
+                const value = await run(args, exec);
+                end(true);
+                return value;
             }
-            finally {
-                end();
+            catch (error) {
+                end(false, messageOf(error));
+                throw error;
             }
         },
     };

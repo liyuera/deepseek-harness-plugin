@@ -412,20 +412,77 @@ describe('ExtensionBackend', () => {
     hello(socket, 'stale-build', ['list-tabs', 'reload'])
     await new Promise(resolve => setTimeout(resolve, 10))
     expect(socket.lastServerText()).toContain('"op":"reload"')
-    expect(backend.extensionStatus()).toMatchObject({ build: 'stale-build', stale: true, autoReloadAsked: true })
+    expect(backend.extensionStatus()).toMatchObject({ build: 'stale-build', stale: true })
   })
 
-  it('never asks twice about the same stale build', async () => {
-    // If a reload cannot move the extension off one version, asking on every
-    // heartbeat would reload it forever.
+  it('does not spend the attempt when the request never went out', async () => {
+    // Marking before sending made a refused request look like a reload that ran
+    // and did not help, and the extension was then never asked again — the
+    // failure this guard is supposed to survive.
+    const { backend, socket } = makeBackend()
+    hello(socket, 'stale-build', ['list-tabs'])
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(backend.extensionStatus().reloadAskedFor, 'a request with no reload op must not count').toBe('')
+
+    hello(socket, 'stale-build', ['list-tabs', 'reload'])
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(socket.lastServerText()).toContain('"op":"reload"')
+    const sent = JSON.parse(socket.lastServerText()!) as { commands: Array<{ seq: number }> }
+    socket.feed(FakeSocket.clientText(JSON.stringify({
+      kind: 'results', results: [{ seq: sent.commands[0]!.seq, ok: true, data: { reloaded: true } }],
+    })))
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(backend.extensionStatus().reloadAskedFor).toBe('stale-build')
+  })
+
+  it('says so when a reload it asked for changed nothing', async () => {
+    // Either the reload did not run or the extension re-reads a different copy
+    // of its files than this plugin ships; from here the two look the same, and
+    // both need a person. Retrying would only hide it.
     const { backend, socket } = makeBackend()
     hello(socket, 'stale-build', ['list-tabs', 'reload'])
     await new Promise(resolve => setTimeout(resolve, 10))
+    const sent = JSON.parse(socket.lastServerText()!) as { commands: Array<{ seq: number }> }
+    socket.feed(FakeSocket.clientText(JSON.stringify({
+      kind: 'results', results: [{ seq: sent.commands[0]!.seq, ok: true, data: { reloaded: true } }],
+    })))
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(backend.extensionStatus().reloadIneffective).toBe(false)
+
+    hello(socket, 'stale-build', ['list-tabs', 'reload'])
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(backend.extensionStatus().reloadIneffective).toBe(true)
+  })
+
+  it('reports what decides an automatic update, for a stalled one to be read', async () => {
+    const { backend, socket } = makeBackend()
+    hello(socket, 'stale-build', ['list-tabs', 'reload'])
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(backend.extensionStatus()).toMatchObject({
+      build: 'stale-build',
+      stale: true,
+      ops: 'list-tabs,reload',
+    })
+  })
+
+  it('never asks twice about a stale build it already asked about', async () => {
+    // If a reload runs and cannot move the extension off one build, asking on
+    // every heartbeat would reload it forever. The attempt counts once the
+    // extension has answered it.
+    const { backend, socket } = makeBackend()
+    hello(socket, 'stale-build', ['list-tabs', 'reload'])
+    await new Promise(resolve => setTimeout(resolve, 10))
+    const sent = JSON.parse(socket.lastServerText()!) as { commands: Array<{ seq: number }> }
+    socket.feed(FakeSocket.clientText(JSON.stringify({
+      kind: 'results', results: [{ seq: sent.commands[0]!.seq, ok: true, data: { reloaded: true } }],
+    })))
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(backend.extensionStatus()).toMatchObject({ autoReloadAsked: true, reloadAskedFor: 'stale-build' })
+
     const before = socket.written.length
     hello(socket, 'stale-build', ['list-tabs', 'reload'])
     await new Promise(resolve => setTimeout(resolve, 10))
     expect(socket.written.length).toBe(before)
-    expect(backend.extensionStatus().autoReloadAsked).toBe(true)
   })
 
   it('asks again when the mismatch moves to a new build', async () => {
@@ -433,6 +490,11 @@ describe('ExtensionBackend', () => {
     // though the first already spent an attempt.
     const { backend, socket } = makeBackend()
     hello(socket, 'stale-build', ['list-tabs', 'reload'])
+    await new Promise(resolve => setTimeout(resolve, 10))
+    const sent = JSON.parse(socket.lastServerText()!) as { commands: Array<{ seq: number }> }
+    socket.feed(FakeSocket.clientText(JSON.stringify({
+      kind: 'results', results: [{ seq: sent.commands[0]!.seq, ok: true, data: { reloaded: true } }],
+    })))
     await new Promise(resolve => setTimeout(resolve, 10))
     const firstAsk = socket.written.length
     hello(socket, 'newer-build', ['list-tabs', 'reload'])
@@ -455,11 +517,13 @@ describe('ExtensionBackend', () => {
   it('calls a changed extension stale even when its version was not bumped', async () => {
     // The failure a version-only check cannot see: same version, new code.
     const { backend, socket } = makeBackend()
-    hello(socket, 'edited-without-a-version-bump', ['list-tabs', 'reload'], '0.3.0')
+    const declared = backend.extensionStatus().expectedVersion
+    expect(declared).not.toBe('')
+    hello(socket, 'edited-without-a-version-bump', ['list-tabs', 'reload'], declared)
     await new Promise(resolve => setTimeout(resolve, 10))
     expect(backend.extensionStatus()).toMatchObject({
-      version: '0.3.0',
-      expectedVersion: '0.3.0',
+      version: declared,
+      expectedVersion: declared,
       stale: true,
     })
     expect(socket.lastServerText()).toContain('"op":"reload"')

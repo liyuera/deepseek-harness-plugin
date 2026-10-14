@@ -112,7 +112,7 @@ const SUPPORTED_OPS = [
  * user stayed on a stale extension with nothing to show for it. Only a value
  * carried by the loaded code can tell the host which code is loaded.
  */
-const BUILD_HASH = 'd985d7da53d76c69be7b9a72879970e33a1e440a01a2741081820c8045ec55e0'
+const BUILD_HASH = '9dd296539a1d1e347c833f21c3f3c207a4f62f864803aa40151aa280e9b07e37'
 
 /** Introduce this worker: what it runs, what it can answer, and which code it is. */
 async function hello() {
@@ -458,7 +458,10 @@ async function run(command) {
       // failed" while the user is looking at something else — and when the
       // window merely stops repainting it returns the PREVIOUS frame with no
       // sign that it did. Page.captureScreenshot has neither problem.
-      const base64 = await captureViaDebugger(Number(command.args.tabId))
+      const base64 = await captureViaDebugger(Number(command.args.tabId), {
+        fullPage: command.args.fullPage === true,
+        selector: typeof command.args.selector === 'string' ? command.args.selector : undefined,
+      })
       // Image bytes travel back as a plain HTTP POST, never as a WS JSON frame:
       // an oversized frame closed the bridge right after a successful capture.
       const blob = await (await fetch('data:image/jpeg;base64,' + base64)).blob()
@@ -481,6 +484,22 @@ async function run(command) {
   }
 }
 
+/**
+ * One element's clip rectangle, or a failure naming the selector.
+ * @param tabId - the tab to measure in.
+ * @param selector - CSS selector of the element to capture.
+ * @returns the clip rectangle in page coordinates.
+ */
+async function rectOf(tabId, selector) {
+  const box = await pageExec(tabId, pageAgent, [{ op: 'rect', selector }])
+  if (box === null || typeof box !== 'object' || box.matched !== 1) {
+    throw new Error(`截图失败:没有匹配 ${selector} 的元素`)
+  }
+  const { x, y, width, height } = box
+  if (!(width > 0) || !(height > 0)) throw new Error(`截图失败:${selector} 没有可见尺寸(宽 ${width} 高 ${height})`)
+  return { x, y, width, height, scale: 1 }
+}
+
 /** JPEG quality the screenshot is encoded at before upload. */
 const SCREENSHOT_QUALITY = 75
 
@@ -492,9 +511,15 @@ const SCREENSHOT_QUALITY = 75
  * answer with a stale frame. It costs the debugger infobar on that tab, which is
  * why a tab `chrome_console` already attached needs no second attach.
  */
-async function captureViaDebugger(tabId) {
+async function captureViaDebugger(tabId, options) {
   const id = Number(tabId)
   if (!Number.isInteger(id)) throw new Error(`无效的标签页 id:${String(tabId)}`)
+  const selector = options !== undefined && typeof options.selector === 'string' && options.selector !== ''
+    ? options.selector
+    : undefined
+  // `captureBeyondViewport` is what turns a viewport grab into a whole-page
+  // one; a clip needs it too, for any element below the fold.
+  const beyond = options !== undefined && (options.fullPage === true || selector !== undefined)
   const targets = await chrome.debugger.getTargets()
   const existing = targets.find(target => target.tabId === id && target.attached === true)
   if (existing !== undefined && existing.extensionId !== chrome.runtime.id) {
@@ -503,10 +528,12 @@ async function captureViaDebugger(tabId) {
   const ours = existing !== undefined
   if (!ours) await chrome.debugger.attach({ tabId: id }, '1.3')
   try {
+    const clip = selector === undefined ? undefined : await rectOf(id, selector)
     const response = await chrome.debugger.sendCommand({ tabId: id }, 'Page.captureScreenshot', {
       format: 'jpeg',
       quality: SCREENSHOT_QUALITY,
-      captureBeyondViewport: false,
+      captureBeyondViewport: beyond,
+      ...(clip === undefined ? {} : { clip }),
     })
     if (response === undefined || typeof response.data !== 'string' || response.data === '') {
       throw new Error('截图失败:调试通道没有返回图像数据')
@@ -688,6 +715,7 @@ function pageAgent(request) {
     switch (request.op) {
       case 'click': return clickSelector(request.selector, request.all === true)
       case 'inventory': return interactiveInventory()
+      case 'rect': return elementRect(request.selector)
       case 'press': return pressKey(request.key, request.selector)
       default: return { __dshPageError: '未知的页面操作:' + request.op }
     }

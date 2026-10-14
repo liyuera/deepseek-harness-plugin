@@ -178,17 +178,24 @@ describe('chrome-browser routes', () => {
 
     const idle = fakeRes()
     handler(fakeReq('GET', '/chrome-browser/activity?sessionId=s1'), idle)
-    expect(JSON.parse(idle.body) as unknown).toMatchObject({ ok: true, active: false })
+    expect(JSON.parse(idle.body) as unknown).toMatchObject({ ok: true, phase: 'ready' })
 
     activity.begin('chrome_click', '7', 's1')
     const busy = fakeRes()
     handler(fakeReq('GET', '/chrome-browser/activity?sessionId=s1'), busy)
     expect(JSON.parse(busy.body) as unknown)
-      .toMatchObject({ ok: true, active: true, tool: 'chrome_click', tabId: '7' })
+      .toMatchObject({ ok: true, phase: 'running', tool: 'chrome_click', tabId: '7' })
 
     const other = fakeRes()
     handler(fakeReq('GET', '/chrome-browser/activity?sessionId=s2'), other)
-    expect(JSON.parse(other.body) as unknown).toMatchObject({ ok: true, active: false })
+    expect(JSON.parse(other.body) as unknown).toMatchObject({ ok: true, phase: 'ready' })
+
+    // The chip needs the two conditions no tool call can report, because a
+    // detached bridge answers nothing at all.
+    activity.clear()
+    const linked = fakeRes()
+    handler(fakeReq('GET', '/chrome-browser/activity'), linked)
+    expect(JSON.parse(linked.body) as unknown).toMatchObject({ ok: true, connected: true, stale: false })
   })
 
   it('rejects a non-GET request for the activity route', async () => {

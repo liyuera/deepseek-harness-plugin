@@ -333,6 +333,32 @@ export function inventoryExpression(): string {
  * the matched element and leaves its selection untouched. Returns whether a
  * match was found.
  */
+/**
+ * Box of one element in PAGE coordinates, for a clipped screenshot.
+ *
+ * `getBoundingClientRect` is viewport-relative while `Page.captureScreenshot`'s
+ * clip is page-relative, so the scroll offset is added back. The caller also
+ * asks for `captureBeyondViewport`, without which an element below the fold
+ * would be captured as blank.
+ * @param selector - CSS selector of the element to measure.
+ * @returns an expression answering `{ matched, x, y, width, height }`.
+ */
+export function rectExpression(selector: string): string {
+  const sel = literal(selector)
+  return `(() => {
+    const el = document.querySelector(${sel})
+    if (el === null) return { matched: 0 }
+    const rect = el.getBoundingClientRect()
+    return {
+      matched: 1,
+      x: rect.left + window.scrollX,
+      y: rect.top + window.scrollY,
+      width: rect.width,
+      height: rect.height,
+    }
+  })()`
+}
+
 export function focusExpression(selector: string): string {
   const sel = literal(selector)
   return `(() => {

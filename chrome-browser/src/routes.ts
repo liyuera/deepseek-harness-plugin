@@ -193,8 +193,12 @@ export function registerChromeRoutes(
     },
   }), 'chrome-browser: extension download route')
 
-  // The browser half polls this while a session view is open, and renders a
-  // strip only for a session that has a call in flight.
+  // The browser half polls this while a session view is open, and renders one
+  // chip in the Session header from it. The route owns the facts a chip needs
+  // besides the call itself: whether the bridge is attached at all, and whether
+  // the extension is running older files than this plugin ships — the two
+  // conditions a user can only fix themselves, and the two no tool call
+  // reports, because a disconnected bridge answers nothing at all.
   ctx.effect(() => webServer.register({
     kind: 'exact',
     path: '/chrome-browser/activity',
@@ -205,8 +209,12 @@ export function registerChromeRoutes(
       }
       const url = new URL(req.url ?? '/', 'http://dsh.internal')
       const sessionId = url.searchParams.get('sessionId') ?? ''
+      const link = backend instanceof ExtensionBackend
+        ? { connected: backend.isConnected(), stale: backend.extensionStatus().stale }
+        : { connected: true, stale: false }
       writeJson(res, 200, {
         ok: true,
+        ...link,
         ...activity.snapshot(sessionId === '' ? undefined : sessionId),
       })
     },

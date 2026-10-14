@@ -29,7 +29,21 @@ import type { WaitState } from './expressions.ts'
 import { Chrome } from './chrome.ts'
 import type { ResolvedChromeConfig } from './chrome.ts'
 import { WsConnection, wsHandshake } from './ws.ts'
+import { rectExpression } from './expressions.ts'
 import { extensionStamp, extensionVersion } from './extension-package.ts'
+
+/**
+ * What a screenshot should cover.
+ *
+ * Absent fields mean "the visible viewport", which is what a caller who just
+ * wants the page as the user sees it needs.
+ */
+export interface ScreenshotOptions {
+  /** Capture the whole scrollable page rather than the viewport. */
+  fullPage?: boolean
+  /** Capture one element instead, matched by CSS selector. */
+  selector?: string
+}
 
 /** One tab as tools and the picker see it. */
 export interface BackendTab {
@@ -177,7 +191,7 @@ export interface BrowserBackend {
    */
   waitFor(tabId: string, selector: string, state: WaitState, timeoutMs: number): Promise<boolean>
   type(tabId: string, selector: string, text: string, clear: boolean): Promise<void>
-  screenshot(tabId: string): Promise<{ data: string; path?: string; mime?: string }>
+  screenshot(tabId: string, options?: ScreenshotOptions): Promise<{ data: string; path?: string; mime?: string }>
   /** Begin forwarding one tab's console output to the sink; idempotent. */
   startConsole(tabId: string): Promise<void>
   /** Stop forwarding one tab's console output; idempotent. */
@@ -421,6 +435,17 @@ export class ExtensionBackend implements BrowserBackend {
    * host process both settle.
    */
   private reloadAskedFor: string | null = null
+  /**
+   * Set when a build the host already asked about came back unchanged.
+   *
+   * The reload usually works. When it does not, the extension is re-reading a
+   * DIFFERENT copy of its files than the one this plugin ships — which happens
+   * when the install method changes while the host is running, because the host
+   * keeps resolving its old module path while Chrome keeps serving the copy it
+   * loaded. No number of reloads can close that, so it is reported rather than
+   * retried.
+   */
+  private reloadIneffective = false
   private seq = 0
   private readonly unacked = new Map<number, { op: string; args: Record<string, unknown> }>()
   /**
@@ -676,6 +701,9 @@ export class ExtensionBackend implements BrowserBackend {
     expectedBuild: string
     stale: boolean
     autoReloadAsked: boolean
+    reloadAskedFor: string
+    reloadIneffective: boolean
+    ops: string
   } {
     const expectedBuild = extensionStamp(import.meta.url)
     const build = this.extension?.build ?? ''
@@ -688,6 +716,13 @@ export class ExtensionBackend implements BrowserBackend {
       // code Chrome loaded — a version number nobody bumped would not.
       stale: build !== '' && expectedBuild !== '' && build !== expectedBuild,
       autoReloadAsked: this.reloadAskedFor !== null,
+      // The two facts that decide whether an automatic update can still happen:
+      // which stamp was already asked about, and whether the extension even
+      // advertises the op that performs it. Both are here because a stalled
+      // update is otherwise indistinguishable from a reload that did not help.
+      reloadAskedFor: this.reloadAskedFor ?? '',
+      reloadIneffective: this.reloadIneffective,
+      ops: (this.extension?.ops ?? []).join(','),
     }
   }
 
@@ -707,12 +742,27 @@ export class ExtensionBackend implements BrowserBackend {
       : []
     this.extension = { version, ops, build }
     const expected = extensionStamp(import.meta.url)
-    if (build === '' || expected === '' || build === expected) return
-    if (!ops.includes('reload') || this.reloadAskedFor === build) return
-    this.reloadAskedFor = build
+    if (build === '' || expected === '' || build === expected) {
+      this.reloadIneffective = false
+      return
+    }
+    if (!ops.includes('reload')) return
+    if (this.reloadAskedFor === build) {
+      // Asked about this exact build and it is still what the extension runs.
+      this.reloadIneffective = true
+      return
+    }
+    this.reloadIneffective = false
+    // The attempt is spent only once the request is on the wire. Marking it
+    // first made a request that never went out — refused by the capability
+    // check, or lost with the socket — indistinguishable from a reload that
+    // ran and did not help, and the extension was then never asked again.
     // Carries the stamp it is asked about, which is what makes two requests
     // distinct to the in-flight dedupe rather than one request twice.
-    void this.push('reload', { build }).catch(() => undefined)
+    void this.push('reload', { build }).then(
+      () => { this.reloadAskedFor = build },
+      () => undefined,
+    )
   }
 
   /**
@@ -965,11 +1015,33 @@ export class CdpBackend implements BrowserBackend {
     })
   }
 
-  async screenshot(tabId: string): Promise<{ data: string; path?: string; mime?: string }> {
+  async screenshot(tabId: string, options?: ScreenshotOptions): Promise<{ data: string; path?: string; mime?: string }> {
     return this.withTab(tabId, async endpoint => {
-      const result = await endpoint.call('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false })
+      const beyond = options?.fullPage === true || options?.selector !== undefined
+      const clip = options?.selector === undefined ? undefined : await this.clipOf(endpoint, options.selector)
+      const result = await endpoint.call('Page.captureScreenshot', {
+        format: 'png',
+        captureBeyondViewport: beyond,
+        ...(clip === undefined ? {} : { clip }),
+      })
       return { data: typeof result.data === 'string' ? result.data : '', mime: 'image/png' }
     })
+  }
+
+  /**
+   * One element's clip rectangle, or a failure naming the selector.
+   * @param endpoint - the tab's CDP endpoint.
+   * @param selector - CSS selector of the element to capture.
+   * @returns the clip rectangle in page coordinates.
+   */
+  private async clipOf(endpoint: CdpEndpoint, selector: string): Promise<{ x: number; y: number; width: number; height: number; scale: number }> {
+    const box = await this.evaluatePage(endpoint, rectExpression(selector)) as
+      | { matched?: unknown; x?: unknown; y?: unknown; width?: unknown; height?: unknown }
+      | undefined
+    if (box?.matched !== 1) throw new Error(`截图失败:没有匹配 ${selector} 的元素`)
+    const { x, y, width, height } = box as { x: number; y: number; width: number; height: number }
+    if (!(width > 0) || !(height > 0)) throw new Error(`截图失败:${selector} 没有可见尺寸(宽 ${width} 高 ${height})`)
+    return { x, y, width, height, scale: 1 }
   }
 
   async startConsole(tabId: string): Promise<void> {

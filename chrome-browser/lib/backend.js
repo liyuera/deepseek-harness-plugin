@@ -12,6 +12,7 @@ import { consoleMessageFrom } from "./console-events.js";
 import { clickExpression, focusAndSelectExpression, focusExpression, hoverExpression, inventoryExpression, pressExpression, readPageExpression, readyStateExpression, selectExpression, waitExpression, } from "./expressions.js";
 import { Chrome } from "./chrome.js";
 import { WsConnection, wsHandshake } from "./ws.js";
+import { rectExpression } from "./expressions.js";
 import { extensionStamp, extensionVersion } from "./extension-package.js";
 /** Shared sleep. */
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -227,6 +228,17 @@ export class ExtensionBackend {
      * host process both settle.
      */
     reloadAskedFor = null;
+    /**
+     * Set when a build the host already asked about came back unchanged.
+     *
+     * The reload usually works. When it does not, the extension is re-reading a
+     * DIFFERENT copy of its files than the one this plugin ships — which happens
+     * when the install method changes while the host is running, because the host
+     * keeps resolving its old module path while Chrome keeps serving the copy it
+     * loaded. No number of reloads can close that, so it is reported rather than
+     * retried.
+     */
+    reloadIneffective = false;
     seq = 0;
     unacked = new Map();
     /**
@@ -455,6 +467,13 @@ export class ExtensionBackend {
             // code Chrome loaded — a version number nobody bumped would not.
             stale: build !== '' && expectedBuild !== '' && build !== expectedBuild,
             autoReloadAsked: this.reloadAskedFor !== null,
+            // The two facts that decide whether an automatic update can still happen:
+            // which stamp was already asked about, and whether the extension even
+            // advertises the op that performs it. Both are here because a stalled
+            // update is otherwise indistinguishable from a reload that did not help.
+            reloadAskedFor: this.reloadAskedFor ?? '',
+            reloadIneffective: this.reloadIneffective,
+            ops: (this.extension?.ops ?? []).join(','),
         };
     }
     /**
@@ -473,14 +492,25 @@ export class ExtensionBackend {
             : [];
         this.extension = { version, ops, build };
         const expected = extensionStamp(import.meta.url);
-        if (build === '' || expected === '' || build === expected)
+        if (build === '' || expected === '' || build === expected) {
+            this.reloadIneffective = false;
             return;
-        if (!ops.includes('reload') || this.reloadAskedFor === build)
+        }
+        if (!ops.includes('reload'))
             return;
-        this.reloadAskedFor = build;
+        if (this.reloadAskedFor === build) {
+            // Asked about this exact build and it is still what the extension runs.
+            this.reloadIneffective = true;
+            return;
+        }
+        this.reloadIneffective = false;
+        // The attempt is spent only once the request is on the wire. Marking it
+        // first made a request that never went out — refused by the capability
+        // check, or lost with the socket — indistinguishable from a reload that
+        // ran and did not help, and the extension was then never asked again.
         // Carries the stamp it is asked about, which is what makes two requests
         // distinct to the in-flight dedupe rather than one request twice.
-        void this.push('reload', { build }).catch(() => undefined);
+        void this.push('reload', { build }).then(() => { this.reloadAskedFor = build; }, () => undefined);
     }
     /**
      * Refuse an op the connected extension does not advertise.
@@ -714,11 +744,32 @@ export class CdpBackend {
             await endpoint.call('Input.insertText', { text });
         });
     }
-    async screenshot(tabId) {
+    async screenshot(tabId, options) {
         return this.withTab(tabId, async (endpoint) => {
-            const result = await endpoint.call('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false });
+            const beyond = options?.fullPage === true || options?.selector !== undefined;
+            const clip = options?.selector === undefined ? undefined : await this.clipOf(endpoint, options.selector);
+            const result = await endpoint.call('Page.captureScreenshot', {
+                format: 'png',
+                captureBeyondViewport: beyond,
+                ...(clip === undefined ? {} : { clip }),
+            });
             return { data: typeof result.data === 'string' ? result.data : '', mime: 'image/png' };
         });
+    }
+    /**
+     * One element's clip rectangle, or a failure naming the selector.
+     * @param endpoint - the tab's CDP endpoint.
+     * @param selector - CSS selector of the element to capture.
+     * @returns the clip rectangle in page coordinates.
+     */
+    async clipOf(endpoint, selector) {
+        const box = await this.evaluatePage(endpoint, rectExpression(selector));
+        if (box?.matched !== 1)
+            throw new Error(`截图失败:没有匹配 ${selector} 的元素`);
+        const { x, y, width, height } = box;
+        if (!(width > 0) || !(height > 0))
+            throw new Error(`截图失败:${selector} 没有可见尺寸(宽 ${width} 高 ${height})`);
+        return { x, y, width, height, scale: 1 };
     }
     async startConsole(tabId) {
         if (this.captures.has(tabId))

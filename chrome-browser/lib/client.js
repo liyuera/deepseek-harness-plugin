@@ -38,40 +38,70 @@ window.__ModuleLoader__.load({
 		* Browser-side activity probe: `GET /chrome-browser/activity` behind a short
 		* cache.
 		*
-		* The strip polls this while a session view is open, so a dropped request or an
-		* unreachable host answers "not active" rather than throwing into React: an
-		* indicator that flickers an error is worse than one that stays hidden.
+		* The header chip polls this while a session view is open. An unreachable host
+		* answers "offline" rather than throwing into React: a chip that flickers an
+		* error is worse than one that says the bridge is not there, which is also the
+		* truth.
 		* @module @liyuera/dsh-chrome-browser/client/activity
 		*/
 		/** One snapshot per this window, however many callers ask. */
-		const CACHE_MS$1 = 900;
-		const IDLE = { active: false };
+		const CACHE_MS$1 = 400;
+		/** What the chip shows when the host cannot be reached at all. */
+		const OFFLINE = { phase: "offline" };
 		let cachedAt$1 = 0;
-		let cached$1 = IDLE;
+		let cached$1 = OFFLINE;
 		let inflight$1 = null;
+		/**
+		* Turn one host answer into the phase the chip renders.
+		*
+		* The link decides first: an extension that is not attached, or is running
+		* older files than the plugin ships, is a condition the user has to fix, and it
+		* outranks whatever the last call happened to do — a `done` flash drawn on top
+		* of a disconnected bridge would be actively misleading.
+		* @param body - the parsed route answer.
+		* @returns the phase and the fields that belong to it.
+		*/
+		function phaseOf(body) {
+			const rest = {
+				...body.tool === void 0 ? {} : { tool: body.tool },
+				...body.tabId === void 0 ? {} : { tabId: body.tabId },
+				...body.detail === void 0 ? {} : { detail: body.detail },
+				...body.since === void 0 ? {} : { since: body.since }
+			};
+			if (body.connected === false) return {
+				phase: "offline",
+				...rest
+			};
+			if (body.stale === true) return {
+				phase: "stale",
+				...rest
+			};
+			const phase = body.phase;
+			if (phase === "running" || phase === "done" || phase === "error") return {
+				phase,
+				...rest
+			};
+			return {
+				phase: "ready",
+				...rest
+			};
+		}
 		async function fetchActivity(sessionId) {
 			try {
 				const query = sessionId === "" ? "" : `?sessionId=${encodeURIComponent(sessionId)}`;
 				const body = await (await fetch(`/chrome-browser/activity${query}`)).json();
 				if (body.ok !== true) throw new Error(body.error ?? "activity probe failed");
-				cached$1 = {
-					active: body.active === true,
-					...body.tool === void 0 ? {} : { tool: body.tool },
-					...body.tabId === void 0 ? {} : { tabId: body.tabId },
-					...body.startedAt === void 0 ? {} : { startedAt: body.startedAt },
-					...body.lastTool === void 0 ? {} : { lastTool: body.lastTool },
-					...body.lastAt === void 0 ? {} : { lastAt: body.lastAt }
-				};
+				cached$1 = phaseOf(body);
 			} catch {
-				cached$1 = IDLE;
+				cached$1 = OFFLINE;
 			}
 			cachedAt$1 = Date.now();
 			return cached$1;
 		}
 		/**
 		* Read the plugin's current activity for one session.
-		* @param sessionId - the session the strip belongs to.
-		* @returns the snapshot, or an inactive one while the host is unreachable.
+		* @param sessionId - the session the chip belongs to.
+		* @returns the snapshot, or an offline one while the host is unreachable.
 		*/
 		async function readChromeActivity(sessionId) {
 			if (Date.now() - cachedAt$1 < CACHE_MS$1) return cached$1;
@@ -83,26 +113,30 @@ window.__ModuleLoader__.load({
 		//#endregion
 		//#region lib/client/BrowserActivity.js
 		/**
-		* Browser activity strip: the one place the user can see, without reading the
-		* transcript, that the agent is driving their browser right now.
+		* Chrome status chip: the one place the user can see, without reading the
+		* transcript, whether the plugin can drive their browser and what it is doing
+		* with it right now.
 		*
-		* It renders **nothing** while the plugin is idle — a permanent badge would be
-		* noise, and the per-call cards already carry the detail. When a call is in
-		* flight it names the tool and the tab, so a user who looks up mid-task can
-		* tell what is happening and on which page.
+		* It sits at the end of the Session header's utilities and is **always**
+		* rendered — a pale idle state that is legible at a glance, and a louder one
+		* only for the phases that ask for attention (a call in flight, a failure, an
+		* extension that needs reloading). An indicator that appears only while a call
+		* runs is not readable: those calls finish in milliseconds, so it reads as a
+		* flicker rather than as information.
 		* @module @liyuera/dsh-chrome-browser/client/activity-strip
 		*/
-		/** Poll interval while the strip is mounted; the host caches for slightly less. */
+		/** Poll interval while the chip is mounted; the host caches for slightly less. */
 		const POLL_MS = 1e3;
 		/**
-		* Human labels for the running call. A tool with no label shows its wire name,
-		* so adding a tool never leaves the strip blank.
+		* Human labels for the tool a phase belongs to. A tool with no label shows its
+		* wire name, so adding a tool never leaves the chip blank.
 		*/
 		const TOOL_LABELS = {
 			chrome_tabs: "列出标签页",
 			chrome_read: "读取页面",
 			chrome_navigate: "导航",
 			chrome_open: "打开标签页",
+			chrome_close: "关闭标签页",
 			chrome_screenshot: "截图",
 			chrome_click: "点击",
 			chrome_hover: "悬停",
@@ -114,48 +148,121 @@ window.__ModuleLoader__.load({
 			chrome_console: "读取控制台",
 			chrome_request_help: "等待你操作"
 		};
+		/** What each phase says, and what a reader who wants more gets on hover. */
+		const PHASES = {
+			offline: {
+				text: "Chrome 未连接",
+				hint: "扩展没有连上。检查 chrome://extensions 里 dsh Chrome Control 是否已加载。"
+			},
+			stale: {
+				text: "扩展待更新",
+				hint: "扩展在跑旧文件，插件正在请它重载；若一直如此，手动重新加载一次扩展。"
+			},
+			running: {
+				text: "工作中",
+				hint: "正在操作你的 Chrome。"
+			},
+			done: {
+				text: "完成",
+				hint: "上一次调用已完成。"
+			},
+			error: {
+				text: "失败",
+				hint: "上一次调用失败。"
+			},
+			ready: {
+				text: "Chrome 就绪",
+				hint: "扩展已连接，空闲中。"
+			}
+		};
+		/** Only the pulse needs a stylesheet; every size is inline on purpose. */
 		const STYLE_ID = "dsh-chrome-browser-activity";
-		const STRIP_CSS = `
-.cb-activity {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin: 0 0 6px;
-  padding: 3px 8px;
-  width: fit-content;
-  border: 1px solid var(--dsw-alias-border-l1);
-  border-radius: 999px;
-  background: var(--dsw-specific-tip);
-  color: var(--dsw-alias-label-primary);
-  font-size: 12px;
-  line-height: 18px;
-}
-.cb-activity img { width: 14px; height: 14px; }
-.cb-activity .cb-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: currentColor;
-  animation: cb-pulse 1.2s ease-in-out infinite;
-}
-@keyframes cb-pulse { 0%, 100% { opacity: .3 } 50% { opacity: 1 } }
-@media (prefers-reduced-motion: reduce) { .cb-activity .cb-dot { animation: none } }
-.cb-activity .cb-activity-tab { opacity: .7 }
-`;
+		const PULSE_CSS = "@keyframes cb-pulse { 0%, 100% { opacity: .25 } 50% { opacity: 1 } }";
 		function ensureStyles() {
 			if (document.getElementById(STYLE_ID) !== null) return;
 			const style = document.createElement("style");
 			style.id = STYLE_ID;
-			style.textContent = STRIP_CSS;
+			style.textContent = PULSE_CSS;
 			document.head.appendChild(style);
 		}
+		/** The colour each phase draws its dot and its text in. */
+		const PHASE_COLOR = {
+			ready: {
+				dot: "var(--dsw-alias-state-success-primary)",
+				ink: "var(--dsw-alias-label-secondary)"
+			},
+			offline: { dot: "var(--dsw-alias-state-idle-primary)" },
+			stale: {
+				dot: "var(--dsw-alias-state-warn-primary)",
+				ink: "var(--dsw-alias-state-warn-primary)"
+			},
+			running: {
+				dot: "var(--dsw-alias-state-success-primary)",
+				ink: "var(--dsw-alias-label-primary)"
+			},
+			done: {
+				dot: "var(--dsw-alias-state-success-primary)",
+				ink: "var(--dsw-alias-state-success-primary)"
+			},
+			error: {
+				dot: "var(--dsw-alias-state-error-primary)",
+				ink: "var(--dsw-alias-state-error-primary)"
+			}
+		};
 		/**
-		* Render the strip while one of this plugin's tools is running.
-		* @param props - the dock entry's session identity.
-		* @returns the strip, or null while nothing is running.
+		* Sizes that must hold whatever the surrounding header does.
+		*
+		* These are inline rather than a rule set: the chip carries this plugin's own
+		* 512px artwork, and a stylesheet that fails to apply does not degrade it to a
+		* plain label — it renders the raw icon at full size and takes the header with
+		* it. Measured, not assumed.
+		*/
+		const CHIP_STYLE = {
+			display: "inline-flex",
+			alignItems: "center",
+			gap: 5,
+			padding: "1px 8px 1px 6px",
+			borderRadius: 999,
+			fontSize: 12,
+			lineHeight: "18px",
+			height: 22,
+			maxHeight: 22,
+			whiteSpace: "nowrap",
+			overflow: "hidden",
+			flex: "none",
+			border: "1px solid transparent",
+			color: "var(--dsw-alias-label-secondary)"
+		};
+		const ICON_STYLE = {
+			width: 13,
+			height: 13,
+			flex: "none",
+			opacity: .75
+		};
+		/** The words one phase shows, given the call it belongs to. */
+		function wording(state) {
+			const phase = PHASES[state.phase];
+			const label = state.tool === void 0 ? void 0 : TOOL_LABELS[state.tool] ?? state.tool;
+			if (state.phase === "running" && label !== void 0) return {
+				text: label,
+				hint: `${phase.hint}${label}${state.tabId === void 0 ? "" : ` · 标签页 ${state.tabId}`}`
+			};
+			if (state.phase === "error") return {
+				text: phase.text,
+				hint: state.detail === void 0 ? phase.hint : `上一次调用失败:${state.detail}`
+			};
+			return {
+				text: phase.text,
+				hint: phase.hint
+			};
+		}
+		/**
+		* Render the persistent Chrome status chip.
+		* @param props - the header utility's session identity.
+		* @returns the chip.
 		*/
 		function BrowserActivity({ sessionId }) {
-			const [state, setState] = (0, react.useState)({ active: false });
+			const [state, setState] = (0, react.useState)({ phase: "ready" });
 			(0, react.useEffect)(() => {
 				ensureStyles();
 				let live = true;
@@ -172,25 +279,40 @@ window.__ModuleLoader__.load({
 					clearInterval(timer);
 				};
 			}, [sessionId]);
-			if (!state.active) return null;
-			const tool = state.tool ?? "";
-			return (0, react_jsx_runtime.jsxs)("div", {
-				className: "cb-activity",
+			const { text, hint } = wording(state);
+			const color = PHASE_COLOR[state.phase];
+			return (0, react_jsx_runtime.jsxs)("span", {
+				className: "cb-status",
+				"data-phase": state.phase,
 				role: "status",
 				"aria-live": "polite",
+				title: hint,
+				style: {
+					...CHIP_STYLE,
+					...color.ink === void 0 ? {} : { color: color.ink }
+				},
 				children: [
 					(0, react_jsx_runtime.jsx)("span", {
-						className: "cb-dot",
-						"aria-hidden": "true"
+						"aria-hidden": "true",
+						style: {
+							width: 6,
+							height: 6,
+							borderRadius: "50%",
+							flex: "none",
+							background: color.dot,
+							opacity: state.phase === "ready" ? .55 : 1,
+							...state.phase === "running" ? { animation: "cb-pulse 1.2s ease-in-out infinite" } : {}
+						}
 					}),
 					(0, react_jsx_runtime.jsx)("img", {
 						src: CHROME_ICON_SRC,
 						alt: "",
-						"aria-hidden": "true"
+						"aria-hidden": "true",
+						style: ICON_STYLE
 					}),
-					(0, react_jsx_runtime.jsx)("span", { children: TOOL_LABELS[tool] ?? tool }),
-					state.tabId === void 0 ? null : (0, react_jsx_runtime.jsxs)("span", {
-						className: "cb-activity-tab",
+					(0, react_jsx_runtime.jsx)("span", { children: text }),
+					state.phase !== "running" || state.tabId === void 0 ? null : (0, react_jsx_runtime.jsxs)("span", {
+						style: { opacity: .7 },
 						children: ["标签页 ", state.tabId]
 					})
 				]
@@ -410,20 +532,20 @@ window.__ModuleLoader__.load({
 		* The composer dock used to carry a full-width tab selector above the input
 		* card. That row, its component and the session-binding routes behind it are
 		* gone: the live tab list lives in the `@` menu, where a pick inserts a
-		* reference chip and binds nothing. The dock carries the activity strip now.
+		* reference chip and binds nothing. The Session header carries the status chip.
 		* @module @liyuera/dsh-chrome-browser/client
 		*/
 		/** Required services for the slot contribution and the `@` source. */
 		const inject = ["slots", "inputTriggers"];
 		/**
-		* Client plugin body: register the activity strip and the `@` tab source.
+		* Client plugin body: register the Chrome status chip and the `@` tab source.
 		* @param ctx - client root context.
 		*/
 		function apply(ctx) {
-			ctx.slots.inject("conversation.input.dock", () => ctx.slots.register({
-				name: "conversation.input.dock",
+			ctx.slots.inject("conversation.session.header.utilities", () => ctx.slots.register({
+				name: "conversation.session.header.utilities",
 				id: "chrome-browser-activity",
-				order: 4
+				order: 90
 			}, BrowserActivity));
 			ctx.effect(() => ctx.inputTriggers.registerSource(createChromeTabSource({
 				listTabs: listChromeTabs,

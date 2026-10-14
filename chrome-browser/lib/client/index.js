@@ -4,7 +4,7 @@
  * The composer dock used to carry a full-width tab selector above the input
  * card. That row, its component and the session-binding routes behind it are
  * gone: the live tab list lives in the `@` menu, where a pick inserts a
- * reference chip and binds nothing. The dock carries the activity strip now.
+ * reference chip and binds nothing. The Session header carries the status chip.
  * @module @liyuera/dsh-chrome-browser/client
  */
 import { BrowserActivity } from "./BrowserActivity.js";
@@ -14,17 +14,18 @@ import { tabIcon } from "./tab-icon.js";
 /** Required services for the slot contribution and the `@` source. */
 export const inject = ['slots', 'inputTriggers'];
 /**
- * Client plugin body: register the activity strip and the `@` tab source.
+ * Client plugin body: register the Chrome status chip and the `@` tab source.
  * @param ctx - client root context.
  */
 export function apply(ctx) {
-    // The activity strip: rendered above the composer only while one of this
-    // plugin's tools is running, so a user who looks up mid-task can see that the
-    // agent is driving their browser and on which tab.
-    ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({
-        name: 'conversation.input.dock',
+    // The status chip: the last item in the Session header's trailing utilities,
+    // so the state of the browser bridge sits with the other session-level
+    // facts. It stays mounted and stays visible — a chip that only appears while
+    // a call runs flickers past, because these calls finish in milliseconds.
+    ctx.slots.inject('conversation.session.header.utilities', () => ctx.slots.register({
+        name: 'conversation.session.header.utilities',
         id: 'chrome-browser-activity',
-        order: 4,
+        order: 90,
     }, BrowserActivity));
     ctx.effect(() => ctx.inputTriggers.registerSource(createChromeTabSource({ listTabs: listChromeTabs, iconFor: tabIcon })), 'chrome-browser: @ tab source');
 }

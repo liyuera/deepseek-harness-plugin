@@ -1,22 +1,25 @@
 /**
- * Browser activity strip: the one place the user can see, without reading the
- * transcript, that the agent is driving their browser right now.
+ * Chrome status chip: the one place the user can see, without reading the
+ * transcript, whether the plugin can drive their browser and what it is doing
+ * with it right now.
  *
- * It renders **nothing** while the plugin is idle — a permanent badge would be
- * noise, and the per-call cards already carry the detail. When a call is in
- * flight it names the tool and the tab, so a user who looks up mid-task can
- * tell what is happening and on which page.
+ * It sits at the end of the Session header's utilities and is **always**
+ * rendered — a pale idle state that is legible at a glance, and a louder one
+ * only for the phases that ask for attention (a call in flight, a failure, an
+ * extension that needs reloading). An indicator that appears only while a call
+ * runs is not readable: those calls finish in milliseconds, so it reads as a
+ * flicker rather than as information.
  * @module @liyuera/dsh-chrome-browser/client/activity-strip
  */
 import React from 'react';
-/** Props every composer-dock entry receives. */
+/** Props every Session-header utility receives. */
 export interface BrowserActivityProps {
     sessionId: string;
 }
 /**
- * Render the strip while one of this plugin's tools is running.
- * @param props - the dock entry's session identity.
- * @returns the strip, or null while nothing is running.
+ * Render the persistent Chrome status chip.
+ * @param props - the header utility's session identity.
+ * @returns the chip.
  */
-export declare function BrowserActivity({ sessionId }: BrowserActivityProps): React.ReactElement | null;
+export declare function BrowserActivity({ sessionId }: BrowserActivityProps): React.ReactElement;
 //# sourceMappingURL=BrowserActivity.d.ts.map
