@@ -25,12 +25,13 @@ interface Calls {
   readonly opened: string[]
   readonly closed: string[]
   readonly navigated: Array<{ tabId: string; url: string }>
+  readonly waitedForLoad: string[]
 }
 
 /** A backend that records opens, closes and navigations. */
 function backend(): { backend: BrowserBackend; calls: Calls } {
   const tab: BackendTab = { id: '7', title: 'T', url: 'https://e.test/', active: true, favicon: '' }
-  const calls: Calls = { opened: [], closed: [], navigated: [] }
+  const calls: Calls = { opened: [], closed: [], navigated: [], waitedForLoad: [] }
   const value = {
     lastEvalWorld: undefined,
     ensure: async () => {},
@@ -48,7 +49,9 @@ function backend(): { backend: BrowserBackend; calls: Calls } {
     navigate: async (tabId: string, url: string) => {
       calls.navigated.push({ tabId, url })
     },
-    waitForLoad: async () => {},
+    waitForLoad: async (tabId: string) => {
+      calls.waitedForLoad.push(tabId)
+    },
     evaluate: async () => undefined,
     click: async () => EMPTY_CLICK,
     hover: async () => ({ matched: 0, hovered: false }),
@@ -111,10 +114,20 @@ describe('chrome_open URL scheme', () => {
     expect(calls.opened).toEqual(['https://example.com'])
   })
 
-  it('opens about:blank when no URL is given', async () => {
+  it('opens about:blank when no URL is given, without waiting for a page it cannot read', async () => {
+    // Waiting evaluates in the new tab, and the extension cannot inject into
+    // about:blank: the default call used to fail outright with Chrome's
+    // "Cannot access about:blank at origin null".
     const { definition, calls } = tool('chrome_open')
-    await definition.execute({}, {} as never)
+    await expect(definition.execute({}, {} as never)).resolves.toMatchObject({ tabId: '7' })
     expect(calls.opened).toEqual(['about:blank'])
+    expect(calls.waitedForLoad).toEqual([])
+  })
+
+  it('still waits for a real page', async () => {
+    const { definition, calls } = tool('chrome_open')
+    await definition.execute({ url: 'https://example.com' }, {} as never)
+    expect(calls.waitedForLoad).toEqual(['7'])
   })
 
   it('refuses a data: URL before a tab exists for it', async () => {
@@ -150,6 +163,15 @@ describe('chrome_navigate URL scheme', () => {
     const { definition, calls } = tool('chrome_navigate')
     await expect(definition.execute({ url: 'data:text/html,<h1>hi</h1>' }, {} as never))
       .rejects.toThrow(/cannot drive a data: URL/)
+    expect(calls.navigated).toEqual([])
+  })
+
+  it('refuses about:blank, which would discard the page and strand the tab', async () => {
+    // Opening a blank tab is a staging move; navigating an existing tab to one
+    // throws away what the user had there and leaves a tab nothing can read.
+    const { definition, calls } = tool('chrome_navigate')
+    await expect(definition.execute({ tabId: '7', url: 'about:blank' }, {} as never))
+      .rejects.toThrow(/would discard the page/)
     expect(calls.navigated).toEqual([])
   })
 })

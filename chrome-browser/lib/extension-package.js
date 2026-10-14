@@ -7,6 +7,7 @@
  * unpacking the archive yields a directory Chrome accepts directly.
  * @module @liyuera/dsh-chrome-browser/extension-package
  */
+import { createHash } from 'node:crypto';
 import { readFileSync, readdirSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -49,6 +50,120 @@ export function crc32(data) {
  */
 export function extensionDir(moduleUrl) {
     return fileURLToPath(new URL('../extension/', moduleUrl));
+}
+/**
+ * Version the loaded extension must report to be current.
+ *
+ * Read from the packaged manifest rather than duplicated as a constant, so the
+ * manifest stays the single source of truth. Compared against what the
+ * extension reports about itself on connect, which is the only way to tell a
+ * stale unpacked extension apart from a current one — Chrome never re-reads
+ * those files on its own.
+ * @param moduleUrl - `import.meta.url` of the module resolving the folder.
+ * @returns the manifest's version, or '' when it cannot be read.
+ */
+export function extensionVersion(moduleUrl) {
+    try {
+        const manifest = JSON.parse(readFileSync(join(extensionDir(moduleUrl), 'manifest.json'), 'utf8'));
+        const version = manifest.version;
+        return typeof version === 'string' ? version : '';
+    }
+    catch (error) {
+        // A missing or malformed manifest is reported by the zip route; here it
+        // only means "no expectation to compare against".
+        if (!/ENOENT|JSON/u.test(String(error.message)))
+            throw error;
+        return '';
+    }
+}
+/**
+ * Every file the extension is made of, as sorted relative paths.
+ *
+ * Sorted so both sides of the version handshake hash the same byte order, and
+ * the whole tree rather than a list so a file added to the folder is covered
+ * without an edit here. extension/service-worker.js carries the same set; a
+ * test keeps the two equal.
+ * @param directory - the extension folder.
+ * @returns relative paths, `/`-separated and sorted.
+ */
+export function extensionFiles(directory) {
+    const found = [];
+    const walk = (current) => {
+        for (const item of readdirSync(current, { withFileTypes: true })) {
+            const absolute = join(current, item.name);
+            if (item.isDirectory()) {
+                walk(absolute);
+                continue;
+            }
+            if (item.isFile())
+                found.push(relative(directory, absolute).split(sep).join('/'));
+        }
+    };
+    walk(directory);
+    return found.sort();
+}
+/** The value `scripts/stamp-extension.mjs` writes into the worker. */
+const STAMP_LINE = /const BUILD_HASH = '[0-9a-f]{64}'/u;
+/**
+ * One file's bytes with the stamp blanked, so the stamp is not self-referential.
+ * @param bytes - the file's contents.
+ * @returns the same bytes with any stamp value removed.
+ */
+function unstamped(bytes) {
+    return Buffer.from(bytes.toString('utf8').replace(STAMP_LINE, "const BUILD_HASH = ''"), 'utf8');
+}
+/**
+ * Fingerprint of one extension folder, as lowercase hex SHA-256.
+ *
+ * A stamp rather than a version number someone has to remember to bump, and a
+ * stamp rather than a hash the extension computes at runtime: measured on a
+ * real browser, `fetch(chrome.runtime.getURL(...))` inside the worker returns
+ * the files on DISK, not the copy Chrome loaded, so a runtime self-hash reports
+ * the new bytes while the old code is still running and nothing ever looks
+ * stale. The worker therefore carries this value as a constant and reports it;
+ * the host compares that constant against this function's answer.
+ * @param directory - the extension folder.
+ * @returns the digest of every file, name and bytes, in sorted order.
+ */
+export function extensionStampOf(directory) {
+    const hash = createHash('sha256');
+    for (const name of extensionFiles(directory)) {
+        hash.update(Buffer.from(name, 'utf8'));
+        hash.update(Buffer.from([0]));
+        hash.update(unstamped(readFileSync(join(directory, name))));
+    }
+    return hash.digest('hex');
+}
+/**
+ * The stamp this package's extension files should carry.
+ * @param moduleUrl - `import.meta.url` of the module resolving the folder.
+ * @returns the digest, or '' when the folder cannot be read.
+ */
+export function extensionStamp(moduleUrl) {
+    try {
+        return extensionStampOf(extensionDir(moduleUrl));
+    }
+    catch (error) {
+        if (!/ENOENT/u.test(String(error.message)))
+            throw error;
+        return '';
+    }
+}
+/**
+ * The stamp actually written into the worker beside this module.
+ * @param moduleUrl - `import.meta.url` of the module resolving the folder.
+ * @returns the constant's value, or '' when it cannot be read.
+ */
+export function extensionStampedValue(moduleUrl) {
+    try {
+        const text = readFileSync(join(extensionDir(moduleUrl), 'service-worker.js'), 'utf8');
+        return /const BUILD_HASH = '([0-9a-f]{64})'/u.exec(text)?.[1] ?? '';
+    }
+    catch (error) {
+        if (!/ENOENT/u.test(String(error.message)))
+            throw error;
+        return '';
+    }
 }
 /** Collect every regular file under one directory, sorted for a stable archive. */
 function collectFiles(root, current) {

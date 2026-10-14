@@ -206,7 +206,25 @@ chrome_request_help { reason: '请在打开的 example.com 页面里登录,然�
 
 **默认 = 扩展后端(推荐)**:控制的就是你**日常运行的 Chrome 本身**——不重启、不复制 profile、无额外窗口。扩展的获取与加载步骤见[安装 → 2. 装配套 Chrome 扩展](#2-装配套-chrome-扩展)。
 
-改了 `extension/` 里的文件后,必须在 `chrome://extensions` 点该扩展的「重新加载」才会生效——Chrome 不会自动重读已加载的解压扩展。
+改了 `extension/` 里的文件后,**从 0.5.0 起插件会自己让扩展重载**——见下。
+
+### 扩展的自动更新
+
+Chrome 不会重读「加载已解压」扩展的文件,所以插件自己补了一条握手:
+
+1. 扩展连上时(以及每 20 秒一次心跳)自报三样东西:「**自己这份代码的指纹**」(`BUILD_HASH`,一个烤进 service worker 的常量)、`manifest.version`、以及它能处理的 op 列表;
+2. 宿主对**包内 `extension/` 的文件**算出同样的指纹(文件名 + `0x00` + 内容,按名排序);
+3. 不一致且扩展支持 `reload` → 宿主请它 `chrome.runtime.reload()`,Chrome 从磁盘重读,新代码生效。
+
+**为什么指纹必须是常量,不能在扩展里现算**:实测过——`fetch(chrome.runtime.getURL(...))` 在 service worker 里读到的是**磁盘上的文件**,不是 Chrome 已加载的那份。运行时自算指纹会**每次都报新值**:宿主以为扩展是最新的,而用户实际跑着旧代码,毫无迹象。只有随着已加载代码一起被读出来的常量才能说明「现在跑的是哪份」。
+
+指纹由 `npm run extension:stamp` 写入;忘了盖章时 `tests/extension-package.spec.ts` 会直接失败,所以这不是一件需要记的事。**实测过 `chrome.runtime.reload()` 确实从磁盘重读**(不只是 manifest,service worker 也是),而 worker 被 Chrome 唤醒**不会**重读。
+
+于是 **npm 升级插件后不用再碰 `chrome://extensions`**。
+
+- **同一个指纹只问一次**:如果某次 `reload` 没能读到新文件(比如目录被换掉),宿主不会反复重载——它会停下并在 `/chrome-browser/ext/status` 里报 `stale: true`、`autoReloadAsked: true`,此时需要手动重载一次。换了一个指纹(又一次升级)则会重新尝试,所以同一进程内的多次升级都能落地。
+- **能力检查**:宿主只会发扩展自报支持的 op。扩展文件比插件旧时直接报「扩展不支持 X,请在 chrome://extensions 重新加载该扩展」,而不是让扩展回一个 `unknown op` 这种看不出原因的内部错误。
+- **首次安装仍需手动**:Chrome 没有以编程方式安装解压扩展的接口,新用户在 `chrome://extensions` 加载一次是绕不过去的(除非上架 Chrome 应用商店)。
 
 之后扩展通过本地 WebSocket(`/chrome-browser/ext/ws`)与插件通信:列真实标签页(自带站点图标)、读取/点击/输入/求值/导航/新开/截图。扩展没连上时 `@` 菜单不出现标签页分组,`/chrome-browser/ext/status` 会报 `connected:false`。
 
@@ -335,7 +353,9 @@ DSH_CHROME_SMOKE=1 npx vitest run tests/smoke.spec.ts   # headless Chrome 全链
 - **页面 CSP 会改变 `chrome_eval` 的执行通道**:`script-src` 里没有 `'unsafe-eval'` 的站点(GitHub 就是)主世界不能 `eval`,插件会自动改走 **`chrome.debugger` 的 `Runtime.evaluate`**(和 CDP 后端同一条路)并在结果里报 `world: "debugger"`。**代价是该标签页会出现调试提示条**,且已打开 DevTools 时无法附着——所以它只是回退,默认仍走无感的普通注入。
 - **`chrome_eval` 的失败是错误,不是 `null`**:语法错误、运行时异常、CSP 拦截以前都会静默变成 `null`,现在会带着原始信息报错。
 - **`chrome_open` 拒绝它驱动不了的 scheme**:`data:`、`chrome:`、`devtools:` 这类页面扩展注不进去,以前会**先把标签页建出来再失败**——那个标签页读不了、跑不了 JS、连导航走都不行。现在在创建前就报错,不留僵尸标签页。`file:` 可以开,但**它依赖一个浏览器设置**:扩展默认没有文件访问权限,要在 `chrome://extensions` 里为该扩展打开「允许访问文件网址」;没开的话 `file://` 页面会和 `data:` 一样读不到(本机已开启,实测 `chrome_open file://` + `chrome_read` 正常)。CDP 模式没有这个限制。
+- **`about:blank` 只能开、不能导航过去**:扩展注不进空白页,所以空白标签页读不了、点不了、跑不了 JS。`chrome_open` 允许开一个(当**临时中转页**用,随后 `chrome_navigate` 走),并且**不会等它加载**(没东西可等);但 `chrome_navigate` 拒绝导航到 `about:blank`——那会丢弃页面上原有的内容,只剩一个谁也读不了的标签页。
 - **`chrome_close` 不猜目标**:`tabId` 是必填的精确 id。省略或写 `active` 都会报错——关掉「用户当前正在看的标签页」几乎总是错的。关闭窗口的最后一个标签页会连带关闭该窗口。
+- **扩展自动更新依赖 `chrome.runtime.reload()` 能读到磁盘上的新文件**:这是该 API 的预期行为,但已加载的解压扩展由 Chrome 缓存,所以插件**只尝试一次**并在失败时明确报告,而不是无限重载。状态见 `/chrome-browser/ext/status`。
 - **`chrome_screenshot` 会在该标签页显示调试提示条**:它走 `chrome.debugger` 的 `Page.captureScreenshot`(与 CDP 后端同一条路),因此在标签页处于后台时照样可用,也**不会返回陈旧帧**。代价是 Chrome 在该标签页顶部显示「正在调试」提示条,且已打开 DevTools 时无法附着(会明确报错)。如果该标签页已被 `chrome_console` 采集,则复用同一会话,不产生第二次附着。
 - ~~截图要求窗口可见~~:旧实现走 `chrome.tabs.captureVisibleTab`,窗口被遮挡时报 `image readback failed`,窗口停止重绘时**返回上一帧**(实测两张相隔数秒的截图逐字节相同,而返回的路径与字节数不会告诉你它是陈旧的)。已改为调试通道。
 - **活动状态条是轮询的**:客户端每秒发一次本地回环 GET。将来若接入会话事件流可以去掉轮询,目前用的是插件已有的路由机制。
@@ -353,7 +373,7 @@ DSH_CHROME_SMOKE=1 npx vitest run tests/smoke.spec.ts   # headless Chrome 全链
 dsh plugin --profile desktop remove @liyuera/dsh-chrome-browser
 ```
 
-再到 `chrome://extensions` 移除 `dsh Chrome Bridge` 扩展。卸载插件不会关闭你的 Chrome(CDP 的 owned 专用实例除外)。
+再到 `chrome://extensions` 移除 `dsh Chrome Control` 扩展。卸载插件不会关闭你的 Chrome(CDP 的 owned 专用实例除外)。
 
 ## 许可
 

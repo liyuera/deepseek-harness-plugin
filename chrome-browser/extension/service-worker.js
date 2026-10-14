@@ -1,5 +1,5 @@
 /**
- * dsh Chrome Bridge service worker: a long-lived WebSocket to the local dsh
+ * dsh Chrome Control service worker: a long-lived WebSocket to the local dsh
  * host. The host pushes commands (list tabs / read / eval / click / type /
  * navigate / open / screenshot); this worker executes them against the real
  * browser and pushes results back. The open socket keeps the worker alive,
@@ -44,6 +44,7 @@ function connect() {
     retryMs = 1000
     hostOrigin = url.replace(/^ws/u, 'http').replace(/\/chrome-browser\/ext\/ws$/u, '')
     trace('open ' + url)
+    hello()
     // Chrome suspends this worker when idle, which detaches the debugger and
     // silently ends console capture. Re-arm whatever was capturing.
     void rearmConsole()
@@ -71,7 +72,11 @@ function scheduleRetry() {
 // does not keep this worker alive: a JS heartbeat interval keeps it warm,
 // and the alarm below wakes a suspended worker so the bridge reconnects.
 setInterval(() => {
-  if (socket !== null && socket.readyState === 1) send({ kind: 'heartbeat' })
+  if (socket === null || socket.readyState !== 1) return
+  send({ kind: 'heartbeat' })
+  // Re-introducing here is what lets the host notice that its own files were
+  // updated underneath a running extension, without waiting for a reconnect.
+  hello()
 }, 20_000)
 
 chrome.alarms.create('dsh-bridge', { periodInMinutes: 0.5 })
@@ -80,6 +85,44 @@ chrome.alarms.onAlarm.addListener(alarm => {
 })
 chrome.runtime.onStartup.addListener(() => connect())
 chrome.runtime.onInstalled.addListener(() => connect())
+
+/**
+ * Ops this worker answers, sent to the host on connect and on every heartbeat.
+ *
+ * Chrome never re-reads an unpacked extension's files, so a host that shipped a
+ * new op would otherwise only find out when the extension answered `unknown op`
+ * — an internal error with no hint that a reload is what is missing. Comparing
+ * this roster, and the version beside it, is what lets the host say so.
+ * tests/extension-scope.spec.ts keeps the list equal to the cases in run().
+ */
+const SUPPORTED_OPS = [
+  'list-tabs', 'read', 'inventory', 'wait', 'hover', 'press', 'select', 'eval',
+  'click', 'type', 'console-start', 'console-stop', 'close', 'navigate', 'open',
+  'screenshot', 'trace', 'reload',
+]
+
+/**
+ * Fingerprint of this extension's own files, written by `npm run extension:stamp`
+ * and checked by tests/extension-package.spec.ts.
+ *
+ * It is a constant rather than a hash computed here on purpose. Measured in a
+ * real browser: `fetch(chrome.runtime.getURL('service-worker.js'))` returns the
+ * file on DISK, not the copy Chrome loaded, so a runtime self-hash reported the
+ * new bytes while the old code was still running — the host saw a match and the
+ * user stayed on a stale extension with nothing to show for it. Only a value
+ * carried by the loaded code can tell the host which code is loaded.
+ */
+const BUILD_HASH = 'd985d7da53d76c69be7b9a72879970e33a1e440a01a2741081820c8045ec55e0'
+
+/** Introduce this worker: what it runs, what it can answer, and which code it is. */
+async function hello() {
+  send({
+    kind: 'hello',
+    version: chrome.runtime.getManifest().version,
+    ops: SUPPORTED_OPS,
+    build: BUILD_HASH,
+  })
+}
 
 function send(payload) {
   if (socket !== null && socket.readyState === 1) socket.send(JSON.stringify(payload))
@@ -389,6 +432,12 @@ async function run(command) {
       return startConsole(command.args.tabId)
     case 'console-stop':
       return stopConsole(command.args.tabId)
+    case 'reload': {
+      // Answer first: `chrome.runtime.reload()` tears this worker down, so a
+      // result sent after it would never leave. The delay lets the frame flush.
+      setTimeout(() => chrome.runtime.reload(), 50)
+      return { reloaded: true }
+    }
     case 'close': {
       const id = Number(command.args.tabId)
       if (!Number.isInteger(id)) throw new Error(`无效的标签页 id:${String(command.args.tabId)}`)

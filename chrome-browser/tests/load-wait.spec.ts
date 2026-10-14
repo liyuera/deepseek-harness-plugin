@@ -117,12 +117,14 @@ describe('chrome_open', () => {
     expect(value).toMatchObject({ tabId: '9', title: CREATED_TITLE })
   })
 
-  it('opens about:blank when no url is given and still settles the wait', async () => {
+  it('opens about:blank without settling the wait it cannot perform', async () => {
+    // A blank tab has nothing to load, and waiting would evaluate in a page the
+    // extension cannot inject into — the default call used to fail outright.
     const host = recorder()
     host.listed = []
     const value = await tools(host.backend).get('chrome_open')?.execute({}, {} as never)
     expect(host.calls).toContain('open:about:blank')
-    expect(host.calls).toContain('waitForLoad:9:8000')
+    expect(host.calls).not.toContain('waitForLoad:9:8000')
     expect(value).toMatchObject({ tabId: '9' })
   })
 })

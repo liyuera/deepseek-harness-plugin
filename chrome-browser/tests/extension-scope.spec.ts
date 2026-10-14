@@ -184,6 +184,51 @@ describe('a broken helper', () => {
   })
 })
 
+describe('the handshake', () => {
+  /** The op roster the extension advertises. */
+  function advertised(): string[] {
+    return loadExtensionFunction<string[]>(['SUPPORTED_OPS'], 'SUPPORTED_OPS', [])() as unknown as string[]
+  }
+
+  /** Every op `run()` actually answers. */
+  function implemented(): string[] {
+    const body = EXTENSION_SOURCE.slice(EXTENSION_SOURCE.indexOf('async function run(command)'))
+    const end = body.indexOf('\nasync function ', 1)
+    const scoped = end === -1 ? body : body.slice(0, end)
+    return [...scoped.matchAll(/case '([a-z-]+)':/gu)].map(match => match[1] as string)
+  }
+
+  it('advertises exactly the ops run() answers', () => {
+    // The roster is what the host uses to tell "your extension is old" apart
+    // from "your plugin is broken"; a roster that drifts makes it lie.
+    expect([...advertised()].sort()).toEqual([...implemented()].sort())
+  })
+
+  it('advertises the reload op the host uses to update it', () => {
+    expect(advertised()).toContain('reload')
+  })
+
+  it('answers reload before tearing the worker down', async () => {
+    // `chrome.runtime.reload()` kills the worker, so a result sent after it
+    // would never leave and the host would report a failed update.
+    const reloaded: number[] = []
+    const chrome = {
+      runtime: { reload: () => { reloaded.push(Date.now()) } },
+      tabs: { remove: async () => {} },
+      scripting: { executeScript: async () => [{ result: null }] },
+    }
+    const run = loadExtensionFunction<(command: unknown) => Promise<unknown>>(
+      ['SUPPORTED_OPS', 'pageAgent', 'pageExec', 'run'],
+      'run',
+      ['chrome', 'setTimeout'],
+    )(chrome, setTimeout)
+    await expect(run({ op: 'reload', args: {} })).resolves.toEqual({ reloaded: true })
+    expect(reloaded).toEqual([])
+    await new Promise(resolve => setTimeout(resolve, 120))
+    expect(reloaded).toHaveLength(1)
+  })
+})
+
 describe('the close op', () => {
   /** `run` over a stub `chrome`; returns what the browser was asked to close. */
   function closeDispatch(): {

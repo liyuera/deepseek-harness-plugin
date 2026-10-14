@@ -22,6 +22,55 @@ export declare function crc32(data: Buffer): number;
  */
 export declare function extensionDir(moduleUrl: string): string;
 /**
+ * Version the loaded extension must report to be current.
+ *
+ * Read from the packaged manifest rather than duplicated as a constant, so the
+ * manifest stays the single source of truth. Compared against what the
+ * extension reports about itself on connect, which is the only way to tell a
+ * stale unpacked extension apart from a current one — Chrome never re-reads
+ * those files on its own.
+ * @param moduleUrl - `import.meta.url` of the module resolving the folder.
+ * @returns the manifest's version, or '' when it cannot be read.
+ */
+export declare function extensionVersion(moduleUrl: string): string;
+/**
+ * Every file the extension is made of, as sorted relative paths.
+ *
+ * Sorted so both sides of the version handshake hash the same byte order, and
+ * the whole tree rather than a list so a file added to the folder is covered
+ * without an edit here. extension/service-worker.js carries the same set; a
+ * test keeps the two equal.
+ * @param directory - the extension folder.
+ * @returns relative paths, `/`-separated and sorted.
+ */
+export declare function extensionFiles(directory: string): string[];
+/**
+ * Fingerprint of one extension folder, as lowercase hex SHA-256.
+ *
+ * A stamp rather than a version number someone has to remember to bump, and a
+ * stamp rather than a hash the extension computes at runtime: measured on a
+ * real browser, `fetch(chrome.runtime.getURL(...))` inside the worker returns
+ * the files on DISK, not the copy Chrome loaded, so a runtime self-hash reports
+ * the new bytes while the old code is still running and nothing ever looks
+ * stale. The worker therefore carries this value as a constant and reports it;
+ * the host compares that constant against this function's answer.
+ * @param directory - the extension folder.
+ * @returns the digest of every file, name and bytes, in sorted order.
+ */
+export declare function extensionStampOf(directory: string): string;
+/**
+ * The stamp this package's extension files should carry.
+ * @param moduleUrl - `import.meta.url` of the module resolving the folder.
+ * @returns the digest, or '' when the folder cannot be read.
+ */
+export declare function extensionStamp(moduleUrl: string): string;
+/**
+ * The stamp actually written into the worker beside this module.
+ * @param moduleUrl - `import.meta.url` of the module resolving the folder.
+ * @returns the constant's value, or '' when it cannot be read.
+ */
+export declare function extensionStampedValue(moduleUrl: string): string;
+/**
  * Build an uncompressed zip archive of one directory tree.
  *
  * Entries use the STORE method: the extension is a few kilobytes, and storing

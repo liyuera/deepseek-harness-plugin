@@ -29,6 +29,7 @@ import type { WaitState } from './expressions.ts'
 import { Chrome } from './chrome.ts'
 import type { ResolvedChromeConfig } from './chrome.ts'
 import { WsConnection, wsHandshake } from './ws.ts'
+import { extensionStamp, extensionVersion } from './extension-package.ts'
 
 /** One tab as tools and the picker see it. */
 export interface BackendTab {
@@ -408,6 +409,18 @@ export class ExtensionBackend implements BrowserBackend {
   private readonly inFlight = new Map<string, Promise<unknown>>()
 
   private conn: WsConnection | null = null
+  /** What the extension last said about itself; null before its first hello. */
+  private extension: { version: string; ops: readonly string[]; build: string } | null = null
+  /**
+   * The stale build stamp an automatic reload was last asked for, or null.
+   *
+   * Keyed by stamp rather than by attempt: a reload that cannot move the
+   * extension off one build must never be asked for twice — that would reload
+   * it on every heartbeat — while a mismatch at a *different* build is a
+   * different problem and deserves its own attempt, so two upgrades within one
+   * host process both settle.
+   */
+  private reloadAskedFor: string | null = null
   private seq = 0
   private readonly unacked = new Map<number, { op: string; args: Record<string, unknown> }>()
   /**
@@ -651,11 +664,86 @@ export class ExtensionBackend implements BrowserBackend {
     this.conn?.close()
   }
 
+  /**
+   * What the connected extension reports about itself, for the status route.
+   * `stale` means its files are older than the ones this package ships, which
+   * only a reload of the extension can fix.
+   */
+  extensionStatus(): {
+    version: string
+    expectedVersion: string
+    build: string
+    expectedBuild: string
+    stale: boolean
+    autoReloadAsked: boolean
+  } {
+    const expectedBuild = extensionStamp(import.meta.url)
+    const build = this.extension?.build ?? ''
+    return {
+      version: this.extension?.version ?? '',
+      expectedVersion: extensionVersion(import.meta.url),
+      build,
+      expectedBuild,
+      // The stamp decides. It is baked into the worker, so it describes the
+      // code Chrome loaded — a version number nobody bumped would not.
+      stale: build !== '' && expectedBuild !== '' && build !== expectedBuild,
+      autoReloadAsked: this.reloadAskedFor !== null,
+    }
+  }
+
+  /**
+   * Record the extension's self-report, and ask it to reload when it is running
+   * older files than this package ships.
+   *
+   * Chrome never re-reads an unpacked extension's files, so an upgraded plugin
+   * would otherwise keep driving a stale bridge until the user reloaded it by
+   * hand. `chrome.runtime.reload()` is the only thing that re-reads them.
+   */
+  private noteExtensionHello(message: Record<string, unknown>): void {
+    const version = typeof message.version === 'string' ? message.version : ''
+    const build = typeof message.build === 'string' ? message.build : ''
+    const ops = Array.isArray(message.ops)
+      ? message.ops.filter((op): op is string => typeof op === 'string')
+      : []
+    this.extension = { version, ops, build }
+    const expected = extensionStamp(import.meta.url)
+    if (build === '' || expected === '' || build === expected) return
+    if (!ops.includes('reload') || this.reloadAskedFor === build) return
+    this.reloadAskedFor = build
+    // Carries the stamp it is asked about, which is what makes two requests
+    // distinct to the in-flight dedupe rather than one request twice.
+    void this.push('reload', { build }).catch(() => undefined)
+  }
+
+  /**
+   * Refuse an op the connected extension does not advertise.
+   *
+   * Sending it anyway earns `unknown op` back — an internal error that says
+   * nothing about the real cause, which is an extension whose files are older
+   * than the plugin driving it.
+   */
+  private assertExtensionSupports(op: string): void {
+    const known = this.extension?.ops
+    if (known === undefined || known.length === 0) return
+    if (known.includes(op)) return
+    throw new Error(
+      `扩展不支持 ${op}(它自报的版本是 ${this.extension?.version ?? '未知'},插件期望 `
+      + `${extensionVersion(import.meta.url)})——扩展文件比插件旧,请在 chrome://extensions 重新加载该扩展。`,
+    )
+  }
+
   private push(op: string, args: Record<string, unknown>): Promise<unknown> {
+    this.assertExtensionSupports(op)
     // Concurrent duplicate of a side-effectful command joins the in-flight
     // one (model retries double-clicking / double-opening otherwise).
+    //
+    // Keyed on every argument, not just the target: two waits on one selector
+    // differ by state and deadline, and two reloads differ by the version they
+    // are stale at. Merging those would answer the second call with the first
+    // call's result. Ops absent from SAFE_RETRY_OPS are never replayed across a
+    // reconnect, so replaying a reload through that set would loop forever.
     const dedupeKey = ExtensionBackend.SAFE_RETRY_OPS.has(op) ? undefined
-      : `${op}:${String(args.tabId ?? '')}:${String(args.url ?? args.selector ?? args.text ?? '')}`
+      : `${op}:${JSON.stringify(args)}`
     if (dedupeKey !== undefined) {
       const existing = this.inFlight.get(dedupeKey)
       if (existing !== undefined) return existing
@@ -699,6 +787,10 @@ export class ExtensionBackend implements BrowserBackend {
     }
     if (message.kind === 'event') {
       this.onEventFrame(message)
+      return
+    }
+    if (message.kind === 'hello') {
+      this.noteExtensionHello(message as unknown as Record<string, unknown>)
       return
     }
     if (message.kind !== 'results' || !Array.isArray(message.results)) return

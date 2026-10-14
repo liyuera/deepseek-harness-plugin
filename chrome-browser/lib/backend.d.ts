@@ -211,6 +211,18 @@ export declare class ExtensionBackend implements BrowserBackend {
      */
     private readonly inFlight;
     private conn;
+    /** What the extension last said about itself; null before its first hello. */
+    private extension;
+    /**
+     * The stale build stamp an automatic reload was last asked for, or null.
+     *
+     * Keyed by stamp rather than by attempt: a reload that cannot move the
+     * extension off one build must never be asked for twice — that would reload
+     * it on every heartbeat — while a mismatch at a *different* build is a
+     * different problem and deserves its own attempt, so two upgrades within one
+     * host process both settle.
+     */
+    private reloadAskedFor;
     private seq;
     private readonly unacked;
     /**
@@ -253,6 +265,36 @@ export declare class ExtensionBackend implements BrowserBackend {
     startConsole(tabId: string): Promise<void>;
     stopConsole(tabId: string): Promise<void>;
     dispose(): void;
+    /**
+     * What the connected extension reports about itself, for the status route.
+     * `stale` means its files are older than the ones this package ships, which
+     * only a reload of the extension can fix.
+     */
+    extensionStatus(): {
+        version: string;
+        expectedVersion: string;
+        build: string;
+        expectedBuild: string;
+        stale: boolean;
+        autoReloadAsked: boolean;
+    };
+    /**
+     * Record the extension's self-report, and ask it to reload when it is running
+     * older files than this package ships.
+     *
+     * Chrome never re-reads an unpacked extension's files, so an upgraded plugin
+     * would otherwise keep driving a stale bridge until the user reloaded it by
+     * hand. `chrome.runtime.reload()` is the only thing that re-reads them.
+     */
+    private noteExtensionHello;
+    /**
+     * Refuse an op the connected extension does not advertise.
+     *
+     * Sending it anyway earns `unknown op` back — an internal error that says
+     * nothing about the real cause, which is an extension whose files are older
+     * than the plugin driving it.
+     */
+    private assertExtensionSupports;
     private push;
     private onFrame;
     /**

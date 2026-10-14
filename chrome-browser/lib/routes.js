@@ -131,6 +131,10 @@ export function registerChromeRoutes(ctx, backend, screenshotDir, activity) {
                 ok: true,
                 backend: backend instanceof ExtensionBackend ? 'extension' : 'cdp',
                 connected: backend instanceof ExtensionBackend ? backend.isConnected() : true,
+                // A stale extension is the one failure the user can fix in one click,
+                // and nothing else surfaces it: every tool would fail as if the plugin
+                // were broken.
+                ...(backend instanceof ExtensionBackend ? backend.extensionStatus() : {}),
             });
         },
     }), 'chrome-browser: extension status route');

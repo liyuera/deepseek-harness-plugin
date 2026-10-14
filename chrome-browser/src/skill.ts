@@ -90,12 +90,13 @@ export const SKILL_CONTENT: string = `# Chrome 浏览器(用户真实标签页)
 | 点击返回成功但页面没反应 | **先看结果的 \`warnings\`**:它逐条说明元素不可见、在视口外、被遮挡或 aria-disabled。没有 warnings 说明点击确实落在可见元素上,再怀疑页面自身没响应。 |
 | 点击报 \`none was clicked\` | 匹配到了元素但全部是原生 \`disabled\`:页面本来就不接受点击,先改变页面状态(如勾选前置选项)再点。 |
 | \`matched\` 比预期多 | 选择器太宽。用更具体的选择器,或确认要点的到底是哪一个。 |
-| 扩展未连接 | 让用户确认 \`chrome://extensions\` 里 \`dsh Chrome Bridge\` 已加载;或访问 \`/chrome-browser/ext/status\` 查看。 |
+| 扩展未连接 | 让用户确认 \`chrome://extensions\` 里 \`dsh Chrome Control\` 已加载;或访问 \`/chrome-browser/ext/status\` 查看。 |
 | 悬停后菜单没出现 | 事件是合成的,纯 CSS \`:hover\` 规则不受影响。改用 \`chrome_read { mode: 'interactive' }\` 确认控件是否已在 DOM 里,否则只能让用户手动展开。 |
 | \`chrome_wait\` 返回 \`satisfied: false\` | 到超时了,元素**没有**达到条件。不要接着点;先 \`chrome_read\` 看当前页面到底是什么状态。 |
 | 操作报「结果未知」 | 命令已发出但没收到结果,页面**可能已经变了**。不要直接重试(会重复执行),先用 \`chrome_tabs\` / \`chrome_read\` 确认当前状态再决定。 |
 | 按了 Enter 但表单没提交 | 合成按键不触发默认行为,所以工具会显式调 \`requestSubmit()\`。看结果的 \`submitted\`:为 \`false\` 说明元素不在表单里——改用 \`chrome_click\` 点提交按钮。 |
 | \`chrome_select\` 报值不存在 | 那是 **option value**,不是显示文本。错误里已列出可用值,照着选。 |
+| 空白标签页读不到 | 扩展注不进 \`about:blank\`,\`chrome_open\` 开出来的空白页读不了也点不了——它是**中转页**,用完 \`chrome_navigate\` 走或者 \`chrome_close\` 关掉。 |
 | 自己开的标签页用完了 | 用 \`chrome_close\` 关掉**你自己开的**那些。关掉窗口的最后一个标签页会连带关闭窗口,先确认不是用户唯一开着的那个。 |
 | 页面要求登录 / 出现验证码 | **不要猜也不要反复重试**——用 \`chrome_request_help\` 说明要做什么,等用户答复。\`completed: true\` 后重新读页面;\`false\` 就停下这条路径并告诉用户。 |
 | 读到的内容明显不全 | 只覆盖主框架的 \`innerText\`;iframe 与大量隐藏内容不在其中,必要时用 \`chrome_eval\` 取。 |

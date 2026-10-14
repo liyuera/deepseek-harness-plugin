@@ -146,8 +146,31 @@ const OPERABLE_URL_SCHEMES = new Set(['http:', 'https:', 'file:'])
  * @param tool - the tool name, for the error message.
  * @param url - the requested URL.
  */
-function assertOperableUrl(tool: string, url: string): void {
-  if (url === '' || url === 'about:blank') return
+/** Whether a URL names the blank page the plugin cannot inject into. */
+function isBlankUrl(url: string): boolean {
+  return url === '' || url === 'about:blank'
+}
+
+/**
+ * Reject a URL whose page the plugin cannot drive.
+ *
+ * The privileged schemes are refused because the extension has no host
+ * permission for them: the tab would be created and then fail every read,
+ * evaluation and navigation. A blank page is refused only where it would
+ * replace one — nothing can be injected into it either, which makes it a
+ * reasonable place to start and a destructive place to end up.
+ * @param tool - tool name, for the message.
+ * @param url - the URL the caller asked for.
+ * @param blankAllowed - whether an empty or `about:blank` URL is acceptable.
+ */
+function assertOperableUrl(tool: string, url: string, blankAllowed: boolean): void {
+  if (isBlankUrl(url)) {
+    if (blankAllowed) return
+    throw new Error(
+      `${tool}: about:blank cannot be driven either — the extension cannot inject into it, so navigating `
+      + 'there would discard the page and leave a tab nothing can read. Close the tab instead.',
+    )
+  }
   let parsed: URL
   try {
     parsed = new URL(url)
@@ -312,7 +335,7 @@ export function chromeToolDefinitions(
       presentCall: args => navigateCall(args),
       presentResult: (_args, outcome) => navigateResult(outcome),
       execute: async (args: { url: string; tabId?: string; waitLoad?: boolean }, _exec: unknown): Promise<JsonValue> => {
-        assertOperableUrl('chrome_navigate', args.url)
+        assertOperableUrl('chrome_navigate', args.url, false)
         const tabId = await resolveTabId(backend, _exec, args.tabId)
         await backend.navigate(tabId, args.url, args.waitLoad !== false, config.waitLoadMs)
         return { tabId, url: args.url } as unknown as JsonValue
@@ -329,7 +352,8 @@ export function chromeToolDefinitions(
         url: {
           type: 'string',
           description: 'URL to open; defaults to about:blank. http(s) and file only — a file: URL also needs '
-            + 'the extension to be granted file access in chrome://extensions, or the page will be unreadable.',
+            + 'the extension to be granted file access in chrome://extensions, or the page will be unreadable. '
+            + 'A blank tab is not readable or drivable either: open one only as a staging tab and navigate it next.',
         },
         waitLoad: { type: 'boolean', description: 'Wait for load completion (default true).' },
       },
@@ -337,9 +361,14 @@ export function chromeToolDefinitions(
       presentCall: args => openCall(args),
       presentResult: (_args, outcome) => openResult(outcome),
       execute: async (args: { url?: string; waitLoad?: boolean }, _exec: unknown): Promise<JsonValue> => {
-        assertOperableUrl('chrome_open', args.url ?? 'about:blank')
-        const opened = await backend.openTab(args.url ?? 'about:blank')
-        if (args.waitLoad === false) {
+        const target = args.url ?? 'about:blank'
+        assertOperableUrl('chrome_open', target, true)
+        const opened = await backend.openTab(target)
+        // A blank tab has nothing to load and nothing to read back: waiting
+        // would evaluate in a page the extension cannot inject into, and the
+        // identity re-read would fail the same way. Opening one is still worth
+        // supporting as a staging tab for a following chrome_navigate.
+        if (args.waitLoad === false || isBlankUrl(target)) {
           return { tabId: opened.id, title: opened.title, url: opened.url } as unknown as JsonValue
         }
         await backend.waitForLoad(opened.id, config.waitLoadMs)

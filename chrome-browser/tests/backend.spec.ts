@@ -378,6 +378,102 @@ describe('ExtensionBackend', () => {
     await expect(answer(backend, socket, 2)).resolves.toBe(2)
   })
 
+  /** Feed one hello, the message the extension introduces itself with. */
+  function hello(socket: FakeSocket, build: string, ops: string[], version = '0.0.1'): void {
+    socket.feed(FakeSocket.clientText(JSON.stringify({ kind: 'hello', version, ops, build })))
+  }
+
+  it('refuses an op the extension does not advertise, naming the real cause', async () => {
+    // Sending it anyway earns `unknown op` from the extension: an internal error
+    // that says nothing about an extension whose files are older than the
+    // plugin driving it — which is what actually happened before this.
+    const { backend, socket } = makeBackend()
+    hello(socket, 'stale-build', ['list-tabs'])
+    await expect(backend.closeTab('7')).rejects.toThrow(/扩展不支持 close/u)
+    await expect(backend.closeTab('7')).rejects.toThrow(/chrome:\/\/extensions/u)
+  })
+
+  it('still sends an op the extension does advertise', async () => {
+    const { backend, socket } = makeBackend()
+    hello(socket, 'stale-build', ['list-tabs', 'close'])
+    const outcome = backend.closeTab('7')
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(socket.lastServerText()).toContain('"op":"close"')
+    await new Promise(resolve => setTimeout(resolve, 10))
+    const sent = JSON.parse(socket.lastServerText()!) as { commands: Array<{ seq: number }> }
+    socket.feed(FakeSocket.clientText(JSON.stringify({
+      kind: 'results', results: [{ seq: sent.commands[0]!.seq, ok: true, data: { tabId: '7' } }],
+    })))
+    await expect(outcome).resolves.toBeUndefined()
+  })
+
+  it('asks a stale extension to reload itself', async () => {
+    const { backend, socket } = makeBackend()
+    hello(socket, 'stale-build', ['list-tabs', 'reload'])
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(socket.lastServerText()).toContain('"op":"reload"')
+    expect(backend.extensionStatus()).toMatchObject({ build: 'stale-build', stale: true, autoReloadAsked: true })
+  })
+
+  it('never asks twice about the same stale build', async () => {
+    // If a reload cannot move the extension off one version, asking on every
+    // heartbeat would reload it forever.
+    const { backend, socket } = makeBackend()
+    hello(socket, 'stale-build', ['list-tabs', 'reload'])
+    await new Promise(resolve => setTimeout(resolve, 10))
+    const before = socket.written.length
+    hello(socket, 'stale-build', ['list-tabs', 'reload'])
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(socket.written.length).toBe(before)
+    expect(backend.extensionStatus().autoReloadAsked).toBe(true)
+  })
+
+  it('asks again when the mismatch moves to a new build', async () => {
+    // Two upgrades inside one host process: the second must settle too, even
+    // though the first already spent an attempt.
+    const { backend, socket } = makeBackend()
+    hello(socket, 'stale-build', ['list-tabs', 'reload'])
+    await new Promise(resolve => setTimeout(resolve, 10))
+    const firstAsk = socket.written.length
+    hello(socket, 'newer-build', ['list-tabs', 'reload'])
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(socket.written.length).toBeGreaterThan(firstAsk)
+    expect(socket.lastServerText()).toContain('"op":"reload"')
+    expect(backend.extensionStatus()).toMatchObject({ build: 'newer-build', stale: true })
+  })
+
+  it('leaves a current extension alone', async () => {
+    const { backend, socket } = makeBackend()
+    const current = backend.extensionStatus().expectedBuild
+    expect(current).toMatch(/^[0-9a-f]{64}$/u)
+    hello(socket, current, ['list-tabs', '0.3.0'])
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(backend.extensionStatus()).toMatchObject({ build: current, stale: false, autoReloadAsked: false })
+    expect(socket.lastServerText() ?? '').not.toContain('"op":"reload"')
+  })
+
+  it('calls a changed extension stale even when its version was not bumped', async () => {
+    // The failure a version-only check cannot see: same version, new code.
+    const { backend, socket } = makeBackend()
+    hello(socket, 'edited-without-a-version-bump', ['list-tabs', 'reload'], '0.3.0')
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(backend.extensionStatus()).toMatchObject({
+      version: '0.3.0',
+      expectedVersion: '0.3.0',
+      stale: true,
+    })
+    expect(socket.lastServerText()).toContain('"op":"reload"')
+  })
+
+  it('cannot ask an extension that predates the handshake to reload', async () => {
+    // Without a reload op there is nothing to ask; the answer is the manual
+    // step, and the status route reports the mismatch.
+    const { backend, socket } = makeBackend()
+    hello(socket, 'stale-build', ['list-tabs'])
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(backend.extensionStatus()).toMatchObject({ stale: true, autoReloadAsked: false })
+  })
+
   it('sends keep-alive pings to the LIVE socket after a reconnect', () => {
     const { backend, socket } = makeBackend(5000)
     vi.useFakeTimers()
