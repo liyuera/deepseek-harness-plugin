@@ -34,6 +34,7 @@ export function cdpEndpoint(socket, options) {
     const pending = new Map();
     let nextId = 1;
     let closed = false;
+    const listeners = new Set();
     const off = socket.onMessage((data) => {
         let message;
         try {
@@ -42,8 +43,18 @@ export function cdpEndpoint(socket, options) {
         catch {
             return;
         }
-        if (typeof message.id !== 'number')
+        if (typeof message.id !== 'number') {
+            // An event: no id, a method name, and params. Commands and events share
+            // the socket, so the id is what tells them apart.
+            if (typeof message.method !== 'string')
+                return;
+            const params = typeof message.params === 'object' && message.params !== null
+                ? message.params
+                : {};
+            for (const listener of listeners)
+                listener(message.method, params);
             return;
+        }
         const entry = pending.get(message.id);
         if (entry === undefined)
             return;
@@ -75,11 +86,16 @@ export function cdpEndpoint(socket, options) {
             socket.send(JSON.stringify({ id, method, params }));
             return outcome;
         },
+        onEvent(listener) {
+            listeners.add(listener);
+            return () => listeners.delete(listener);
+        },
         close() {
             if (closed)
                 return;
             closed = true;
             off();
+            listeners.clear();
             socket.close();
             for (const [id, entry] of pending) {
                 clearTimeout(entry.timer);

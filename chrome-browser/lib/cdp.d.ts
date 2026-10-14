@@ -20,7 +20,13 @@ export interface CdpSocket {
 export interface CdpEndpoint {
     /** Send one CDP command and await its `result`; rejects on CDP error or timeout. */
     call(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>>;
-    /** Close the session; in-flight calls reject with a closed-endpoint error. */
+    /**
+     * Subscribe to CDP events: frames carrying a `method` and no numeric id.
+     * @param listener - receives the event name and its params.
+     * @returns the disposer.
+     */
+    onEvent(listener: (method: string, params: Record<string, unknown>) => void): () => void;
+    /** Close the session; in-flight calls reject and listeners stop with a closed-endpoint error. */
     close(): void;
 }
 export interface CdpEndpointOptions {

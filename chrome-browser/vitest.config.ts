@@ -17,6 +17,9 @@ const ALIASES: Array<[string, string]> = [
   ['@deepseek-ai/dsh-invariants$', 'packages/runtime-diagnostics/invariants/src/index.ts'],
   ['@deepseek-ai/dsh-tools$', 'packages/core/tools/src/index.ts'],
   ['@deepseek-ai/dsh-tools/', 'packages/core/tools/src/'],
+  // The real skill registry, so a test can exercise registration AND loading
+  // rather than a stub that accepts whatever it is handed.
+  ['@deepseek-ai/dsh-skill$', 'packages/skill/skill/src/index.ts'],
   // Browser-only package whose Node entry cannot load; see the stub's own note.
   ['@deepseek-ai/dsh-client-ui-primitives$', 'deepseek-harness-plugin/chrome-browser/tests/support/ui-primitives.ts'],
 ]

@@ -1,0 +1,24 @@
+{
+  // Type-checks this package's test files, which the build program deliberately
+  // excludes: tsconfig.json compiles `src` only, and vitest transpiles without
+  // checking. Without this, a fake backend that no longer matches
+  // BrowserBackend — or a route called with the wrong argument list — is caught
+  // only when a test happens to touch it, and a test that references a name it
+  // cannot see passes as long as the closure is never invoked.
+  //
+  // The `paths` aliases pull workspace sources in, so this program also sees
+  // files owned by other projects (the harness's client packages, vendored
+  // cordis) compiled under this package's flags. Those are theirs to check, not
+  // ours: run it through scripts/typecheck-tests.mjs, which fails only on
+  // diagnostics in this package.
+  //
+  // `rootDir` is widened for the same reason.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "composite": false,
+    "incremental": false,
+    "rootDir": "../.."
+  },
+  "include": ["src", "tests"]
+}

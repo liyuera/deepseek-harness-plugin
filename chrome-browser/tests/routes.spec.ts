@@ -1,15 +1,33 @@
 import { describe, expect, it } from 'vitest'
 import type { ServerResponse } from 'node:http'
 import type { IncomingMessage } from 'node:http'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { CdpBackend } from '../src/backend.ts'
-import { SessionBindings } from '../src/bindings.ts'
 import { Chrome, resolveChromeConfig } from '../src/chrome.ts'
 import type { ChromeTab } from '../src/chrome.ts'
+import { ActivityTracker } from '../src/activity.ts'
 import { registerChromeRoutes } from '../src/routes.ts'
+
+/** One fake response, plus what the assertions read back off it. */
+interface FakeResponse extends ServerResponse {
+  status: number
+  body: string
+  headers: Record<string, string>
+  raw: unknown
+}
+
+/** Screenshot directory the routes take; no test writes into it. */
+const SHOTS = join(tmpdir(), 'dsh-chrome-routes-shots')
 
 /** Fake HTTP carrier capturing registered routes. */
 function fakeWebServer(): {
-  register(route: { path: string; handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void> }): () => void
+  register(route: {
+    kind?: 'exact' | 'prefix'
+    path: string
+    handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
+  }): () => void
+  registerUpgrade(route: { path: string; handler: unknown }): () => void
   routes: Record<string, (req: IncomingMessage, res: ServerResponse) => void | Promise<void>>
 } {
   const routes: Record<string, (req: IncomingMessage, res: ServerResponse) => void | Promise<void>> = {}
@@ -34,22 +52,24 @@ function fakeCtx(webServer: unknown): { get(name: string): unknown; effect(callb
   }
 }
 
-function fakeRes(): ServerResponse {
+function fakeRes(): FakeResponse {
   const response = {
     status: 0,
     body: '',
     headers: {} as Record<string, string>,
     raw: undefined as unknown,
-  } as ServerResponse & { status: number; body: string; headers: Record<string, string>; raw: unknown }
-  response.writeHead = ((status: number, headers?: Record<string, string>) => {
-    response.status = status
-    response.headers = headers ?? {}
-  }) as unknown as ServerResponse['writeHead']
-  response.end = ((body?: unknown) => {
-    response.raw = body
-    response.body = body === undefined ? '' : String(body)
-  }) as unknown as ServerResponse['end']
-  return response
+    writeHead: (status: number, headers?: Record<string, string>) => {
+      response.status = status
+      response.headers = headers ?? {}
+      return response
+    },
+    end: (body?: unknown) => {
+      response.raw = body
+      response.body = body === undefined ? '' : String(body)
+      return response
+    },
+  }
+  return response as unknown as FakeResponse
 }
 
 function fakeReq(method: string, url?: string, body?: unknown): IncomingMessage {
@@ -99,8 +119,7 @@ const TABS: ReadonlyArray<Record<string, unknown>> = [
 describe('chrome-browser routes', () => {
   it('lists tabs (POST /chrome-browser/tabs)', async () => {
     const server = fakeWebServer()
-    const bindings = new SessionBindings()
-    registerChromeRoutes(fakeCtx(server) as never, new CdpBackend(fakeChrome(TABS)), bindings)
+    registerChromeRoutes(fakeCtx(server) as never, new CdpBackend(fakeChrome(TABS)), SHOTS, new ActivityTracker())
     const res = fakeRes()
     await (server.routes['/chrome-browser/tabs'] as (req: IncomingMessage, res: ServerResponse) => Promise<void>)(fakeReq('POST'), res)
     expect(res.status).toBe(200)
@@ -113,7 +132,7 @@ describe('chrome-browser routes', () => {
 
   it('reports an ok:false error when the browser cannot be reached', async () => {
     const server = fakeWebServer()
-    registerChromeRoutes(fakeCtx(server) as never, new CdpBackend(deadChrome()), new SessionBindings())
+    registerChromeRoutes(fakeCtx(server) as never, new CdpBackend(deadChrome()), SHOTS, new ActivityTracker())
     const res = fakeRes()
     await (server.routes['/chrome-browser/tabs'] as (req: IncomingMessage, res: ServerResponse) => Promise<void>)(fakeReq('POST'), res)
     const body = JSON.parse(res.body) as { ok: boolean; error?: string }
@@ -121,73 +140,9 @@ describe('chrome-browser routes', () => {
     expect(body.error).toContain('no Chrome DevTools endpoint')
   })
 
-  it('binds a tab to the session (POST /chrome-browser/select)', async () => {
-    const server = fakeWebServer()
-    const bindings = new SessionBindings()
-    registerChromeRoutes(fakeCtx(server) as never, new CdpBackend(fakeChrome(TABS)), bindings)
-    const handler = server.routes['/chrome-browser/select'] as (req: IncomingMessage, res: ServerResponse) => Promise<void>
-    const res = fakeRes()
-    await handler(fakeReq('POST', undefined, { sessionId: 's0', tabId: 't2' }), res)
-    const body = JSON.parse(res.body) as { ok: boolean; tab?: ChromeTab }
-    expect(body.ok).toBe(true)
-    expect(body.tab?.id).toBe('t2')
-    expect(bindings.get('s0')).toBe('t2')
-  })
-
-  it('binds a multi-selection (POST tabIds) and reports every picked tab', async () => {
-    const server = fakeWebServer()
-    const bindings = new SessionBindings()
-    registerChromeRoutes(fakeCtx(server) as never, new CdpBackend(fakeChrome(TABS)), bindings)
-    const handler = server.routes['/chrome-browser/select'] as (req: IncomingMessage, res: ServerResponse) => Promise<void>
-    const res = fakeRes()
-    await handler(fakeReq('POST', undefined, { sessionId: 's0', tabIds: ['t2', 't1'] }), res)
-    const body = JSON.parse(res.body) as { ok: boolean; tab?: ChromeTab; tabs?: ChromeTab[] }
-    expect(body.ok).toBe(true)
-    expect(body.tab?.id).toBe('t2')
-    expect(body.tabs?.map(tab => tab.id)).toEqual(['t2', 't1'])
-    expect(bindings.all('s0')).toEqual(['t2', 't1'])
-  })
-
-  it('rejects a malformed select body', async () => {
-    const server = fakeWebServer()
-    registerChromeRoutes(fakeCtx(server) as never, new CdpBackend(fakeChrome(TABS)), new SessionBindings())
-    const handler = server.routes['/chrome-browser/select'] as (req: IncomingMessage, res: ServerResponse) => Promise<void>
-    const res = fakeRes()
-    await handler(fakeReq('POST', undefined, { sessionId: 's0' }), res)
-    expect(res.status).toBe(400)
-    expect(JSON.parse(res.body) as { ok: boolean }).toMatchObject({ ok: false })
-  })
-
-  it('rejects an unknown tab id', async () => {
-    const server = fakeWebServer()
-    registerChromeRoutes(fakeCtx(server) as never, new CdpBackend(fakeChrome(TABS)), new SessionBindings())
-    const handler = server.routes['/chrome-browser/select'] as (req: IncomingMessage, res: ServerResponse) => Promise<void>
-    const res = fakeRes()
-    await handler(fakeReq('POST', undefined, { sessionId: 's0', tabId: 'nope' }), res)
-    const body = JSON.parse(res.body) as { ok: boolean; error?: string }
-    expect(body.ok).toBe(false)
-    expect(body.error).toContain('not found')
-  })
-
-  it('reports the current binding (GET /chrome-browser/state)', async () => {
-    const server = fakeWebServer()
-    const bindings = new SessionBindings()
-    registerChromeRoutes(fakeCtx(server) as never, new CdpBackend(fakeChrome(TABS)), bindings)
-    const handler = server.routes['/chrome-browser/state'] as (req: IncomingMessage, res: ServerResponse) => Promise<void>
-    const emptyRes = fakeRes()
-    await handler(fakeReq('GET', '/chrome-browser/state?sessionId=s0'), emptyRes)
-    expect((JSON.parse(emptyRes.body) as { selected: unknown }).selected).toBeNull()
-
-    bindings.set('s0', ['t1'])
-    const boundRes = fakeRes()
-    await handler(fakeReq('GET', '/chrome-browser/state?sessionId=s0'), boundRes)
-    const body = JSON.parse(boundRes.body) as { selected: { tabId: string; title: string } | null }
-    expect(body.selected).toMatchObject({ tabId: 't1', title: 'One' })
-  })
-
   it('hands out the bundled extension as a zip (GET /chrome-browser/extension.zip)', async () => {
     const server = fakeWebServer()
-    registerChromeRoutes(fakeCtx(server) as never, new CdpBackend(fakeChrome(TABS)), new SessionBindings())
+    registerChromeRoutes(fakeCtx(server) as never, new CdpBackend(fakeChrome(TABS)), SHOTS, new ActivityTracker())
     const handler = server.routes['/chrome-browser/extension.zip'] as (req: IncomingMessage, res: ServerResponse) => void
     const res = fakeRes()
     handler(fakeReq('GET', '/chrome-browser/extension.zip'), res)
@@ -202,11 +157,46 @@ describe('chrome-browser routes', () => {
 
   it('rejects a non-GET request for the extension zip', async () => {
     const server = fakeWebServer()
-    registerChromeRoutes(fakeCtx(server) as never, new CdpBackend(fakeChrome(TABS)), new SessionBindings())
+    registerChromeRoutes(fakeCtx(server) as never, new CdpBackend(fakeChrome(TABS)), SHOTS, new ActivityTracker())
     const handler = server.routes['/chrome-browser/extension.zip'] as (req: IncomingMessage, res: ServerResponse) => void
     const res = fakeRes()
     handler(fakeReq('POST', '/chrome-browser/extension.zip'), res)
     expect(res.status).toBe(405)
     expect(JSON.parse(res.body) as { ok: boolean }).toMatchObject({ ok: false })
+  })
+
+  it('reports whether a session has a browser call in flight', async () => {
+    const server = fakeWebServer()
+    const activity = new ActivityTracker()
+    registerChromeRoutes(
+      fakeCtx(server) as never,
+      new CdpBackend(fakeChrome(TABS)),
+      join(tmpdir(), 'dsh-chrome-routes-shots'),
+      activity,
+    )
+    const handler = server.routes['/chrome-browser/activity'] as (req: IncomingMessage, res: ServerResponse) => void
+
+    const idle = fakeRes()
+    handler(fakeReq('GET', '/chrome-browser/activity?sessionId=s1'), idle)
+    expect(JSON.parse(idle.body) as unknown).toMatchObject({ ok: true, active: false })
+
+    activity.begin('chrome_click', '7', 's1')
+    const busy = fakeRes()
+    handler(fakeReq('GET', '/chrome-browser/activity?sessionId=s1'), busy)
+    expect(JSON.parse(busy.body) as unknown)
+      .toMatchObject({ ok: true, active: true, tool: 'chrome_click', tabId: '7' })
+
+    const other = fakeRes()
+    handler(fakeReq('GET', '/chrome-browser/activity?sessionId=s2'), other)
+    expect(JSON.parse(other.body) as unknown).toMatchObject({ ok: true, active: false })
+  })
+
+  it('rejects a non-GET request for the activity route', async () => {
+    const server = fakeWebServer()
+    registerChromeRoutes(fakeCtx(server) as never, new CdpBackend(fakeChrome(TABS)), SHOTS, new ActivityTracker())
+    const handler = server.routes['/chrome-browser/activity'] as (req: IncomingMessage, res: ServerResponse) => void
+    const res = fakeRes()
+    handler(fakeReq('POST', '/chrome-browser/activity'), res)
+    expect(res.status).toBe(405)
   })
 })

@@ -8,7 +8,17 @@
  * @module @liyuera/dsh-chrome-browser/client/tab-catalog
  */
 
-import type { TabInfo } from './TabPicker.tsx'
+/**
+ * One live tab as the host describes it: the wire shape of the tabs route,
+ * shared by the `@` source and this catalog.
+ */
+export interface TabInfo {
+  id: string
+  title: string
+  url: string
+  active: boolean
+  favicon: string
+}
 
 /** How long one listing (successful or failed) stays fresh. */
 const CACHE_MS = 2000

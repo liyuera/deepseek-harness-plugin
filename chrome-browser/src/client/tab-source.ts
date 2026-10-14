@@ -22,7 +22,13 @@ import type {
   CandidateRequest, ClientSessionContext, InputTriggerCandidate, InputTriggerPick, InputTriggerSource,
   PickOutcome, ReferenceCodec,
 } from '@deepseek-ai/dsh-client-ui-input-trigger/client'
-import type { TabInfo } from './TabPicker.tsx'
+/** One tab row this source needs: identity, label and icon. */
+export interface ChromeTabRow {
+  readonly id: string
+  readonly title: string
+  readonly url: string
+  readonly favicon: string
+}
 
 /** Source name: the `@` roster key and the reference owner a chip routes back through. */
 export const CHROME_TAB_SOURCE_NAME = 'chrome-browser'
@@ -47,7 +53,7 @@ export interface ChromeTabSourceDeps {
    * @param signal - superseded when the query changes or the menu closes.
    * @returns the tabs, an empty list while the browser is unreachable.
    */
-  listTabs(signal: AbortSignal): Promise<readonly TabInfo[]>
+  listTabs(signal: AbortSignal): Promise<readonly ChromeTabRow[]>
   /**
    * Icon component for one favicon.
    * @param favicon - favicon URL, or '' when Chrome reported none.
@@ -57,7 +63,7 @@ export interface ChromeTabSourceDeps {
 }
 
 /** Row title: the tab title, or its URL for an untitled page. */
-function rowLabel(tab: TabInfo): string {
+function rowLabel(tab: ChromeTabRow): string {
   const title = tab.title.trim()
   return title === '' ? tab.url : title
 }
@@ -69,7 +75,7 @@ function rowLabel(tab: TabInfo): string {
  * host expands it into the URLs and ids the model works from. Quotes and line
  * breaks are dropped: a `"` would end the quoted token early.
  */
-function tabMention(tab: TabInfo): string {
+function tabMention(tab: ChromeTabRow): string {
   const label = rowLabel(tab).replace(/["\r\n\t]+/gu, ' ').replace(/\s+/gu, ' ').trim()
   return `@"${label === '' ? tab.id : label}"`
 }
@@ -84,7 +90,7 @@ export function createChromeTabSource(deps: ChromeTabSourceDeps): InputTriggerSo
   // rather than re-listing and risking a different page, and the chip's id
   // resolves back to that exact tab at submit time — titles repeat across
   // tabs, ids do not.
-  const rows = new Map<string, TabInfo>()
+  const rows = new Map<string, ChromeTabRow>()
   // The mention each picked tab inserted, kept past the listing so a tab closed
   // before the send still serializes to the reference the user saw.
   const picked = new Map<string, string>()

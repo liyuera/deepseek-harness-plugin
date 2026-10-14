@@ -467,6 +467,26 @@ export class Chrome {
         return { id: tab.id, title: tab.title, url: tab.url, active: tab.active };
     }
     /**
+     * Close one tab by target id.
+     *
+     * Chrome answers `/json/close` with the plain text "Target is closing", so
+     * this does not go through `httpJson`, which parses a JSON body.
+     * @param targetId - the tab's target id, as `listTabs` reports it.
+     */
+    async closeTab(targetId) {
+        await this.ensure();
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), this.config.timeoutMs);
+        try {
+            const response = await this.httpFetch(`${this.baseUrl}/json/close/${encodeURIComponent(targetId)}`, { method: 'GET', signal: controller.signal });
+            if (!response.ok)
+                throw new Error(`Chrome refused to close tab ${targetId} (HTTP ${response.status})`);
+        }
+        finally {
+            clearTimeout(timer);
+        }
+    }
+    /**
      * Open a CDP endpoint on one tab. The caller owns the endpoint and must
      * `close()` it (close also detaches the session).
      * @param tabId - explicit tab id from the tool args.

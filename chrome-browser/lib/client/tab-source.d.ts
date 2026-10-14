@@ -18,7 +18,13 @@
 import type { ComponentType } from 'react';
 import type { IconProps } from '@deepseek-ai/dsh-client-ui-primitives';
 import type { InputTriggerSource } from '@deepseek-ai/dsh-client-ui-input-trigger/client';
-import type { TabInfo } from './TabPicker.tsx';
+/** One tab row this source needs: identity, label and icon. */
+export interface ChromeTabRow {
+    readonly id: string;
+    readonly title: string;
+    readonly url: string;
+    readonly favicon: string;
+}
 /** Source name: the `@` roster key and the reference owner a chip routes back through. */
 export declare const CHROME_TAB_SOURCE_NAME = "chrome-browser";
 /**
@@ -38,7 +44,7 @@ export interface ChromeTabSourceDeps {
      * @param signal - superseded when the query changes or the menu closes.
      * @returns the tabs, an empty list while the browser is unreachable.
      */
-    listTabs(signal: AbortSignal): Promise<readonly TabInfo[]>;
+    listTabs(signal: AbortSignal): Promise<readonly ChromeTabRow[]>;
     /**
      * Icon component for one favicon.
      * @param favicon - favicon URL, or '' when Chrome reported none.

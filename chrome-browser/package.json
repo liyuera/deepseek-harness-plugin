@@ -1,7 +1,7 @@
 {
   "name": "@liyuera/dsh-chrome-browser",
-  "description": "Chrome browser control for dsh: list the user's tabs, read page content, navigate, click/type, evaluate JS and capture screenshots through the Chrome DevTools Protocol, plus an @ menu source listing the live tabs",
-  "version": "0.3.0",
+  "description": "Chrome browser control for dsh: list the user's tabs, read page text or the actionable elements, navigate, click/hover/type, wait for elements, evaluate JS, capture screenshots and read console output through the extension bridge or the Chrome DevTools Protocol, plus an @ menu source listing the live tabs and a browser skill",
+  "version": "0.4.0",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -39,7 +39,8 @@
     "bundle": "tsdown --config-loader tsx",
     "watch": "tsdown --watch --config-loader tsx",
     "test": "vitest run",
-    "test:smoke": "DSH_CHROME_SMOKE=1 vitest run tests/smoke.spec.ts"
+    "test:smoke": "DSH_CHROME_SMOKE=1 vitest run tests/smoke.spec.ts",
+    "typecheck:tests": "node scripts/typecheck-tests.mjs"
   },
   "license": "UNLICENSED",
   "repository": {

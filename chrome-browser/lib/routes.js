@@ -17,35 +17,6 @@ export function writeJson(res, status, value) {
     res.writeHead(status, { 'content-type': 'application/json' });
     res.end(body);
 }
-/** Read and parse one JSON request body. */
-async function readJsonBody(req) {
-    const chunks = [];
-    for await (const chunk of req) {
-        chunks.push(chunk);
-    }
-    try {
-        const value = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
-        return typeof value === 'object' && value !== null ? value : undefined;
-    }
-    catch {
-        return undefined;
-    }
-}
-/** Validate one select body: a session id plus any non-empty tab-id selection. */
-export function parseSelectBody(body) {
-    const sessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
-    let tabIds = [];
-    if (Array.isArray(body.tabIds)) {
-        tabIds = body.tabIds.filter((id) => typeof id === 'string' && id !== '');
-    }
-    else if (typeof body.tabId === 'string' && body.tabId !== '') {
-        tabIds = [body.tabId];
-    }
-    if (sessionId === '' || tabIds.length === 0)
-        return undefined;
-    // deduplicate while preserving selection order
-    return { sessionId, tabIds: [...new Set(tabIds)] };
-}
 /** The extension-bridge WS upgrade handler (handshake + attach). */
 function upgradeHandler(backend) {
     return (req, socket, head) => {
@@ -64,9 +35,9 @@ function upgradeHandler(backend) {
  * All answered ok/error shaped so the client only needs one answer type.
  * @param ctx - Cordis context (webServer read through ctx.get).
  * @param backend - the live browser backend.
- * @param bindings - the session tab binding store.
+ * @param activity - the in-flight call tracker the status strip reads.
  */
-export function registerChromeRoutes(ctx, backend, bindings, screenshotDir) {
+export function registerChromeRoutes(ctx, backend, screenshotDir, activity) {
     const webServer = ctx.get('webServer');
     if (webServer === undefined)
         return;
@@ -150,84 +121,6 @@ export function registerChromeRoutes(ctx, backend, bindings, screenshotDir) {
     }), 'chrome-browser: bridge trace route');
     ctx.effect(() => webServer.register({
         kind: 'exact',
-        path: '/chrome-browser/select',
-        handler: async (req, res) => {
-            if (req.method !== 'POST') {
-                writeJson(res, 405, { ok: false, error: 'method not allowed' });
-                return;
-            }
-            const body = await readJsonBody(req);
-            if (body === undefined) {
-                writeJson(res, 400, { ok: false, error: 'invalid JSON body' });
-                return;
-            }
-            const parsed = parseSelectBody(body);
-            if (parsed === undefined) {
-                writeJson(res, 400, { ok: false, error: 'sessionId and a non-empty tabId/tabIds selection are required' });
-                return;
-            }
-            try {
-                const tabs = await backend.listTabs();
-                const byId = new Map(tabs.map(tab => [tab.id, tab]));
-                const picked = parsed.tabIds
-                    .map(tabId => byId.get(tabId))
-                    .filter((tab) => tab !== undefined);
-                if (picked.length !== parsed.tabIds.length) {
-                    writeJson(res, 200, { ok: false, error: 'one or more tab ids were not found in Chrome; list tabs first' });
-                    return;
-                }
-                bindings.set(parsed.sessionId, picked.map(tab => tab.id));
-                writeJson(res, 200, { ok: true, tab: picked[0], tabs: picked });
-            }
-            catch (error) {
-                writeJson(res, 200, {
-                    ok: false,
-                    error: error instanceof Error ? error.message : String(error),
-                });
-            }
-        },
-    }), 'chrome-browser: select route');
-    ctx.effect(() => webServer.register({
-        kind: 'exact',
-        path: '/chrome-browser/state',
-        handler: async (req, res) => {
-            if (req.method !== 'GET') {
-                writeJson(res, 405, { ok: false, error: 'method not allowed' });
-                return;
-            }
-            const url = new URL(req.url ?? '/', 'http://dsh.internal');
-            const sessionId = url.searchParams.get('sessionId') ?? '';
-            const tabId = bindings.get(sessionId);
-            let title = '';
-            let urlValue = '';
-            let favicon = '';
-            if (tabId !== undefined) {
-                try {
-                    const tab = (await backend.listTabs()).find(candidate => candidate.id === tabId);
-                    if (tab !== undefined) {
-                        title = tab.title;
-                        urlValue = tab.url;
-                        favicon = tab.favicon;
-                    }
-                }
-                catch {
-                    // The browser is not connected; the binding itself stays.
-                }
-            }
-            writeJson(res, 200, {
-                ok: true,
-                selected: tabId === undefined ? null : {
-                    tabId,
-                    tabIds: bindings.all(sessionId),
-                    title,
-                    url: urlValue,
-                    favicon,
-                },
-            });
-        },
-    }), 'chrome-browser: state route');
-    ctx.effect(() => webServer.register({
-        kind: 'exact',
         path: '/chrome-browser/ext/status',
         handler: async (req, res) => {
             if (req.method !== 'GET') {
@@ -268,6 +161,24 @@ export function registerChromeRoutes(ctx, backend, bindings, screenshotDir) {
             res.end(req.method === 'HEAD' ? undefined : archive);
         },
     }), 'chrome-browser: extension download route');
+    // The browser half polls this while a session view is open, and renders a
+    // strip only for a session that has a call in flight.
+    ctx.effect(() => webServer.register({
+        kind: 'exact',
+        path: '/chrome-browser/activity',
+        handler: (req, res) => {
+            if (req.method !== 'GET') {
+                writeJson(res, 405, { ok: false, error: 'method not allowed' });
+                return;
+            }
+            const url = new URL(req.url ?? '/', 'http://dsh.internal');
+            const sessionId = url.searchParams.get('sessionId') ?? '';
+            writeJson(res, 200, {
+                ok: true,
+                ...activity.snapshot(sessionId === '' ? undefined : sessionId),
+            });
+        },
+    }), 'chrome-browser: activity route');
     ctx.effect(() => webServer.registerUpgrade({
         path: '/chrome-browser/ext/ws',
         handler: upgradeHandler(backend),

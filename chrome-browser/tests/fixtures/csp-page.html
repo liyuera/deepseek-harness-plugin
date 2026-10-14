@@ -1,0 +1,27 @@
+<!doctype html>
+<!--
+  A page whose Content-Security-Policy forbids `eval`, the way GitHub's does.
+
+  It exists to pin one failure mode: on the extension bridge, an escaping throw
+  inside `chrome.scripting.executeScript` becomes `result: undefined`, so a
+  CSP-blocked eval, a syntax error and a runtime throw all reached the model as
+  a bare `null`. Serve it over http (not file://, which the extension reaches
+  only with file access granted) and evaluate any expression against it.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!-- `unsafe-inline` keeps the inline handlers below working; `unsafe-eval`
+         is what this page withholds, and that alone disables `chrome_eval`. -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'" />
+    <title>CSP probe</title>
+    <style>body { font: 14px system-ui; margin: 2rem } code { background: #eee; padding: 0 .3em }</style>
+  </head>
+  <body>
+    <h1>CSP probe</h1>
+    <p>This page sends <code>script-src 'self' 'unsafe-inline'</code> without <code>'unsafe-eval'</code>.</p>
+    <p id="marker">DOM reads work here; <code>eval</code> does not.</p>
+    <button id="b" onclick="document.getElementById('marker').textContent = 'CLICKED'">click me</button>
+    <input id="i" />
+  </body>
+</html>

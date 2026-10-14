@@ -4,20 +4,25 @@
  * Protocol (cdp fallback): list tabs, read page content, navigate, open
  * tabs, capture screenshots, click, type, and evaluate JS — plus the
  * same-origin routes the browser half uses to list tabs, bind them per
- * session, and serve the extension bridge WebSocket, and the pre-step hook
- * that expands a tab citation into a context message.
+ * session, and serve the extension bridge WebSocket, the pre-step hook that
+ * expands a tab citation into a context message, the `chrome-browser` agent
+ * skill (when this composition exposes a skill registry), and the human-help
+ * channel behind `chrome_request_help` (when it exposes a question service).
  * @module @liyuera/dsh-chrome-browser
  */
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { PreStepDecision } from '@deepseek-ai/dsh-agent'
 import z from '@deepseek-ai/schemastery'
+import { ActivityTracker, withActivity } from './activity.ts'
 import { buildBackend } from './backend.ts'
-import { SessionBindings } from './bindings.ts'
 import { resolveChromeConfig } from './chrome.ts'
 import type { ChromeMode, ResolvedChromeConfig } from './chrome.ts'
+import { ConsoleLog } from './console-log.ts'
+import { HelpChannel, registerHelpChannel } from './help.ts'
 import { expandTabMentions } from './mentions.ts'
 import { registerChromeRoutes } from './routes.ts'
+import { registerChromeSkill } from './skill.ts'
 import { chromeToolDefinitions } from './tools.ts'
 
 /** Plugin identity. */
@@ -83,13 +88,30 @@ export const Config: z<ChromePluginConfig> = z.object({
  */
 export function apply(ctx: Context, config: ChromePluginConfig = {}): void {
   const resolved: ResolvedChromeConfig = resolveChromeConfig(config)
-  const { backend, chrome } = buildBackend(resolved)
+  // The console buffer lives here, in the long-lived host: the extension's
+  // service worker is suspended by Chrome and would lose it silently.
+  const consoleLog = new ConsoleLog()
+  const { backend, chrome } = buildBackend(resolved, (tabId, message) => {
+    consoleLog.append(tabId, message)
+  })
   if (chrome !== undefined) chrome.reclaimOwnedLeftover()
-  const bindings = new SessionBindings()
-  for (const definition of chromeToolDefinitions(backend, resolved, bindings)) {
-    ctx.tools.register(definition)
+  // The help channel reaches the user through the harness's question service;
+  // it stays unwired (and says so) when this composition has none.
+  const help = new HelpChannel()
+  // Every tool execution is recorded here so the browser half can show what the
+  // agent is doing without reading the session stream itself.
+  const activity = new ActivityTracker()
+  for (const definition of chromeToolDefinitions(backend, resolved, consoleLog, help)) {
+    ctx.tools.register(withActivity(definition, activity))
   }
-  registerChromeRoutes(ctx, backend, bindings, config.screenshotDir ?? resolveChromeConfig(config).screenshotDir)
+  registerHelpChannel(ctx, help)
+  registerChromeRoutes(
+    ctx,
+    backend,
+    config.screenshotDir ?? resolveChromeConfig(config).screenshotDir,
+    activity,
+  )
+  registerChromeSkill(ctx)
 
   // A message citing tabs gains one context message carrying their URLs and
   // ids. Only the messages this step admits are scanned, and the context
@@ -101,5 +123,9 @@ export function apply(ctx: Context, config: ChromePluginConfig = {}): void {
     return messages === undefined ? decision : { ...decision, messages }
   }, { prepend: true })
 
-  ctx.effect(() => () => backend.dispose(), 'chrome-browser: backend lifecycle')
+  ctx.effect(() => () => {
+    consoleLog.releaseAll()
+    activity.clear()
+    backend.dispose()
+  }, 'chrome-browser: backend lifecycle')
 }

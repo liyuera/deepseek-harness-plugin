@@ -1,8 +1,12 @@
 /**
  * Minimal WebSocket server for the extension bridge: RFC 6455 handshake,
  * text frames only (client frames arrive masked, server frames unmasked),
- * no extensions or subprotocols. Chrome's WebSocket client sends one
- * unfragmented text frame per message, which is all this needs.
+ * no extensions or subprotocols.
+ *
+ * Fragmented messages are reassembled. Chrome splits a large message into
+ * continuation frames, so a bridge result of a few hundred kilobytes arrives
+ * that way — treating a non-final frame as a protocol error closed the socket
+ * and left the command unacknowledged, which the host then re-sent in a loop.
  * @module @liyuera/dsh-chrome-browser/ws
  */
 import { createHash } from 'node:crypto';
@@ -11,6 +15,9 @@ const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 const OP_TEXT = 0x1;
 const OP_CLOSE = 0x8;
 const OP_PING = 0x9;
+const OP_PONG = 0xA;
+/** Continuation of a fragmented message (RFC 6455 5.4). */
+const OP_CONTINUATION = 0x0;
 /**
  * Perform the RFC 6455 opening handshake on an upgraded socket.
  * @returns false when the request is not a valid upgrade (socket destroyed).
@@ -56,6 +63,9 @@ function textFrame(text) {
 export class WsConnection {
     socket;
     buffer = Buffer.alloc(0);
+    /** Payloads of the message being reassembled, and the opcode that opened it. */
+    fragments = [];
+    fragmentOpcode = 0;
     listeners = new Set();
     constructor(socket, head) {
         this.socket = socket;
@@ -95,27 +105,47 @@ export class WsConnection {
             const frame = this.readFrame();
             if (frame === null)
                 break;
-            const final = frame.final;
-            const opcode = frame.opcode;
-            const payload = final ? frame.payload : null;
-            if (payload === null) {
-                // Fragmented messages are not used by Chrome's bridge clients.
-                this.socket.destroy();
-                return;
+            const { final, opcode, payload } = frame;
+            // Control frames may arrive in the middle of a fragmented message and are
+            // never themselves fragmented, so they are answered without touching the
+            // reassembly state.
+            if (opcode === OP_PING) {
+                this.socket.write(Buffer.from([0x80 | OP_PONG, payload.length]));
+                continue;
             }
-            if (opcode === OP_TEXT) {
-                const text = payload.toString('utf8');
-                for (const listener of this.listeners)
-                    listener(text);
-            }
-            else if (opcode === OP_PING) {
-                this.socket.write(Buffer.from([0x80 | 0xA, payload.length]));
-            }
-            // close (0x8) gaps the data stream and terminates the conversation.
-            if (opcode === 0x8) {
+            if (opcode === OP_CLOSE) {
                 this.close();
                 return;
             }
+            if (opcode !== OP_TEXT && opcode !== OP_CONTINUATION)
+                continue;
+            if (opcode === OP_CONTINUATION) {
+                // A continuation with nothing open is a protocol error.
+                if (this.fragments.length === 0 && this.fragmentOpcode === 0) {
+                    this.socket.destroy();
+                    return;
+                }
+                this.fragments.push(payload);
+            }
+            else {
+                // A new data message before the previous one finished is a protocol error.
+                if (this.fragmentOpcode !== 0) {
+                    this.socket.destroy();
+                    return;
+                }
+                this.fragmentOpcode = opcode;
+                this.fragments = [payload];
+            }
+            if (!final)
+                continue;
+            const whole = this.fragments.length === 1
+                ? this.fragments[0]
+                : Buffer.concat(this.fragments);
+            this.fragments = [];
+            this.fragmentOpcode = 0;
+            const text = whole.toString('utf8');
+            for (const listener of this.listeners)
+                listener(text);
         }
     }
     /** Parse one frame off the buffer; null when incomplete. */

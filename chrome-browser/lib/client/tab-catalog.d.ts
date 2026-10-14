@@ -7,7 +7,17 @@
  * one logged request instead of one per keystroke.
  * @module @liyuera/dsh-chrome-browser/client/tab-catalog
  */
-import type { TabInfo } from './TabPicker.tsx';
+/**
+ * One live tab as the host describes it: the wire shape of the tabs route,
+ * shared by the `@` source and this catalog.
+ */
+export interface TabInfo {
+    id: string;
+    title: string;
+    url: string;
+    active: boolean;
+    favicon: string;
+}
 /**
  * List the live Chrome tabs.
  * @param signal - superseded when the query changes or the menu closes; a

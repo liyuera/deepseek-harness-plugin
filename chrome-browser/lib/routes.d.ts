@@ -9,20 +9,15 @@
 import type { Context } from '@deepseek-ai/cordis';
 import type { ServerResponse } from 'node:http';
 import type { BrowserBackend } from './backend.ts';
-import type { SessionBindings } from './bindings.ts';
+import type { ActivityTracker } from './activity.ts';
 /** JSON response writer. */
 export declare function writeJson(res: ServerResponse, status: number, value: unknown): void;
-/** Validate one select body: a session id plus any non-empty tab-id selection. */
-export declare function parseSelectBody(body: Record<string, unknown>): {
-    sessionId: string;
-    tabIds: string[];
-} | undefined;
 /**
  * Register the plugin's browser-half routes and the extension bridge upgrade.
  * All answered ok/error shaped so the client only needs one answer type.
  * @param ctx - Cordis context (webServer read through ctx.get).
  * @param backend - the live browser backend.
- * @param bindings - the session tab binding store.
+ * @param activity - the in-flight call tracker the status strip reads.
  */
-export declare function registerChromeRoutes(ctx: Context, backend: BrowserBackend, bindings: SessionBindings, screenshotDir: string): void;
+export declare function registerChromeRoutes(ctx: Context, backend: BrowserBackend, screenshotDir: string, activity: ActivityTracker): void;
 //# sourceMappingURL=routes.d.ts.map

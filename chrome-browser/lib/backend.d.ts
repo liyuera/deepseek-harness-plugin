@@ -9,6 +9,8 @@
  * @module @liyuera/dsh-chrome-browser/backend
  */
 import type { Duplex } from 'node:stream';
+import type { CapturedMessage } from './console-events.ts';
+import type { WaitState } from './expressions.ts';
 import { Chrome } from './chrome.ts';
 import type { ResolvedChromeConfig } from './chrome.ts';
 /** One tab as tools and the picker see it. */
@@ -26,6 +28,89 @@ export interface BackendRead {
     text: string;
     html: string;
 }
+/** One interactive element, as the page reports it. */
+export interface InteractiveElement {
+    /** Selector that addresses this element from the document root. */
+    selector: string;
+    /** ARIA role, or the tag name when the element declares none. */
+    role: string;
+    /** Label, text, value or placeholder — whichever the element offers first. */
+    name: string;
+    /** Whether the element's centre lies inside the viewport. */
+    inView: boolean;
+    /** Natively disabled, or marked `aria-disabled="true"`. */
+    disabled: boolean;
+    /** Another element sits at the element's centre, so a real click would miss it. */
+    covered: boolean;
+}
+/** What one page's interactive elements are, and how many were left out. */
+export interface BackendInventory {
+    /** Page title when the listing was taken. */
+    title: string;
+    /** Page URL when the listing was taken. */
+    url: string;
+    /** Elements the inventory selector matched, before the cap. */
+    matched: number;
+    /** The reported elements, in document order. */
+    items: InteractiveElement[];
+}
+/**
+ * What one click actually did. `clicked` counts elements that received a
+ * dispatched click event — never merely elements the selector matched, which is
+ * the distinction a caller needs to tell "the page ignored it" from "nothing
+ * was there". The remaining counters explain clicks that were refused or that a
+ * real pointer could not have delivered.
+ */
+export interface ClickOutcome {
+    /** Elements the selector matched. */
+    matched: number;
+    /** Elements that received a dispatched click event. */
+    clicked: number;
+    /** Matched elements whose native `disabled` state suppresses the click event. */
+    disabled: number;
+    /** Clicked elements with no layout box, or `display:none` / `visibility:hidden`. */
+    invisible: number;
+    /** Clicked elements whose centre lies outside the viewport. */
+    offscreen: number;
+    /** Clicked elements where a hit test at their centre lands on another element. */
+    covered: number;
+    /** Clicked elements carrying `aria-disabled="true"`, which dispatches but asks consumers to ignore it. */
+    ariaDisabled: number;
+}
+/** Where captured console messages go: the host's bounded per-tab buffer. */
+export type ConsoleSink = (tabId: string, message: CapturedMessage) => void;
+/** What one key press did. */
+export interface PressOutcome {
+    /** Whether a target existed: the selector's match, or whatever had focus. */
+    found: boolean;
+    /** Whether the key events were dispatched. */
+    pressed: boolean;
+    /**
+     * Whether the owning form was submitted explicitly. Synthetic key events
+     * trigger no browser default action, so Enter would otherwise do nothing.
+     */
+    submitted: boolean;
+}
+/** What one `<select>` assignment did. */
+export interface SelectOutcome {
+    /** Elements the selector matched. */
+    matched: number;
+    /** Whether the value actually changed; false means the control was left alone. */
+    changed: boolean;
+    /** The value in effect after the attempt. */
+    value: string;
+    /** Values the control offered, so a failed match can name them. */
+    options: string[];
+    /** Why the control could not be selected, when it is not a `<select>`. */
+    reason?: string;
+}
+/** What one hover did. */
+export interface HoverOutcome {
+    /** Elements the selector matched. */
+    matched: number;
+    /** Whether the first match received the hover events. */
+    hovered: boolean;
+}
 /** The face every chrome_* tool speaks to. */
 export interface BrowserBackend {
     /** Bring the browser online; throws a user-actionable error when impossible. */
@@ -34,18 +119,71 @@ export interface BrowserBackend {
     activeTabId(): Promise<string>;
     listTabs(): Promise<BackendTab[]>;
     openTab(url: string): Promise<BackendTab>;
+    /** Close one tab. Closing the last tab of a window closes that window. */
+    closeTab(tabId: string): Promise<void>;
     read(tabId: string, includeHtml: boolean): Promise<BackendRead>;
+    /** List one tab's interactive elements with what a reader must know before acting on them. */
+    inventory(tabId: string): Promise<BackendInventory>;
     navigate(tabId: string, url: string, waitLoad: boolean, waitLoadMs: number): Promise<void>;
+    /** Wait for one tab to reach `readyState === "complete"`, or the bound to elapse. */
+    waitForLoad(tabId: string, waitLoadMs: number): Promise<void>;
     evaluate(tabId: string, expression: string): Promise<unknown>;
-    click(tabId: string, selector: string, all: boolean): Promise<number>;
+    /**
+     * How the most recent `evaluate` reached the page. `'main'` is the page's own
+     * world, where its JavaScript globals live. `'debugger'` is the debugger
+     * protocol, taken when the page's Content-Security-Policy forbids `eval` —
+     * same semantics, different mechanism, and it shows the debugger infobar on
+     * that tab. `chrome_eval` reports the non-default route. Undefined before the
+     * first evaluation, and on backends that have only the one route.
+     */
+    readonly lastEvalWorld: 'main' | 'debugger' | undefined;
+    click(tabId: string, selector: string, all: boolean): Promise<ClickOutcome>;
+    /** Dispatch hover input on the first element matching the selector. */
+    hover(tabId: string, selector: string): Promise<HoverOutcome>;
+    /** Press one key on the selector's match, or on whatever currently has focus. */
+    press(tabId: string, key: string, selector?: string): Promise<PressOutcome>;
+    /** Set a `<select>`'s value. */
+    select(tabId: string, selector: string, value: string): Promise<SelectOutcome>;
+    /**
+     * Poll one element condition until it holds or the bound elapses.
+     * @returns whether it held; false means the bound passed, not that the page failed.
+     */
+    waitFor(tabId: string, selector: string, state: WaitState, timeoutMs: number): Promise<boolean>;
     type(tabId: string, selector: string, text: string, clear: boolean): Promise<void>;
     screenshot(tabId: string): Promise<{
         data: string;
         path?: string;
         mime?: string;
     }>;
+    /** Begin forwarding one tab's console output to the sink; idempotent. */
+    startConsole(tabId: string): Promise<void>;
+    /** Stop forwarding one tab's console output; idempotent. */
+    stopConsole(tabId: string): Promise<void>;
     dispose(): void;
 }
+/** Read a hover result from the page or the bridge. */
+export declare function mapHover(value: unknown): HoverOutcome;
+/** Read a press result from the page or the bridge. */
+export declare function mapPress(value: unknown): PressOutcome;
+/** Read a select result from the page or the bridge. */
+export declare function mapSelect(value: unknown): SelectOutcome;
+/**
+ * Map a click result onto {@link ClickOutcome}. A bare number is accepted as the
+ * pre-0.4 bridge's "matched and clicked" count, so a Chrome extension still
+ * loaded from an older package keeps working until it is reloaded.
+ * @param value - the evaluated page value or the bridge's reply payload.
+ * @returns the outcome, with every field defaulted.
+ */
+export declare function mapClickOutcome(value: unknown): ClickOutcome;
+/**
+ * Map an inventory result from the page or the bridge onto
+ * {@link BackendInventory}. An unusable reply becomes an empty inventory rather
+ * than an error: the caller asked what it can act on, and "nothing reported" is
+ * a truthful answer for a page that would not answer.
+ * @param value - the evaluated page value or the bridge's reply payload.
+ * @returns the inventory, with unreadable entries dropped.
+ */
+export declare function mapInventory(value: unknown): BackendInventory;
 /**
  * Extension bridge backend: commands are queued, sent over the bridge
  * WebSocket, and resolved when the extension replies. The socket is attached
@@ -53,12 +191,17 @@ export interface BrowserBackend {
  */
 export declare class ExtensionBackend implements BrowserBackend {
     private readonly config;
+    private readonly onConsole;
+    /** @inheritdoc BrowserBackend.lastEvalWorld */
+    lastEvalWorld: 'main' | 'debugger' | undefined;
     /**
      * Ops a disconnect may transparently retry on the next reconnect: they are
-     * side-effect free, so a lost result is safe to recompute. Side-effectful
-     * ops (open/navigate/click/type) are NEVER auto-resent — the caller gets
-     * the disconnect error and the model retries explicitly (no duplicate
-     * tabs/clicks/typing from hidden replays).
+     * side-effect free or idempotent, so a lost result is safe to recompute.
+     * Side-effectful ops (open/navigate/click/type) are NEVER auto-resent — the
+     * caller gets the disconnect error and the model retries explicitly (no
+     * duplicate tabs/clicks/typing from hidden replays). Console capture is
+     * idempotent and the extension re-arms it on reconnect, so retrying it is
+     * how a restarted service worker gets its capture back.
      */
     private static readonly SAFE_RETRY_OPS;
     /**
@@ -77,7 +220,8 @@ export declare class ExtensionBackend implements BrowserBackend {
      */
     private readonly pending;
     private pingTimer;
-    constructor(config: ResolvedChromeConfig);
+    /** Where console messages from the bridge land. */
+    constructor(config: ResolvedChromeConfig, onConsole?: ConsoleSink);
     /** The WS upgrade route calls this after a successful handshake. */
     attach(socket: Duplex, head: Buffer): void;
     detach(): void;
@@ -90,44 +234,82 @@ export declare class ExtensionBackend implements BrowserBackend {
     listTabs(): Promise<BackendTab[]>;
     openTab(url: string): Promise<BackendTab>;
     read(tabId: string, includeHtml: boolean): Promise<BackendRead>;
+    inventory(tabId: string): Promise<BackendInventory>;
+    closeTab(tabId: string): Promise<void>;
     navigate(tabId: string, url: string, waitLoad: boolean, waitLoadMs: number): Promise<void>;
+    waitForLoad(tabId: string, waitLoadMs: number): Promise<void>;
     evaluate(tabId: string, expression: string): Promise<unknown>;
-    click(tabId: string, selector: string, all: boolean): Promise<number>;
+    click(tabId: string, selector: string, all: boolean): Promise<ClickOutcome>;
+    hover(tabId: string, selector: string): Promise<HoverOutcome>;
+    press(tabId: string, key: string, selector?: string): Promise<PressOutcome>;
+    select(tabId: string, selector: string, value: string): Promise<SelectOutcome>;
+    waitFor(tabId: string, selector: string, state: WaitState, timeoutMs: number): Promise<boolean>;
     type(tabId: string, selector: string, text: string, clear: boolean): Promise<void>;
     screenshot(tabId: string): Promise<{
         data: string;
         path?: string;
         mime?: string;
     }>;
+    startConsole(tabId: string): Promise<void>;
+    stopConsole(tabId: string): Promise<void>;
     dispose(): void;
     private push;
     private onFrame;
+    /**
+     * One pushed console batch. Anything unrecognized is dropped rather than
+     * throwing: this is a wire boundary, and a malformed event must not kill the
+     * connection that carries the commands.
+     */
+    private onEventFrame;
     private flush;
 }
 /** CDP backend: the Chrome class plus per-tab endpoint operations. */
 export declare class CdpBackend implements BrowserBackend {
+    private readonly onConsole;
+    /** @inheritdoc BrowserBackend.lastEvalWorld */
+    lastEvalWorld: 'main' | 'debugger' | undefined;
     private readonly chrome;
-    constructor(chrome: Chrome);
+    /**
+     * Long-lived sessions held open for console capture, one per capturing tab.
+     * Every other operation opens and closes its own session; capture cannot,
+     * because the events arrive between calls.
+     */
+    private readonly captures;
+    constructor(chrome: Chrome, onConsole?: ConsoleSink);
     ensure(): Promise<void>;
     activeTabId(): Promise<string>;
     listTabs(): Promise<BackendTab[]>;
     openTab(url: string): Promise<BackendTab>;
     read(tabId: string, includeHtml: boolean): Promise<BackendRead>;
+    inventory(tabId: string): Promise<BackendInventory>;
+    closeTab(tabId: string): Promise<void>;
     navigate(tabId: string, url: string, waitLoad: boolean, waitLoadMs: number): Promise<void>;
+    waitForLoad(tabId: string, waitLoadMs: number): Promise<void>;
     evaluate(tabId: string, expression: string): Promise<unknown>;
-    click(tabId: string, selector: string, all: boolean): Promise<number>;
+    click(tabId: string, selector: string, all: boolean): Promise<ClickOutcome>;
+    hover(tabId: string, selector: string): Promise<HoverOutcome>;
+    press(tabId: string, key: string, selector?: string): Promise<PressOutcome>;
+    select(tabId: string, selector: string, value: string): Promise<SelectOutcome>;
+    waitFor(tabId: string, selector: string, state: WaitState, timeoutMs: number): Promise<boolean>;
     type(tabId: string, selector: string, text: string, clear: boolean): Promise<void>;
     screenshot(tabId: string): Promise<{
         data: string;
         path?: string;
         mime?: string;
     }>;
+    startConsole(tabId: string): Promise<void>;
+    stopConsole(tabId: string): Promise<void>;
     dispose(): void;
     private withTab;
     private evaluatePage;
 }
-/** Build the configured backend. */
-export declare function buildBackend(config: ResolvedChromeConfig): {
+/**
+ * Build the configured backend.
+ * @param config - the resolved plugin configuration.
+ * @param onConsole - where captured console messages land.
+ * @returns the backend, plus the `Chrome` instance the CDP path owns.
+ */
+export declare function buildBackend(config: ResolvedChromeConfig, onConsole?: ConsoleSink): {
     backend: BrowserBackend;
     chrome?: Chrome;
 };

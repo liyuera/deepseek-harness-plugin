@@ -15,8 +15,24 @@ import {
   resolveChromeConfig,
   resolveChromePath,
   resolveTab,
-  type CdpTabTarget,
 } from '../src/chrome.ts'
+
+/** One target row, as `parseTabList` produces it — the type stays private to the module. */
+type CdpTabTarget = ReturnType<typeof parseTabList>[number]
+
+/**
+ * A fake spawned Chrome: an emitter with the members `spawnChrome`/`dispose`
+ * touch. `exitCode: null` is what makes `dispose` reach `kill`.
+ */
+function fakeProc(): { pid: number; exitCode: number | null; kill: (signal?: string) => void; stderr: EventEmitter } {
+  const emitter = new EventEmitter()
+  return Object.assign(emitter, {
+    pid: 42,
+    exitCode: null as number | null,
+    kill: vi.fn(),
+    stderr: new EventEmitter(),
+  }) as unknown as { pid: number; exitCode: number | null; kill: (signal?: string) => void; stderr: EventEmitter }
+}
 
 describe('parseTabList', () => {
   it('keeps page targets with a websocket url and maps fields', () => {
@@ -150,11 +166,6 @@ describe('Chrome user mode', () => {
     throw new Error('ECONNREFUSED')
   }
 
-  function fakeProc() {
-    const emitter = new EventEmitter()
-    return Object.assign(emitter, { pid: 42, exitCode: null, kill: vi.fn(), stderr: new EventEmitter() }) as never
-  }
-
   it('errors without autoRelaunch and never touches Chrome', async () => {
     const stop = vi.fn(async () => {})
     const config = resolveChromeConfig({ port: 59322, mode: 'user', autoRelaunch: false, timeoutMs: 200 })
@@ -166,20 +177,20 @@ describe('Chrome user mode', () => {
   it('relaunches a running Chrome with the debug port and the user profile', async () => {
     const stop = vi.fn(async () => {})
     const isRunning = vi.fn(async () => true)
-    const spawnProcess = vi.fn(() => fakeProc())
+    const spawnProcess = vi.fn(() => fakeProc() as never)
     const source = mkdtempSync(join(tmpdir(), 'dsh-profile-src-'))
-    const config = resolveChromeConfig({ port: 59323, mode: 'user', autoRelaunch: true, timeoutMs: 120, pollIntervalMs: 5 })
+    const config = resolveChromeConfig({ port: 59323, mode: 'user', autoRelaunch: true, timeoutMs: 120 })
     const chrome = new Chrome(config, {
       httpFetch: failingFetch,
       platformOps: { isRunning, stop },
       spawnProcess,
       userProfileSource: source,
-      profileDir: undefined,
+      pollIntervalMs: 5,
     })
     await expect(chrome.ensure()).rejects.toThrow('did not become ready')
     expect(isRunning).toHaveBeenCalled()
     expect(stop).toHaveBeenCalled()
-    const [path, args] = spawnProcess.mock.calls[0] as [string, string[]]
+    const [path, args] = spawnProcess.mock.calls[0] as unknown as [string, string[]]
     expect(path.length).toBeGreaterThan(0)
     expect(args).toContain(`--remote-debugging-port=59323`)
     expect(args).toContain(`--user-data-dir=${config.profileDir}`)
@@ -189,14 +200,15 @@ describe('Chrome user mode', () => {
 
   it('spawns directly when Chrome is not running (no stop call)', async () => {
     const stop = vi.fn(async () => {})
-    const spawnProcess = vi.fn(() => fakeProc())
+    const spawnProcess = vi.fn(() => fakeProc() as never)
     const source = mkdtempSync(join(tmpdir(), 'dsh-profile-src-'))
-    const config = resolveChromeConfig({ port: 59324, mode: 'user', autoRelaunch: true, timeoutMs: 120, pollIntervalMs: 5 })
+    const config = resolveChromeConfig({ port: 59324, mode: 'user', autoRelaunch: true, timeoutMs: 120 })
     const chrome = new Chrome(config, {
       httpFetch: failingFetch,
       platformOps: { isRunning: async () => false, stop },
       spawnProcess,
       userProfileSource: source,
+      pollIntervalMs: 5,
     })
     await expect(chrome.ensure()).rejects.toThrow('did not become ready')
     expect(stop).not.toHaveBeenCalled()
@@ -204,7 +216,7 @@ describe('Chrome user mode', () => {
   })
 
   it('never terminates the user browser on dispose', () => {
-    const spawnProcess = vi.fn(() => fakeProc())
+    const spawnProcess = vi.fn(() => fakeProc() as never)
     const config = resolveChromeConfig({ port: 59325, mode: 'user' })
     const chrome = new Chrome(config, { spawnProcess })
     chrome.dispose()
@@ -213,13 +225,35 @@ describe('Chrome user mode', () => {
 })
 
 describe('Chrome owned mode', () => {
-  it('keeps the dedicated profile and terminates on dispose', () => {
-    const spawnProcess = vi.fn(() => fakeProc())
+  it('keeps the dedicated profile and terminates the owned Chrome on dispose', async () => {
+    const signals: string[] = []
+    const proc = fakeProc()
+    proc.kill = (signal?: string) => { signals.push(signal ?? '') }
+    // The endpoint answers only once Chrome has been spawned, which is what
+    // makes `ensure()` take the owned-mode path rather than the early return.
+    let spawned = false
+    const spawnProcess = vi.fn(() => {
+      spawned = true
+      return proc as never
+    })
     const config = resolveChromeConfig({ port: 59326, mode: 'owned' })
-    const chrome = new Chrome(config, { spawnProcess })
-    chrome.dispose()
-    // dispose of a never-started browser is a no-op; spawns still carry args
+    const chrome = new Chrome(config, {
+      httpFetch: async () => {
+        if (!spawned) throw new Error('ECONNREFUSED')
+        return { ok: true, json: async () => ({ browser: 'Chrome' }) } as never
+      },
+      spawnProcess,
+      pollIntervalMs: 5,
+    })
+
+    await chrome.ensure()
+    expect(spawnProcess).toHaveBeenCalledTimes(1)
+    const [, args] = spawnProcess.mock.calls[0] as unknown as [string, string[]]
+    expect(args).toContain(`--user-data-dir=${config.profileDir}`)
     expect(config.profileDir).toContain('profile-59326')
+
+    chrome.dispose()
+    expect(signals).toContain('SIGTERM')
   })
 })
 
@@ -281,7 +315,7 @@ describe('reclaimOwnedLeftover', () => {
     return {
       readPidFile: (): number | undefined => 1234,
       processAlive: (): boolean => true,
-      commandLineOf: (pid: number): string => `Chrome --user-data-dir=${marker}`,
+      commandLineOf: (_pid: number): string | undefined => `Chrome --user-data-dir=${marker}`,
       kill: vi.fn((): boolean => true),
       unlink: vi.fn(),
     }

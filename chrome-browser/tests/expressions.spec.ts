@@ -9,17 +9,17 @@ import {
 } from '../src/expressions.ts'
 
 describe('clickExpression', () => {
-  it('clicks the first match and returns hit count', () => {
+  // Behaviour lives in tests/click-outcome.spec.ts, which runs this expression
+  // against a stub document; here we only pin how the source is assembled.
+  it('interpolates the selector and targets only the first match by default', () => {
     const expression = clickExpression('#submit', false)
-    expect(expression).toContain('document.querySelector("#submit")')
+    expect(expression).toContain('document.querySelectorAll("#submit")')
+    expect(expression).toContain('matched.length > 0 ? [matched[0]] : []')
     expect(expression).toContain('el.click()')
-    expect(expression).not.toContain('querySelectorAll')
   })
 
-  it('clicks every match when all is set', () => {
-    const expression = clickExpression('a.item', true)
-    expect(expression).toContain('document.querySelectorAll("a.item")')
-    expect(expression).toContain('n++')
+  it('targets every match when all is set', () => {
+    expect(clickExpression('a.item', true)).toContain('Array.from(matched)')
   })
 
   it('escapes quotes in the selector', () => {

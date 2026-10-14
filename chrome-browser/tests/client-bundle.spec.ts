@@ -41,7 +41,7 @@ describe('shipped client bundle', () => {
     expect(loadBundle().id).toBe('@liyuera/dsh-chrome-browser')
   })
 
-  it('applies the @ tab source and no composer-dock row', async () => {
+  it('applies the activity strip and the @ tab source', async () => {
     const slots: string[] = []
     const sources: Array<{ name?: string; trigger?: string; order?: number }> = []
     const ctx = {
@@ -51,8 +51,8 @@ describe('shipped client bundle', () => {
           slots.push(key)
           callback()
         },
-        register: (options: { name: string }) => {
-          slots.push(options.name)
+        register: (options: { name: string; id: string }) => {
+          slots.push(options.id)
           return () => {}
         },
       },
@@ -66,7 +66,8 @@ describe('shipped client bundle', () => {
     const plugin = loadPlugin()
     expect(plugin.inject).toEqual(['slots', 'inputTriggers'])
     plugin.apply(ctx)
-    expect(slots).toEqual([])
+    // The dock carries the activity strip and nothing else.
+    expect(slots).toEqual(['conversation.input.dock', 'chrome-browser-activity'])
     expect(sources).toHaveLength(1)
     expect(sources[0]?.name).toBe('chrome-browser')
     expect(sources[0]?.trigger).toBe('@')

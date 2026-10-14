@@ -8,7 +8,8 @@
  *   used as a fallback when config selects `cdp`.
  * @module @liyuera/dsh-chrome-browser/backend
  */
-import { clickExpression, focusAndSelectExpression, focusExpression, readPageExpression, readyStateExpression, } from "./expressions.js";
+import { consoleMessageFrom } from "./console-events.js";
+import { clickExpression, focusAndSelectExpression, focusExpression, hoverExpression, inventoryExpression, pressExpression, readPageExpression, readyStateExpression, selectExpression, waitExpression, } from "./expressions.js";
 import { Chrome } from "./chrome.js";
 import { WsConnection, wsHandshake } from "./ws.js";
 /** Shared sleep. */
@@ -24,20 +25,188 @@ function mapExtTab(tab) {
     };
 }
 /**
+ * Poll one tab's `document.readyState` until it reports `complete` or the bound
+ * elapses. Reaching the bound is not an error: a page that never settles (a
+ * long-polling app, a stalled asset) must still hand control back to the model,
+ * which can read what is there and decide what to do.
+ * @param evaluate - runs one expression in the tab.
+ * @param waitLoadMs - the bound; zero or less returns immediately.
+ */
+async function awaitReady(evaluate, waitLoadMs) {
+    if (waitLoadMs <= 0)
+        return;
+    const deadline = Date.now() + waitLoadMs;
+    while (Date.now() < deadline) {
+        if (await evaluate(readyStateExpression()) === 'complete')
+            return;
+        await sleep(300);
+    }
+}
+/** Poll interval for `waitFor`, milliseconds. */
+const WAIT_POLL_MS = 100;
+/**
+ * Poll one boolean expression until it answers true or the bound elapses. It is
+ * always evaluated at least once, so a zero bound asks "does it hold now?".
+ * @param evaluate - runs one expression in the tab.
+ * @param expression - the condition to poll.
+ * @param timeoutMs - the bound.
+ * @returns whether the condition held before the bound passed.
+ */
+async function awaitTruthy(evaluate, expression, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+        if (await evaluate(expression) === true)
+            return true;
+        if (Date.now() >= deadline)
+            return false;
+        await sleep(WAIT_POLL_MS);
+    }
+}
+/** Read a hover result from the page or the bridge. */
+export function mapHover(value) {
+    if (typeof value !== 'object' || value === null)
+        return { matched: 0, hovered: false };
+    const source = value;
+    return { matched: counter(source, 'matched'), hovered: source.hovered === true };
+}
+/** Read a press result from the page or the bridge. */
+export function mapPress(value) {
+    if (typeof value !== 'object' || value === null)
+        return { found: false, pressed: false, submitted: false };
+    const source = value;
+    return {
+        found: flag(source, 'found'),
+        pressed: flag(source, 'pressed'),
+        submitted: flag(source, 'submitted'),
+    };
+}
+/** Read a select result from the page or the bridge. */
+export function mapSelect(value) {
+    if (typeof value !== 'object' || value === null) {
+        return { matched: 0, changed: false, value: '', options: [] };
+    }
+    const source = value;
+    const reason = typeof source.reason === 'string' && source.reason !== '' ? source.reason : undefined;
+    return {
+        matched: counter(source, 'matched'),
+        changed: flag(source, 'changed'),
+        value: typeof source.value === 'string' ? source.value : '',
+        options: Array.isArray(source.options)
+            ? source.options.filter((option) => typeof option === 'string')
+            : [],
+        ...(reason === undefined ? {} : { reason }),
+    };
+}
+/**
+ * The error a side-effectful command produces when it was sent and no outcome
+ * came back — a disconnect, a timeout, or a bridge that gave up mid-operation.
+ *
+ * The distinction matters to the model: a command that FAILED is safe to retry,
+ * while a command whose outcome is UNKNOWN is not. A re-sent click is a second
+ * click and a re-sent type is a second insertion, so the message says what to do
+ * instead. Commands in `SAFE_RETRY_OPS` never reach this: they are side-effect
+ * free and replay on reconnect.
+ * @param op - the operation whose outcome is unknown, when it is known.
+ * @param cause - what went wrong, for whoever reads the transcript.
+ * @returns the error to reject the command with.
+ */
+function unknownOutcome(op, cause) {
+    return new Error(`${op ?? '命令'} 结果未知(${cause}):命令已发出但没有收到执行结果,页面可能已经改变。`
+        + '不要直接重试,先用 chrome_tabs / chrome_read 确认页面当前状态。');
+}
+/** Read one click counter from an untrusted result, treating anything else as absent. */
+function counter(source, key) {
+    const value = source[key];
+    return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+/**
+ * Map a click result onto {@link ClickOutcome}. A bare number is accepted as the
+ * pre-0.4 bridge's "matched and clicked" count, so a Chrome extension still
+ * loaded from an older package keeps working until it is reloaded.
+ * @param value - the evaluated page value or the bridge's reply payload.
+ * @returns the outcome, with every field defaulted.
+ */
+export function mapClickOutcome(value) {
+    if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
+        return { matched: value, clicked: value, disabled: 0, invisible: 0, offscreen: 0, covered: 0, ariaDisabled: 0 };
+    }
+    if (typeof value !== 'object' || value === null) {
+        return { matched: 0, clicked: 0, disabled: 0, invisible: 0, offscreen: 0, covered: 0, ariaDisabled: 0 };
+    }
+    const source = value;
+    return {
+        matched: counter(source, 'matched'),
+        clicked: counter(source, 'clicked'),
+        disabled: counter(source, 'disabled'),
+        invisible: counter(source, 'invisible'),
+        offscreen: counter(source, 'offscreen'),
+        covered: counter(source, 'covered'),
+        ariaDisabled: counter(source, 'ariaDisabled'),
+    };
+}
+/** Read one boolean field, treating anything but `true` as false. */
+function flag(source, key) {
+    return source[key] === true;
+}
+/**
+ * Map an inventory result from the page or the bridge onto
+ * {@link BackendInventory}. An unusable reply becomes an empty inventory rather
+ * than an error: the caller asked what it can act on, and "nothing reported" is
+ * a truthful answer for a page that would not answer.
+ * @param value - the evaluated page value or the bridge's reply payload.
+ * @returns the inventory, with unreadable entries dropped.
+ */
+export function mapInventory(value) {
+    if (typeof value !== 'object' || value === null)
+        return { title: '', url: '', matched: 0, items: [] };
+    const source = value;
+    const raw = Array.isArray(source.items) ? source.items : [];
+    const items = [];
+    for (const entry of raw) {
+        if (typeof entry !== 'object' || entry === null)
+            continue;
+        const item = entry;
+        const selector = typeof item.selector === 'string' ? item.selector : '';
+        if (selector === '')
+            continue;
+        items.push({
+            selector,
+            role: typeof item.role === 'string' ? item.role : '',
+            name: typeof item.name === 'string' ? item.name : '',
+            inView: flag(item, 'inView'),
+            disabled: flag(item, 'disabled'),
+            covered: flag(item, 'covered'),
+        });
+    }
+    return {
+        title: typeof source.title === 'string' ? source.title : '',
+        url: typeof source.url === 'string' ? source.url : '',
+        matched: counter(source, 'matched'),
+        items,
+    };
+}
+/**
  * Extension bridge backend: commands are queued, sent over the bridge
  * WebSocket, and resolved when the extension replies. The socket is attached
  * by the `/chrome-browser/ext/ws` upgrade route.
  */
 export class ExtensionBackend {
     config;
+    onConsole;
+    /** @inheritdoc BrowserBackend.lastEvalWorld */
+    lastEvalWorld = undefined;
     /**
      * Ops a disconnect may transparently retry on the next reconnect: they are
-     * side-effect free, so a lost result is safe to recompute. Side-effectful
-     * ops (open/navigate/click/type) are NEVER auto-resent — the caller gets
-     * the disconnect error and the model retries explicitly (no duplicate
-     * tabs/clicks/typing from hidden replays).
+     * side-effect free or idempotent, so a lost result is safe to recompute.
+     * Side-effectful ops (open/navigate/click/type) are NEVER auto-resent — the
+     * caller gets the disconnect error and the model retries explicitly (no
+     * duplicate tabs/clicks/typing from hidden replays). Console capture is
+     * idempotent and the extension re-arms it on reconnect, so retrying it is
+     * how a restarted service worker gets its capture back.
      */
-    static SAFE_RETRY_OPS = new Set(['list-tabs', 'read', 'eval', 'screenshot']);
+    static SAFE_RETRY_OPS = new Set([
+        'list-tabs', 'read', 'eval', 'screenshot', 'console-start', 'console-stop',
+    ]);
     /**
      * In-flight dedupe keys for side-effectful ops: a second identical command
      * while the first is still in flight JOIN it instead of firing twice
@@ -54,8 +223,10 @@ export class ExtensionBackend {
      */
     pending = new Map();
     pingTimer = null;
-    constructor(config) {
+    /** Where console messages from the bridge land. */
+    constructor(config, onConsole = () => { }) {
         this.config = config;
+        this.onConsole = onConsole;
     }
     /** The WS upgrade route calls this after a successful handshake. */
     attach(socket, head) {
@@ -90,7 +261,6 @@ export class ExtensionBackend {
             clearInterval(this.pingTimer);
             this.pingTimer = null;
         }
-        const error = new Error('Chrome 扩展已断开连接');
         const settled = new Set();
         for (const [seq, entry] of this.pending) {
             const op = this.unacked.get(seq)?.op;
@@ -120,7 +290,7 @@ export class ExtensionBackend {
             // re-sent `open` would open another tab and `type`/`click`/`navigate`
             // would repeat their side effects.
             clearTimeout(entry.timer);
-            entry.reject(error);
+            entry.reject(unknownOutcome(op, 'Chrome 扩展已断开连接'));
             settled.add(seq);
             this.pending.delete(seq);
             this.unacked.delete(seq);
@@ -177,24 +347,55 @@ export class ExtensionBackend {
             html: typeof result?.html === 'string' ? result.html : '',
         };
     }
+    async inventory(tabId) {
+        return mapInventory(await this.push('inventory', { tabId }));
+    }
+    async closeTab(tabId) {
+        await this.push('close', { tabId });
+    }
     async navigate(tabId, url, waitLoad, waitLoadMs) {
         await this.push('navigate', { tabId, url });
-        if (!waitLoad || waitLoadMs <= 0)
-            return;
-        const deadline = Date.now() + waitLoadMs;
-        while (Date.now() < deadline) {
-            const state = await this.evaluate(tabId, readyStateExpression());
-            if (state === 'complete')
-                return;
-            await sleep(300);
-        }
+        if (waitLoad)
+            await this.waitForLoad(tabId, waitLoadMs);
+    }
+    async waitForLoad(tabId, waitLoadMs) {
+        await awaitReady(expression => this.evaluate(tabId, expression), waitLoadMs);
     }
     async evaluate(tabId, expression) {
-        return await this.push('eval', { tabId, expression });
+        const answer = await this.push('eval', { tabId, expression });
+        // An extension built before this envelope answers with the bare value; a
+        // current one tags it. The tag is what keeps an expression that legitimately
+        // returns `{ ok, value }` from being read as an envelope.
+        if (typeof answer !== 'object' || answer === null || answer.__dshEval !== 1) {
+            this.lastEvalWorld = undefined;
+            return answer;
+        }
+        const envelope = answer;
+        if (envelope.ok !== true) {
+            this.lastEvalWorld = undefined;
+            throw new Error(typeof envelope.error === 'string' && envelope.error !== ''
+                ? `chrome_eval: ${envelope.error}`
+                : 'chrome_eval: 表达式执行失败');
+        }
+        this.lastEvalWorld = envelope.world === 'debugger' ? 'debugger' : 'main';
+        return envelope.value;
     }
     async click(tabId, selector, all) {
-        const count = await this.push('click', { tabId, selector, all });
-        return typeof count === 'number' ? count : 0;
+        return mapClickOutcome(await this.push('click', { tabId, selector, all }));
+    }
+    async hover(tabId, selector) {
+        return mapHover(await this.push('hover', { tabId, selector }));
+    }
+    async press(tabId, key, selector) {
+        return mapPress(await this.push('press', selector === undefined
+            ? { tabId, key }
+            : { tabId, key, selector }));
+    }
+    async select(tabId, selector, value) {
+        return mapSelect(await this.push('select', { tabId, selector, value }));
+    }
+    async waitFor(tabId, selector, state, timeoutMs) {
+        return awaitTruthy(expression => this.evaluate(tabId, expression), waitExpression(selector, state), timeoutMs);
     }
     async type(tabId, selector, text, clear) {
         const done = await this.push('type', { tabId, selector, text, clear });
@@ -212,6 +413,14 @@ export class ExtensionBackend {
                 : { data: '', path: result.path })
             : { data: '' };
     }
+    async startConsole(tabId) {
+        // The extension attaches its debugger and forwards events; it also persists
+        // the capture set, so a service worker that Chrome suspends re-arms it.
+        await this.push('console-start', { tabId });
+    }
+    async stopConsole(tabId) {
+        await this.push('console-stop', { tabId });
+    }
     dispose() {
         this.detach();
         this.conn?.close();
@@ -228,11 +437,17 @@ export class ExtensionBackend {
         }
         const seq = ++this.seq;
         this.unacked.set(seq, { op, args });
+        // A timeout means the extension never answered. For a side-effectful op the
+        // command may still have run, so the caller gets the unknown-outcome error
+        // rather than a plain failure it would retry.
+        const sideEffectful = dedupeKey !== undefined;
         const outcome = new Promise((resolve, reject) => {
             const timer = setTimeout(() => {
                 this.pending.delete(seq);
                 this.unacked.delete(seq);
-                reject(new Error(`Chrome 扩展 ${op} 超时(${this.config.timeoutMs}ms)`));
+                reject(sideEffectful
+                    ? unknownOutcome(op, `Chrome 扩展 ${this.config.timeoutMs}ms 内未应答`)
+                    : new Error(`Chrome 扩展 ${op} 超时(${this.config.timeoutMs}ms)`));
             }, this.config.timeoutMs);
             const deadline = Date.now() + this.config.timeoutMs * 2;
             this.pending.set(seq, { resolve, reject, timer, deadline });
@@ -258,6 +473,10 @@ export class ExtensionBackend {
         catch {
             return;
         }
+        if (message.kind === 'event') {
+            this.onEventFrame(message);
+            return;
+        }
         if (message.kind !== 'results' || !Array.isArray(message.results))
             return;
         for (const entry of message.results) {
@@ -276,6 +495,29 @@ export class ExtensionBackend {
                 pending.reject(new Error(entry.error ?? 'Chrome 扩展执行失败'));
         }
     }
+    /**
+     * One pushed console batch. Anything unrecognized is dropped rather than
+     * throwing: this is a wire boundary, and a malformed event must not kill the
+     * connection that carries the commands.
+     */
+    onEventFrame(message) {
+        if (message.event !== 'console')
+            return;
+        const tabId = message.tabId === undefined || message.tabId === null ? '' : String(message.tabId);
+        if (tabId === '' || !Array.isArray(message.entries))
+            return;
+        for (const raw of message.entries) {
+            if (typeof raw !== 'object' || raw === null)
+                continue;
+            const entry = raw;
+            const text = typeof entry.text === 'string' ? entry.text : '';
+            if (text === '')
+                continue;
+            const level = typeof entry.level === 'string' && entry.level !== '' ? entry.level : 'log';
+            const source = typeof entry.source === 'string' && entry.source !== '' ? entry.source : undefined;
+            this.onConsole(tabId, source === undefined ? { level, text } : { level, text, source });
+        }
+    }
     flush() {
         const conn = this.conn;
         if (conn === null)
@@ -287,8 +529,18 @@ export class ExtensionBackend {
 }
 /** CDP backend: the Chrome class plus per-tab endpoint operations. */
 export class CdpBackend {
+    onConsole;
+    /** @inheritdoc BrowserBackend.lastEvalWorld */
+    lastEvalWorld = undefined;
     chrome;
-    constructor(chrome) {
+    /**
+     * Long-lived sessions held open for console capture, one per capturing tab.
+     * Every other operation opens and closes its own session; capture cannot,
+     * because the events arrive between calls.
+     */
+    captures = new Map();
+    constructor(chrome, onConsole = () => { }) {
+        this.onConsole = onConsole;
         this.chrome = chrome;
     }
     async ensure() {
@@ -328,30 +580,47 @@ export class CdpBackend {
             };
         });
     }
+    async inventory(tabId) {
+        return this.withTab(tabId, async (endpoint) => (mapInventory(await this.evaluatePage(endpoint, inventoryExpression()))));
+    }
+    async closeTab(tabId) {
+        await this.chrome.closeTab(tabId);
+    }
     async navigate(tabId, url, waitLoad, waitLoadMs) {
         await this.withTab(tabId, async (endpoint) => {
             const result = await endpoint.call('Page.navigate', { url });
             const errorText = typeof result.errorText === 'string' ? result.errorText : undefined;
             if (errorText !== undefined)
                 throw new Error(`chrome_navigate failed: ${errorText}`);
-            if (waitLoad && waitLoadMs > 0) {
-                const deadline = Date.now() + waitLoadMs;
-                while (Date.now() < deadline) {
-                    if (await this.evaluatePage(endpoint, readyStateExpression()) === 'complete')
-                        return;
-                    await sleep(300);
-                }
-            }
+            if (waitLoad)
+                await awaitReady(expression => this.evaluatePage(endpoint, expression), waitLoadMs);
         });
     }
+    async waitForLoad(tabId, waitLoadMs) {
+        // One CDP session for the whole wait, rather than one per poll.
+        await this.withTab(tabId, endpoint => awaitReady(expression => this.evaluatePage(endpoint, expression), waitLoadMs));
+    }
     async evaluate(tabId, expression) {
+        // Runtime.evaluate is not subject to the page's CSP, so there is no second
+        // world to fall back to.
+        this.lastEvalWorld = 'main';
         return this.withTab(tabId, endpoint => this.evaluatePage(endpoint, expression));
     }
     async click(tabId, selector, all) {
-        return this.withTab(tabId, async (endpoint) => {
-            const count = await this.evaluatePage(endpoint, clickExpression(selector, all));
-            return typeof count === 'number' ? count : 0;
-        });
+        return this.withTab(tabId, async (endpoint) => (mapClickOutcome(await this.evaluatePage(endpoint, clickExpression(selector, all)))));
+    }
+    async hover(tabId, selector) {
+        return this.withTab(tabId, async (endpoint) => (mapHover(await this.evaluatePage(endpoint, hoverExpression(selector)))));
+    }
+    async press(tabId, key, selector) {
+        return this.withTab(tabId, async (endpoint) => (mapPress(await this.evaluatePage(endpoint, pressExpression(key, selector)))));
+    }
+    async select(tabId, selector, value) {
+        return this.withTab(tabId, async (endpoint) => (mapSelect(await this.evaluatePage(endpoint, selectExpression(selector, value)))));
+    }
+    async waitFor(tabId, selector, state, timeoutMs) {
+        // One CDP session for the whole wait, rather than one per poll.
+        return this.withTab(tabId, endpoint => (awaitTruthy(expression => this.evaluatePage(endpoint, expression), waitExpression(selector, state), timeoutMs)));
     }
     async type(tabId, selector, text, clear) {
         await this.withTab(tabId, async (endpoint) => {
@@ -367,7 +636,38 @@ export class CdpBackend {
             return { data: typeof result.data === 'string' ? result.data : '', mime: 'image/png' };
         });
     }
+    async startConsole(tabId) {
+        if (this.captures.has(tabId))
+            return;
+        const { endpoint } = await this.chrome.tabEndpoint(tabId, undefined);
+        try {
+            endpoint.onEvent((method, params) => {
+                const message = consoleMessageFrom(method, params);
+                if (message !== undefined)
+                    this.onConsole(tabId, message);
+            });
+            // `Log.enable` also replays entries the browser buffered before it was
+            // enabled, which is the closest thing to capturing from page load.
+            await endpoint.call('Runtime.enable');
+            await endpoint.call('Log.enable');
+        }
+        catch (error) {
+            endpoint.close();
+            throw error;
+        }
+        this.captures.set(tabId, endpoint);
+    }
+    async stopConsole(tabId) {
+        const endpoint = this.captures.get(tabId);
+        if (endpoint === undefined)
+            return;
+        this.captures.delete(tabId);
+        endpoint.close();
+    }
     dispose() {
+        for (const endpoint of this.captures.values())
+            endpoint.close();
+        this.captures.clear();
         this.chrome.dispose();
     }
     async withTab(tabId, fn) {
@@ -400,13 +700,18 @@ export class CdpBackend {
         return typeof remote === 'object' && remote !== null ? remote.value : undefined;
     }
 }
-/** Build the configured backend. */
-export function buildBackend(config) {
+/**
+ * Build the configured backend.
+ * @param config - the resolved plugin configuration.
+ * @param onConsole - where captured console messages land.
+ * @returns the backend, plus the `Chrome` instance the CDP path owns.
+ */
+export function buildBackend(config, onConsole = () => { }) {
     if (config.backend === 'cdp') {
         const chrome = new Chrome(config);
-        return { backend: new CdpBackend(chrome), chrome };
+        return { backend: new CdpBackend(chrome, onConsole), chrome };
     }
-    return { backend: new ExtensionBackend(config) };
+    return { backend: new ExtensionBackend(config, onConsole) };
 }
 /** The WS upgrade handler the routes register: handshake then attach. */
 export function extensionUpgradeHandler(backend) {

@@ -22,6 +22,12 @@
       "@deepseek-ai/dsh-agent": [
         "./../../packages/core/agent/src/index.ts"
       ],
+      "@deepseek-ai/dsh-skill": [
+        "./../../packages/skill/skill/src/index.ts"
+      ],
+      "@deepseek-ai/dsh-llm": [
+        "./../../packages/llm/llm/src/index.ts"
+      ],
       "@deepseek-ai/dsh-llm/message": [
         "./../../packages/llm/llm/src/message.ts"
       ],

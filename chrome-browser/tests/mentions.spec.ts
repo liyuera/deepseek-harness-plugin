@@ -14,10 +14,10 @@ import {
 
 /** Live tabs, including two that share a title and one that has none. */
 const TABS = [
-  { id: '7', title: '任务管理-列表', url: 'http://192.168.2.84/task/list' },
-  { id: '4', title: '星瞰河山一体化平台', url: 'https://ecard.htwisdom.cn/TEAMS-364' },
-  { id: '5', title: '星瞰河山一体化平台', url: 'https://ecard.htwisdom.cn/XKSZ-611' },
-  { id: '9', title: '', url: 'https://example.com/untitled' },
+  { id: '7', title: '任务管理-列表', url: 'http://192.168.2.84/task/list', favicon: '' },
+  { id: '4', title: '星瞰河山一体化平台', url: 'https://ecard.htwisdom.cn/TEAMS-364', favicon: '' },
+  { id: '5', title: '星瞰河山一体化平台', url: 'https://ecard.htwisdom.cn/XKSZ-611', favicon: '' },
+  { id: '9', title: '', url: 'https://example.com/untitled', favicon: '' },
 ]
 
 /** One user message carrying the given text. */

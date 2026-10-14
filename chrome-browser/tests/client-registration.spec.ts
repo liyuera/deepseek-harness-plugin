@@ -1,12 +1,12 @@
 /**
- * Browser-half wiring: which `@` source the plugin contributes, and that the
- * retired composer-dock selector contributes nothing.
+ * Browser-half wiring: which dock rows the plugin contributes, which `@` source
+ * it registers, and that the retired composer-dock selector stays off.
  *
  * The slot registry and the trigger service live in the Web shell's browser
  * artifacts, so these specs boot the real plugin over recording stand-ins with
  * the same method surface the plugin uses. The behavioral claims are the ones
- * the change is about: no dock row registers while the picker is switched off,
- * one `@` tab source does, and disposing the fiber releases it.
+ * the change is about: the activity strip registers, one `@` tab source
+ * registers, and disposing the fiber releases both.
  */
 import { Context } from '@deepseek-ai/cordis'
 import { describe, expect, it } from 'vitest'
@@ -56,9 +56,11 @@ describe('chrome-browser browser half', () => {
     expect(inject).toEqual(['slots', 'inputTriggers'])
   })
 
-  it('registers no composer-dock row while the tab picker is switched off', async () => {
+  it('registers the activity strip on the composer dock', async () => {
     const { contributions } = await bench()
-    expect(contributions).toEqual([])
+    expect(contributions).toHaveLength(1)
+    expect(contributions[0]?.options.name).toBe('conversation.input.dock')
+    expect(contributions[0]?.options.id).toBe('chrome-browser-activity')
   })
 
   it('registers one @ source above the saved-prompt group', async () => {

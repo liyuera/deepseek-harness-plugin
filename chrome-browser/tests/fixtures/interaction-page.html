@@ -1,0 +1,42 @@
+<!doctype html>
+<!--
+  Every interaction the bridge can perform, on one page, so the extension
+  backend can be exercised against a real browser: a native <select>, a form
+  that records its own submit, a control revealed only on hover, and buttons
+  that log — the last of which is what chrome_console reads back.
+-->
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>交互探针</title>
+    <style>
+      body { font: 14px system-ui; margin: 2rem; display: grid; gap: .75rem; max-width: 32rem }
+      #revealed { display: none; color: #0a0 }
+      #hoverer { border: 1px dashed #999; padding: .4rem; width: fit-content }
+      #hoverer:hover #revealed { display: block }
+    </style>
+  </head>
+  <body>
+    <h1>交互探针</h1>
+
+    <label>城市
+      <select id="city">
+        <option value="bj">北京</option>
+        <option value="sh">上海</option>
+        <option value="gz">广州</option>
+      </select>
+    </label>
+
+    <form id="form" onsubmit="event.preventDefault(); document.getElementById('submitted').textContent = 'submitted'">
+      <input id="q" placeholder="回车提交" />
+      <button id="submit-btn" type="submit">提交</button>
+    </form>
+    <div id="submitted">idle</div>
+
+    <div id="hoverer" onmouseover="void 0">悬停我
+      <div id="revealed" role="button">悬停后才出现</div>
+    </div>
+
+    <button id="log" onclick="console.error('probe-error-xyz')">写一条控制台错误</button>
+  </body>
+</html>

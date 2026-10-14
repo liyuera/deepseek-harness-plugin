@@ -207,6 +207,14 @@ export declare class Chrome {
     /** Open a new tab (foreground) and return its public view. */
     openTab(url: string): Promise<ChromeTab>;
     /**
+     * Close one tab by target id.
+     *
+     * Chrome answers `/json/close` with the plain text "Target is closing", so
+     * this does not go through `httpJson`, which parses a JSON body.
+     * @param targetId - the tab's target id, as `listTabs` reports it.
+     */
+    closeTab(targetId: string): Promise<void>;
+    /**
      * Open a CDP endpoint on one tab. The caller owns the endpoint and must
      * `close()` it (close also detaches the session).
      * @param tabId - explicit tab id from the tool args.

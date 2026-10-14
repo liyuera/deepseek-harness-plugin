@@ -22,7 +22,13 @@ export interface CdpSocket {
 export interface CdpEndpoint {
   /** Send one CDP command and await its `result`; rejects on CDP error or timeout. */
   call(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>>
-  /** Close the session; in-flight calls reject with a closed-endpoint error. */
+  /**
+   * Subscribe to CDP events: frames carrying a `method` and no numeric id.
+   * @param listener - receives the event name and its params.
+   * @returns the disposer.
+   */
+  onEvent(listener: (method: string, params: Record<string, unknown>) => void): () => void
+  /** Close the session; in-flight calls reject and listeners stop with a closed-endpoint error. */
   close(): void
 }
 
@@ -66,15 +72,25 @@ export function cdpEndpoint(socket: CdpSocket, options: CdpEndpointOptions): Cdp
   const pending = new Map<number, PendingCall>()
   let nextId = 1
   let closed = false
+  const listeners = new Set<(method: string, params: Record<string, unknown>) => void>()
 
   const off = socket.onMessage((data) => {
-    let message: { id?: unknown; result?: unknown; error?: { code?: unknown; message?: unknown } }
+    let message: { id?: unknown; method?: unknown; params?: unknown; result?: unknown; error?: { code?: unknown; message?: unknown } }
     try {
       message = JSON.parse(data) as typeof message
     } catch {
       return
     }
-    if (typeof message.id !== 'number') return
+    if (typeof message.id !== 'number') {
+      // An event: no id, a method name, and params. Commands and events share
+      // the socket, so the id is what tells them apart.
+      if (typeof message.method !== 'string') return
+      const params = typeof message.params === 'object' && message.params !== null
+        ? message.params as Record<string, unknown>
+        : {}
+      for (const listener of listeners) listener(message.method, params)
+      return
+    }
     const entry = pending.get(message.id)
     if (entry === undefined) return
     pending.delete(message.id)
@@ -104,10 +120,15 @@ export function cdpEndpoint(socket: CdpSocket, options: CdpEndpointOptions): Cdp
       socket.send(JSON.stringify({ id, method, params }))
       return outcome
     },
+    onEvent(listener) {
+      listeners.add(listener)
+      return () => listeners.delete(listener)
+    },
     close() {
       if (closed) return
       closed = true
       off()
+      listeners.clear()
       socket.close()
       for (const [id, entry] of pending) {
         clearTimeout(entry.timer)

@@ -1,13 +1,14 @@
 {
   "manifest_version": 3,
   "name": "dsh Chrome Bridge",
-  "description": "Bridges the local dsh agent to this Chrome instance: list tabs, read pages, click/type, run JS and capture screenshots. Runs on the machine only.",
-  "version": "0.1.0",
+  "description": "Bridges the local dsh agent to this Chrome instance: list tabs, read pages, click/type, run JS, capture screenshots and read console output. Runs on the machine only.",
+  "version": "0.2.0",
   "permissions": [
     "tabs",
     "scripting",
     "alarms",
-    "storage"
+    "storage",
+    "debugger"
   ],
   "host_permissions": [
     "<all_urls>"

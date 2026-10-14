@@ -4,8 +4,10 @@
  * Protocol (cdp fallback): list tabs, read page content, navigate, open
  * tabs, capture screenshots, click, type, and evaluate JS — plus the
  * same-origin routes the browser half uses to list tabs, bind them per
- * session, and serve the extension bridge WebSocket, and the pre-step hook
- * that expands a tab citation into a context message.
+ * session, and serve the extension bridge WebSocket, the pre-step hook that
+ * expands a tab citation into a context message, the `chrome-browser` agent
+ * skill (when this composition exposes a skill registry), and the human-help
+ * channel behind `chrome_request_help` (when it exposes a question service).
  * @module @liyuera/dsh-chrome-browser
  */
 import type { Context } from '@deepseek-ai/cordis';
