@@ -20,7 +20,7 @@
  */
 import { describe, expect, it } from 'vitest'
 import { EXTENSION_SOURCE } from './support/extension-source.ts'
-import { loadExtensionFunction } from './support/extension-source.ts'
+import { extractDeclaration, loadExtensionFunction } from './support/extension-source.ts'
 
 /** Names declared at the file's top level (functions and consts). */
 function topLevelNames(source: string): Set<string> {
@@ -181,6 +181,25 @@ describe('a broken helper', () => {
   it('reports an unknown op the same way', () => {
     const outcome = agent()({ op: 'nope' }) as { __dshPageError?: string }
     expect(outcome.__dshPageError).toContain('未知的页面操作')
+  })
+})
+
+describe('the injected dispatcher', () => {
+  /**
+   * Every helper `pageAgent` calls must be declared inside it.
+   *
+   * `chrome.scripting.executeScript` serializes that one function's source, so
+   * a call to a top-level helper compiles fine here and throws a
+   * ReferenceError in the page — which the model then reads as "nothing
+   * matched". Two helpers were added at the top level and nothing noticed,
+   * because the call sites existed and the tests looked at those.
+   */
+  it('calls only helpers it declares itself', () => {
+    const source = extractDeclaration(EXTENSION_SOURCE, 'pageAgent')
+    const declared = new Set([...source.matchAll(/function ([A-Za-z_$][\w$]*)\s*\(/gu)].map(match => match[1]))
+    const dispatched = [...source.matchAll(/case '[a-z-]+':\s*return ([A-Za-z_$][\w$]*)\s*\(/gu)].map(match => match[1])
+    expect(dispatched.length, 'the dispatcher should have several ops').toBeGreaterThan(4)
+    expect(dispatched.filter(name => !declared.has(name))).toEqual([])
   })
 })
 

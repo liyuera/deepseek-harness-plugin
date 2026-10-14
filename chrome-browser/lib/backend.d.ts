@@ -280,7 +280,7 @@ export declare class ExtensionBackend implements BrowserBackend {
     select(tabId: string, selector: string, value: string): Promise<SelectOutcome>;
     waitFor(tabId: string, selector: string, state: WaitState, timeoutMs: number): Promise<boolean>;
     type(tabId: string, selector: string, text: string, clear: boolean): Promise<void>;
-    screenshot(tabId: string): Promise<{
+    screenshot(tabId: string, options?: ScreenshotOptions): Promise<{
         data: string;
         path?: string;
         mime?: string;
@@ -365,6 +365,15 @@ export declare class CdpBackend implements BrowserBackend {
         path?: string;
         mime?: string;
     }>;
+    /**
+     * Clip rectangle covering the whole page, scaled down when it would not fit.
+     *
+     * Without a clip, `captureBeyondViewport` returns exactly one viewport — the
+     * flag permits reaching past the fold, it does not ask for it.
+     * @param endpoint - the tab's CDP endpoint.
+     * @returns the clip rectangle, with the scale that keeps it capturable.
+     */
+    private pageClipOf;
     /**
      * One element's clip rectangle, or a failure naming the selector.
      * @param endpoint - the tab's CDP endpoint.

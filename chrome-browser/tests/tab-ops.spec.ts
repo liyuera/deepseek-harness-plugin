@@ -26,12 +26,13 @@ interface Calls {
   readonly closed: string[]
   readonly navigated: Array<{ tabId: string; url: string }>
   readonly waitedForLoad: string[]
+  readonly shots: Array<{ tabId: string; fullPage?: boolean; selector?: string }>
 }
 
 /** A backend that records opens, closes and navigations. */
 function backend(): { backend: BrowserBackend; calls: Calls } {
   const tab: BackendTab = { id: '7', title: 'T', url: 'https://e.test/', active: true, favicon: '' }
-  const calls: Calls = { opened: [], closed: [], navigated: [], waitedForLoad: [] }
+  const calls: Calls = { opened: [], closed: [], navigated: [], waitedForLoad: [], shots: [] }
   const value = {
     lastEvalWorld: undefined,
     ensure: async () => {},
@@ -59,7 +60,11 @@ function backend(): { backend: BrowserBackend; calls: Calls } {
     select: async () => ({ matched: 0, changed: false, value: '', options: [] }),
     waitFor: async () => false,
     type: async () => {},
-    screenshot: async () => ({ data: '' }),
+    screenshot: async (tabId: string, options?: { fullPage?: boolean; selector?: string }) => {
+      calls.shots.push({ tabId, ...options })
+      // One byte: enough for the tool to write a file and report it.
+      return { data: Buffer.from([0x89]).toString('base64'), mime: 'image/png' }
+    },
     startConsole: async () => {},
     stopConsole: async () => {},
     dispose: () => {},
@@ -76,6 +81,30 @@ function tool(name: string): { definition: ToolDefinition; calls: Calls } {
   if (found === undefined) throw new Error(`${name} is not registered`)
   return { definition: found, calls: fixture.calls }
 }
+
+describe('chrome_screenshot', () => {
+  it('asks for the viewport by default', async () => {
+    const { definition, calls } = tool('chrome_screenshot')
+    await definition.execute({ tabId: '7' }, {} as never)
+    expect(calls.shots).toEqual([{ tabId: '7', fullPage: false }])
+  })
+
+  it('forwards fullPage, which is what makes the capture the whole page', async () => {
+    // `captureBeyondViewport` alone returns exactly one viewport; the flag has
+    // to reach the backend for the clip to be built. It silently did not, once:
+    // the extension backend never accepted the option, and a broken replace
+    // left it that way while reporting success.
+    const { definition, calls } = tool('chrome_screenshot')
+    await definition.execute({ tabId: '7', fullPage: true }, {} as never)
+    expect(calls.shots).toEqual([{ tabId: '7', fullPage: true }])
+  })
+
+  it('forwards a selector, preferring it over fullPage', async () => {
+    const { definition, calls } = tool('chrome_screenshot')
+    await definition.execute({ tabId: '7', fullPage: true, selector: '#main' }, {} as never)
+    expect(calls.shots).toEqual([{ tabId: '7', fullPage: true, selector: '#main' }])
+  })
+})
 
 describe('chrome_close', () => {
   it('closes the tab it was given', async () => {

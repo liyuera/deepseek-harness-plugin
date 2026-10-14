@@ -112,7 +112,7 @@ const SUPPORTED_OPS = [
  * user stayed on a stale extension with nothing to show for it. Only a value
  * carried by the loaded code can tell the host which code is loaded.
  */
-const BUILD_HASH = '9dd296539a1d1e347c833f21c3f3c207a4f62f864803aa40151aa280e9b07e37'
+const BUILD_HASH = 'd20a9c8f1b8b1023b11ed2a3f36001f2e9f452c3c98ed02e976313164927f27e'
 
 /** Introduce this worker: what it runs, what it can answer, and which code it is. */
 async function hello() {
@@ -485,6 +485,36 @@ async function run(command) {
 }
 
 /**
+ * Longest edge a capture may produce, in device pixels.
+ *
+ * A tab can be far taller than this (a package page runs past 12000 CSS px),
+ * and a texture beyond the GPU's limit makes the capture fail outright rather
+ * than downscale it. Width is left to follow the scale, so the aspect ratio is
+ * the page's.
+ */
+const MAX_CAPTURE_PX = 16_000
+
+/**
+ * Clip rectangle covering the whole page, scaled down when it would not fit.
+ * @param tabId - the tab to measure.
+ * @returns the clip rectangle, with the scale that keeps it capturable.
+ */
+async function pageClip(tabId) {
+  const size = await pageExec(tabId, pageAgent, [{ op: 'size' }])
+  if (size === null || typeof size !== 'object' || !(size.width > 0) || !(size.height > 0)) {
+    throw new Error('截图失败:读不到页面尺寸')
+  }
+  const device = size.height * (size.dpr || 1)
+  return {
+    x: 0,
+    y: 0,
+    width: size.width,
+    height: size.height,
+    scale: device > MAX_CAPTURE_PX ? MAX_CAPTURE_PX / device : 1,
+  }
+}
+
+/**
  * One element's clip rectangle, or a failure naming the selector.
  * @param tabId - the tab to measure in.
  * @param selector - CSS selector of the element to capture.
@@ -528,7 +558,9 @@ async function captureViaDebugger(tabId, options) {
   const ours = existing !== undefined
   if (!ours) await chrome.debugger.attach({ tabId: id }, '1.3')
   try {
-    const clip = selector === undefined ? undefined : await rectOf(id, selector)
+    const clip = selector !== undefined
+      ? await rectOf(id, selector)
+      : options !== undefined && options.fullPage === true ? await pageClip(id) : undefined
     const response = await chrome.debugger.sendCommand({ tabId: id }, 'Page.captureScreenshot', {
       format: 'jpeg',
       quality: SCREENSHOT_QUALITY,
@@ -708,6 +740,44 @@ function pageAgent(request) {
     return { found: true, pressed: true, submitted }
   }
 
+  /**
+   * One element's box in PAGE coordinates, for a clipped screenshot.
+   *
+   * `getBoundingClientRect` is viewport-relative; `Page.captureScreenshot`'s
+   * clip is page-relative, so the scroll offset is added back. Page coordinates
+   * are also why the caller asks for `captureBeyondViewport`: the element may
+   * sit below the fold.
+   */
+  function elementRect(selector) {
+    const el = document.querySelector(selector)
+    if (el === null) return { matched: 0 }
+    const rect = el.getBoundingClientRect()
+    return {
+      matched: 1,
+      x: rect.left + window.scrollX,
+      y: rect.top + window.scrollY,
+      width: rect.width,
+      height: rect.height,
+    }
+  }
+
+  /**
+   * The whole page's box and pixel ratio, for a full-page screenshot.
+   *
+   * `captureBeyondViewport` on its own does NOT widen the capture; it only
+   * permits a clip that reaches past the fold. The ratio is here because the
+   * caller's size cap is in device pixels.
+   */
+  function pageSize() {
+    const el = document.documentElement
+    const body = document.body
+    return {
+      width: Math.max(el.scrollWidth, el.clientWidth, body === null ? 0 : body.scrollWidth),
+      height: Math.max(el.scrollHeight, el.clientHeight, body === null ? 0 : body.scrollHeight),
+      dpr: window.devicePixelRatio || 1,
+    }
+  }
+
   // A throw must not escape: `chrome.scripting.executeScript` answers it with
   // `result: undefined` and no `error`, so a malformed selector would reach the
   // model as "no element matched" — the page never saw the query at all.
@@ -716,6 +786,7 @@ function pageAgent(request) {
       case 'click': return clickSelector(request.selector, request.all === true)
       case 'inventory': return interactiveInventory()
       case 'rect': return elementRect(request.selector)
+      case 'size': return pageSize()
       case 'press': return pressKey(request.key, request.selector)
       default: return { __dshPageError: '未知的页面操作:' + request.op }
     }

@@ -29,7 +29,7 @@ import type { WaitState } from './expressions.ts'
 import { Chrome } from './chrome.ts'
 import type { ResolvedChromeConfig } from './chrome.ts'
 import { WsConnection, wsHandshake } from './ws.ts'
-import { rectExpression } from './expressions.ts'
+import { pageSizeExpression, rectExpression } from './expressions.ts'
 import { extensionStamp, extensionVersion } from './extension-package.ts'
 
 /**
@@ -44,6 +44,15 @@ export interface ScreenshotOptions {
   /** Capture one element instead, matched by CSS selector. */
   selector?: string
 }
+
+/**
+ * Longest edge a capture may produce, in device pixels.
+ *
+ * A page can be far taller than this, and a texture beyond the GPU's limit
+ * makes the capture fail outright rather than downscale it. Width follows the
+ * scale, so the aspect ratio stays the page's.
+ */
+const MAX_CAPTURE_PX = 16_000
 
 /** One tab as tools and the picker see it. */
 export interface BackendTab {
@@ -662,11 +671,15 @@ export class ExtensionBackend implements BrowserBackend {
     if (done !== true) throw new Error(`chrome_type: no element matched selector "${selector}"`)
   }
 
-  async screenshot(tabId: string): Promise<{ data: string; path?: string; mime?: string }> {
+  async screenshot(tabId: string, options?: ScreenshotOptions): Promise<{ data: string; path?: string; mime?: string }> {
     // The extension uploads the image bytes over plain HTTP back to the host
     // and returns only the file path: a large base64 frame inside a WS JSON
     // message closed the bridge right after a successful capture.
-    const result = await this.push('screenshot', { tabId }) as { path?: string; mime?: string } | null
+    const result = await this.push('screenshot', {
+      tabId,
+      fullPage: options?.fullPage === true,
+      ...(options?.selector === undefined ? {} : { selector: options.selector }),
+    }) as { path?: string; mime?: string } | null
     return result?.path !== undefined
       ? (result.mime !== undefined
           ? { data: '', path: result.path, mime: result.mime }
@@ -1018,7 +1031,9 @@ export class CdpBackend implements BrowserBackend {
   async screenshot(tabId: string, options?: ScreenshotOptions): Promise<{ data: string; path?: string; mime?: string }> {
     return this.withTab(tabId, async endpoint => {
       const beyond = options?.fullPage === true || options?.selector !== undefined
-      const clip = options?.selector === undefined ? undefined : await this.clipOf(endpoint, options.selector)
+      const clip = options?.selector !== undefined
+        ? await this.clipOf(endpoint, options.selector)
+        : options?.fullPage === true ? await this.pageClipOf(endpoint) : undefined
       const result = await endpoint.call('Page.captureScreenshot', {
         format: 'png',
         captureBeyondViewport: beyond,
@@ -1026,6 +1041,25 @@ export class CdpBackend implements BrowserBackend {
       })
       return { data: typeof result.data === 'string' ? result.data : '', mime: 'image/png' }
     })
+  }
+
+  /**
+   * Clip rectangle covering the whole page, scaled down when it would not fit.
+   *
+   * Without a clip, `captureBeyondViewport` returns exactly one viewport — the
+   * flag permits reaching past the fold, it does not ask for it.
+   * @param endpoint - the tab's CDP endpoint.
+   * @returns the clip rectangle, with the scale that keeps it capturable.
+   */
+  private async pageClipOf(endpoint: CdpEndpoint): Promise<{ x: number; y: number; width: number; height: number; scale: number }> {
+    const size = await this.evaluatePage(endpoint, pageSizeExpression()) as
+      | { width?: unknown; height?: unknown; dpr?: unknown }
+      | undefined
+    const width = Number(size?.width)
+    const height = Number(size?.height)
+    if (!(width > 0) || !(height > 0)) throw new Error('截图失败:读不到页面尺寸')
+    const device = height * (Number(size?.dpr) || 1)
+    return { x: 0, y: 0, width, height, scale: device > MAX_CAPTURE_PX ? MAX_CAPTURE_PX / device : 1 }
   }
 
   /**

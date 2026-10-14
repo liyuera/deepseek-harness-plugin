@@ -324,6 +324,25 @@ export function inventoryExpression() {
  * @param selector - CSS selector of the element to measure.
  * @returns an expression answering `{ matched, x, y, width, height }`.
  */
+/**
+ * The whole page's box and pixel ratio, for a full-page screenshot.
+ *
+ * `captureBeyondViewport` alone does not widen the capture; it permits a clip
+ * that reaches past the fold. The ratio matters because the size cap is in
+ * device pixels.
+ * @returns an expression answering `{ width, height, dpr }`.
+ */
+export function pageSizeExpression() {
+    return `(() => {
+    const el = document.documentElement
+    const body = document.body
+    return {
+      width: Math.max(el.scrollWidth, el.clientWidth, body === null ? 0 : body.scrollWidth),
+      height: Math.max(el.scrollHeight, el.clientHeight, body === null ? 0 : body.scrollHeight),
+      dpr: window.devicePixelRatio || 1,
+    }
+  })()`;
+}
 export function rectExpression(selector) {
     const sel = literal(selector);
     return `(() => {

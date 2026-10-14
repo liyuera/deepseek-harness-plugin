@@ -99,6 +99,15 @@ export declare function inventoryExpression(): string;
  * @param selector - CSS selector of the element to measure.
  * @returns an expression answering `{ matched, x, y, width, height }`.
  */
+/**
+ * The whole page's box and pixel ratio, for a full-page screenshot.
+ *
+ * `captureBeyondViewport` alone does not widen the capture; it permits a clip
+ * that reaches past the fold. The ratio matters because the size cap is in
+ * device pixels.
+ * @returns an expression answering `{ width, height, dpr }`.
+ */
+export declare function pageSizeExpression(): string;
 export declare function rectExpression(selector: string): string;
 export declare function focusExpression(selector: string): string;
 /**
