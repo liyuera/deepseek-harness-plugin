@@ -16,9 +16,10 @@ import type { PreStepDecision } from '@deepseek-ai/dsh-agent'
 import z from '@deepseek-ai/schemastery'
 import { ActivityTracker, withActivity } from './activity.ts'
 import { buildBackend } from './backend.ts'
-import { resolveChromeConfig } from './chrome.ts'
+import { DEFAULT_BRIDGE_PORT, resolveChromeConfig } from './chrome.ts'
 import type { ChromeMode, ResolvedChromeConfig } from './chrome.ts'
 import { ConsoleLog } from './console-log.ts'
+import { installExtensionBridge } from './bridge.ts'
 import { HelpChannel, registerHelpChannel } from './help.ts'
 import { expandTabMentions } from './mentions.ts'
 import { registerChromeRoutes } from './routes.ts'
@@ -62,6 +63,12 @@ export interface ChromePluginConfig {
   timeoutMs?: number
   /** Screenshot output directory; defaults to <tmp>/dsh-chrome-shots. */
   screenshotDir?: string
+  /**
+   * Loopback port of this plugin's own extension bridge (21987). The shipped
+   * extension dials it and cannot discover another; `0` asks the OS for a free
+   * port (tests and diagnostics only).
+   */
+  bridgePort?: number
 }
 
 /** Runtime configuration schema for the plugin. */
@@ -77,6 +84,7 @@ export const Config: z<ChromePluginConfig> = z.object({
   waitLoadMs: z.number().step(1).min(0).default(8000),
   timeoutMs: z.number().step(1).min(100).default(15000),
   screenshotDir: z.string(),
+  bridgePort: z.number().step(1).min(0).max(65535).default(DEFAULT_BRIDGE_PORT),
 })
 
 /**
@@ -105,12 +113,11 @@ export function apply(ctx: Context, config: ChromePluginConfig = {}): void {
     ctx.tools.register(withActivity(definition, activity))
   }
   registerHelpChannel(ctx, help)
-  registerChromeRoutes(
-    ctx,
-    backend,
-    config.screenshotDir ?? resolveChromeConfig(config).screenshotDir,
-    activity,
-  )
+  // Only the extension backend has a bridge to keep on its fixed port.
+  const bridge = resolved.backend === 'extension'
+    ? installExtensionBridge(ctx, backend, resolved.screenshotDir, resolved.bridgePort)
+    : undefined
+  registerChromeRoutes(ctx, backend, resolved.screenshotDir, activity, bridge)
   registerChromeSkill(ctx)
 
   // A message citing tabs gains one context message carrying their URLs and

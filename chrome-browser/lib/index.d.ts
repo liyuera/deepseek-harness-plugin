@@ -48,6 +48,12 @@ export interface ChromePluginConfig {
     timeoutMs?: number;
     /** Screenshot output directory; defaults to <tmp>/dsh-chrome-shots. */
     screenshotDir?: string;
+    /**
+     * Loopback port of this plugin's own extension bridge (21987). The shipped
+     * extension dials it and cannot discover another; `0` asks the OS for a free
+     * port (tests and diagnostics only).
+     */
+    bridgePort?: number;
 }
 /** Runtime configuration schema for the plugin. */
 export declare const Config: z<ChromePluginConfig>;

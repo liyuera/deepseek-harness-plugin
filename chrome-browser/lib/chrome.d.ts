@@ -10,6 +10,14 @@ import { type ChildProcess } from 'node:child_process';
 import { type CdpEndpoint } from './cdp.ts';
 /** How the plugin reaches a browser via CDP (extension backend config separately). */
 export type ChromeMode = 'user' | 'owned';
+/**
+ * Loopback port the shipped Chrome extension dials (`ws://127.0.0.1:21987/...`).
+ * The extension's service worker cannot discover a port, so the bridge keeps
+ * this fixed number while the dsh web server's own port varies. It is the
+ * plugin's own port: reusing a port dsh itself ever listens on (the desktop
+ * client used to, at 19387) would make the two contend for the bind.
+ */
+export declare const DEFAULT_BRIDGE_PORT = 21987;
 /** Fully-resolved plugin configuration (schema defaults already applied). */
 export interface ResolvedChromeConfig {
     /** Backend: `extension` (real Chrome via the extension bridge, default) or `cdp`. */
@@ -38,6 +46,11 @@ export interface ResolvedChromeConfig {
     waitLoadMs: number;
     /** Directory for screenshot files. */
     screenshotDir: string;
+    /**
+     * Loopback port of the plugin's own extension bridge. `0` lets the OS pick
+     * one (tests and diagnostics only — the shipped extension cannot find it).
+     */
+    bridgePort: number;
 }
 /** One page target as the model sees it (internal ws url kept private). */
 export interface ChromeTab {

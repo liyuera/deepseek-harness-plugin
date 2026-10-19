@@ -11,6 +11,14 @@ import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } fr
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { cdpEndpoint, websocketSocket, } from "./cdp.js";
+/**
+ * Loopback port the shipped Chrome extension dials (`ws://127.0.0.1:21987/...`).
+ * The extension's service worker cannot discover a port, so the bridge keeps
+ * this fixed number while the dsh web server's own port varies. It is the
+ * plugin's own port: reusing a port dsh itself ever listens on (the desktop
+ * client used to, at 19387) would make the two contend for the bind.
+ */
+export const DEFAULT_BRIDGE_PORT = 21987;
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 /** Page expression resolving the favicon url (first icon link wins). */
 const FAVICON_EXPRESSION = `(() => {
@@ -246,6 +254,7 @@ export function resolveChromeConfig(config, _platform = process.platform) {
         readTextLimit: config.readTextLimit ?? 30000,
         waitLoadMs: config.waitLoadMs ?? 8000,
         screenshotDir: config.screenshotDir ?? defaultScreenshotDir(),
+        bridgePort: config.bridgePort ?? DEFAULT_BRIDGE_PORT,
     };
 }
 /**

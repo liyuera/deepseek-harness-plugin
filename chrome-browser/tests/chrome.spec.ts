@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import {
   Chrome,
+  DEFAULT_BRIDGE_PORT,
   chromeCandidates,
   copyUserProfileTo,
   defaultUserCopyProfileDir,
@@ -125,6 +126,8 @@ describe('resolveChromeConfig', () => {
     expect(config.timeoutMs).toBe(15000)
     expect(config.readTextLimit).toBe(30000)
     expect(config.waitLoadMs).toBe(8000)
+    expect(config.bridgePort).toBe(DEFAULT_BRIDGE_PORT)
+    expect(config.bridgePort).toBe(21987)
     expect(config.profileDir).toContain('chrome-browser')
     expect(config.profileDir).toContain('profile-9222')
   })
@@ -141,9 +144,10 @@ describe('resolveChromeConfig', () => {
   })
 
   it('lets callers override defaults', () => {
-    const config = resolveChromeConfig({ port: 9333, mode: 'owned', readTextLimit: 1000 })
+    const config = resolveChromeConfig({ port: 9333, mode: 'owned', readTextLimit: 1000, bridgePort: 12345 })
     expect(config.port).toBe(9333)
     expect(config.readTextLimit).toBe(1000)
+    expect(config.bridgePort).toBe(12345)
     expect(config.profileDir).toContain('profile-9333')
   })
 })

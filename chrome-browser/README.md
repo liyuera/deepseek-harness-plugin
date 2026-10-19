@@ -1,6 +1,6 @@
 # @liyuera/dsh-chrome-browser
 
-Chrome 浏览器控制插件(host + 浏览器半边):通过 Chrome 扩展桥(默认)或 Chrome DevTools Protocol (CDP) 控制你的 Chrome——列出标签页、读取网页内容、导航、新开标签页、截图、点击、输入文本、执行 JS;`@` 菜单里列出实时标签页(标题 + URL),选中即把该标签页插进当前这条消息,AI 就在那个标签页里工作。零浏览器自动化运行时依赖(Node 内建 fetch / WebSocket / child_process)。
+Chrome 浏览器控制插件(host + 浏览器半边):通过 Chrome 扩展桥(默认)或 Chrome DevTools Protocol (CDP) 控制你的 Chrome——列出标签页、读取网页内容、导航、新开标签页、截图、点击、输入文本、执行 JS;`@` 菜单里列出实时标签页(标题 + URL),选中即把该标签页插进当前这条消息,AI 就在那个标签页里工作。零浏览器自动化运行时依赖(Node 内建 http / fetch / WebSocket / child_process)。
 
 ## 功能
 
@@ -220,6 +220,14 @@ chrome_request_help { reason: '请在打开的 example.com 页面里登录,然�
 
 **默认 = 扩展后端(推荐)**:控制的就是你**日常运行的 Chrome 本身**——不重启、不复制 profile、无额外窗口。扩展的获取与加载步骤见[安装 → 2. 装配套 Chrome 扩展](#2-装配套-chrome-扩展)。
 
+**扩展桥跑在插件自己的固定回环端口上**,与 dsh web server 监听哪个端口无关:宿主半边在 `127.0.0.1:21987`(配置项 `bridgePort` 的默认值)起一个只服务扩展的 HTTP/WebSocket 服务。桌面版 dsh 让 web server 使用操作系统分配的临时端口(`--port 0`),固定桥是不改扩展也能连上的原因。
+
+21987 是插件自有端口,故意避开 dsh 曾用的 19387(旧桌面端就监听这个端口):桥若复用 dsh 自己的固定端口,就可能和正在运行的 dsh(或旧版 dsh)抢同一个 bind。这避开了 dsh,但**两个 DSH 实例之间仍会争 21987**——见 Known Limitations。
+
+扩展面路由(`/chrome-browser/ext/ws`、`/ext/upload`、`/ext/trace`、`/ext/status`、`/chrome-browser/extension.zip`)在 dsh web server 上始终注册一份,插件固定桥另起时再注册一份;浏览器半边的 `/chrome-browser/tabs` 与 `/chrome-browser/activity` 只在 dsh origin。扩展仍然先连 `ws://127.0.0.1:21987`,失败再试 `ws://127.0.0.1:3080`:固定桥在,第一个地址就连上;源码启动的 `pnpm dsh web` 自己的 web server 在 3080,插件的桥仍是 21987,所以同样连第一个地址,3080 只是扩展的备用地址。
+
+固定端口被占用时(另一个 dsh 实例已经在用)插件不 crash、也不自动重试:该端口没有 listener,扩展面路由仍由 dsh web server 提供,`/chrome-browser/ext/status` 的 `bridge` 字段报出绑定失败原因。dsh 自己的 web server 恰好就监听在 `bridgePort` 上时同样不另起 listener,由 dsh web server 应答。桥用 Node 内建的 `http` 与本包已有的 WebSocket 实现,没有新增运行时依赖。
+
 改了 `extension/` 里的文件后,**从 0.5.0 起插件会自己让扩展重载**——见下。
 
 ### 扩展的自动更新
@@ -236,11 +244,13 @@ Chrome 不会重读「加载已解压」扩展的文件,所以插件自己补了
 
 于是 **npm 升级插件后不用再碰 `chrome://extensions`**。
 
+**例外:首次升级到 21987 这一版**。自动重载握手要求扩展已经连着桥;旧扩展(0.4.1)拨的还是 19387/3080,桌面应用的 dsh 端口每次启动随机,旧扩展没有可用地址,够不到 21987,连不上就收不到握手,所以桌面应用升级后第一次要手动重载(步骤见[安装 → 2](#2-装配套-chrome-扩展));源码启动的 `pnpm dsh web` 在 3080 上仍可能让旧扩展经备用地址连上并自动完成重载,没自动恢复时同样手动重载一次。重载后扩展拨 21987,后续升级恢复自动;新装用户加载的已经是新扩展,没有这一步。
+
 - **同一个指纹只问一次**:如果某次 `reload` 没能读到新文件(比如目录被换掉),宿主不会反复重载——它会停下并在 `/chrome-browser/ext/status` 里报 `stale: true`、`autoReloadAsked: true`,此时需要手动重载一次。换了一个指纹(又一次升级)则会重新尝试,所以同一进程内的多次升级都能落地。
 - **能力检查**:宿主只会发扩展自报支持的 op。扩展文件比插件旧时直接报「扩展不支持 X,请在 chrome://extensions 重新加载该扩展」,而不是让扩展回一个 `unknown op` 这种看不出原因的内部错误。
 - **首次安装仍需手动**:Chrome 没有以编程方式安装解压扩展的接口,新用户在 `chrome://extensions` 加载一次是绕不过去的(除非上架 Chrome 应用商店)。
 
-之后扩展通过本地 WebSocket(`/chrome-browser/ext/ws`)与插件通信:列真实标签页(自带站点图标)、读取/点击/输入/求值/导航/新开/截图。扩展没连上时 `@` 菜单不出现标签页分组,`/chrome-browser/ext/status` 会报 `connected:false`。
+之后扩展通过本地 WebSocket(`/chrome-browser/ext/ws`)与插件通信(走插件的固定桥端口,见上):列真实标签页(自带站点图标)、读取/点击/输入/求值/导航/新开/截图。扩展没连上时 `@` 菜单不出现标签页分组,`/chrome-browser/ext/status` 会报 `connected:false`。
 
 **CDP 后端(可选,`backend: 'cdp'`)**——原有能力保留:
 
@@ -270,16 +280,18 @@ dsh plugin --profile desktop add link:/绝对路径/deepseek-harness-plugin/chro
 
 宿主插件靠一条本地 WebSocket 桥(`/chrome-browser/ext/ws`)与 Chrome 通信,**扩展必须手动装一次**(它不在 Chrome 应用商店)。扩展文件随插件包一起发布,两种取法:
 
-**方式 A:从插件自己的下载路由(推荐)** —— 把当前 dsh 地址拼上下载路径,浏览器打开即下载(桌面应用默认 `http://127.0.0.1:19387`,源码启动默认 `http://127.0.0.1:3080`):
+> ⚠️ **从旧版插件升级:桌面应用里需要手动重新加载一次扩展**。旧扩展(0.4.1)只拨 `ws://127.0.0.1:19387` 与 `ws://127.0.0.1:3080`,够不到新端口 21987;桌面应用的 dsh 端口每次启动随机,旧扩展没有可用的备用地址,连不上桥就收不到自动重载握手。装好新插件并重启应用后,到 `chrome://extensions` 对 `dsh Chrome Control` 点一次「重新加载」,之后扩展拨 21987,后续升级恢复自动更新。源码启动的 `pnpm dsh web` 在 3080 上仍可能让旧扩展经备用地址连上并自动完成重载,没自动恢复时同样手动重载一次。新装用户加载的就是新扩展,没有这一步。
+
+**方式 A:从插件自己的下载路由(推荐)** —— 浏览器打开下载路径即下载。默认地址是 `http://127.0.0.1:21987`:这是插件的固定桥端口(配置项 `bridgePort` 的默认值),不是 dsh 自己监听的端口,桌面应用与源码启动都一样。扩展面路由也照旧注册在 dsh web server 上,所以把**当前 dsh 地址**拼上 `/chrome-browser/extension.zip` 同样可取(桌面版的 dsh 端口每次启动由系统分配):
 
 ```
-http://127.0.0.1:19387/chrome-browser/extension.zip
+http://127.0.0.1:21987/chrome-browser/extension.zip
 ```
 
 命令行等价:
 
 ```sh
-curl -L -o dsh-chrome-browser-extension.zip http://127.0.0.1:19387/chrome-browser/extension.zip
+curl -L -o dsh-chrome-browser-extension.zip http://127.0.0.1:21987/chrome-browser/extension.zip
 unzip dsh-chrome-browser-extension.zip     # 得到 dsh-chrome-browser-extension/ 目录
 ```
 
@@ -295,10 +307,24 @@ $DSH_HOME/profiles/<profile>/node_modules/@liyuera/dsh-chrome-browser/extension/
 
 1. 打开 `chrome://extensions`,右上角开启「开发者模式」;
 2. 点「加载已解压的扩展程序」,选择方式 A 解压出的 `dsh-chrome-browser-extension/` 目录(方式 B 就是那个 `extension/` 目录);
-3. 打开 dsh 页面。扩展会依次尝试 `ws://127.0.0.1:19387`(桌面应用)与 `ws://127.0.0.1:3080`(源码启动),哪个在跑连哪个,不用改代码;
-4. 核对连接:`http://127.0.0.1:19387/chrome-browser/ext/status` 返回 `{"ok":true,"backend":"extension","connected":true}` 即已连上。
+3. 打开 dsh 页面。扩展会依次尝试 `ws://127.0.0.1:21987`(插件的固定桥)与 `ws://127.0.0.1:3080`(源码启动的 dsh web server),哪个在跑连哪个,不用改代码;
+4. 核对连接:打开 `http://127.0.0.1:21987/chrome-browser/ext/status`(或当前 dsh 地址上的同一路径),返回 `connected: true` 且 `bridge.listening: true` 即已连上。
 
-两个端口都不是默认值时,改扩展 `service-worker.js` 顶部的 `WS_URLS`,再到 `chrome://extensions` 点该扩展的「重新加载」——Chrome 不会自动重读已加载的解压扩展。
+`/chrome-browser/ext/status` 的字段:
+
+| 字段 | 含义 |
+| --- | --- |
+| `backend` | 当前后端:`extension`(扩展桥)或 `cdp` |
+| `connected` | 扩展的 WebSocket 是否已连上;`false` = 扩展没装、没重载,或固定桥不可达 |
+| `bridge.port` | 扩展要拨的固定端口(`bridgePort`;配成 `0` 时是系统实际分配到的端口) |
+| `bridge.carrier` | 谁在应答该端口:`plugin` = 插件自建服务器;`webServer` = dsh web server 自己就监听在该端口 |
+| `bridge.listening` | 该端口当前是否有人在服务 |
+| `bridge.error` | 自建服务器绑定失败原因(如 `EADDRINUSE`),只在失败时出现;插件不自动重试 |
+| `stale` / `autoReloadAsked` | 扩展在跑旧文件 / 已请求过自动重载,见[扩展的自动更新](#扩展的自动更新) |
+
+`bridge` 字段只在扩展后端出现;`cdp` 后端没有它。
+
+把 `bridgePort` 改成扩展 `WS_URLS` 里没有的端口(包括 `0`,系统分配、扩展找不到)后,改扩展 `service-worker.js` 顶部的 `WS_URLS`,再到 `chrome://extensions` 点该扩展的「重新加载」——Chrome 不会自动重读已加载的解压扩展。默认 21987 不需要改扩展文件。
 
 ### 3. 重启 dsh
 
@@ -314,6 +340,7 @@ $DSH_HOME/profiles/<profile>/node_modules/@liyuera/dsh-chrome-browser/extension/
       name: '@liyuera/dsh-chrome-browser'
       config:
         backend: extension    # extension(默认,真实 Chrome 通过扩展桥);cdp = DevTools 协议
+        bridgePort: 21987     # 插件自有的扩展桥固定端口(避开 dsh 旧版的 19387);0 = 系统分配(测试/诊断)
         port: 9222            # DevTools 端口(cdp 后端)
         mode: owned           # 仅 cdp:owned = 插件专用 Chrome;user = profile 副本接管
         autoRelaunch: false   # user 模式:默认 false,绝不自动重启你的浏览器
@@ -325,6 +352,8 @@ $DSH_HOME/profiles/<profile>/node_modules/@liyuera/dsh-chrome-browser/extension/
         timeoutMs: 15000      # 单命令/就绪超时
         screenshotDir: null   # 默认 <tmp>/dsh-chrome-shots
 ```
+
+`bridgePort` 是扩展要拨的固定回环端口(默认 **21987**,插件自有端口,理由见[浏览器连接模式](#浏览器连接模式)):dsh web server 的实际监听端口与它不同时,插件在这个端口上另起一个只服务扩展的 HTTP/WS 服务;相同时不另起 listener,由 dsh web server 应答。`bridgePort: 0` 交给系统分配,扩展不知道实际端口,只用于测试/诊断。`backend: 'cdp'` 不启动固定桥,扩展面路由只在 dsh web server 上。
 
 ## Model Experience
 
@@ -358,6 +387,9 @@ DSH_CHROME_SMOKE=1 npx vitest run tests/smoke.spec.ts   # headless Chrome 全链
 - **带空格的文件引用与本插件的引用同形**:两者都是 `@"…"`;匹配不到任何在开的标签页时本插件不注入任何东西,所以不会污染文件引用的消息。
 - **`@` 分组最多渲染 50 行标签页**,更靠后的标签页要靠输入关键词(标题或 URL 都能匹配)过滤出来。
 - **Chrome 未连接时 `@` 分组不出现**:扩展未安装/未打开时列表抓取失败,只在控制台留一条记录,不占菜单空间;原因查询走 `/chrome-browser/ext/status`。
+- **固定桥端口同一时刻只能被一个进程占用**:两个 DSH 实例同时运行、且 `bridgePort` 都是默认 21987 时,只有一个能监听 21987;另一个实例的固定桥绑定失败,它的扩展面路由只在它自己的 dsh web server 上,而 Chrome 里只装了一个扩展,所以只有拿到端口的那个实例能接上 Chrome。两个实例都要用,给其中一个改 `bridgePort` 并同步改扩展 `WS_URLS`。
+- **`bridgePort` 绑定失败不自动重试**:端口被占用时插件不 crash、也不反复重绑;该端口没有 listener,扩展面路由仍由 dsh web server 提供,`/chrome-browser/ext/status` 的 `bridge.listening` 为 `false`、`bridge.error` 给出绑定原因。改端口或释放端口后重启 dsh 才能恢复固定桥。
+- **固定桥仍然只绑 `127.0.0.1` 且没有鉴权**:固定端口上的扩展面路由(含 `/chrome-browser/ext/upload`、`/ext/trace`、`/chrome-browser/extension.zip`)任何本机进程都能访问,与 dsh web server 上同一批路由的暴露面相同。
 - **owned 模式重启 dsh 后需首次调用恢复窗口**:专用 Chrome 的窗口在 dsh 重启后不会自动弹出,第一次使用工具/选择器时拉起(profile 持久化,标签页都在)。
 - **user 模式只支持手动带调试端口启动的 Chrome**:插件不自动接管、不重启;`autoRelaunch` 打开时仍建议先把 dsh 界面移到别的浏览器再使用。
 - **点击/输入是 DOM 事件 + CDP Input**:不模拟真实指针/MIME 手势,对依赖真实 pointer 事件或 iframe/shadow DOM 深层结构的页面不完全可靠;这些场景可用 `chrome_eval` 绕过。`chrome_click` 已把「派发了但真实用户点不到」的情形报进 `warnings`,但**警告是启发式**:命中测试在 shadow DOM 内按元素自己的 root 进行,闭合 shadow root 与 iframe 内部无法判定。

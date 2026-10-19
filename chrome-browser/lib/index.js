@@ -13,8 +13,9 @@
 import z from '@deepseek-ai/schemastery';
 import { ActivityTracker, withActivity } from "./activity.js";
 import { buildBackend } from "./backend.js";
-import { resolveChromeConfig } from "./chrome.js";
+import { DEFAULT_BRIDGE_PORT, resolveChromeConfig } from "./chrome.js";
 import { ConsoleLog } from "./console-log.js";
+import { installExtensionBridge } from "./bridge.js";
 import { HelpChannel, registerHelpChannel } from "./help.js";
 import { expandTabMentions } from "./mentions.js";
 import { registerChromeRoutes } from "./routes.js";
@@ -44,6 +45,7 @@ export const Config = z.object({
     waitLoadMs: z.number().step(1).min(0).default(8000),
     timeoutMs: z.number().step(1).min(100).default(15000),
     screenshotDir: z.string(),
+    bridgePort: z.number().step(1).min(0).max(65535).default(DEFAULT_BRIDGE_PORT),
 });
 /**
  * Register the chrome-browser plugin: eight model tools, the browser-half
@@ -72,7 +74,11 @@ export function apply(ctx, config = {}) {
         ctx.tools.register(withActivity(definition, activity));
     }
     registerHelpChannel(ctx, help);
-    registerChromeRoutes(ctx, backend, config.screenshotDir ?? resolveChromeConfig(config).screenshotDir, activity);
+    // Only the extension backend has a bridge to keep on its fixed port.
+    const bridge = resolved.backend === 'extension'
+        ? installExtensionBridge(ctx, backend, resolved.screenshotDir, resolved.bridgePort)
+        : undefined;
+    registerChromeRoutes(ctx, backend, resolved.screenshotDir, activity, bridge);
     registerChromeSkill(ctx);
     // A message citing tabs gains one context message carrying their URLs and
     // ids. Only the messages this step admits are scanned, and the context

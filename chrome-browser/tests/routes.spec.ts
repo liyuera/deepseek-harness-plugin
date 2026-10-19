@@ -3,11 +3,12 @@ import type { ServerResponse } from 'node:http'
 import type { IncomingMessage } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { CdpBackend } from '../src/backend.ts'
-import { Chrome, resolveChromeConfig } from '../src/chrome.ts'
+import { CdpBackend, ExtensionBackend } from '../src/backend.ts'
+import { Chrome, DEFAULT_BRIDGE_PORT, resolveChromeConfig } from '../src/chrome.ts'
 import type { ChromeTab } from '../src/chrome.ts'
 import { ActivityTracker } from '../src/activity.ts'
-import { registerChromeRoutes } from '../src/routes.ts'
+import { registerChromeRoutes, registerExtensionRoutes } from '../src/routes.ts'
+import type { BridgeReport } from '../src/routes.ts'
 
 /** One fake response, plus what the assertions read back off it. */
 interface FakeResponse extends ServerResponse {
@@ -29,16 +30,20 @@ function fakeWebServer(): {
   }): () => void
   registerUpgrade(route: { path: string; handler: unknown }): () => void
   routes: Record<string, (req: IncomingMessage, res: ServerResponse) => void | Promise<void>>
+  upgrades: Record<string, unknown>
 } {
   const routes: Record<string, (req: IncomingMessage, res: ServerResponse) => void | Promise<void>> = {}
+  const upgrades: Record<string, unknown> = {}
   return {
     routes,
+    upgrades,
     register(route) {
       routes[route.path] = route.handler
       return () => { delete routes[route.path] }
     },
-    registerUpgrade() {
-      return () => {}
+    registerUpgrade(route) {
+      upgrades[route.path] = route.handler
+      return () => { delete upgrades[route.path] }
     },
   }
 }
@@ -205,5 +210,89 @@ describe('chrome-browser routes', () => {
     const res = fakeRes()
     handler(fakeReq('POST', '/chrome-browser/activity'), res)
     expect(res.status).toBe(405)
+  })
+
+  it('registers the extension-facing routes on any carrier and disposes them', () => {
+    const carrier = fakeWebServer()
+    const dispose = registerExtensionRoutes(carrier as never, new CdpBackend(fakeChrome(TABS)), SHOTS)
+    for (const path of [
+      '/chrome-browser/ext/upload',
+      '/chrome-browser/ext/trace',
+      '/chrome-browser/ext/status',
+      '/chrome-browser/extension.zip',
+    ]) {
+      expect(carrier.routes[path], `${path} is missing`).toBeTypeOf('function')
+    }
+    dispose()
+    expect(carrier.routes).toEqual({})
+  })
+
+  it('registers the bridge upgrade with the extension carrier and removes it on dispose', () => {
+    const carrier = fakeWebServer()
+    const dispose = registerExtensionRoutes(carrier as never, new CdpBackend(fakeChrome(TABS)), SHOTS)
+    expect(carrier.upgrades['/chrome-browser/ext/ws']).toBeTypeOf('function')
+    dispose()
+    expect(carrier.upgrades).toEqual({})
+  })
+
+  it('reports the fixed-port bridge in the extension status route', async () => {
+    const server = fakeWebServer()
+    const bridge: BridgeReport = { port: DEFAULT_BRIDGE_PORT, carrier: 'plugin', listening: true }
+    registerChromeRoutes(
+      fakeCtx(server) as never,
+      new ExtensionBackend(resolveChromeConfig({})),
+      SHOTS,
+      new ActivityTracker(),
+      bridge,
+    )
+    const handler = server.routes['/chrome-browser/ext/status'] as (req: IncomingMessage, res: ServerResponse) => void
+    const res = fakeRes()
+    handler(fakeReq('GET', '/chrome-browser/ext/status'), res)
+    expect(JSON.parse(res.body) as unknown).toMatchObject({
+      ok: true,
+      backend: 'extension',
+      connected: false,
+      bridge: { port: DEFAULT_BRIDGE_PORT, carrier: 'plugin', listening: true },
+    })
+  })
+
+  it('reports the bind failure that keeps the bridge from owning its port', async () => {
+    const server = fakeWebServer()
+    const bridge: BridgeReport = {
+      port: DEFAULT_BRIDGE_PORT,
+      carrier: 'plugin',
+      listening: false,
+      error: 'listen EADDRINUSE: address already in use 127.0.0.1:21987',
+    }
+    registerChromeRoutes(
+      fakeCtx(server) as never,
+      new ExtensionBackend(resolveChromeConfig({})),
+      SHOTS,
+      new ActivityTracker(),
+      bridge,
+    )
+    const handler = server.routes['/chrome-browser/ext/status'] as (req: IncomingMessage, res: ServerResponse) => void
+    const res = fakeRes()
+    handler(fakeReq('GET', '/chrome-browser/ext/status'), res)
+    expect(JSON.parse(res.body) as unknown).toMatchObject({
+      bridge: { listening: false, error: expect.stringContaining('EADDRINUSE') },
+    })
+  })
+
+  it('omits the bridge report for the cdp backend, which has no extension bridge', async () => {
+    const server = fakeWebServer()
+    registerChromeRoutes(
+      fakeCtx(server) as never,
+      new CdpBackend(fakeChrome(TABS)),
+      SHOTS,
+      new ActivityTracker(),
+      { port: DEFAULT_BRIDGE_PORT, carrier: 'plugin', listening: true },
+    )
+    const handler = server.routes['/chrome-browser/ext/status'] as (req: IncomingMessage, res: ServerResponse) => void
+    const res = fakeRes()
+    handler(fakeReq('GET', '/chrome-browser/ext/status'), res)
+    const body = JSON.parse(res.body) as { bridge?: unknown; backend: string }
+    expect(body.backend).toBe('cdp')
+    expect(body).not.toHaveProperty('bridge')
   })
 })

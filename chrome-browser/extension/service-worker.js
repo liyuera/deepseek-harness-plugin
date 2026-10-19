@@ -7,19 +7,19 @@
  */
 
 /**
- * dsh web origins, tried in order until one accepts the socket. 19387 is the
- * desktop APP's profile, 3080 a source-launched `pnpm dsh web`; whichever is
- * running wins, so neither environment needs this file edited. The upload
- * origin follows the socket that connected.
+ * dsh web origins, tried in order until one accepts the socket. 21987 is the
+ * plugin's own fixed bridge port (it is not the dsh web server's port, which
+ * the desktop client assigns at launch); 3080 is a source-launched
+ * `pnpm dsh web` fallback. The upload origin follows the socket that connected.
  */
 const WS_URLS = [
-  'ws://127.0.0.1:19387/chrome-browser/ext/ws',
+  'ws://127.0.0.1:21987/chrome-browser/ext/ws',
   'ws://127.0.0.1:3080/chrome-browser/ext/ws',
 ]
 
 let candidate = 0
 /** Origin of the socket that last opened; the HTTP upload posts here. */
-let hostOrigin = 'http://127.0.0.1:19387'
+let hostOrigin = 'http://127.0.0.1:21987'
 let socket = null
 let retryMs = 1000
 let closed = false
@@ -112,7 +112,7 @@ const SUPPORTED_OPS = [
  * user stayed on a stale extension with nothing to show for it. Only a value
  * carried by the loaded code can tell the host which code is loaded.
  */
-const BUILD_HASH = 'd20a9c8f1b8b1023b11ed2a3f36001f2e9f452c3c98ed02e976313164927f27e'
+const BUILD_HASH = '65be701f5531310569fcb63cc5742009504abac3a41227bd89337ae723bf81df'
 
 /** Introduce this worker: what it runs, what it can answer, and which code it is. */
 async function hello() {

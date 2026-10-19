@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "dsh Chrome Control",
   "description": "Lets the local dsh agent drive this Chrome: list tabs, read pages, click and type, run JS, capture screenshots, read console output. Talks to dsh on this machine only.",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "permissions": [
     "tabs",
     "scripting",
