@@ -23,6 +23,13 @@ let hostOrigin = 'http://127.0.0.1:21987'
 let socket = null
 let retryMs = 1000
 let closed = false
+/**
+ * When the last live socket closed; 0 while connected. The worker only stays
+ * warm for a bounded window after this: a restarted dsh host takes seconds to
+ * bind its bridge, but a host that stays down for hours must not pin the
+ * service worker awake.
+ */
+let disconnectedAt = 0
 
 function connect() {
   if (closed) return
@@ -42,6 +49,7 @@ function connect() {
   socket.onopen = () => {
     opened = true
     retryMs = 1000
+    disconnectedAt = 0
     hostOrigin = url.replace(/^ws/u, 'http').replace(/\/chrome-browser\/ext\/ws$/u, '')
     trace('open ' + url)
     hello()
@@ -54,6 +62,7 @@ function connect() {
   socket.onclose = (event) => {
     trace('close ' + (event && event.code !== undefined ? event.code : '?'))
     socket = null
+    disconnectedAt = nextDisconnectAt(opened, disconnectedAt, Date.now())
     // Nothing answered at this origin: advance before retrying, so a machine
     // running only the other profile connects without an edit. A socket that
     // did open keeps its origin — that host is the right one to reconnect to.
@@ -62,9 +71,76 @@ function connect() {
   }
 }
 
+/**
+ * Record when the current warm-window started.
+ *
+ * Only a live socket loss starts the window: a failed attempt is evidence that
+ * the host is still down, not a new loss, and re-stamping it every attempt would
+ * keep the worker warm forever. Passing `previous` back also keeps a fresh
+ * worker cold until it has actually lost a connection.
+ * @param opened - whether the socket that closed had opened.
+ * @param previous - the loss time already recorded; 0 when none.
+ * @param now - close time, milliseconds.
+ * @returns the loss time to record.
+ */
+function nextDisconnectAt(opened, previous, now) {
+  return opened ? now : previous
+}
+
+/**
+ * Plan one bridge retry.
+ *
+ * The worker stays warm (snappy retries, bounded interval) only shortly after
+ * losing a live connection: that is when a restarted host is booting. Past that
+ * window, retries fall back to the cold cadence and the 30s alarm drives
+ * reconnection, so a host that stays down does not keep the worker awake.
+ * @param disconnectedAt - when the last live socket closed; 0 while connected.
+ * @param attemptMs - the delay queued for this attempt.
+ * @param now - current time, milliseconds.
+ * @returns the delay to use now, whether to reset Chrome's idle clock, and the
+ *   delay for the next attempt.
+ */
+function retryPlan(disconnectedAt, attemptMs, now) {
+  const warm = disconnectedAt !== 0 && now - disconnectedAt < 300000
+  return { delay: attemptMs, warm, nextAttemptMs: Math.min(attemptMs * 2, warm ? 5000 : 15000) }
+}
+
+/**
+ * Reset Chrome's 30s idle clock.
+ *
+ * A suspended service worker cannot run its own retry timer, so without an
+ * extension API call the warm retries below die exactly when a slow host boot
+ * would have supplied the bridge. Calling an API resets the idle clock; this is
+ * deliberately limited to the warm window in {@link retryPlan}.
+ */
+function touchWorker() {
+  try {
+    const pending = chrome.alarms.get('dsh-bridge')
+    if (pending !== undefined && typeof pending.catch === 'function') pending.catch(() => {})
+  } catch {
+    // No chrome.alarms in a plain test scope: the retry timer still runs.
+  }
+}
+
 function scheduleRetry() {
-  setTimeout(connect, retryMs)
-  retryMs = Math.min(retryMs * 2, 15000)
+  const plan = retryPlan(disconnectedAt, retryMs, Date.now())
+  if (plan.warm) touchWorker()
+  setTimeout(connect, plan.delay)
+  retryMs = plan.nextAttemptMs
+}
+
+/**
+ * Wake the bridge on ordinary Chrome activity.
+ *
+ * A restarted host can only be found by an attempt; any tab switch, navigation
+ * or window focus wakes the suspended worker, so the bridge comes back as soon
+ * as the user touches Chrome instead of waiting for the 30s alarm.
+ */
+function wakeBridge() {
+  // The same duplicate-socket guard `connect` applies: an in-flight connect or
+  // a live socket must not be replaced by a second one.
+  if (socket !== null && (socket.readyState === 0 || socket.readyState === 1)) return
+  connect()
 }
 
 // MV3 service workers are suspended by Chrome after idle. The browser
@@ -85,6 +161,11 @@ chrome.alarms.onAlarm.addListener(alarm => {
 })
 chrome.runtime.onStartup.addListener(() => connect())
 chrome.runtime.onInstalled.addListener(() => connect())
+chrome.tabs.onActivated.addListener(() => wakeBridge())
+chrome.tabs.onUpdated.addListener((_tabId, change) => {
+  if (change.status === 'complete' || typeof change.url === 'string') wakeBridge()
+})
+chrome.windows.onFocusChanged.addListener(() => wakeBridge())
 
 /**
  * Ops this worker answers, sent to the host on connect and on every heartbeat.
@@ -112,7 +193,7 @@ const SUPPORTED_OPS = [
  * user stayed on a stale extension with nothing to show for it. Only a value
  * carried by the loaded code can tell the host which code is loaded.
  */
-const BUILD_HASH = '6d025c12bba2e73376b264ef911282489baadba72c42e29cb419a5ec7ccdd407'
+const BUILD_HASH = 'd842f7fb0da47b0025c90035ad7f5a5dc5fc8743acd4c7bc85f8b4b231be38f2'
 
 /** Introduce this worker: what it runs, what it can answer, and which code it is. */
 async function hello() {
