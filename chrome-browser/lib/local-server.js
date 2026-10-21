@@ -19,13 +19,23 @@ export class BridgeServer {
     server;
     httpRoutes = new Map();
     upgradeRoutes = new Map();
+    /**
+     * Accepted upgrade sockets. `server.close()` and `closeAllConnections()` do
+     * not reach upgraded connections: the bridge must destroy them itself, or a
+     * host process that lingers after shutdown keeps the extension's socket open
+     * and the extension never reconnects to the next host.
+     */
+    upgraded = new Set();
     boundPort;
     /** The pending bind, so `close` requested during it still closes the listener. */
     listenPromise;
     constructor() {
         this.server = createServer((req, res) => this.dispatchHttp(req, res));
         this.server.on('upgrade', (req, socket, head) => {
-            this.dispatchUpgrade(req, socket, head);
+            const upgraded = socket;
+            this.upgraded.add(upgraded);
+            upgraded.once('close', () => this.upgraded.delete(upgraded));
+            this.dispatchUpgrade(req, upgraded, head);
         });
         // A malformed request must not take the host down: the bridge is exposed to
         // whatever the browser sends, including half-closed sockets.
@@ -118,6 +128,13 @@ export class BridgeServer {
         this.boundPort = undefined;
         if (!this.server.listening)
             return;
+        for (const upgraded of this.upgraded) {
+            // Destroyed here, not left to the process exit: a stuck shutdown keeps
+            // this process alive, and its extension socket would stay connected to a
+            // host nobody serves.
+            upgraded.destroy();
+        }
+        this.upgraded.clear();
         await new Promise(resolve => {
             this.server.close(() => resolve());
             // Keep-alive sockets would otherwise hold the close callback; upgraded

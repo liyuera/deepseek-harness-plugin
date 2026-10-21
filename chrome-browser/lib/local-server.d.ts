@@ -40,6 +40,13 @@ export declare class BridgeServer implements RouteCarrier {
     private readonly server;
     private readonly httpRoutes;
     private readonly upgradeRoutes;
+    /**
+     * Accepted upgrade sockets. `server.close()` and `closeAllConnections()` do
+     * not reach upgraded connections: the bridge must destroy them itself, or a
+     * host process that lingers after shutdown keeps the extension's socket open
+     * and the extension never reconnects to the next host.
+     */
+    private readonly upgraded;
     private boundPort;
     /** The pending bind, so `close` requested during it still closes the listener. */
     private listenPromise;

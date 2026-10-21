@@ -120,14 +120,40 @@ describe('retry scheduling while the host is down', () => {
   })
 })
 
+describe('host liveness watchdog', () => {
+  type HostIsStale = (lastMessageAt: number, now: number) => boolean
+  const hostIsStale = loadExtensionFunction<HostIsStale>(['hostIsStale'], 'hostIsStale')()
+
+  it('trusts the bridge until the host has been silent past two ping periods', () => {
+    expect(hostIsStale(0, 10_000)).toBe(false)
+    expect(hostIsStale(1_000, 46_000)).toBe(false)
+    expect(hostIsStale(1_000, 46_001)).toBe(true)
+  })
+
+  it('drops a silent host instead of staying attached to a zombie process', () => {
+    const interval = EXTENSION_SOURCE.slice(EXTENSION_SOURCE.indexOf('setInterval(() => {'))
+    expect(interval).toContain('hostIsStale(lastHostMessageAt, Date.now())')
+    expect(interval).toContain("trace('close stale-host')")
+    expect(interval).toContain('socket.close()')
+  })
+
+  it('records host activity on open and on every frame', () => {
+    expect(EXTENSION_SOURCE).toContain('lastHostMessageAt = Date.now()')
+    const message = EXTENSION_SOURCE.slice(EXTENSION_SOURCE.indexOf('ws.onmessage = (event) =>'))
+    expect(message.slice(0, 160)).toContain('lastHostMessageAt = Date.now()')
+    expect(message.slice(0, 160)).toContain('handle(event.data)')
+  })
+})
+
 describe('wake-up wiring', () => {
   /** Build `wakeBridge` over a stubbed socket; returns the connect-call count. */
   function wakeCalls(socket: unknown): number {
     let calls = 0
-    const wake = loadExtensionFunction<() => void>(['wakeBridge'], 'wakeBridge', ['socket', 'connect'])(
-      socket,
-      () => { calls += 1 },
-    )
+    const wake = loadExtensionFunction<() => void>(
+      ['bridgeBusy', 'wakeBridge'],
+      'wakeBridge',
+      ['socket', 'connect'],
+    )(socket, () => { calls += 1 })
     wake()
     return calls
   }
@@ -136,9 +162,28 @@ describe('wake-up wiring', () => {
     expect(wakeCalls(null)).toBe(1)
   })
 
-  it('does not stack sockets while connecting or connected', () => {
+  it('does not stack sockets while connecting, connected or closing', () => {
     expect(wakeCalls({ readyState: 0 })).toBe(0)
     expect(wakeCalls({ readyState: 1 })).toBe(0)
+    // CLOSING still owns the global slot: a replacement opened now would be
+    // nulled by the closing socket's onclose.
+    expect(wakeCalls({ readyState: 2 })).toBe(0)
+    expect(wakeCalls({ readyState: 3 })).toBe(1)
+  })
+
+  it('treats only a closed or absent socket as idle', () => {
+    type BridgeBusy = (current: unknown) => boolean
+    const bridgeBusy = loadExtensionFunction<BridgeBusy>(['bridgeBusy'], 'bridgeBusy')()
+    expect(bridgeBusy(null)).toBe(false)
+    expect(bridgeBusy({ readyState: 0 })).toBe(true)
+    expect(bridgeBusy({ readyState: 1 })).toBe(true)
+    expect(bridgeBusy({ readyState: 2 })).toBe(true)
+    expect(bridgeBusy({ readyState: 3 })).toBe(false)
+  })
+
+  it('keeps socket identity checks so an obsolete socket cannot clobber state', () => {
+    expect(EXTENSION_SOURCE).toContain('if (socket !== ws) {')
+    expect(EXTENSION_SOURCE).toContain('if (socket !== ws) return')
   })
 
   it('is wired to tab and window activity so a restarted host is found immediately', () => {

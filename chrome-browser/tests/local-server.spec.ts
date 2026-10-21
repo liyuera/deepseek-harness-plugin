@@ -115,6 +115,27 @@ describe('bridge server', () => {
       .resolves.toBe('echo:hello')
   })
 
+  it('destroys open upgrade sockets on close so a lingering host cannot hold the extension', async () => {
+    const { server, port } = await start()
+    server.registerUpgrade({
+      path: '/chrome-browser/ext/ws',
+      handler: (req, socket, head) => {
+        if (!wsHandshake(req, socket)) return
+        // Accepted and deliberately idle: this is the stuck-host state where
+        // TCP stays open but nothing serves the bridge.
+        void new WsConnection(socket, head)
+      },
+    })
+    const client = new WebSocket(`ws://127.0.0.1:${port}/chrome-browser/ext/ws`)
+    await new Promise<void>((resolve, reject) => {
+      client.onopen = () => resolve()
+      client.onerror = () => reject(new Error('client failed to open'))
+    })
+    const closed = new Promise<void>((resolve) => { client.onclose = () => resolve() })
+    await server.close()
+    await expect(closed).resolves.toBeUndefined()
+  })
+
   it('destroys an upgrade for a path no route claims', async () => {
     const { server, port } = await start()
     server.registerUpgrade({

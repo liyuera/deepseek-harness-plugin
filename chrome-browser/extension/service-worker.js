@@ -23,6 +23,8 @@ let hostOrigin = 'http://127.0.0.1:21987'
 let socket = null
 let retryMs = 1000
 let closed = false
+/** Last time any frame arrived from the host; drives the liveness watchdog. */
+let lastHostMessageAt = 0
 /**
  * When the last live socket closed; 0 while connected. The worker only stays
  * warm for a bounded window after this: a restarted dsh host takes seconds to
@@ -31,25 +33,44 @@ let closed = false
  */
 let disconnectedAt = 0
 
+/**
+ * Whether the current socket blocks a new attempt.
+ *
+ * CONNECTING and OPEN clearly do. CLOSING must too: its `onclose` is still
+ * pending, and it would null the global `socket` after a replacement opened,
+ * orphaning the healthy connection and delaying the real reconnect.
+ * @param current - the tracked socket, or null when none is current.
+ * @returns whether a new socket must wait.
+ */
+function bridgeBusy(current) {
+  return current !== null && current.readyState !== 3
+}
+
 function connect() {
   if (closed) return
-  // Guard against duplicate sockets: alarms/heartbeat may call connect while
-  // a live socket exists. A second socket would make the host replace (and
-  // close) the current one mid-command, and the closed socket's onclose
-  // schedules yet another connect — an open/close flap every ~2s.
-  if (socket !== null && (socket.readyState === 0 || socket.readyState === 1)) return
+  // Guard against duplicate sockets: alarms/heartbeat/wake-ups may call connect
+  // while a socket is live or closing.
+  if (bridgeBusy(socket)) return
   const url = WS_URLS[candidate]
   let opened = false
+  let ws
   try {
-    socket = new WebSocket(url)
+    ws = new WebSocket(url)
   } catch {
     scheduleRetry()
     return
   }
-  socket.onopen = () => {
+  socket = ws
+  ws.onopen = () => {
+    // An obsolete socket must not announce itself or schedule work.
+    if (socket !== ws) {
+      ws.close()
+      return
+    }
     opened = true
     retryMs = 1000
     disconnectedAt = 0
+    lastHostMessageAt = Date.now()
     hostOrigin = url.replace(/^ws/u, 'http').replace(/\/chrome-browser\/ext\/ws$/u, '')
     trace('open ' + url)
     hello()
@@ -57,9 +78,14 @@ function connect() {
     // silently ends console capture. Re-arm whatever was capturing.
     void rearmConsole()
   }
-  socket.onmessage = (event) => { void handle(event.data) }
-  socket.onerror = () => { /* onclose follows */ }
-  socket.onclose = (event) => {
+  ws.onmessage = (event) => {
+    lastHostMessageAt = Date.now()
+    void handle(event.data)
+  }
+  ws.onerror = () => { /* onclose follows */ }
+  ws.onclose = (event) => {
+    // A stale socket's close must not touch the socket that replaced it.
+    if (socket !== ws) return
     trace('close ' + (event && event.code !== undefined ? event.code : '?'))
     socket = null
     disconnectedAt = nextDisconnectAt(opened, disconnectedAt, Date.now())
@@ -70,6 +96,7 @@ function connect() {
     scheduleRetry()
   }
 }
+
 
 /**
  * Record when the current warm-window started.
@@ -137,10 +164,24 @@ function scheduleRetry() {
  * as the user touches Chrome instead of waiting for the 30s alarm.
  */
 function wakeBridge() {
-  // The same duplicate-socket guard `connect` applies: an in-flight connect or
-  // a live socket must not be replaced by a second one.
-  if (socket !== null && (socket.readyState === 0 || socket.readyState === 1)) return
+  // The same duplicate-socket guard `connect` applies: an in-flight, live or
+  // closing socket must not be replaced by a second one.
+  if (bridgeBusy(socket)) return
   connect()
+}
+
+/**
+ * Whether the open bridge has gone silent long enough to abandon it.
+ *
+ * The host sends an application-level ping every 10s. A host process that is
+ * stuck half-shut down can keep the TCP connection ESTABLISHED while serving
+ * nothing; closing the socket is the only way to notice and reconnect.
+ * @param lastMessageAt - when the host last sent any frame; 0 before the first.
+ * @param now - current time, milliseconds.
+ * @returns whether to drop the connection.
+ */
+function hostIsStale(lastMessageAt, now) {
+  return lastMessageAt !== 0 && now - lastMessageAt > 45000
 }
 
 // MV3 service workers are suspended by Chrome after idle. The browser
@@ -149,6 +190,12 @@ function wakeBridge() {
 // and the alarm below wakes a suspended worker so the bridge reconnects.
 setInterval(() => {
   if (socket === null || socket.readyState !== 1) return
+  if (hostIsStale(lastHostMessageAt, Date.now())) {
+    // onclose schedules the retry; nothing else listens for a silent host.
+    trace('close stale-host')
+    socket.close()
+    return
+  }
   send({ kind: 'heartbeat' })
   // Re-introducing here is what lets the host notice that its own files were
   // updated underneath a running extension, without waiting for a reconnect.
@@ -193,7 +240,7 @@ const SUPPORTED_OPS = [
  * user stayed on a stale extension with nothing to show for it. Only a value
  * carried by the loaded code can tell the host which code is loaded.
  */
-const BUILD_HASH = 'd842f7fb0da47b0025c90035ad7f5a5dc5fc8743acd4c7bc85f8b4b231be38f2'
+const BUILD_HASH = '5705d1300af6088a998545e83bf2bc3ce58c5ae69de7d4983ad32fc10b1cc6bb'
 
 /** Introduce this worker: what it runs, what it can answer, and which code it is. */
 async function hello() {
