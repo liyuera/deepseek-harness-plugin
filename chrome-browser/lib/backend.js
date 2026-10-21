@@ -9,7 +9,7 @@
  * @module @liyuera/dsh-chrome-browser/backend
  */
 import { consoleMessageFrom } from "./console-events.js";
-import { clickExpression, focusAndSelectExpression, focusExpression, hoverExpression, inventoryExpression, pressExpression, readPageExpression, readyStateExpression, selectExpression, waitExpression, } from "./expressions.js";
+import { clickExpression, focusAndSelectExpression, focusExpression, hoverExpression, inventoryExpression, pressExpression, readPageExpression, readyStateExpression, selectExpression, waitExpression, webmcpCallExpression, webmcpListExpression, } from "./expressions.js";
 import { Chrome } from "./chrome.js";
 import { WsConnection, wsHandshake } from "./ws.js";
 import { pageSizeExpression, rectExpression } from "./expressions.js";
@@ -22,6 +22,72 @@ import { extensionStamp, extensionVersion } from "./extension-package.js";
  * scale, so the aspect ratio stays the page's.
  */
 const MAX_CAPTURE_PX = 16_000;
+/** Read one untrusted value as a plain record, or undefined. */
+function recordOf(value) {
+    return typeof value === 'object' && value !== null && !Array.isArray(value)
+        ? value
+        : undefined;
+}
+/**
+ * Map a WebMCP listing envelope from either backend onto {@link WebMcpTools}.
+ * @param value - the `__dshWebmcp` envelope.
+ * @returns the listing, with unreadable rows dropped.
+ */
+export function mapWebMcpTools(value) {
+    const envelope = recordOf(value);
+    if (envelope === undefined || envelope.__dshWebmcp !== 1)
+        throw new Error('WebMCP 列表应答格式无法识别');
+    if (envelope.available !== true) {
+        return {
+            available: false,
+            reason: typeof envelope.reason === 'string' && envelope.reason !== '' ? envelope.reason : '该页面没有可用的 WebMCP 工具',
+            tools: [],
+        };
+    }
+    const rows = Array.isArray(envelope.tools) ? envelope.tools : [];
+    return {
+        available: true,
+        tools: rows.flatMap((row) => {
+            const tool = recordOf(row);
+            if (tool === undefined || typeof tool.name !== 'string' || tool.name === '')
+                return [];
+            return [{
+                    name: tool.name,
+                    title: typeof tool.title === 'string' ? tool.title : '',
+                    description: typeof tool.description === 'string' ? tool.description : '',
+                    origin: typeof tool.origin === 'string' ? tool.origin : '',
+                    inputSchema: tool.inputSchema === undefined ? null : tool.inputSchema,
+                    annotations: recordOf(tool.annotations) ?? {},
+                }];
+        }),
+    };
+}
+/**
+ * Map a WebMCP invocation envelope from either backend onto
+ * {@link WebMcpCallOutcome}; a page-reported failure becomes a thrown error so
+ * the model sees the reason and can pick another tool.
+ * @param value - the `__dshWebmcp` envelope.
+ * @returns the outcome.
+ */
+export function mapWebMcpCall(value) {
+    const envelope = recordOf(value);
+    if (envelope === undefined || envelope.__dshWebmcp !== 1)
+        throw new Error('WebMCP 调用应答格式无法识别');
+    if (envelope.ok !== true) {
+        throw new Error(typeof envelope.error === 'string' && envelope.error !== '' ? envelope.error : 'WebMCP 工具调用失败');
+    }
+    const tool = typeof envelope.tool === 'string' ? envelope.tool : '';
+    if (envelope.pending === true) {
+        return {
+            tool,
+            pending: true,
+            ...(typeof envelope.note === 'string' && envelope.note !== '' ? { note: envelope.note } : {}),
+        };
+    }
+    if (envelope.navigated === true)
+        return { tool, navigated: true };
+    return { tool, result: envelope.result };
+}
 /** Shared sleep. */
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 /** Map one extension tab row to the backend face. */
@@ -215,7 +281,7 @@ export class ExtensionBackend {
      * how a restarted service worker gets its capture back.
      */
     static SAFE_RETRY_OPS = new Set([
-        'list-tabs', 'read', 'eval', 'screenshot', 'console-start', 'console-stop',
+        'list-tabs', 'read', 'eval', 'screenshot', 'console-start', 'console-stop', 'webmcp-list',
     ]);
     /**
      * In-flight dedupe keys for side-effectful ops: a second identical command
@@ -412,6 +478,14 @@ export class ExtensionBackend {
         }
         this.lastEvalWorld = envelope.world === 'debugger' ? 'debugger' : 'main';
         return envelope.value;
+    }
+    async webmcpTools(tabId) {
+        return mapWebMcpTools(await this.push('webmcp-list', { tabId }));
+    }
+    async webmcpCall(tabId, name, input) {
+        // Arguments are sent as one object: the page's `executeTool(tool, input)`
+        // takes a single JSON-serializable value, never a spread argument list.
+        return mapWebMcpCall(await this.push('webmcp-call', { tabId, name, input }));
     }
     async click(tabId, selector, all) {
         return mapClickOutcome(await this.push('click', { tabId, selector, all }));
@@ -731,6 +805,14 @@ export class CdpBackend {
         // world to fall back to.
         this.lastEvalWorld = 'main';
         return this.withTab(tabId, endpoint => this.evaluatePage(endpoint, expression));
+    }
+    async webmcpTools(tabId) {
+        // Runtime.evaluate runs in the page's main world and awaits the expression's
+        // promise, so the WebMCP surface is reachable without an extension.
+        return mapWebMcpTools(await this.withTab(tabId, endpoint => this.evaluatePage(endpoint, webmcpListExpression())));
+    }
+    async webmcpCall(tabId, name, input) {
+        return mapWebMcpCall(await this.withTab(tabId, endpoint => this.evaluatePage(endpoint, webmcpCallExpression(name, input))));
     }
     async click(tabId, selector, all) {
         return this.withTab(tabId, async (endpoint) => (mapClickOutcome(await this.evaluatePage(endpoint, clickExpression(selector, all)))));

@@ -41,6 +41,8 @@ export const SKILL_CONTENT: string = `# Chrome 浏览器(用户真实标签页)
 | \`chrome_select\` | 按 option 的 value 选中 \`<select>\`;值不存在时会列出可用值 |
 | \`chrome_press\` | 按一个键(可选先聚焦):Enter 提交表单、Escape 关闭浮层、Tab/方向键移动 |
 | \`chrome_eval\` | 在页面里执行 JS 表达式,按值返回 |
+| \`chrome_webmcp_list\` | 列出该页声明的 **WebMCP 工具**(名称/说明/JSON Schema/安全注解);\`available: false\` 表示浏览器没开 WebMCP 或列表失败,退回 DOM 工具;\`available: true\` 且 \`tools: []\` 表示页面有 API 但当前没注册工具 |
+| \`chrome_webmcp_call\` | 执行一个 WebMCP 工具(页面自己实现的动作,比点 DOM 稳);\`pending: true\` 表示已激活但等用户操作,不要重试;对象结果会以 JSON 字符串返回,需要自行解析 |
 | \`chrome_wait\` | 等元素达到 visible / hidden / attached / detached;\`satisfied: false\` 表示超时,不是成功 |
 | \`chrome_console\` | 采集/读取控制台(start / read / stop),含浏览器自己抛的错误 |
 | \`chrome_request_help\` | 请用户做只有人能做的事(登录/验证码),等答复;\`completed: false\` 表示用户跳过,不要重试 |
@@ -56,6 +58,9 @@ export const SKILL_CONTENT: string = `# Chrome 浏览器(用户真实标签页)
 
 ## 工作顺序
 
+0. **先看有没有 WebMCP**——页面若实现了 WebMCP(需要 Chrome 启用 WebMCP),先 \`chrome_webmcp_list\`;
+   有工具时优先 \`chrome_webmcp_call\`,比点 DOM 稳。\`pending: true\` 表示工具已激活但还在等用户操作
+   (常见于声明式表单),不要重复调用,先请用户确认。
 1. **拿到 tabId**——引用已注入时直接用;否则先 \`chrome_tabs\`。
 2. **先感知再操作**——要动手时用 \`chrome_read { mode: 'interactive' }\`:它直接给出每个可交互元素的
    \`selector\` 以及 \`disabled\` / \`covered\` / \`inView\`,比读正文小得多,而且读完就能点。

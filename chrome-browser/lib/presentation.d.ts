@@ -1,5 +1,5 @@
 /**
- * UI-facing presentation for the eight `chrome_*` tools: the pending-call title,
+ * UI-facing presentation for the `chrome_*` tools: the pending-call title,
  * the completed card, and the concurrency classification the scheduler reads.
  *
  * This module is UI-only — the model still receives exactly the JSON `render`
@@ -120,6 +120,19 @@ export declare function evalCall(args: {
 }): GenericCallView;
 /** `chrome_eval` completed card: the serialized value the model received. */
 export declare function evalResult(outcome: ToolResult): GenericResultView | undefined;
+/** `chrome_webmcp_list` pending call. */
+export declare function webmcpListCall(args: {
+    tabId?: string;
+}): GenericCallView;
+/** `chrome_webmcp_list` completed card: what the page exposes, or why nothing does. */
+export declare function webmcpListResult(outcome: ToolResult): GenericResultView | undefined;
+/** `chrome_webmcp_call` pending call: the tool name only; arguments may hold user data. */
+export declare function webmcpCallCall(args: {
+    name: string;
+    tabId?: string;
+}): GenericCallView;
+/** `chrome_webmcp_call` completed card: the tool result, or what the user still has to do. */
+export declare function webmcpCallResult(outcome: ToolResult): GenericResultView | undefined;
 /** `chrome_console` pending call, titled by the lifecycle step it performs. */
 export declare function consoleCall(args: {
     action: string;

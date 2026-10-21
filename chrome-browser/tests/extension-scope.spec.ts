@@ -86,6 +86,39 @@ describe('injected helpers', () => {
   })
 })
 
+describe('the WebMCP main-world helpers', () => {
+  /**
+   * The helpers `webmcpRequest` hands to `pageExec`, in call order.
+   *
+   * `webmcpBegin` and `webmcpPoll` are called with the plain `tabId` parameter
+   * rather than `command.args.tabId`, so the generic scan above does not see
+   * them; this is the focused check that they obey the same rule.
+   */
+  function injected(): string[] {
+    const body = topLevelBody(EXTENSION_SOURCE, 'webmcpRequest') as string
+    return [...body.matchAll(/pageExec\(\s*[^,]+,\s*([A-Za-z0-9_]+)/gu)].map(match => match[1] as string)
+  }
+
+  it('injects both page-side helpers through executeScript', () => {
+    // The driver runs in the service worker and can call them by name; what
+    // reaches the page is each function's own source.
+    expect(injected()).toEqual(['webmcpBegin', 'webmcpPoll'])
+  })
+
+  it('keeps both helpers clear of the file-level declarations they cannot see', () => {
+    // `document.modelContext` is page JavaScript, so these run in the MAIN
+    // world; a reference to a worker-scope declaration would throw there and be
+    // read back as "no WebMCP surface".
+    const top = topLevelNames(EXTENSION_SOURCE)
+    for (const name of injected()) {
+      const body = topLevelBody(EXTENSION_SOURCE, name) as string
+      expect(body, `${name} must be declared at the top level to be serialized`).toBeDefined()
+      const free = [...top].filter(candidate => candidate !== name && new RegExp(`\\b${candidate}\\b`, 'u').test(body))
+      expect(free, `${name} reads a name the injected scope will not have`).toEqual([])
+    }
+  })
+})
+
 describe('injection arguments', () => {
   /**
    * The dispatch, loaded with the helpers it can reach for these ops.

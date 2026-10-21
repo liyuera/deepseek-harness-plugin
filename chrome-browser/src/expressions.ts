@@ -410,3 +410,92 @@ export function focusAndSelectExpression(selector: string): string {
     return true
   })()`
 }
+
+/** Why a page has no WebMCP surface, shared by the bridge and CDP webs. */
+const NO_WEBMCP_REASON =
+  'document.modelContext 不存在:Chrome 未启用 WebMCP(需 --enable-features=WebMCP 或站点在 origin trial 中),或该页面未实现 WebMCP。'
+
+/**
+ * List a page's WebMCP tools in the MAIN world.
+ *
+ * `document.modelContext` is page JavaScript, so both backends must run this in
+ * the page's own world. The envelope tag keeps a legitimate tool list from being
+ * mistaken for an error payload; the host maps it in `mapWebMcpTools`.
+ * @returns a self-contained async IIFE returning the `__dshWebmcp` envelope.
+ */
+export function webmcpListExpression(): string {
+  return `(async () => {
+  const mc = typeof document === 'object' && document !== null ? document.modelContext : undefined
+  if (mc === undefined || mc === null || typeof mc.getTools !== 'function') {
+    return { __dshWebmcp: 1, available: false, reason: ${literal(NO_WEBMCP_REASON)} }
+  }
+  try {
+    const tools = await mc.getTools()
+    return {
+      __dshWebmcp: 1,
+      available: true,
+      tools: tools.map(tool => ({
+        name: tool.name,
+        title: tool.title || '',
+        description: tool.description || '',
+        origin: tool.origin || location.origin,
+        inputSchema: tool.inputSchema === undefined ? null : tool.inputSchema,
+        annotations: tool.annotations || {},
+      })),
+    }
+  } catch (error) {
+    return { __dshWebmcp: 1, available: false, reason: String((error && error.message) || error) }
+  }
+})()`
+}
+
+/**
+ * Execute one page-declared WebMCP tool in the MAIN world.
+ *
+ * Bounded at 8s: a declarative form tool without `toolautosubmit` stays pending
+ * until the user clicks Submit, and a pending outcome is reported as such rather
+ * than as success or timeout.
+ * @param name - the tool name from `chrome_webmcp_list`.
+ * @param input - the tool arguments, serialized into the expression.
+ * @returns a self-contained async IIFE returning the `__dshWebmcp` envelope.
+ */
+export function webmcpCallExpression(name: string, input: Record<string, unknown>): string {
+  return `(async () => {
+  const name = ${literal(name)}
+  const input = ${JSON.stringify(input)}
+  const mc = typeof document === 'object' && document !== null ? document.modelContext : undefined
+  if (mc === undefined || mc === null || typeof mc.executeTool !== 'function') {
+    return { __dshWebmcp: 1, ok: false, error: ${literal(NO_WEBMCP_REASON)} }
+  }
+  try {
+    const tools = await mc.getTools()
+    const tool = tools.find(candidate => candidate.name === name)
+    if (tool === undefined) {
+      const available = tools.map(candidate => candidate.name)
+      return {
+        __dshWebmcp: 1,
+        ok: false,
+        error: available.length === 0
+          ? '当前页面没有注册任何 WebMCP 工具'
+          : '当前页面没有名为 "' + name + '" 的 WebMCP 工具;可用: ' + available.join(', '),
+      }
+    }
+    const pending = { __dshWebmcp: 1, ok: true, tool: name, pending: true, note: '工具已激活,但 8 秒内没有返回结果:声明式表单通常需要用户在页面上点提交。不要重复调用,先请用户确认。' }
+    let timer
+    const timeout = new Promise(resolve => { timer = setTimeout(() => resolve(pending), 8000) })
+    let result
+    try {
+      result = await Promise.race([mc.executeTool(tool, input), timeout])
+    } finally {
+      clearTimeout(timer)
+    }
+    if (result === pending) return pending
+    if (result === null || result === undefined) {
+      return { __dshWebmcp: 1, ok: true, tool: name, navigated: true }
+    }
+    return { __dshWebmcp: 1, ok: true, tool: name, result }
+  } catch (error) {
+    return { __dshWebmcp: 1, ok: false, error: String((error && error.message) || error) }
+  }
+})()`
+}

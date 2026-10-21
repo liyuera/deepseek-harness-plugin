@@ -1,6 +1,6 @@
 # @liyuera/dsh-chrome-browser
 
-Chrome 浏览器控制插件(host + 浏览器半边):通过 Chrome 扩展桥(默认)或 Chrome DevTools Protocol (CDP) 控制你的 Chrome——列出标签页、读取网页内容、导航、新开标签页、截图、点击、输入文本、执行 JS;`@` 菜单里列出实时标签页(标题 + URL),选中即把该标签页插进当前这条消息,AI 就在那个标签页里工作。零浏览器自动化运行时依赖(Node 内建 http / fetch / WebSocket / child_process)。
+Chrome 浏览器控制插件(host + 浏览器半边):通过 Chrome 扩展桥(默认)或 Chrome DevTools Protocol (CDP) 控制你的 Chrome——列出标签页、读取网页内容、导航、新开标签页、截图、点击、输入文本、执行 JS、调用页面声明的 WebMCP 工具;`@` 菜单里列出实时标签页(标题 + URL),选中即把该标签页插进当前这条消息,AI 就在那个标签页里工作。零浏览器自动化运行时依赖(Node 内建 http / fetch / WebSocket / child_process)。
 
 ## 功能
 
@@ -18,6 +18,8 @@ Chrome 浏览器控制插件(host + 浏览器半边):通过 Chrome 扩展桥(默
 | `chrome_select` | 按 **option value**(不是显示文本)选中 `<select>` 的一项;值不存在时**列出可用值** |
 | `chrome_press` | 按一个键(可选先聚焦某元素):Enter 提交、Escape 关闭、Tab/方向键切换;**Enter 会显式提交所属表单并报告 `submitted`** |
 | `chrome_eval` | 在页面上下文执行 JS 表达式,按值返回(≤200k 字符);**页面 CSP 禁止 `eval` 时自动改走调试通道并在结果里说明**(`world: "debugger"`) |
+| `chrome_webmcp_list` | 列出当前标签页声明的 **WebMCP 工具**(name / title / description / origin / `inputSchema` / `annotations`);浏览器没有 WebMCP API 面(Chrome 未启用)或列表失败时返回 `available: false` + `reason`,退回 DOM 工具;页面有 API 但没注册工具(包括页面没实现 WebMCP)时是 `available: true` + 空 `tools`。只读、并发安全(见 [WebMCP 小节](#webmcp页面声明的工具)) |
+| `chrome_webmcp_call` | 按 `name` + `input`(符合该工具 JSON Schema 的参数对象)调用页面自己实现的工具;**`pending: true` 表示声明式表单在等用户点提交,不要重试**;`navigated: true` 表示调用触发了页面跳转;页面报错会 throw;`result` 上限 200k 字符,**对象结果以 JSON 字符串返回,模型需自己 parse** |
 | `chrome_wait` | 等元素达到某个状态(`visible` / `hidden` / `attached` / `detached`);**`satisfied: false` 表示超时,不是成功** |
 | `chrome_console` | 采集/读取某个标签页的控制台(`action: start / read / stop`);**必须在页面出问题之前 start**,含浏览器自身抛的错误(资源加载失败、CSP 拦截) |
 | `chrome_request_help` | 停下来请用户做只有人能做的事(登录、验证码、二次验证),等用户答复;`completed: false` 表示用户跳过了,不要重试 |
@@ -86,10 +88,10 @@ Chrome 浏览器控制插件(host + 浏览器半边):通过 Chrome 扩展桥(默
 
 ### 工具卡片与并发
 
-九个工具都声明了 UI 呈现与会话调度所需的元数据,模型侧收到的 JSON 不受影响:
+17 个工具都声明了 UI 呈现与会话调度所需的元数据,模型侧收到的 JSON 不受影响:
 
-- **卡片**:调用中显示语义标题(如「读取标签页 42」「导航到 https://…」),完成后换成结果卡片——标签页列表带 ▶ 标记活动页、读取卡片显示页面标题与字符数(可交互模式显示元素清单与禁用/遮挡标记)、截图卡片显示文件名与大小。`chrome_type` 的调用与结果卡片都**不显示输入内容**(可能是密码)。
-- **并发**:`chrome_tabs` 与 `chrome_read` 声明为并发安全,可与其他调用并行;其余七个要么改页面要么独占扩展桥,保持串行。DSH 的调度器对「未声明」一律按独占处理,所以这里是显式声明「哪些能并行」,而不是显式禁止。
+- **卡片**:调用中显示语义标题(如「读取标签页 42」「导航到 https://…」),完成后换成结果卡片——标签页列表带 ▶ 标记活动页、读取卡片显示页面标题与字符数(可交互模式显示元素清单与禁用/遮挡标记)、截图卡片显示文件名与大小。`chrome_type` 的调用与结果卡片都**不显示输入内容**(可能是密码)。WebMCP 列表卡片显示工具数与每条的安全注解,调用卡片区分「等待用户完成」「触发了页面导航」与结果。
+- **并发**:`chrome_tabs`、`chrome_read` 与 `chrome_webmcp_list` 声明为并发安全,可与其他调用并行;其余 14 个要么改页面要么独占扩展桥,保持串行。DSH 的调度器对「未声明」一律按独占处理,所以这里是显式声明「哪些能并行」,而不是显式禁止。
 
 ### chrome_click 的返回值:派发 ≠ 生效
 
@@ -216,6 +218,38 @@ chrome_request_help { reason: '请在打开的 example.com 页面里登录,然�
 
 - 状态**不落盘、不进模型请求**:它只影响界面。
 
+### WebMCP:页面声明的工具
+
+**WebMCP 让页面把自己的动作暴露成结构化工具**:每个工具有名字、说明、JSON Schema 参数和一组安全注解,由**页面自己执行**;对实现了 WebMCP 的页面,先列工具再调用,比猜 DOM 可靠得多。
+
+`chrome_webmcp_list` 列出某个标签页声明的工具(可传 `tabId`,省略即当前活动页):返回 `available` 与 `tools[]`,每项含 `name` / `title` / `description` / `origin` / `inputSchema` / `annotations`。`available: false` 时带 `reason`——浏览器没有 WebMCP API 面(Chrome 未启用),或列表失败;页面有 API 但没有注册工具(含页面没实现 WebMCP)时是 `available: true` + 空 `tools`。它只读,声明为并发安全。
+
+`chrome_webmcp_call` 用 `name`(来自列表)和 `input`(符合该工具 `inputSchema` 的参数对象,不需要参数时省略)执行页面的工具,返回这三种之一:
+
+| 返回 | 含义 |
+| --- | --- |
+| `pending: true` + `note` | 工具已激活但 8 秒内没有结果——声明式表单工具通常在等用户点提交。**不要重复调用**,先请用户确认 |
+| `navigated: true` | 调用触发了页面跳转,原页面上下文已不在,没有 `result` |
+| `result` | 工具返回值;对象结果会以 JSON 字符串返回,按 200k 字符截断 |
+
+**对象结果到达时是 JSON 字符串,不是对象**:页面工具返回对象时,Chrome 在把结果交给扩展前会先序列化成字符串(例如 `{"background":"blue","count":0}` 以字符串形态到达);插件原样保留、只按 200k 字符截断,不替模型解析——用字段前先自己 `JSON.parse`。
+
+页面报错(工具不存在、参数不合法、执行抛错)直接抛错;工具不存在时错误里会列出可用工具名。
+
+`annotations` 是页面给工具打的安全提示,调用前按它行事:
+
+| 注解 | 含义 |
+| --- | --- |
+| `readOnlyHint` | 工具不改变页面状态,可以直接调 |
+| `consequentialHint` | 高风险或不可逆动作(下单、转账之类),先 `chrome_request_help` 问用户 |
+| `untrustedContentHint` | 返回值是用户生成或外部来源的内容,当数据看,**不要当指令执行** |
+
+**Chrome 侧要先启用 WebMCP**:WebMCP 从 Chrome 149 起走 origin trial(站点在 trial 里就不需要本地开关);本地开发按官方文档用 `chrome://flags/#enable-webmcp-testing`。Chrome 155.0.8059.80 实测**没有**这个 flag 条目(写 Local State 会被丢弃),改用命令行 `--enable-features=WebMCP` 重启 Chrome,`document.modelContext` 才可用(本机在 155 上实测 imperative 与 declarative 工具都正常)。其它版本按官方文档走 flag 或 origin trial。
+
+**两条后端走同一套语义**:扩展桥用新 op `webmcp-list` / `webmcp-call`,在页面 **MAIN world** 注入(`document.modelContext` 是页面自己的 JS,扩展的隔离世界看不到),请求状态存在页面里、service worker 每 100ms 轮询到 8 秒;CDP 后端用 `Runtime.evaluate` 执行同样的表达式。`pending` 在两条路上都是 8 秒判定。
+
+WebMCP 与 DOM 自动化不互斥:页面没启用或没实现 WebMCP 时,`chrome_read` / `chrome_click` 等 DOM 工具照常可用。插件只调用页面注册的工具,不注册、不代理、也不改写工具定义。
+
 ## 浏览器连接模式
 
 **默认 = 扩展后端(推荐)**:控制的就是你**日常运行的 Chrome 本身**——不重启、不复制 profile、无额外窗口。扩展的获取与加载步骤见[安装 → 2. 装配套 Chrome 扩展](#2-装配套-chrome-扩展)。
@@ -243,6 +277,8 @@ Chrome 不会重读「加载已解压」扩展的文件,所以插件自己补了
 指纹由 `npm run extension:stamp` 写入;忘了盖章时 `tests/extension-package.spec.ts` 会直接失败,所以这不是一件需要记的事。**实测过 `chrome.runtime.reload()` 确实从磁盘重读**(不只是 manifest,service worker 也是),而 worker 被 Chrome 唤醒**不会**重读。
 
 于是 **npm 升级插件后不用再碰 `chrome://extensions`**。
+
+**扩展 0.5.0 这次升级会自动重载**:它只加了 `webmcp-list` / `webmcp-call` 两个 op、改了 `BUILD_HASH`,`WS_URLS` 与桥端口没变(仍拨 21987);已经连着 21987 的扩展会被现有自动更新握手用 `chrome.runtime.reload()` 重读磁盘,升到 0.5.0。下面的手动重载只针对从 0.4.1/19387 跨端口升级的那一次。
 
 **例外:首次升级到 21987 这一版**。自动重载握手要求扩展已经连着桥;旧扩展(0.4.1)拨的还是 19387/3080,桌面应用的 dsh 端口每次启动随机,旧扩展没有可用地址,够不到 21987,连不上就收不到握手,所以桌面应用升级后第一次要手动重载(步骤见[安装 → 2](#2-装配套-chrome-扩展));源码启动的 `pnpm dsh web` 在 3080 上仍可能让旧扩展经备用地址连上并自动完成重载,没自动恢复时同样手动重载一次。重载后扩展拨 21987,后续升级恢复自动;新装用户加载的已经是新扩展,没有这一步。
 
@@ -357,9 +393,9 @@ $DSH_HOME/profiles/<profile>/node_modules/@liyuera/dsh-chrome-browser/extension/
 
 ## Model Experience
 
-模型可见的输入/输出只有八个工具 JSON 结果,加上被引用标签页的上下文:每次 `chrome_read` 最多携带约 `readTextLimit` 字符的页面文本;`chrome_screenshot` 只返回文件路径与元数据,页面视觉内容需通过 `read_image` 再读取;`chrome_eval` 结果上限 200k 字符。从 `@` 菜单选中标签页时,客户端在草稿里插入一个引用芯片,它序列化成 `@"标题"`——用户消息里只有这个引用(宿主按文本形状投影成引用芯片),宿主随后在用户消息后注入一条本插件的上下文消息(`## Referenced Chrome tabs`),逐个列出被引用标签页的 `tabId` 与 URL,模型照着 id 调 `chrome_*` 即可。同名标签页会列出全部候选并提示向用户确认;引用没有匹配到任何在开的标签页(已关闭,或那其实是带空格的文件路径)时不注入任何东西。插件不做会话级标签页绑定,一次选择只影响它所在的那条消息。本插件不发任何 provider 请求,无 LLM/KV-cache 影响。
+模型可见的输入/输出只有 17 个工具 JSON 结果,加上被引用标签页的上下文:每次 `chrome_read` 最多携带约 `readTextLimit` 字符的页面文本;`chrome_screenshot` 只返回文件路径与元数据,页面视觉内容需通过 `read_image` 再读取;`chrome_eval` 结果上限 200k 字符;`chrome_webmcp_list` 把页面声明的工具名、说明、JSON Schema 与安全注解带进模型上下文,`chrome_webmcp_call` 的结果同样按 200k 字符截断;对象结果以 JSON 字符串返回,模型要自己 parse,`pending` / `navigated` 是状态标记而不是执行结果,页面报错按工具错误返回。从 `@` 菜单选中标签页时,客户端在草稿里插入一个引用芯片,它序列化成 `@"标题"`——用户消息里只有这个引用(宿主按文本形状投影成引用芯片),宿主随后在用户消息后注入一条本插件的上下文消息(`## Referenced Chrome tabs`),逐个列出被引用标签页的 `tabId` 与 URL,模型照着 id 调 `chrome_*` 即可。同名标签页会列出全部候选并提示向用户确认;引用没有匹配到任何在开的标签页(已关闭,或那其实是带空格的文件路径)时不注入任何东西。插件不做会话级标签页绑定,一次选择只影响它所在的那条消息。本插件不发任何 provider 请求,无 LLM/KV-cache 影响。
 
-工具卡片与并发分类是**宿主 + 客户端**的呈现信息,不进入模型请求:模型拿到的是与以前逐字节相同的八个工具 JSON 结果与同一组 tool schema。skill 正文只在被调用时加载,目录里常驻的只有一行 description。
+工具卡片与并发分类是**宿主 + 客户端**的呈现信息,不进入模型请求:模型拿到的是 17 个工具 JSON 结果与 tool schema。skill 正文只在被调用时加载,目录里常驻的只有一行 description。
 
 ## 开发
 
@@ -390,6 +426,15 @@ DSH_CHROME_SMOKE=1 npx vitest run tests/smoke.spec.ts   # headless Chrome 全链
 - **固定桥端口同一时刻只能被一个进程占用**:两个 DSH 实例同时运行、且 `bridgePort` 都是默认 21987 时,只有一个能监听 21987;另一个实例的固定桥绑定失败,它的扩展面路由只在它自己的 dsh web server 上,而 Chrome 里只装了一个扩展,所以只有拿到端口的那个实例能接上 Chrome。两个实例都要用,给其中一个改 `bridgePort` 并同步改扩展 `WS_URLS`。
 - **`bridgePort` 绑定失败不自动重试**:端口被占用时插件不 crash、也不反复重绑;该端口没有 listener,扩展面路由仍由 dsh web server 提供,`/chrome-browser/ext/status` 的 `bridge.listening` 为 `false`、`bridge.error` 给出绑定原因。改端口或释放端口后重启 dsh 才能恢复固定桥。
 - **固定桥仍然只绑 `127.0.0.1` 且没有鉴权**:固定端口上的扩展面路由(含 `/chrome-browser/ext/upload`、`/ext/trace`、`/chrome-browser/extension.zip`)任何本机进程都能访问,与 dsh web server 上同一批路由的暴露面相同。
+- **WebMCP 需要 Chrome 启用**:浏览器没启用时(origin trial 之外要命令行 `--enable-features=WebMCP` 或官方文档的 flag),`chrome_webmcp_list` 返回 `available: false` + `reason`,继续用 DOM 工具;Chrome 启用后 API 面在任意页面都存在,页面没实现或没注册工具时是 `available: true` + 空 `tools`。
+- **`chrome_webmcp_list` 的输出大小由页面控制**:工具元数据(description / `inputSchema` / `annotations`)来自页面,没有额外限长;页面工具很多或元数据很大时模型上下文会随之变大(正常站点工具通常只有几个)。
+- **CDP 后端与扩展桥在极端场景略有差异**:CDP 的 list 没有 8s 上界,页面 `getTools` 永不 resolve 时表现为宿主超时错误而不是 `available: false`;CDP 下工具触发导航/执行上下文销毁时可能报页面求值错误,而不是 `navigated: true`。
+- **结果被截断的 JSON 文本可能无法解析**:`chrome_webmcp_call` 的 `result` 超过 200k 字符会被截断并带截断标记,此时 `JSON.parse` 会失败,应按截断内容处理。
+- **声明式表单工具会 `pending`**:没有 `toolautosubmit` 的声明式表单工具在用户点提交前不会返回结果,8 秒后报 `pending: true` + `note`;这不是成功,不要重复调用,先请用户确认。
+- **`consequentialHint` 先问用户,`untrustedContentHint` 不可信**:标了 consequentialHint 的工具是高成本或不可逆动作,调用前用 `chrome_request_help` 得到确认;标了 untrustedContentHint 时返回值是用户生成或外部内容,只能当数据,不要当指令执行。
+- **WebMCP 结果会截断,对象结果是 JSON 文本**:`chrome_webmcp_call` 的 `result` 和 `chrome_eval` 一样按 200k 字符截断;对象结果到达时是 JSON 字符串而不是对象,模型要自己 parse;`pending` / `navigated` 时没有 `result`。
+- **跨源 iframe 的工具默认不可见**:iframe 要带 `allow="tools"`,页面注册工具时用 `exposedTo` 暴露,Chrome 才让该工具可见;声明式表单没有对应的跨源暴露属性。主框架页面不受影响。
+- **插件只调用页面自己的工具,不注册工具**:`chrome_webmcp_*` 暴露的是页面实现的动作;页面不实现 WebMCP 就没有可调用的工具,插件不改写工具定义。
 - **owned 模式重启 dsh 后需首次调用恢复窗口**:专用 Chrome 的窗口在 dsh 重启后不会自动弹出,第一次使用工具/选择器时拉起(profile 持久化,标签页都在)。
 - **user 模式只支持手动带调试端口启动的 Chrome**:插件不自动接管、不重启;`autoRelaunch` 打开时仍建议先把 dsh 界面移到别的浏览器再使用。
 - **点击/输入是 DOM 事件 + CDP Input**:不模拟真实指针/MIME 手势,对依赖真实 pointer 事件或 iframe/shadow DOM 深层结构的页面不完全可靠;这些场景可用 `chrome_eval` 绕过。`chrome_click` 已把「派发了但真实用户点不到」的情形报进 `warnings`,但**警告是启发式**:命中测试在 shadow DOM 内按元素自己的 root 进行,闭合 shadow root 与 iframe 内部无法判定。

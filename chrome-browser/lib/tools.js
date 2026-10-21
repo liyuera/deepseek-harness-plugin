@@ -7,7 +7,7 @@
 import { copyFileSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { defineTool } from '@deepseek-ai/dsh-tools';
-import { clickCall, clickResult, closeCall, closeResult, consoleCall, consoleResult, evalCall, evalResult, helpCall, helpResult, hoverCall, hoverResult, navigateCall, navigateResult, openCall, openResult, pressCall, pressResult, readCall, readResult, screenshotCall, screenshotResult, selectCall, selectResult, tabsCall, tabsResult, typeCall, typeResult, waitCall, waitResult, } from "./presentation.js";
+import { clickCall, clickResult, closeCall, closeResult, consoleCall, consoleResult, evalCall, evalResult, helpCall, helpResult, hoverCall, hoverResult, navigateCall, navigateResult, openCall, openResult, pressCall, pressResult, readCall, readResult, screenshotCall, screenshotResult, selectCall, selectResult, tabsCall, tabsResult, typeCall, typeResult, waitCall, waitResult, webmcpCallCall, webmcpCallResult, webmcpListCall, webmcpListResult, } from "./presentation.js";
 import { clipJson, clipText, normalizePageText, windowText } from "./text.js";
 /** chrome_eval result serialization budget, characters. */
 const EVAL_RESULT_LIMIT = 200_000;
@@ -530,6 +530,73 @@ export function chromeToolDefinitions(backend, config, consoleLog, help) {
                     // Absent on the normal route; present when the page's CSP forced the
                     // expression through the debugger protocol instead.
                     ...(backend.lastEvalWorld === 'debugger' ? { world: 'debugger' } : {}),
+                };
+            },
+        }),
+        defineTool({
+            name: 'chrome_webmcp_list',
+            description: 'List the WebMCP tools the page in one tab declares. A WebMCP page exposes structured tools (name, '
+                + 'description, JSON Schema input, safety annotations) that the page itself executes, which is far more '
+                + 'reliable than guessing at DOM clicks — check this before chrome_read/chrome_click when the page may '
+                + 'implement WebMCP. `available: false` means the browser has no WebMCP surface (Chrome needs '
+                + '--enable-features=WebMCP or an origin trial) or listing failed — fall back to the DOM tools. '
+                + '`available: true` with an empty `tools` array means the page has the API but registers no tools right now.',
+            parameters: {
+                tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the tab the user is looking at; omitting it means 'active' too." },
+            },
+            output: { schema: { type: 'json' }, render },
+            isConcurrencySafe: () => true,
+            presentCall: args => webmcpListCall(args),
+            presentResult: (_args, outcome) => webmcpListResult(outcome),
+            execute: async (args, _exec) => {
+                const tabId = await resolveTabId(backend, _exec, args.tabId);
+                const listing = await backend.webmcpTools(tabId);
+                return {
+                    tabId,
+                    available: listing.available,
+                    tools: listing.tools,
+                    ...(listing.reason === undefined ? {} : { reason: listing.reason }),
+                };
+            },
+        }),
+        defineTool({
+            name: 'chrome_webmcp_call',
+            description: 'Execute one WebMCP tool the page declares (see chrome_webmcp_list). `input` is the tool\'s JSON Schema '
+                + 'arguments. `pending: true` means the page activated the tool but it has not settled — declarative form '
+                + 'tools wait for the user to click Submit; do not call it again, ask the user first. `navigated: true` '
+                + 'means the call changed the page. `result` is the page\'s returned value: Chrome serializes structured '
+                + 'returns to JSON TEXT, so JSON.parse it before reading fields; a plain-text return stays text. '
+                + 'Respect consequentialHint: confirm with the user '
+                + '(chrome_request_help) before high-stakes tools.',
+            parameters: {
+                name: { type: 'string', required: true, description: '工具名,来自 chrome_webmcp_list 的 name。' },
+                input: { type: 'object', additionalProperties: true, description: '该工具 inputSchema 对应的参数对象;不需要参数时省略。' },
+                tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the tab the user is looking at; omitting it means 'active' too." },
+            },
+            output: { schema: { type: 'json' }, render },
+            presentCall: args => webmcpCallCall(args),
+            presentResult: (_args, outcome) => webmcpCallResult(outcome),
+            execute: async (args, _exec) => {
+                const tabId = await resolveTabId(backend, _exec, args.tabId);
+                const input = typeof args.input === 'object' && args.input !== null && !Array.isArray(args.input) ? args.input : {};
+                const outcome = await backend.webmcpCall(tabId, args.name, input);
+                return {
+                    tabId,
+                    tool: outcome.tool,
+                    ...(outcome.pending === true
+                        ? { pending: true, ...(outcome.note === undefined ? {} : { note: outcome.note }) }
+                        : {}),
+                    ...(outcome.navigated === true ? { navigated: true } : {}),
+                    ...(outcome.pending === true || outcome.navigated === true || outcome.result === undefined
+                        ? {}
+                        : {
+                            // Chrome already serializes object returns to a JSON STRING. Clipping
+                            // that text keeps the model-facing value one JSON layer deep; running
+                            // clipJson on it again would escape the text a second time.
+                            result: typeof outcome.result === 'string'
+                                ? clipText(outcome.result, EVAL_RESULT_LIMIT)
+                                : clipJson(outcome.result, EVAL_RESULT_LIMIT),
+                        }),
                 };
             },
         }),

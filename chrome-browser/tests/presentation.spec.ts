@@ -35,13 +35,15 @@ const TOOL_NAMES = [
   'chrome_press',
   'chrome_select',
   'chrome_eval',
+  'chrome_webmcp_list',
+  'chrome_webmcp_call',
   'chrome_wait',
   'chrome_request_help',
   'chrome_console',
 ] as const
 
 /** Tools that only observe: they may run alongside sibling calls. */
-const PARALLEL_SAFE = ['chrome_tabs', 'chrome_read']
+const PARALLEL_SAFE = ['chrome_tabs', 'chrome_read', 'chrome_webmcp_list']
 
 /** Arguments that satisfy each tool's schema, for the presenter tests. */
 const SAMPLE_ARGS: Record<(typeof TOOL_NAMES)[number], unknown> = {
@@ -57,6 +59,8 @@ const SAMPLE_ARGS: Record<(typeof TOOL_NAMES)[number], unknown> = {
   chrome_press: { key: 'Enter' },
   chrome_select: { selector: '#country', value: 'CA' },
   chrome_eval: { expression: 'document.title' },
+  chrome_webmcp_list: { tabId: '1' },
+  chrome_webmcp_call: { name: 'search', input: { q: '手机' } },
   chrome_wait: { selector: '#ready' },
   chrome_request_help: { reason: '请登录' },
   chrome_console: { action: 'read' },
@@ -85,6 +89,8 @@ function fakeBackend(overrides: Partial<BrowserBackend> = {}): BrowserBackend {
     navigate: async () => {},
     waitForLoad: async () => {},
     evaluate: async () => undefined,
+    webmcpTools: async () => ({ available: false as const, reason: 'test backend', tools: [] }),
+    webmcpCall: async () => { throw new Error('no WebMCP tool in the test backend') },
     click: async () => EMPTY_CLICK,
     hover: async () => ({ matched: 0, hovered: false }),
     press: async () => ({ found: true, pressed: true, submitted: false }),
@@ -128,7 +134,7 @@ function serialized(view: ToolCallView | ToolResultView | undefined): string {
 }
 
 describe('concurrency classification', () => {
-  it('registers exactly the fifteen chrome tools', () => {
+  it('registers exactly the seventeen chrome tools', () => {
     expect([...definitions().keys()]).toEqual([...TOOL_NAMES])
   })
 
@@ -173,6 +179,20 @@ describe('soft argument validation', () => {
     expect(click?.isConcurrencySafe).toBeUndefined()
     expect(click?.isConcurrencySafe?.(SAMPLE_ARGS.chrome_click) ?? false).toBe(false)
   })
+
+  it('renders no WebMCP card when the logged arguments no longer validate', () => {
+    // A card may be replayed from logged arguments an older schema produced;
+    // the tab id and the required tool name are what those calls carried.
+    expect(definitions().get('chrome_webmcp_list')?.presentResult?.(
+      { tabId: 42 },
+      outcome({ tabId: '1', available: true, tools: [] }),
+    )).toBeUndefined()
+    expect(definitions().get('chrome_webmcp_call')?.presentResult?.(
+      {},
+      outcome({ tabId: '1', tool: 'search', result: '{}' }),
+    )).toBeUndefined()
+    expect(definitions().get('chrome_webmcp_call')?.presentCall?.({})).toBeUndefined()
+  })
 })
 
 describe('pending call titles', () => {
@@ -205,6 +225,17 @@ describe('pending call titles', () => {
     const view = definitions().get('chrome_eval')?.presentCall?.({ expression: 'document.title' })
     expect(view).toMatchObject({ kind: 'execute', rawInput: 'document.title' })
     expect(view?.title).toBe('执行 JS 当前标签页')
+  })
+
+  it('names the WebMCP tool a call activates without echoing its arguments', () => {
+    // `input` is arbitrary page data (searches, credentials) and the title may
+    // end up in a list a bystander reads; only the tool name belongs there.
+    const view = definitions().get('chrome_webmcp_call')?.presentCall?.({ name: 'searchItems', input: { query: '手机' } })
+    expect(view).toMatchObject({ card: 'generic', kind: 'execute', title: '调用 WebMCP 工具 searchItems' })
+    expect(serialized(view)).not.toContain('手机')
+
+    const list = definitions().get('chrome_webmcp_list')?.presentCall?.({ tabId: '42' })
+    expect(list).toMatchObject({ card: 'generic', kind: 'search', title: '列出 WebMCP 工具 42' })
   })
 })
 
@@ -298,6 +329,87 @@ describe('completed cards', () => {
     )
     expect(view?.title).toBe('求值结果')
     expect(body(view)).toBe('42')
+  })
+
+  it('lists WebMCP tools with their safety hints', () => {
+    const view = definitions().get('chrome_webmcp_list')?.presentResult?.(
+      SAMPLE_ARGS.chrome_webmcp_list,
+      outcome({
+        tabId: '1',
+        available: true,
+        tools: [
+          { name: 'search', description: '查商品', annotations: { readOnlyHint: true } },
+          { name: 'checkout', annotations: { consequentialHint: true } },
+          { name: 'scrape', annotations: { untrustedContentHint: true } },
+          { name: 'applyTheme', description: '改主题' },
+        ],
+      }),
+    )
+    expect(view?.title).toBe('4 个 WebMCP 工具')
+    expect(body(view)).toContain('search [只读] — 查商品')
+    expect(body(view)).toContain('checkout [高风险,先确认]')
+    expect(body(view)).toContain('scrape [输出不可信]')
+    expect(body(view)).toContain('applyTheme — 改主题')
+  })
+
+  it('tells the two no-tool cases apart', () => {
+    // `available: false` means the browser has no WebMCP API; `available: true`
+    // with an empty list means the page has it but registers nothing. They call
+    // for different next steps, so the cards must differ too.
+    const noSurface = definitions().get('chrome_webmcp_list')?.presentResult?.(
+      SAMPLE_ARGS.chrome_webmcp_list,
+      outcome({ tabId: '1', available: false, tools: [], reason: 'Chrome 未启用 WebMCP' }),
+    )
+    expect(noSurface?.title).toBe('该页没有 WebMCP')
+    expect(body(noSurface)).toBe('Chrome 未启用 WebMCP')
+
+    const noTools = definitions().get('chrome_webmcp_list')?.presentResult?.(
+      SAMPLE_ARGS.chrome_webmcp_list,
+      outcome({ tabId: '1', available: true, tools: [] }),
+    )
+    expect(noTools?.title).toBe('该页有 WebMCP,但没有注册工具')
+  })
+
+  it('shows what the user still has to do for a pending WebMCP call', () => {
+    const view = definitions().get('chrome_webmcp_call')?.presentResult?.(
+      SAMPLE_ARGS.chrome_webmcp_call,
+      outcome({ tabId: '1', tool: 'searchItems', pending: true, note: '请在页面上提交表单' }),
+    )
+    expect(view?.title).toBe('WebMCP 工具等待用户完成')
+    expect(body(view)).toBe('请在页面上提交表单')
+  })
+
+  it('marks a WebMCP call that navigated the page', () => {
+    const view = definitions().get('chrome_webmcp_call')?.presentResult?.(
+      SAMPLE_ARGS.chrome_webmcp_call,
+      outcome({ tabId: '1', tool: 'go', navigated: true }),
+    )
+    expect(view?.title).toBe('WebMCP 工具触发了页面导航')
+    expect(body(view)).toBe('')
+  })
+
+  it('renders an object WebMCP result as the JSON text the model receives', async () => {
+    // The tool layer serializes a returned object to pretty JSON text; the card
+    // must show that text, not re-escape it into a quoted JS string.
+    const tool = definitions(fakeBackend({
+      webmcpCall: async () => ({ tool: 'applyTheme', result: { background: 'blue', count: 1 } }),
+    })).get('chrome_webmcp_call')
+    if (tool === undefined) throw new Error('chrome_webmcp_call is not registered')
+    const value = await tool.execute(SAMPLE_ARGS.chrome_webmcp_call, {} as never)
+    const view = tool.presentResult?.(SAMPLE_ARGS.chrome_webmcp_call, outcome(value))
+    expect(view?.title).toBe('WebMCP 工具执行完成')
+    expect(body(view)).toBe(JSON.stringify({ background: 'blue', count: 1 }, null, 2))
+  })
+
+  it('keeps a huge WebMCP result readable by cutting the card, not the model result', async () => {
+    const tool = definitions(fakeBackend({
+      webmcpCall: async () => ({ tool: 'scrape', result: { text: 'x'.repeat(5000) } }),
+    })).get('chrome_webmcp_call')
+    if (tool === undefined) throw new Error('chrome_webmcp_call is not registered')
+    const value = await tool.execute(SAMPLE_ARGS.chrome_webmcp_call, {} as never)
+    const view = tool.presentResult?.(SAMPLE_ARGS.chrome_webmcp_call, outcome(value))
+    expect(body(view).length).toBe(4001)
+    expect(body(view).endsWith('…')).toBe(true)
   })
 
   it('reports an opened tab by its id', async () => {

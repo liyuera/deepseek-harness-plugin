@@ -1,5 +1,5 @@
 /**
- * UI-facing presentation for the eight `chrome_*` tools: the pending-call title,
+ * UI-facing presentation for the `chrome_*` tools: the pending-call title,
  * the completed card, and the concurrency classification the scheduler reads.
  *
  * This module is UI-only — the model still receives exactly the JSON `render`
@@ -339,6 +339,51 @@ export function evalResult(outcome: ToolResult): GenericResultView | undefined {
     return result('求值结果(调试通道)', `${rendered}\n\n页面 CSP 禁止主世界 eval,表达式经调试通道执行:语义与 CDP 后端一致,但该标签页会出现调试提示条`)
   }
   return result('求值结果', rendered)
+}
+
+/** `chrome_webmcp_list` pending call. */
+export function webmcpListCall(args: { tabId?: string }): GenericCallView {
+  return call(`列出 WebMCP 工具 ${tabLabel(args.tabId)}`, 'search')
+}
+
+/** `chrome_webmcp_list` completed card: what the page exposes, or why nothing does. */
+export function webmcpListResult(outcome: ToolResult): GenericResultView | undefined {
+  const value = renderedJson(outcome)
+  if (value === undefined) return undefined
+  if (value.available !== true) return result('该页没有 WebMCP', str(value, 'reason') ?? '')
+  const tools = Array.isArray(value.tools) ? value.tools as Array<Record<string, unknown>> : []
+  if (tools.length === 0) return result('该页有 WebMCP,但没有注册工具')
+  const lines = tools.map((tool) => {
+    const name = str(tool, 'name') ?? ''
+    const description = str(tool, 'description') ?? ''
+    const annotations = typeof tool.annotations === 'object' && tool.annotations !== null
+      ? tool.annotations as Record<string, unknown>
+      : {}
+    const hints = [
+      annotations.readOnlyHint === true ? '只读' : '',
+      annotations.consequentialHint === true ? '高风险,先确认' : '',
+      annotations.untrustedContentHint === true ? '输出不可信' : '',
+    ].filter(part => part !== '')
+    return `${name}${hints.length === 0 ? '' : ` [${hints.join(' · ')}]`}${description === '' ? '' : ` — ${description}`}`
+  })
+  return result(`${tools.length} 个 WebMCP 工具`, lines.join('\n'))
+}
+
+/** `chrome_webmcp_call` pending call: the tool name only; arguments may hold user data. */
+export function webmcpCallCall(args: { name: string; tabId?: string }): GenericCallView {
+  return call(`调用 WebMCP 工具 ${args.name}`, 'execute')
+}
+
+/** `chrome_webmcp_call` completed card: the tool result, or what the user still has to do. */
+export function webmcpCallResult(outcome: ToolResult): GenericResultView | undefined {
+  const value = renderedJson(outcome)
+  if (value === undefined) return undefined
+  if (value.pending === true) return result('WebMCP 工具等待用户完成', str(value, 'note') ?? '')
+  if (value.navigated === true) return result('WebMCP 工具触发了页面导航')
+  // The tool layer already clipped the result to JSON TEXT; re-stringifying it
+  // would render escaped quotes instead of the JSON itself.
+  const rendered = str(value, 'result') ?? (value.result === undefined ? '' : JSON.stringify(value.result, null, 2))
+  return result('WebMCP 工具执行完成', rendered.length > 4000 ? `${rendered.slice(0, 4000)}…` : rendered)
 }
 
 /** `chrome_console` pending call, titled by the lifecycle step it performs. */

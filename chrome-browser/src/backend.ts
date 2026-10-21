@@ -24,6 +24,8 @@ import {
   readyStateExpression,
   selectExpression,
   waitExpression,
+  webmcpCallExpression,
+  webmcpListExpression,
 } from './expressions.ts'
 import type { WaitState } from './expressions.ts'
 import { Chrome } from './chrome.ts'
@@ -153,6 +155,109 @@ export interface SelectOutcome {
   reason?: string
 }
 
+/** One tool a page declares through WebMCP. */
+export interface WebMcpTool {
+  name: string
+  title: string
+  description: string
+  origin: string
+  /** JSON Schema of the tool's input, or null when the page declares none. */
+  inputSchema: unknown
+  /** Safety hints the page attached: readOnlyHint, consequentialHint, untrustedContentHint, debugging. */
+  annotations: Record<string, unknown>
+}
+
+/** What one tab's WebMCP surface looks like. */
+export interface WebMcpTools {
+  /** Whether the browser and page expose a WebMCP surface at all. */
+  available: boolean
+  /** Why there is no surface, or why listing failed. */
+  reason?: string
+  tools: WebMcpTool[]
+}
+
+/** One WebMCP tool invocation. */
+export interface WebMcpCallOutcome {
+  /** Tool name the page executed. */
+  tool: string
+  /** The tool's return value; absent when `navigated` or `pending` is set. */
+  result?: unknown
+  /** The tool caused a navigation, so the page context changed. */
+  navigated?: boolean
+  /**
+   * The tool was activated but had not settled when the call returned — a
+   * declarative form tool usually waits for the user to click Submit.
+   */
+  pending?: boolean
+  /** What the user still needs to do when `pending` is set. */
+  note?: string
+}
+
+/** Read one untrusted value as a plain record, or undefined. */
+function recordOf(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined
+}
+
+/**
+ * Map a WebMCP listing envelope from either backend onto {@link WebMcpTools}.
+ * @param value - the `__dshWebmcp` envelope.
+ * @returns the listing, with unreadable rows dropped.
+ */
+export function mapWebMcpTools(value: unknown): WebMcpTools {
+  const envelope = recordOf(value)
+  if (envelope === undefined || envelope.__dshWebmcp !== 1) throw new Error('WebMCP 列表应答格式无法识别')
+  if (envelope.available !== true) {
+    return {
+      available: false,
+      reason: typeof envelope.reason === 'string' && envelope.reason !== '' ? envelope.reason : '该页面没有可用的 WebMCP 工具',
+      tools: [],
+    }
+  }
+  const rows = Array.isArray(envelope.tools) ? envelope.tools : []
+  return {
+    available: true,
+    tools: rows.flatMap((row) => {
+      const tool = recordOf(row)
+      if (tool === undefined || typeof tool.name !== 'string' || tool.name === '') return []
+      return [{
+        name: tool.name,
+        title: typeof tool.title === 'string' ? tool.title : '',
+        description: typeof tool.description === 'string' ? tool.description : '',
+        origin: typeof tool.origin === 'string' ? tool.origin : '',
+        inputSchema: tool.inputSchema === undefined ? null : tool.inputSchema,
+        annotations: recordOf(tool.annotations) ?? {},
+      }]
+    }),
+  }
+}
+
+/**
+ * Map a WebMCP invocation envelope from either backend onto
+ * {@link WebMcpCallOutcome}; a page-reported failure becomes a thrown error so
+ * the model sees the reason and can pick another tool.
+ * @param value - the `__dshWebmcp` envelope.
+ * @returns the outcome.
+ */
+export function mapWebMcpCall(value: unknown): WebMcpCallOutcome {
+  const envelope = recordOf(value)
+  if (envelope === undefined || envelope.__dshWebmcp !== 1) throw new Error('WebMCP 调用应答格式无法识别')
+  if (envelope.ok !== true) {
+    throw new Error(typeof envelope.error === 'string' && envelope.error !== '' ? envelope.error : 'WebMCP 工具调用失败')
+  }
+  const tool = typeof envelope.tool === 'string' ? envelope.tool : ''
+  if (envelope.pending === true) {
+    return {
+      tool,
+      pending: true,
+      ...(typeof envelope.note === 'string' && envelope.note !== '' ? { note: envelope.note } : {}),
+    }
+  }
+  if (envelope.navigated === true) return { tool, navigated: true }
+  return { tool, result: envelope.result }
+}
+
 /** What one hover did. */
 export interface HoverOutcome {
   /** Elements the selector matched. */
@@ -187,6 +292,18 @@ export interface BrowserBackend {
    * first evaluation, and on backends that have only the one route.
    */
   readonly lastEvalWorld: 'main' | 'debugger' | undefined
+  /**
+   * Tools the page declares through WebMCP. `available: false` means the browser
+   * exposes no WebMCP surface (flag or origin trial off) or the page implements
+   * none — an answer, not an error, so the caller can fall back to DOM automation.
+   */
+  webmcpTools(tabId: string): Promise<WebMcpTools>
+  /**
+   * Execute one page-declared WebMCP tool. `pending` means the page activated it
+   * but had not settled when the call returned (a declarative form waiting for
+   * the user), not that it succeeded.
+   */
+  webmcpCall(tabId: string, name: string, input: Record<string, unknown>): Promise<WebMcpCallOutcome>
   click(tabId: string, selector: string, all: boolean): Promise<ClickOutcome>
   /** Dispatch hover input on the first element matching the selector. */
   hover(tabId: string, selector: string): Promise<HoverOutcome>
@@ -422,7 +539,7 @@ export class ExtensionBackend implements BrowserBackend {
    * how a restarted service worker gets its capture back.
    */
   private static readonly SAFE_RETRY_OPS = new Set([
-    'list-tabs', 'read', 'eval', 'screenshot', 'console-start', 'console-stop',
+    'list-tabs', 'read', 'eval', 'screenshot', 'console-start', 'console-stop', 'webmcp-list',
   ])
   /**
    * In-flight dedupe keys for side-effectful ops: a second identical command
@@ -642,6 +759,16 @@ export class ExtensionBackend implements BrowserBackend {
     }
     this.lastEvalWorld = envelope.world === 'debugger' ? 'debugger' : 'main'
     return envelope.value
+  }
+
+  async webmcpTools(tabId: string): Promise<WebMcpTools> {
+    return mapWebMcpTools(await this.push('webmcp-list', { tabId }))
+  }
+
+  async webmcpCall(tabId: string, name: string, input: Record<string, unknown>): Promise<WebMcpCallOutcome> {
+    // Arguments are sent as one object: the page's `executeTool(tool, input)`
+    // takes a single JSON-serializable value, never a spread argument list.
+    return mapWebMcpCall(await this.push('webmcp-call', { tabId, name, input }))
   }
 
   async click(tabId: string, selector: string, all: boolean): Promise<ClickOutcome> {
@@ -984,6 +1111,19 @@ export class CdpBackend implements BrowserBackend {
     // world to fall back to.
     this.lastEvalWorld = 'main'
     return this.withTab(tabId, endpoint => this.evaluatePage(endpoint, expression))
+  }
+
+  async webmcpTools(tabId: string): Promise<WebMcpTools> {
+    // Runtime.evaluate runs in the page's main world and awaits the expression's
+    // promise, so the WebMCP surface is reachable without an extension.
+    return mapWebMcpTools(await this.withTab(tabId, endpoint => this.evaluatePage(endpoint, webmcpListExpression())))
+  }
+
+  async webmcpCall(tabId: string, name: string, input: Record<string, unknown>): Promise<WebMcpCallOutcome> {
+    return mapWebMcpCall(await this.withTab(
+      tabId,
+      endpoint => this.evaluatePage(endpoint, webmcpCallExpression(name, input)),
+    ))
   }
 
   async click(tabId: string, selector: string, all: boolean): Promise<ClickOutcome> {

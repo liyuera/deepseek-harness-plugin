@@ -10,7 +10,7 @@ DeepSeek Harness (dsh) 插件集。每个插件一个目录，目录名即插件
 | 目录 | npm 包名 | 0.2.0 | 说明 |
 | --- | --- | --- | --- |
 | [`dev-dock/`](dev-dock/) | `@liyuera/dsh-dev-dock` | ✅ 已移植 | devDock v1.0.0：项目 = dsh 工作区；开始上班弹窗、会话头部 IDE/终端/启动（确定性桌面动作）、每工作区 IDE 偏好与编辑器检测（真实应用图标） |
-| [`chrome-browser/`](chrome-browser/) | `@liyuera/dsh-chrome-browser` | ✅ 已移植 | Chrome 浏览器控制:扩展桥(默认)或 CDP 驱动你已打开的 Chrome——列标签页/读网页内容/导航/新开/截图/点击/输入/执行 JS;`@` 菜单列出实时标签页(标题 + URL),选中插入引用芯片,AI 在该页面工作 |
+| [`chrome-browser/`](chrome-browser/) | `@liyuera/dsh-chrome-browser` | ✅ 已移植 | Chrome 浏览器控制:扩展桥(默认)或 CDP 驱动你已打开的 Chrome——列标签页/读网页内容/导航/新开/截图/点击/输入/执行 JS、调用页面声明的 WebMCP 工具;`@` 菜单列出实时标签页(标题 + URL),选中插入引用芯片,AI 在该页面工作 |
 | [`ui-favorite-prompts/`](ui-favorite-prompts/) | `@liyuera/dsh-favorite-prompts` | ✅ 已移植 | 消息下方一键收藏、`@` 拉出收藏并整段插入、设置页增删改 |
 | [`user-ds-balance/`](user-ds-balance/) | `@liyuera/dsh-user-ds-balance` | ✅ 无需改 | DeepSeek 账户余额读数:composer 工具行单元格,每 5 分钟轮询、点击刷新、loading 态(host 半边 `/ds-balance` 路由,API Key 现取现用) |
 

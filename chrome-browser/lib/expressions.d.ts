@@ -116,4 +116,24 @@ export declare function focusExpression(selector: string): string;
  * elements via a Range over its contents). Returns whether a match was found.
  */
 export declare function focusAndSelectExpression(selector: string): string;
+/**
+ * List a page's WebMCP tools in the MAIN world.
+ *
+ * `document.modelContext` is page JavaScript, so both backends must run this in
+ * the page's own world. The envelope tag keeps a legitimate tool list from being
+ * mistaken for an error payload; the host maps it in `mapWebMcpTools`.
+ * @returns a self-contained async IIFE returning the `__dshWebmcp` envelope.
+ */
+export declare function webmcpListExpression(): string;
+/**
+ * Execute one page-declared WebMCP tool in the MAIN world.
+ *
+ * Bounded at 8s: a declarative form tool without `toolautosubmit` stays pending
+ * until the user clicks Submit, and a pending outcome is reported as such rather
+ * than as success or timeout.
+ * @param name - the tool name from `chrome_webmcp_list`.
+ * @param input - the tool arguments, serialized into the expression.
+ * @returns a self-contained async IIFE returning the `__dshWebmcp` envelope.
+ */
+export declare function webmcpCallExpression(name: string, input: Record<string, unknown>): string;
 //# sourceMappingURL=expressions.d.ts.map

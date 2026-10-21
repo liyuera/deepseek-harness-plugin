@@ -165,6 +165,9 @@ function backend(): BrowserBackend {
     navigate: async () => {},
     waitForLoad: async () => {},
     evaluate: async () => undefined,
+    webmcpTools: async () => ({ available: false, reason: 'test backend', tools: [] }),
+    webmcpCall: async () => { throw new Error('no WebMCP tool in the test backend') },
+
     click: async () => EMPTY_CLICK,
     hover: async () => ({ matched: 0, hovered: false }),
     press: async () => ({ found: false, pressed: false, submitted: false }),

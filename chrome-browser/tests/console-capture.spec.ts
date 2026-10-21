@@ -141,6 +141,9 @@ function host(): {
     navigate: async () => {},
     waitForLoad: async () => {},
     evaluate: async () => undefined,
+    webmcpTools: async () => ({ available: false, reason: 'test backend', tools: [] }),
+    webmcpCall: async () => { throw new Error('no WebMCP tool in the test backend') },
+
     click: async () => empty,
     hover: async () => ({ matched: 0, hovered: false }),
     press: async () => ({ found: true, pressed: true, submitted: false }),

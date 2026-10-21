@@ -580,6 +580,9 @@ function host(): Host {
     navigate: async () => {},
     waitForLoad: async () => {},
     evaluate: async () => undefined,
+    webmcpTools: async () => ({ available: false, reason: 'test backend', tools: [] }),
+    webmcpCall: async () => { throw new Error('no WebMCP tool in the test backend') },
+
     click: async () => EMPTY_CLICK,
     hover: async (tabId: string, selector: string) => {
       state.hovers.push(`${tabId}:${selector}`)

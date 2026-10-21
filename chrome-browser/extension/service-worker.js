@@ -98,7 +98,7 @@ chrome.runtime.onInstalled.addListener(() => connect())
 const SUPPORTED_OPS = [
   'list-tabs', 'read', 'inventory', 'wait', 'hover', 'press', 'select', 'eval',
   'click', 'type', 'console-start', 'console-stop', 'close', 'navigate', 'open',
-  'screenshot', 'trace', 'reload',
+  'screenshot', 'trace', 'reload', 'webmcp-list', 'webmcp-call',
 ]
 
 /**
@@ -112,7 +112,7 @@ const SUPPORTED_OPS = [
  * user stayed on a stale extension with nothing to show for it. Only a value
  * carried by the loaded code can tell the host which code is loaded.
  */
-const BUILD_HASH = '65be701f5531310569fcb63cc5742009504abac3a41227bd89337ae723bf81df'
+const BUILD_HASH = '6d025c12bba2e73376b264ef911282489baadba72c42e29cb419a5ec7ccdd407'
 
 /** Introduce this worker: what it runs, what it can answer, and which code it is. */
 async function hello() {
@@ -422,6 +422,16 @@ async function run(command) {
       return pageExec(command.args.tabId, selectOption, [command.args.selector, command.args.value])
     case 'eval':
       return evalInPage(command.args.tabId, command.args.expression)
+    case 'webmcp-list':
+      // WebMCP lives on `document.modelContext` in the page's MAIN world: it is
+      // page JavaScript, so the extension's isolated world cannot see it.
+      return webmcpRequest(command.args.tabId, { mode: 'list' })
+    case 'webmcp-call':
+      return webmcpRequest(command.args.tabId, {
+        mode: 'call',
+        name: command.args.name,
+        input: command.args.input || {},
+      })
     case 'click':
       return pageExec(command.args.tabId, pageAgent, [
         { op: 'click', selector: command.args.selector, all: command.args.all === true },
@@ -834,6 +844,132 @@ function readPage(includeHtml) {
     url: location.href,
     text: document.body ? document.body.innerText : '',
     html: includeHtml && document.documentElement ? document.documentElement.outerHTML : '',
+  }
+}
+
+/**
+ * Begin one WebMCP request in the page's MAIN world.
+ *
+ * `document.modelContext` is page JavaScript: the extension's isolated world has
+ * a separate `document` and cannot see it. The async APIs cannot be awaited by
+ * `chrome.scripting.executeScript` here (the returned promise is serialized, not
+ * awaited), so the request stores its state on the page and the service worker
+ * polls it with {@link webmcpPoll}.
+ *
+ * A missing modelContext is an ANSWER, not an error: the browser flag or origin
+ * trial is off, or the page implements no WebMCP, and the model needs to know
+ * which before falling back to DOM automation.
+ */
+function webmcpBegin(request) {
+  const state = { done: false }
+  window.__dshWebmcp = state
+  const reason = 'document.modelContext 不存在:Chrome 未启用 WebMCP(需 --enable-features=WebMCP 或站点在 origin trial 中),或该页面未实现 WebMCP。'
+  const fail = (error) => {
+    const message = String((error && error.message) || error)
+    if (request.mode === 'call') Object.assign(state, { done: true, __dshWebmcp: 1, ok: false, error: message })
+    else Object.assign(state, { done: true, __dshWebmcp: 1, available: false, reason: message })
+  }
+  try {
+    const mc = typeof document === 'object' && document !== null ? document.modelContext : undefined
+    if (request.mode === 'call') {
+      if (mc === undefined || mc === null || typeof mc.executeTool !== 'function' || typeof mc.getTools !== 'function') {
+        Object.assign(state, { done: true, __dshWebmcp: 1, ok: false, error: reason })
+        return true
+      }
+      Promise.resolve(mc.getTools())
+        .then((tools) => {
+          const tool = tools.find(candidate => candidate.name === request.name)
+          if (tool === undefined) {
+            const available = tools.map(candidate => candidate.name)
+            throw new Error(available.length === 0
+              ? '当前页面没有注册任何 WebMCP 工具'
+              : '当前页面没有名为 "' + request.name + '" 的 WebMCP 工具;可用: ' + available.join(', '))
+          }
+          return mc.executeTool(tool, request.input || {})
+        })
+        .then((result) => {
+          if (result === null || result === undefined) {
+            Object.assign(state, { done: true, __dshWebmcp: 1, ok: true, tool: request.name, navigated: true })
+            return
+          }
+          Object.assign(state, { done: true, __dshWebmcp: 1, ok: true, tool: request.name, result })
+        })
+        .catch(fail)
+      return true
+    }
+    if (mc === undefined || mc === null || typeof mc.getTools !== 'function') {
+      Object.assign(state, { done: true, __dshWebmcp: 1, available: false, reason })
+      return true
+    }
+    Promise.resolve(mc.getTools())
+      .then((tools) => {
+        Object.assign(state, {
+          done: true,
+          __dshWebmcp: 1,
+          available: true,
+          tools: tools.map(tool => ({
+            name: tool.name,
+            title: tool.title || '',
+            description: tool.description || '',
+            origin: tool.origin || location.origin,
+            inputSchema: tool.inputSchema === undefined ? null : tool.inputSchema,
+            annotations: tool.annotations || {},
+          })),
+        })
+      })
+      .catch(fail)
+    return true
+  } catch (error) {
+    fail(error)
+    return true
+  }
+}
+
+/** Read the WebMCP request state the page stored; null before/after a navigation. */
+function webmcpPoll() {
+  return window.__dshWebmcp || null
+}
+
+/**
+ * Drive one WebMCP request: start it in the page, then poll the state it stored.
+ *
+ * A declarative form tool without `toolautosubmit` never settles until the user
+ * clicks Submit, so an unfinished request is reported as `pending` rather than
+ * as success or as a timeout.
+ */
+async function webmcpRequest(tabId, request) {
+  const before = await chrome.tabs.get(Number(tabId)).catch(() => null)
+  await pageExec(tabId, webmcpBegin, [request])
+  const deadline = Date.now() + 8000
+  while (Date.now() < deadline) {
+    const state = await pageExec(tabId, webmcpPoll)
+    if (state !== null && state !== undefined && state.done === true) {
+      const value = Object.assign({}, state)
+      delete value.done
+      return value
+    }
+    await new Promise(resolve => setTimeout(resolve, 100))
+  }
+  const after = await chrome.tabs.get(Number(tabId)).catch(() => null)
+  const navigated = before !== null && after !== null && before.url !== after.url
+  if (request.mode === 'list') {
+    return {
+      __dshWebmcp: 1,
+      available: false,
+      reason: navigated ? '读取 WebMCP 工具期间页面发生了导航' : '读取 WebMCP 工具超时(8s)',
+    }
+  }
+  // A tool that navigated the tab may have destroyed the state before a poll
+  // could read it; the URL change is the only remaining evidence.
+  if (navigated) {
+    return { __dshWebmcp: 1, ok: true, tool: request.name || '', navigated: true }
+  }
+  return {
+    __dshWebmcp: 1,
+    ok: true,
+    tool: request.name,
+    pending: true,
+    note: '工具已激活,但 8 秒内没有返回结果:声明式表单通常需要用户在页面上点提交。不要重复调用,先请用户确认。',
   }
 }
 
