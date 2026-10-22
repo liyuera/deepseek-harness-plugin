@@ -1,0 +1,51 @@
+# Publish chrome-browser to npm with Trusted Publishing (OIDC).
+#
+# One-time setup on npmjs.com: package Settings -> Trusted Publisher -> GitHub
+# Actions, with:
+#   Organization/user:  liyuera
+#   Repository:         deepseek-harness-plugin
+#   Workflow filename:  publish-chrome-browser.yml
+#   Allowed actions:    npm publish  (new configurations default to stage-only)
+# The configuration expires unless the first successful publish happens within
+# two days of creating it.
+#
+# Release flow: bump chrome-browser/package.json, commit, push, then push a tag
+# named `chrome-browser-v<version>`. Nothing needs an NPM_TOKEN secret.
+name: Publish chrome-browser
+
+on:
+  push:
+    tags:
+      - 'chrome-browser-v*'
+  workflow_dispatch:
+
+permissions:
+  id-token: write # OIDC for npm Trusted Publishing
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: chrome-browser
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false
+      # Node 24's bundled npm may predate Trusted Publishing support (11.5.1).
+      - run: npm install -g npm@latest
+      - name: Check the tag matches the package version
+        shell: bash
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          tag="${GITHUB_REF_NAME#chrome-browser-v}"
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$tag" != "$version" ]; then
+            echo "tag chrome-browser-v$tag does not match package version $version" >&2
+            exit 1
+          fi
+          echo "publishing $version"
+      - run: npm publish --access public
