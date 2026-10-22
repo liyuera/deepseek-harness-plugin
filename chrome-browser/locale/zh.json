@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Chrome 浏览器控制",
+    "description": "控制你真实打开的 Chrome 标签页：列标签、读页面、点击/输入、执行 JS、截图，并调用页面声明的 WebMCP 工具。"
+  }
+}

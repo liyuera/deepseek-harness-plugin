@@ -323,6 +323,8 @@ dsh plugin --profile desktop add link:/绝对路径/deepseek-harness-plugin/chro
 
 `desktop` 是桌面应用独占的 profile(源码启动的 `pnpm dsh web` 用 `web`)。两种装法的产物都已构建好,目标机器不需要 `npm install` 或联网。
 
+插件在 dsh 插件管理页里的**图标、标题和一栏简介**来自插件包自己的 `package.json`:顶层 `icon` 是包内相对路径(DSH 0.2.x 起支持,SVG/PNG/JPEG/WebP,≤256 KiB,宿主转成 data URL 渲染),`locale/{en,zh}.json` 的 `meta.title` / `meta.description` 按界面语言显示。本包用扩展自带的 128px 图标,并提供中英文卡片文案;旧版 dsh 会忽略这些字段。
+
 宿主半边 import `@deepseek-ai/schemastery`、`@deepseek-ai/dsh-tools`、`@deepseek-ai/dsh-llm/message`,三者都声明在 `peerDependencies`:宿主从自己的安装目录提供,与装好的 dsh 版本一致。`dependencies` 里的包在 `link:` 安装下解析不到——运行时依赖一律写 `peerDependencies`(详见仓库根 README)。
 
 ### 2. 装配套 Chrome 扩展

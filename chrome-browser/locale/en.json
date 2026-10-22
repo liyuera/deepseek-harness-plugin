@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Chrome Browser Control",
+    "description": "Control your real Chrome tabs: list tabs, read pages, click and type, run JS, take screenshots, and call page-declared WebMCP tools through the extension bridge or CDP."
+  }
+}
