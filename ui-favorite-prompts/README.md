@@ -61,6 +61,21 @@ node ../../node_modules/vitest/vitest.mjs run  # 测试
 
 收藏条是自建 Chat 节点，靠节点 key 的字典序落在用户消息正下方：`key = ${kind.length}:${kind}${id}`，内置用户节点是 `13:input-message…`，本插件 `favorite-strip` 是 `14:favorite-strip…`。**改 kind 名长度或把 `anchorSeq` 从 `event.seq` 挪开，都会让收藏条跑到气泡上面或被折进"思考过程"折叠组。** 契约写在 `src/client/strip/definition.ts` 顶部，并有单测守着。
 
+## 发布
+
+发布走 GitHub Actions 的 npm **Trusted Publishing**（OIDC，无 NPM_TOKEN、无浏览器授权）：
+
+```sh
+# 1. 改 ui-favorite-prompts/package.json 的 version，提交并 push main
+# 2. 打 tag 并 push，触发 .github/workflows/publish-ui-favorite-prompts.yml
+git tag ui-favorite-prompts-v0.1.2
+git push origin ui-favorite-prompts-v0.1.2
+```
+
+workflow 在 `ui-favorite-prompts/` 里跑 `npm publish --access public`，tag 与 `package.json` 版本不一致会直接失败；公开仓库 + 公开包会自动生成 provenance 证明。npm 侧的一次性配置在 npmjs.com 上做：包 Settings → Trusted Publisher → GitHub Actions，`liyuera` / `deepseek-harness-plugin` / `publish-ui-favorite-prompts.yml`，并勾上 **Allow npm publish**；创建后 2 天内必须完成一次成功发布来验证配置。若 workflow 报 `ENEEDAUTH`，先核对 workflow 文件名、owner/repo 是否与 npm 配置完全一致，以及是否勾了 Allow npm publish。
+
+发布前确认 `lib/` 产物已按最新 `src/` 构建并提交（安装即用，目标机器不构建）。
+
 ## 卸载
 
 ```sh

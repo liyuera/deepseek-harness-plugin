@@ -111,4 +111,4 @@ tsc -b && tsdown --config-loader tsx   # 重新构建（bin 解析自 harness �
 
 ## 许可
 
-专有软件，保留所有权利。未经版权持有人书面许可，不得使用、复制、修改、分发或再许可本仓库的任何内容，详见 [LICENSE](LICENSE)。各插件 `package.json` 声明为 `UNLICENSED` 且 `private`，不从 npm 发布。
+专有软件，保留所有权利。未经版权持有人书面许可，不得使用、复制、修改、分发或再许可本仓库的任何内容，详见 [LICENSE](LICENSE)。各插件 `package.json` 声明为 `UNLICENSED`；已发布到 npm 的包允许通过 npm 安装并运行，但不授予修改、再分发、再许可或销售的权利（全文见各包 `LICENSE`）。发布流程见 [`chrome-browser/README.md`](chrome-browser/README.md#发布) 与 [`ui-favorite-prompts/README.md`](ui-favorite-prompts/README.md#发布)。
