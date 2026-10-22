@@ -426,6 +426,19 @@ DSH_CHROME_SMOKE=1 npx vitest run tests/smoke.spec.ts   # headless Chrome 全链
 
 **为什么需要 `typecheck:tests`**:`tsc -b` 只编译 `src`,而 vitest 只转译不做类型检查——所以测试里的假实现和真实接口漂移**不会报错**,只在某个用例恰好走到那条路径时才炸。这个检查已经抓到过:假后端漏了新增的接口方法、路由改了参数个数但调用点没跟上、`fakeProc` 定义在别的 `describe` 里(闭包捕获了名字却从未被调用,于是用例一直「通过」)。它只看本包的诊断——`paths` 别名会把 harness 其他项目的源码拉进同一个程序,那些错误属于它们自己的构建。
 
+### 发布
+
+发布走 GitHub Actions 的 npm **Trusted Publishing**(OIDC,无 NPM_TOKEN、无浏览器授权):
+
+```sh
+# 1. 改 chrome-browser/package.json 的 version,提交并 push main
+# 2. 打 tag 并 push,触发 .github/workflows/publish-chrome-browser.yml
+git tag chrome-browser-v0.6.6
+git push origin chrome-browser-v0.6.6
+```
+
+workflow 在 `chrome-browser/` 里跑 `npm publish --access public`,tag 与 `package.json` 版本不一致会直接失败;公开仓库 + 公开包会自动生成 provenance 证明。npm 侧的一次性配置(已完成):包 Settings → Trusted Publisher → GitHub Actions,`liyuera` / `deepseek-harness-plugin` / `publish-chrome-browser.yml`,并勾上 **Allow npm publish**;创建后 2 天内必须完成一次成功发布来验证配置,Publishing access 已设为最严格的「disallow bypass 2fa tokens」——token 不能发布,但 trusted publisher 不受影响。若 workflow 报 `ENEEDAUTH`,先核对 workflow 文件名、owner/repo 是否与 npm 配置完全一致,以及是否勾了 Allow npm publish。
+
 ## Known Limitations and Deferred Work
 
 - **`@` 菜单插入的是引用,不是绑定**:选中一个标签页只插入引用芯片,**不绑定会话**,
