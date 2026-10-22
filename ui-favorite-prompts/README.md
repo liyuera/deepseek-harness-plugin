@@ -19,6 +19,8 @@ dsh plugin --profile desktop add link:/绝对路径/deepseek-harness-plugin/ui-f
 
 需要 dsh 0.2.x：`@deepseek-ai/dsh-*` 依赖声明在 `peerDependencies`（`^0.2.0-rc.2`），版本不匹配时 `dsh plugin add` 会拒绝安装。
 
+插件在 dsh 插件管理页里的**图标、标题和一栏简介**来自插件包自己的 `package.json`：顶层 `icon` 是包内相对路径（DSH 0.2.x 起支持，SVG/PNG/JPEG/WebP，≤ 256 KiB，宿主转成 data URL 渲染），`locale/{en,zh}.json` 的 `meta.title` / `meta.description` 按界面语言显示。本包用 `icon.svg`（深色磁贴 + 渐变书签：DeepSeek Harness 的鲸鱼蜷成 @ 的外圈，@ 的内层 a 落在鲸鱼蜷起的空腔里）和中英文卡片文案；旧版 dsh 会忽略这些字段。
+
 ## 三个入口
 
 | 入口 | 扩展点 | 说明 |

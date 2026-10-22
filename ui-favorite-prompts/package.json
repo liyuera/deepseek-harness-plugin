@@ -1,10 +1,11 @@
 {
   "name": "@liyuera/dsh-favorite-prompts",
   "description": "Saved prompts for dsh: bookmark a message, recall it with @ in the composer, manage the list in Settings",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
+  "icon": "./icon.svg",
   "exports": {
     ".": {
       "types": "./lib/types/index.d.ts",
@@ -15,6 +16,7 @@
       "default": "./lib/client.js"
     },
     "./src/*": "./src/*",
+    "./locale/*.json": "./locale/*.json",
     "./package.json": "./package.json"
   },
   "dsh": {
@@ -41,7 +43,9 @@
     "lib/index.js",
     "lib/client.js",
     "lib/types/**/*.d.ts",
-    "cordis.patch.yml"
+    "cordis.patch.yml",
+    "icon.svg",
+    "locale/*.json"
   ],
   "license": "UNLICENSED",
   "repository": {
