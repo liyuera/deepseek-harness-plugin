@@ -78,6 +78,28 @@ test('a non-whitelisted preset is never touched', () => {
   assert.equal(priming.primed(agent), false)
 })
 
+test('enabling inside a running app primes live agents already on a whitelisted preset', () => {
+  const { agent, sections } = fakeAgent('liyu')
+  const other = fakeAgent('standard').agent
+  const listeners = []
+  const ctx = {
+    on(event, handler) {
+      listeners.push({ event, handler })
+      return () => {}
+    },
+    get(service) {
+      return service === 'agents' ? { list: () => [agent, other] } : undefined
+    },
+  }
+  const priming = installPresetPriming(ctx, { presets: ['liyu'] })
+  assert.equal(sections.length, 1, 'the existing liyu agent is backfilled on enable')
+  assert.equal(priming.primed(agent), true)
+  assert.equal(priming.primed(other), false)
+  // The event path still works and stays idempotent with the backfill.
+  listeners[0].handler({ agent })
+  assert.equal(sections.length, 1)
+})
+
 test('an empty preset list installations no listener at all', () => {
   const { listeners } = listenerHarness([])
   assert.equal(listeners.length, 0)

@@ -75,24 +75,47 @@ export function installPresetPriming(ctx, options) {
   const presets = options.presets
   /** @type {WeakSet<object>} agents already carrying the section. */
   const primedAgents = new WeakSet()
+
+  /**
+   * Prime one live agent when its durable preset is whitelisted. Safe to call
+   * more than once per agent: the WeakSet makes the second call a no-op.
+   * @param {unknown} agent - live agent handle.
+   */
+  const primeAgent = agent => {
+    if (agent === null || typeof agent !== 'object' || primedAgents.has(agent)) return
+    const preset = presetOf(agent)
+    if (preset === undefined || !presets.includes(preset)) return
+    const prompt = /** @type {Record<string, any>} */ (agent).ctx?.get?.('systemPrompt')
+    if (prompt === undefined || prompt === null) return
+    primedAgents.add(agent);
+    /** @type {Record<string, any>} */ (agent).ctx.effect(() => prompt.section({
+      name: PRIME_SECTION_NAME,
+      order: PRIME_SECTION_ORDER,
+      text: primeText(),
+      // The body is literal prose: never run strict `{{variable}}`
+      // interpolation over it.
+      interpolate: false,
+    }), 'wx-mp-tools: preset prime')
+  }
+
   if (presets.length > 0) {
     ctx.on('agent/created', payload => {
       const agent = payload !== null && typeof payload === 'object' ? /** @type {Record<string, any>} */ (payload).agent : undefined
-      if (agent === null || typeof agent !== 'object' || primedAgents.has(agent)) return
-      const preset = presetOf(agent)
-      if (preset === undefined || !presets.includes(preset)) return
-      const prompt = agent.ctx?.get?.('systemPrompt')
-      if (prompt === undefined || prompt === null) return
-      primedAgents.add(agent)
-      agent.ctx.effect(() => prompt.section({
-        name: PRIME_SECTION_NAME,
-        order: PRIME_SECTION_ORDER,
-        text: primeText(),
-        // The body is literal prose: never run strict `{{variable}}`
-        // interpolation over it.
-        interpolate: false,
-      }), 'wx-mp-tools: preset prime')
+      primeAgent(agent)
     })
+    // A plugin reload/enable inside a running app: existing sessions created
+    // before this listener registered are primed immediately rather than only
+    // after the next new/resumed session. Absent `agents` service: no-op.
+    const agents = ctx.get?.('agents')
+    if (typeof agents?.list === 'function') {
+      for (const agent of agents.list()) {
+        try {
+          primeAgent(agent)
+        } catch {
+          // A disposed agent racing this pass must not fail plugin activation.
+        }
+      }
+    }
   }
   return {
     presets,
