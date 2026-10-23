@@ -14,6 +14,10 @@ function fakeContext() {
         return () => {}
       },
     },
+    on(event, handler) {
+      effects.push({ label: `on:${event}` })
+      return () => {}
+    },
     inject(services, callback) {
       injected.push(services)
       callback({ get: () => undefined, effect: () => () => {} })

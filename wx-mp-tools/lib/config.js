@@ -20,6 +20,13 @@ export const DEFAULT_MAX_TEXT_CHARS = 60_000
 const CLIENT_NAME_PATTERN = /^[A-Za-z0-9_.-]{1,32}$/
 
 /**
+ * Agent presets that get the `wx-mp` skill body preloaded into the system
+ * prompt. Defaults to 李昱模式 (`liyu`) because that is this deployment's
+ * default preset; set `primePresets: []` to disable priming entirely.
+ */
+export const DEFAULT_PRIME_PRESETS = Object.freeze(['liyu'])
+
+/**
  * Read one optional non-empty string.
  * @param {unknown} value - candidate value.
  * @param {string | undefined} fallback - value used when the candidate is absent.
@@ -53,8 +60,26 @@ function positiveInt(value, fallback) {
  *   timeoutMs: number,
  *   maxTextChars: number,
  *   skillVersion: string | undefined,
+ *   primePresets: readonly string[],
  * }} the resolved configuration.
  */
+/**
+ * Read the preset-id whitelist for skill priming.
+ * @param {unknown} value - candidate value (array or comma-separated string).
+ * @returns {string[]} validated preset ids; empty disables priming.
+ */
+function primePresetList(value) {
+  if (Array.isArray(value)) {
+    return value
+      .filter(item => typeof item === 'string' && item.trim() !== '')
+      .map(item => item.trim())
+  }
+  if (typeof value === 'string' && value.trim() !== '') {
+    return value.split(',').map(item => item.trim()).filter(item => item !== '')
+  }
+  return [...DEFAULT_PRIME_PRESETS]
+}
+
 export function resolveConfig(raw = {}, env = process.env) {
   const clientName = optionalString(raw.clientName, DEFAULT_CLIENT_NAME)
   const token = optionalString(raw.token, optionalString(env.WECHAT_DEVTOOLS_CLI_TOKEN, undefined))
@@ -70,5 +95,6 @@ export function resolveConfig(raw = {}, env = process.env) {
     // default: this plugin consumes the CLI tool surface, not the skill files,
     // so a version mismatch is informational rather than blocking.
     skillVersion: optionalString(raw.skillVersion, undefined),
+    primePresets: primePresetList(raw.primePresets),
   }
 }

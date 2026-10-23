@@ -306,7 +306,7 @@ const RAW_PROJECTLESS = new Set(['login', 'quit', 'project_list', 'share_minicod
  * }} deps - bridge, project resolver, and resolved config.
  * @returns {Record<string, unknown>[]} plain tool definitions for `ctx.tools.register`.
  */
-export function toolDefinitions({ cli, resolver, config }) {
+export function toolDefinitions({ cli, resolver, config, priming }) {
   const render = jsonRender(config.maxTextChars)
 
   /**
@@ -347,8 +347,17 @@ export function toolDefinitions({ cli, resolver, config }) {
       }),
       output: { schema: {}, render },
       execute: async (args, exec) => {
+        const agent = exec?.agent
+        // Diagnostics for the preset priming: which preset this agent runs and
+        // whether the wx-mp body is already in its system prompt.
+        const prime = {
+          presets: priming?.presets ?? [],
+          preset: priming?.presetOf?.(agent) ?? null,
+          applied: priming?.primed?.(agent) === true,
+        }
         const info = {
           clientName: config.clientName,
+          prime,
           /** @type {string | null} */
           cliPath: null,
           cliFound: false,
@@ -435,6 +444,7 @@ export function toolDefinitions({ cli, resolver, config }) {
         return {
           ...info,
           bridge: 'ok',
+          prime,
           login: {
             loginExpired: status.loginExpired === true,
             loginUser: status.loginUser ?? null,

@@ -17,7 +17,11 @@ import {
 const CONFIG = resolveConfig({}, {})
 
 /** Build tool definitions over stubs that record CLI calls. */
-function harness({ callResult = { result: { success: true } }, authResult = { ok: true, authorized: true } } = {}) {
+function harness({
+  callResult = { result: { success: true } },
+  authResult = { ok: true, authorized: true },
+  priming = { presets: [], presetOf: () => undefined, primed: () => false },
+} = {}) {
   const calls = []
   const cli = {
     resolveCliPath: () => '/fake/wechatide',
@@ -39,7 +43,7 @@ function harness({ callResult = { result: { success: true } }, authResult = { ok
     },
     invalidate() {},
   }
-  const definitions = toolDefinitions({ cli, resolver, config: CONFIG })
+  const definitions = toolDefinitions({ cli, resolver, config: CONFIG, priming })
   const byName = name => definitions.find(definition => definition.name === name)
   return { calls, definitions, byName }
 }
@@ -231,6 +235,23 @@ test('raw injects the resolved project and surfaces CLI warnings', async () => {
   assert.equal(calls[0].toolName, 'compile_wxml')
   assert.deepEqual(calls[0].flags, { page: 'pages/index/index', project: '/project/dist/build/mp-weixin' })
   assert.deepEqual(value.warnings, ['未知参数 --bogus 已忽略，继续执行'])
+})
+
+test('status reports preset priming state for the calling agent', async () => {
+  const { byName } = harness({
+    priming: { presets: ['liyu'], presetOf: agent => (agent === undefined ? undefined : 'liyu'), primed: () => true },
+  })
+  const value = await byName('wx_mp_status').execute({}, { agent: { id: 'a1' } })
+  assert.equal(value.bridge, 'ok')
+  assert.deepEqual(value.prime, { presets: ['liyu'], preset: 'liyu', applied: true })
+})
+
+test('status reports priming as not applied when the preset is a different one', async () => {
+  const { byName } = harness({
+    priming: { presets: ['liyu'], presetOf: () => 'standard', primed: () => false },
+  })
+  const value = await byName('wx_mp_status').execute({}, { agent: { id: 'a2' } })
+  assert.deepEqual(value.prime, { presets: ['liyu'], preset: 'standard', applied: false })
 })
 
 test('status reports a missing bridge instead of throwing', async () => {

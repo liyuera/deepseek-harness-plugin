@@ -11,6 +11,14 @@ test('resolveConfig applies defaults', () => {
   assert.equal(config.cliPath, undefined)
   assert.equal(config.project, undefined)
   assert.equal(config.skillVersion, undefined)
+  assert.deepEqual(config.primePresets, ['liyu'])
+})
+
+test('primePresets accepts an explicit list or comma string and can disable priming', () => {
+  assert.deepEqual(resolveConfig({ primePresets: ['liyu', 'work'] }, {}).primePresets, ['liyu', 'work'])
+  assert.deepEqual(resolveConfig({ primePresets: 'liyu, work' }, {}).primePresets, ['liyu', 'work'])
+  assert.deepEqual(resolveConfig({ primePresets: [] }, {}).primePresets, [])
+  assert.deepEqual(resolveConfig({ primePresets: [1, '', 'liyu'] }, {}).primePresets, ['liyu'])
 })
 
 test('resolveConfig falls back to environment variables for secrets and path', () => {

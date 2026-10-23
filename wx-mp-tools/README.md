@@ -60,6 +60,7 @@ dsh plugin --profile desktop add @liyuera/dsh-wx-mp-tools
 | `timeoutMs` | `180000` | 单次 CLI 调用上限 |
 | `maxTextChars` | `60000` | 单条结果给模型看的文本上限 |
 | `skillVersion` | 无 | 仅用于 `check_wechatide_status --skill-version`，一般不用填 |
+| `primePresets` | `['liyu']` | 这些 agent preset 的新会话会把 `wx-mp` 技能正文**预载**进 system prompt；`[]` 关闭预载 |
 
 环境变量：`WECHATIDE_CLI_PATH`、`WECHAT_DEVTOOLS_CLI_TOKEN`。
 
@@ -81,6 +82,28 @@ dsh plugin --profile desktop add @liyuera/dsh-wx-mp-tools
 | `wx_mp_raw` | 其余官方工具 | 逃生舱：登录、项目导入/移除、单文件编译、清缓存、mock wx API、云开发等 |
 
 另外注册一个 `wx-mp` skill：模型在执行小程序调试任务时会先读到工作流、项目路径规则和失败快表。
+
+## 李昱模式默认预载（preset priming）
+
+插件默认把 `wx-mp` 技能正文**预载**进「李昱模式」（preset id `liyu`）的系统提示，
+所以该模式下开小程序任务时模型一开始就带着工作流，不需要再调 `skill(name='wx-mp')`：
+
+- 触发时机：会话创建（含 resume）时读 session header 里持久化的 `agentPreset`，
+  命中 `primePresets` 白名单就在该 agent 的 scope 里注册一个 system-prompt section
+  （name `wx-mp:primed-skill`，order 4000），会话结束时随 scope 一起销毁。
+  标准 spawn/fork 子代理继承父会话的 preset，因此同样被预载；agent-team 队友跑在自己的
+  preset（本机为 `cordis`）下，不预载（白名单语义，非遗漏）。
+- 正文来源：直接引用 [lib/skill.js](lib/skill.js) 的 `SKILL_CONTENT`，预载副本与 `skill` 工具
+  加载的正文**永远一致**，不存在两份要同步的文案。
+- 其他预设（官方 standard、自定义 preset）完全不受影响；`primePresets: []` 可关闭。
+- 已存在的会话不会被追溯注入（装配在创建时固定），改配置后**新开会话**生效；
+  改插件代码后需要重启 dsh 或 disable→enable 插件重新加载。
+- 自检：`wx_mp_status` 返回 `prime: { presets, preset, applied }`，
+  `preset` 是当前 agent 的预设 id，`applied` 表示技能正文是否已预载。
+
+> 为什么不写进 preset 文档：preset 的插件行只能从 **harness 安装目录**解析包名（或绝对路径文件），
+> 解析不到 profile 里安装的第三方插件；而且把 4 KB 技能正文复制进 `sync.mjs` 生成的 preset 会
+> 与 `skill.js` 漂移。由全局插件按 session 的 preset id 注入 scoped section 是唯一单源做法。
 
 ## 典型闭环
 
@@ -135,12 +158,13 @@ wx-mp-tools/
 ├── icon.svg
 ├── locale/{en,zh}.json   # 插件卡片文案
 ├── lib/
-│   ├── index.js          # plugin 入口：注册工具 + skill + 清理
-│   ├── config.js         # 配置默认值与校验
+│   ├── index.js          # plugin 入口：注册工具 + skill + preset 预载 + 清理
+│   ├── config.js         # 配置默认值与校验（含 primePresets）
 │   ├── cli.js            # wechatide 定位、子进程、JSON 解析、错误分类、串行队列
 │   ├── project.js        # 会话 cwd / IDE 项目列表 / 源码根 → 产物目录 解析
+│   ├── prime.js          # 按 agent preset 预载 wx-mp 技能正文（默认李昱模式）
 │   ├── tools.js          # 12 个 wx_mp_* 工具定义
-│   └── skill.js          # wx-mp agent skill
+│   └── skill.js          # wx-mp agent skill（预载正文的唯一来源）
 └── test/                 # node --test 单元测试（纯函数 + 工具契约）
 ```
 

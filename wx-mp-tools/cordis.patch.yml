@@ -25,3 +25,8 @@
         # timeoutMs: 180000
         # Model-facing cap for one text result (characters).
         # maxTextChars: 60000
+        # Agent presets that get the wx-mp skill body preloaded into the system
+        # prompt on session creation (default: [liyu] = 李昱模式). An existing
+        # session is never patched after the fact: new sessions only.
+        # primePresets: [liyu]
+        # primePresets: []            # disable preloading entirely

@@ -12,6 +12,7 @@
 
 import { resolveConfig } from './config.js'
 import { WechatideCli } from './cli.js'
+import { installPresetPriming } from './prime.js'
 import { ProjectResolver } from './project.js'
 import { registerWxMpSkill } from './skill.js'
 import { toolDefinitions } from './tools.js'
@@ -35,7 +36,10 @@ export function apply(ctx, rawConfig = {}) {
   const config = resolveConfig(rawConfig)
   const cli = new WechatideCli(config)
   const resolver = new ProjectResolver(cli, config)
-  for (const definition of toolDefinitions({ cli, resolver, config })) {
+  // Preset priming is what makes 李昱模式 start with the `wx-mp` workflow
+  // already in context instead of re-loading the skill on demand.
+  const priming = installPresetPriming(ctx, { presets: config.primePresets })
+  for (const definition of toolDefinitions({ cli, resolver, config, priming })) {
     ctx.tools.register(definition)
   }
   registerWxMpSkill(ctx)
