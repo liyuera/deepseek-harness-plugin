@@ -87,7 +87,8 @@ export function installPresetPriming(ctx, options) {
     if (preset === undefined || !presets.includes(preset)) return
     const prompt = /** @type {Record<string, any>} */ (agent).ctx?.get?.('systemPrompt')
     if (prompt === undefined || prompt === null) return
-    primedAgents.add(agent);
+    // Register first, then remember: a throwing `effect` must leave the agent
+    // unmarked so a later event retries instead of silently claiming success.
     /** @type {Record<string, any>} */ (agent).ctx.effect(() => prompt.section({
       name: PRIME_SECTION_NAME,
       order: PRIME_SECTION_ORDER,
@@ -95,7 +96,8 @@ export function installPresetPriming(ctx, options) {
       // The body is literal prose: never run strict `{{variable}}`
       // interpolation over it.
       interpolate: false,
-    }), 'wx-mp-tools: preset prime')
+    }), 'wx-mp-tools: preset prime');
+    primedAgents.add(agent)
   }
 
   if (presets.length > 0) {
