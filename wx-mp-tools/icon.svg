@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="WeChat Mini Program Control">
+  <defs>
+    <linearGradient id="wxmp-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1ED39A"/>
+      <stop offset="1" stop-color="#0B7A55"/>
+    </linearGradient>
+  </defs>
+  <rect x="0" y="0" width="64" height="64" rx="14" fill="url(#wxmp-bg)"/>
+  <rect x="15" y="10" width="24" height="44" rx="6" fill="none" stroke="#FFFFFF" stroke-width="2.4"/>
+  <line x1="23.5" y1="14.8" x2="30.5" y2="14.8" stroke="#FFFFFF" stroke-width="1.8" stroke-linecap="round"/>
+  <circle cx="27" cy="32" r="7.2" fill="none" stroke="#FFFFFF" stroke-width="2.2"/>
+  <circle cx="27" cy="32" r="2.2" fill="#FFFFFF"/>
+  <line x1="27" y1="21.4" x2="27" y2="24.4" stroke="#FFFFFF" stroke-width="1.8" stroke-linecap="round"/>
+  <line x1="27" y1="39.6" x2="27" y2="42.6" stroke="#FFFFFF" stroke-width="1.8" stroke-linecap="round"/>
+  <line x1="16.4" y1="32" x2="19.4" y2="32" stroke="#FFFFFF" stroke-width="1.8" stroke-linecap="round"/>
+  <line x1="34.6" y1="32" x2="37.6" y2="32" stroke="#FFFFFF" stroke-width="1.8" stroke-linecap="round"/>
+  <path d="M41 38 L52 42.4 L47.4 45 L50.6 51.6 L47.2 53.2 L44.2 46.8 L40.6 49.6 Z" fill="#FFD166" stroke="#0B7A55" stroke-width="1.2" stroke-linejoin="round"/>
+</svg>

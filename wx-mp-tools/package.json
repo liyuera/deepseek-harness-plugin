@@ -1,0 +1,39 @@
+{
+  "name": "@liyuera/dsh-wx-mp-tools",
+  "description": "WeChat Mini Program control for dsh through the official wechatide agent CLI: compile/refresh the simulator, screenshot it for the model, grep console/network logs, inspect page data and elements, tap/input/navigate, evaluate JS, and preview/upload.",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./package.json": "./package.json",
+    "./icon": "./icon.svg"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "icon": "./icon.svg",
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/liyuera/deepseek-harness-plugin.git",
+    "directory": "wx-mp-tools"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "lib/**/*.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ]
+}

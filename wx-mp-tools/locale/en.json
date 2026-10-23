@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "WeChat Mini Program Control",
+    "description": "Drive 微信开发者工具 from the agent through its official wechatide CLI: compile and refresh the simulator, screenshot it, grep console/network logs, inspect page data and elements, tap/input/navigate, evaluate JS, and preview or upload."
+  }
+}

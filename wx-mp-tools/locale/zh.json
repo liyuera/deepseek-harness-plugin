@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "微信小程序控制（dsh-control-wxMpTools）",
+    "description": "通过微信开发者工具官方 wechatide CLI 直接控制小程序模拟器：编译刷新、截图、console/network 日志、页面数据与元素读取、点击输入导航、执行 JS、预览上传。"
+  }
+}

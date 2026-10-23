@@ -1,0 +1,27 @@
+# dsh bundle layer: mount the WeChat Mini Program control plugin.
+# Backend: the official `wechatide` agent CLI shipped inside 微信开发者工具
+# (Contents/MacOS/wechatide on macOS, wechatide.cmd on Windows).
+#
+# Every config field is optional; the defaults below are what the plugin uses
+# when the row omits them. Uncomment and edit only what differs on this machine.
+- insert:
+    - id: wx-mp-tools
+      name: '@liyuera/dsh-wx-mp-tools'
+      config:
+        # Name shown in the WeChat DevTools authorization dialog. Keep it stable:
+        # changing it re-triggers the one-time authorization prompt.
+        clientName: dsh
+        # Absolute path of the wechatide CLI. Omitted: auto-detect the macOS
+        # .app bundle and the Windows install locations.
+        # cliPath: /Applications/wechatwebdevtools.app/Contents/MacOS/wechatide
+        # Default mini-program project (source root or compiled dist dir).
+        # Omitted: matched against the session workspace and the IDE project list.
+        # project: /absolute/path/to/miniprogram
+        # CLI access token, only needed when 微信开发者工具 → 设置 → 安全 enables
+        # the CLI token check. Prefer the WECHAT_DEVTOOLS_CLI_TOKEN env var over
+        # committing a token here.
+        # token: ''
+        # Per-call bound for one wechatide invocation (ms).
+        # timeoutMs: 180000
+        # Model-facing cap for one text result (characters).
+        # maxTextChars: 60000

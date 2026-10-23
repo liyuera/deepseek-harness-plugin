@@ -13,6 +13,7 @@ DeepSeek Harness (dsh) 插件集。每个插件一个目录，目录名即插件
 | [`chrome-browser/`](chrome-browser/) | `@liyuera/dsh-chrome-browser` | ✅ 已移植 | Chrome 浏览器控制:扩展桥(默认)或 CDP 驱动你已打开的 Chrome——列标签页/读网页内容/导航/新开/截图/点击/输入/执行 JS、调用页面声明的 WebMCP 工具;`@` 菜单列出实时标签页(标题 + URL),选中插入引用芯片,AI 在该页面工作 |
 | [`ui-favorite-prompts/`](ui-favorite-prompts/) | `@liyuera/dsh-favorite-prompts` | ✅ 已移植 | 消息下方一键收藏、`@` 拉出收藏并整段插入、设置页增删改 |
 | [`user-ds-balance/`](user-ds-balance/) | `@liyuera/dsh-user-ds-balance` | ✅ 无需改 | DeepSeek 账户余额读数:composer 工具行单元格,每 5 分钟轮询、点击刷新、loading 态(host 半边 `/ds-balance` 路由,API Key 现取现用) |
+| [`wx-mp-tools/`](wx-mp-tools/) | `@liyuera/dsh-wx-mp-tools` | 🆕 | 微信小程序控制(dsh-control-wxMpTools):通过微信开发者工具官方 `wechatide` agent CLI 编译刷新模拟器、截图(模型用 `read_image` 看)、console/network 日志、页面数据与元素读取、点击输入导航、执行 JS、预览上传 |
 
 ## 安装
 
@@ -32,7 +33,7 @@ dsh plugin --profile desktop add link:/绝对路径/deepseek-harness-plugin/chro
 
 `desktop` 是桌面应用独占的 profile；源码启动的 `pnpm dsh web` 用 `web`。装完**退出重开**——宿主半边只在启动时加载，浏览器硬刷新只换得到 `lib/client.js`。
 
-四个包的 npm 名：`@liyuera/dsh-dev-dock`、`@liyuera/dsh-chrome-browser`、`@liyuera/dsh-favorite-prompts`、`@liyuera/dsh-user-ds-balance`。
+五个包的 npm 名：`@liyuera/dsh-dev-dock`、`@liyuera/dsh-chrome-browser`、`@liyuera/dsh-favorite-prompts`、`@liyuera/dsh-user-ds-balance`、`@liyuera/dsh-wx-mp-tools`。
 
 `dsh-chrome-browser` 还要在 Chrome 里加载一次配套扩展（扩展随包发布，从 `<dsh 地址>/chrome-browser/extension.zip` 下载解压后「加载已解压的扩展程序」），步骤见[该插件 README](chrome-browser/README.md#2-装配套-chrome-扩展)。
 
