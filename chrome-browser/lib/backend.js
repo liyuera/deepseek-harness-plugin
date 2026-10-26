@@ -523,12 +523,14 @@ export class ExtensionBackend {
         const outcome = { data: '', path: result.path };
         if (result.mime !== undefined)
             outcome.mime = result.mime;
-        // Absent on the normal route. Present when DevTools owned the debugger and
+        // Absent on the normal route. Present when the debugger capture failed and
         // the visible-window capture had to stand in for it.
         if (result.fallback === 'visible-tab') {
             outcome.fallback = 'visible-tab';
             if (result.viewportOnly === true)
                 outcome.viewportOnly = true;
+            if (typeof result.reason === 'string' && result.reason !== '')
+                outcome.fallbackReason = result.reason;
         }
         return outcome;
     }

@@ -62,12 +62,14 @@ export interface ScreenshotOutcome {
   /** Actual encoding, so a JPEG is never handed over under a `.png` name. */
   mime?: string
   /**
-   * Present when DevTools owned the tab's debugger and the viewport-only
-   * fallback had to stand in for the debugger capture.
+   * Present when the debugger capture failed and the viewport-only fallback had
+   * to stand in for it.
    */
   fallback?: 'visible-tab'
   /** True when the fallback could not honour the requested fullPage/selector. */
   viewportOnly?: boolean
+  /** Why the debugger capture failed, so the warning can name the cause. */
+  fallbackReason?: string
 }
 
 /**
@@ -829,15 +831,16 @@ export class ExtensionBackend implements BrowserBackend {
       tabId,
       fullPage: options?.fullPage === true,
       ...(options?.selector === undefined ? {} : { selector: options.selector }),
-    }) as { path?: string; mime?: string; fallback?: string; viewportOnly?: boolean } | null
+    }) as { path?: string; mime?: string; fallback?: string; viewportOnly?: boolean; reason?: string } | null
     if (result?.path === undefined) return { data: '' }
     const outcome: ScreenshotOutcome = { data: '', path: result.path }
     if (result.mime !== undefined) outcome.mime = result.mime
-    // Absent on the normal route. Present when DevTools owned the debugger and
+    // Absent on the normal route. Present when the debugger capture failed and
     // the visible-window capture had to stand in for it.
     if (result.fallback === 'visible-tab') {
       outcome.fallback = 'visible-tab'
       if (result.viewportOnly === true) outcome.viewportOnly = true
+      if (typeof result.reason === 'string' && result.reason !== '') outcome.fallbackReason = result.reason
     }
     return outcome
   }

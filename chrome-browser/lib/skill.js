@@ -28,7 +28,7 @@ export const SKILL_CONTENT = `# Chrome 浏览器(用户真实标签页)
 | \`chrome_navigate\` | 让某个标签页导航到 URL,默认等加载完成 |
 | \`chrome_open\` | 新开一个前台标签页,默认等加载完成;URL 只接受 http/https/file,其它 scheme 直接报错(不建僵尸标签页)。\`file://\` 还需要用户在 \`chrome://extensions\` 里给扩展开文件访问权限,读不到就是这个原因 |
 | \`chrome_close\` | 按 id 关闭一个标签页;**\`tabId\` 必填且不接受 \`active\`**——关掉用户正在看的那一页几乎总是错的 |
-| \`chrome_screenshot\` | 截图存成图片文件并返回路径。**要整页用 \`fullPage: true\`**;只要某个元素用 \`selector\`——两者都只调一次,不要靠滚动拼接。格式随连接而定(CDP 是 PNG、扩展桥是 JPEG),结果的 \`mime\` 说明实际格式。**标签页已打开 DevTools 时自动退回可视区域截图**:结果带 \`fallback: "visible-tab"\` 和 \`warning\`,\`fullPage\`/\`selector\` 范围不生效(\`viewportOnly: true\`) |
+| \`chrome_screenshot\` | 截图存成图片文件并返回路径。**要整页用 \`fullPage: true\`**;只要某个元素用 \`selector\`——两者都只调一次,不要靠滚动拼接。格式随连接而定(CDP 是 PNG、扩展桥是 JPEG),结果的 \`mime\` 说明实际格式。**调试通道失败时自动降级**:退回可视区域截图,结果带 \`fallback: "visible-tab"\` 和 \`warning\`(\`fullPage\`/\`selector\` 可能不生效,见下文「截图与降级」) |
 | \`chrome_click\` | 按 CSS 选择器点击(可选全部匹配元素),返回实际派发点击的元素数并报告不可点原因 |
 | \`chrome_hover\` | 悬停到元素上,展开只在 hover 时出现的菜单/工具条 |
 | \`chrome_type\` | 按 CSS 选择器聚焦并输入文本(默认先清空) |
@@ -102,6 +102,26 @@ export const SKILL_CONTENT = `# Chrome 浏览器(用户真实标签页)
 | 页面没反应,但说不清为什么 | **先 \`chrome_console { action: 'start' }\`,再复现,再 \`action: 'read'\`**。采集不回溯,所以必须在使用之前开。控制台里有资源加载失败、CSP 拦截这类浏览器自己抛的错误——\`chrome_eval\` 看不到它们。 |
 | \`chrome_console\` 报 \`not being captured\` | 没 start。顺序是 start → 操作 → read,不是「出问题了再回头看」。 |
 | \`chrome_console\` 报标签页已被占用 | 该标签页已打开 DevTools。让用户关掉 DevTools 再试。 |
+| \`chrome_screenshot\` 报错,或结果带 \`fallback\` | 工具已经自动降级过(见「截图与降级」)。带 \`fallback\` 的图只有可视区域、可能是旧帧、指定范围可能没生效;**两级都失败时不要连续重试截图**,改用 \`chrome_eval\` 量尺寸/样式、\`chrome_read\` 读文本作为替代证据,并告诉用户要关 DevTools 或把窗口切到前台。 |
+
+## 截图与降级
+
+\`chrome_screenshot\` 内部按下面的顺序降级,模型按结果判断即可,**不要自己滚动拼接截图**:
+
+1. **调试通道**(默认):\`fullPage\` / \`selector\` / 后台标签页都能拍,也不会返回旧帧;
+   代价是该标签页顶部出现 Chrome 的「正在调试」提示条。
+2. **可视区域回退**(自动):调试通道失败时(DevTools 占用、页面拒绝渲染、clip 测量失败等)
+   自动改拍 \`chrome.tabs.captureVisibleTab\`。结果带 \`fallback: "visible-tab"\` + \`warning\`
+   (里有失败原因);\`fullPage\`/\`selector\` 无法生效时还带 \`viewportOnly: true\`。
+   回退图只有视口、可能是一帧旧画面,而且只拍**该窗口当前活动标签页**——
+   目标不在前台会明确报错,不会拍错页面。
+3. **两条都失败**:工具抛错,错误里同时给出调试通道和回退通道的原因。此时**不要反复硬试截图**:
+   用 \`chrome_eval\` 取 \`getBoundingClientRect()\` / computed style / 页面尺寸,用 \`chrome_read\`
+   读文本作为替代证据,把原因告诉用户;需要精确截图时请用户关掉 DevTools、把窗口切到前台后
+   **再拍一次**。
+
+看到 \`fallback\` 时不要把回退图当成整页/元素截图,也不要用裁剪或滚动拼接去「补」——
+坐标系不同,固定元素还会重复。
 
 ## 用户在看什么
 
@@ -129,11 +149,13 @@ export const SKILL_CONTENT = `# Chrome 浏览器(用户真实标签页)
 - **操作的是用户真实标签页**:用户可能同时在操作同一个页面;
   写操作前确认目标,不要在用户正在输入的页面上抢焦点。截图优先走调试通道,不会切换标签页,
   但会在该标签页显示「正在调试」提示条。
-- **DevTools 打开时截图自动回退**:调试通道被 DevTools 占用时,\`chrome_screenshot\` 退回
-  \`chrome.tabs.captureVisibleTab\` 的可视区域截图,结果带 \`fallback: "visible-tab"\` 和 \`warning\`。
-  回退图只有视口、可能是一帧旧画面、\`fullPage\`/\`selector\` 范围不生效,而且**只拍该窗口当前活动标签页**
-  (目标不在前台会明确报错)。看到 \`fallback\` 时不要把它当成整页/元素截图;要精确截图就请用户关掉
-  DevTools 后重试,不要靠裁剪或滚动拼接去补。
+- **截图自带降级**:调试通道失败(DevTools 占用、页面拒绝渲染、clip 测量失败等)时,
+  \`chrome_screenshot\` 自动退回 \`chrome.tabs.captureVisibleTab\` 的可视区域截图,结果带
+  \`fallback: "visible-tab"\` + \`warning\`(含失败原因),\`fullPage\`/\`selector\` 不生效时还带
+  \`viewportOnly: true\`。回退图只有视口、可能是一帧旧画面,而且**只拍该窗口当前活动标签页**。
+  两条通道都失败时抛错(两个原因都给出)——这时不要再硬试截图,改用 \`chrome_eval\` 取尺寸/样式、
+  \`chrome_read\` 取文本作为替代证据,并请用户关 DevTools 或把窗口切到前台后再拍。
+  看到 \`fallback\` 时不要把它当成整页/元素截图,也不要靠裁剪或滚动拼接去「补」。
 - **只开自己能收尾的标签页**:\`chrome_open\` 建的页面记得用 \`chrome_close\` 关掉。
   用户没要求时不要动他已有的标签页。
 - **截图只返回文件路径**,视觉内容要用 \`read_image\` 再读一次。

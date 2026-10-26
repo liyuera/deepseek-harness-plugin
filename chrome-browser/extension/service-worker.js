@@ -240,7 +240,7 @@ const SUPPORTED_OPS = [
  * user stayed on a stale extension with nothing to show for it. Only a value
  * carried by the loaded code can tell the host which code is loaded.
  */
-const BUILD_HASH = '0fee982aaf70d918a88a88b4228d1daabd5885af9b5e043c0a6e120a36df58e6'
+const BUILD_HASH = '943df6ac41fdd0029c907516df85edfe2ae9ba40b6d1917cf87fd93934534519'
 
 /** Introduce this worker: what it runs, what it can answer, and which code it is. */
 async function hello() {
@@ -611,7 +611,13 @@ async function run(command) {
       return {
         path: body.path,
         mime: 'image/jpeg',
-        ...(shot.fallback ? { fallback: 'visible-tab', viewportOnly: shot.viewportOnly } : {}),
+        ...(shot.fallback
+          ? {
+              fallback: 'visible-tab',
+              viewportOnly: shot.viewportOnly,
+              ...(shot.reason === undefined ? {} : { reason: shot.reason }),
+            }
+          : {}),
       }
     }
     case 'trace': {
@@ -737,15 +743,16 @@ const VISIBLE_CAPTURE_TIMEOUT_MS = 10_000
  *
  * The first alternative is that refusal's own message; the second is what
  * `chrome.debugger.attach` answers when DevTools came in between the target
- * listing and the attach. Everything else — a missing tab, a page Chrome does
- * not let the extension capture — is not a reason to photograph the window.
+ * listing and the attach. Only used to give the degradation a readable cause —
+ * every debugger failure degrades, this one just has a friendlier name than
+ * Chrome's raw attach error.
  */
 const DEBUGGER_OWNED = /已被另一个调试器占用|Another debugger is already attached/iu
 
 /**
  * Whether a capture failure is DevTools owning the tab, not a broken page.
  * @param error - whatever the debugger path threw.
- * @returns whether the visible-window fallback is worth trying.
+ * @returns whether the cause should be reported as DevTools rather than verbatim.
  */
 function debuggerOwnedByDevTools(error) {
   return DEBUGGER_OWNED.test(String((error && error.message) || error))
@@ -754,10 +761,10 @@ function debuggerOwnedByDevTools(error) {
 /**
  * Capture the window's visible tab as a data URL.
  *
- * The only capture Chrome still allows while DevTools owns the tab's debugger.
- * It reads back the window's painted surface instead of rendering the tab, so
- * it needs the window visible, can answer with a previous frame while the page
- * is not repainting, and it always photographs whichever tab is active in the
+ * The degradation route when the debugger capture failed for any reason. It
+ * reads back the window's painted surface instead of rendering the tab, so it
+ * needs the window visible, can answer with a previous frame while the page is
+ * not repainting, and it always photographs whichever tab is active in the
  * window — hence the active-tab refusal rather than a silently wrong image.
  * @param tabId - the tab to capture.
  * @returns the image as a `data:` URL.
@@ -795,41 +802,49 @@ async function captureVisibleTab(tabId) {
 }
 
 /**
- * Capture one tab, through the debugger when it can attach and through the
- * visible window when DevTools owns that debugger.
+ * Capture one tab, through the debugger when it can, and through the visible
+ * window when it cannot.
  *
- * DevTools and `chrome.debugger` cannot share a tab, and DevTools is exactly
- * when a screenshot is most useful — so this falls back rather than only
- * telling the user to close it. The fallback cannot honour `fullPage` or
- * `selector`, and its image can be a stale frame; both facts travel with the
- * answer so a viewport never silently passes for the whole page.
+ * A screenshot is evidence, so any failure of the precise route — DevTools
+ * owning the debugger, a page Chrome refuses to render, an over-tall clip —
+ * degrades to a viewport image of the window instead of returning no image at
+ * all. The fallback cannot honour `fullPage`/`selector`, can repeat an older
+ * frame, and needs the tab in front; therefore its answer carries `fallback`,
+ * `viewportOnly` and the failure that caused it. A viewport must never silently
+ * pass for the whole page.
  * @param tabId - the tab to capture.
  * @param options - what to cover, as `chrome_screenshot` asked.
- * @returns the image data URL, whether the fallback produced it, and whether
- *   the fallback could not honour the requested scope.
+ * @returns the image data URL, whether the fallback produced it, whether it
+ *   could not honour the requested scope, and why the primary route failed.
  */
 async function takeScreenshot(tabId, options) {
+  const id = Number(tabId)
+  if (!Number.isInteger(id)) throw new Error(`无效的标签页 id:${String(tabId)}`)
+  let failure
   try {
-    const base64 = await captureViaDebugger(tabId, options)
+    const base64 = await captureViaDebugger(id, options)
     return { dataUrl: 'data:image/jpeg;base64,' + base64, fallback: false, viewportOnly: false }
   } catch (error) {
-    if (!debuggerOwnedByDevTools(error)) throw error
-    try {
-      return {
-        dataUrl: await captureVisibleTab(tabId),
-        fallback: true,
-        viewportOnly: options !== undefined && (
-          options.fullPage === true
-          || (typeof options.selector === 'string' && options.selector !== '')
-        ),
-      }
-    } catch (visibleError) {
-      // Keep the DevTools cause in the message: the fallback failing for its own
-      // reason (hidden window, background tab) does not remove the conflict, and
-      // closing DevTools still fixes both.
-      const reason = String((visibleError && visibleError.message) || visibleError)
-      throw new Error(`该标签页被另一个调试器占用(例如已打开 DevTools),调试通道无法截图;可视区域回退也失败:${reason}`)
+    failure = error
+  }
+  const primary = String((failure && failure.message) || failure)
+  try {
+    return {
+      dataUrl: await captureVisibleTab(id),
+      fallback: true,
+      viewportOnly: options !== undefined && (
+        options.fullPage === true
+        || (typeof options.selector === 'string' && options.selector !== '')
+      ),
+      // DevTools' conflict has one cause worth naming; every other failure is
+      // already an error message the caller can read.
+      reason: debuggerOwnedByDevTools(failure) ? 'DevTools 占用了该标签页的调试通道' : primary,
     }
+  } catch (visibleError) {
+    // Both routes failed: report both, because closing DevTools or bringing the
+    // window forward fixes one of them and the caller should know which.
+    const secondary = String((visibleError && visibleError.message) || visibleError)
+    throw new Error(`截图失败(调试通道:${primary};可视区域回退:${secondary})`)
   }
 }
 

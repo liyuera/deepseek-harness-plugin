@@ -323,9 +323,10 @@ export function chromeToolDefinitions(backend, config, consoleLog, help) {
             description: 'Capture one tab to an image file on the host and return its path (plus bytes and the `mime`). The format '
                 + 'depends on the connection — PNG over CDP, JPEG over the extension bridge — so a `.png` a caller asks for '
                 + 'becomes `.jpg` rather than a JPEG named `.png`. Use the read_image tool on the returned path to view the '
-                + 'page visually. When DevTools occupies the tab, the extension bridge falls back to a viewport-only capture: '
-                + 'the result then carries `fallback: "visible-tab"` and a `warning`, and `fullPage`/`selector` could not be '
-                + 'honoured.',
+                + 'page visually. When the debugger capture fails (DevTools occupies the tab, the page refuses to render, '
+                + 'the requested clip cannot be measured), the extension bridge falls back to a viewport-only capture: the '
+                + 'result then carries `fallback: "visible-tab"`, a `warning`, and `viewportOnly` when `fullPage`/`selector` '
+                + 'could not be honoured. If that fallback fails too, the call throws with both causes.',
             parameters: {
                 tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the tab the user is looking at; omitting it means 'active' too." },
                 path: { type: 'string', description: 'Optional output file path; defaults to <screenshotDir>/<timestamp>-<tabId>.png.' },
@@ -370,16 +371,22 @@ export function chromeToolDefinitions(backend, config, consoleLog, help) {
                 // A fallback image is still useful, so it is returned rather than
                 // refused — but the caller must know it is not the capture it asked for.
                 const warning = shot.fallback === 'visible-tab'
-                    ? 'DevTools 占用了该标签页的调试通道,已退回 chrome.tabs.captureVisibleTab 的可视区域截图'
+                    ? `调试通道截图失败(${shot.fallbackReason ?? '原因未知'}),已退回 chrome.tabs.captureVisibleTab 的可视区域截图`
                         + (shot.viewportOnly === true ? ';请求的整页/元素范围没有生效,这张只有可视区域' : '')
-                        + ';窗口停止重绘时可能是旧帧,需要精确截图请关闭 DevTools 后重试'
+                        + ';回退图可能是一帧旧画面,需要精确截图请关闭 DevTools/把窗口切到前台后重试'
                     : undefined;
                 return {
                     path,
                     bytes,
                     mime: shot.mime ?? (ext === 'jpg' ? 'image/jpeg' : 'image/png'),
                     tabId,
-                    ...(warning === undefined ? {} : { fallback: 'visible-tab', warning }),
+                    ...(warning === undefined
+                        ? {}
+                        : {
+                            fallback: 'visible-tab',
+                            ...(shot.viewportOnly === true ? { viewportOnly: true } : {}),
+                            warning,
+                        }),
                 };
             },
         }),

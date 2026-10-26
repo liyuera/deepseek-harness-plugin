@@ -108,7 +108,7 @@ describe('chrome_screenshot', () => {
     expect(calls.shots).toEqual([{ tabId: '7', fullPage: true, selector: '#main' }])
   })
 
-  it('warns when DevTools forced the viewport-only fallback', async () => {
+  it('warns when a failed debugger capture degraded to the viewport fallback', async () => {
     // A usable image still comes back, but the result must not read as the
     // full-page capture that was asked for.
     const source = join(mkdtempSync(join(tmpdir(), 'dsh-fallback-')), 'shot.jpg')
@@ -123,6 +123,7 @@ describe('chrome_screenshot', () => {
           mime: 'image/jpeg',
           fallback: 'visible-tab' as const,
           viewportOnly: true,
+          fallbackReason: 'Unable to capture screenshot',
         }),
       } as unknown as BrowserBackend,
       resolveChromeConfig({}), new ConsoleLog(), new HelpChannel(),
@@ -130,11 +131,14 @@ describe('chrome_screenshot', () => {
     if (found === undefined) throw new Error('chrome_screenshot is not registered')
     const value = await found.execute({ tabId: '7', fullPage: true }, {} as never) as {
       fallback?: string
+      viewportOnly?: boolean
       warning?: string
       path?: string
       mime?: string
     }
     expect(value.fallback).toBe('visible-tab')
+    expect(value.viewportOnly).toBe(true)
+    expect(value.warning).toContain('调试通道截图失败(Unable to capture screenshot)')
     expect(value.warning).toContain('可视区域')
     expect(value.warning).toContain('整页')
     expect(value.path).toMatch(/\.jpg$/)

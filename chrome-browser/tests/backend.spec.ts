@@ -584,14 +584,20 @@ describe('screenshot results', () => {
   it('passes on the visible-window fallback the extension reports', async () => {
     // The extension cannot carry the image inline here, so the fallback flag is
     // the only way the host learns the capture is not what was asked for.
-    await expect(capture({ path: '/tmp/shot.jpg', mime: 'image/jpeg', fallback: 'visible-tab', viewportOnly: true }))
-      .resolves.toEqual({
-        data: '',
-        path: '/tmp/shot.jpg',
-        mime: 'image/jpeg',
-        fallback: 'visible-tab',
-        viewportOnly: true,
-      })
+    await expect(capture({
+      path: '/tmp/shot.jpg',
+      mime: 'image/jpeg',
+      fallback: 'visible-tab',
+      viewportOnly: true,
+      reason: 'DevTools 占用了该标签页的调试通道',
+    })).resolves.toEqual({
+      data: '',
+      path: '/tmp/shot.jpg',
+      mime: 'image/jpeg',
+      fallback: 'visible-tab',
+      viewportOnly: true,
+      fallbackReason: 'DevTools 占用了该标签页的调试通道',
+    })
   })
 
   it('does not invent a fallback on the debugger path', async () => {

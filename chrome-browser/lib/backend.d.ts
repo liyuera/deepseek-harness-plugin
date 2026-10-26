@@ -40,12 +40,14 @@ export interface ScreenshotOutcome {
     /** Actual encoding, so a JPEG is never handed over under a `.png` name. */
     mime?: string;
     /**
-     * Present when DevTools owned the tab's debugger and the viewport-only
-     * fallback had to stand in for the debugger capture.
+     * Present when the debugger capture failed and the viewport-only fallback had
+     * to stand in for it.
      */
     fallback?: 'visible-tab';
     /** True when the fallback could not honour the requested fullPage/selector. */
     viewportOnly?: boolean;
+    /** Why the debugger capture failed, so the warning can name the cause. */
+    fallbackReason?: string;
 }
 /** One tab as tools and the picker see it. */
 export interface BackendTab {

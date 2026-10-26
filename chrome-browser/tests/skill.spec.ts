@@ -89,6 +89,14 @@ describe('chrome-browser skill identity', () => {
     expect(SKILL_CONTENT).toContain('只覆盖主框架')
     expect(SKILL_CONTENT).toContain('shadow DOM')
   })
+
+  it('documents the screenshot degradation ladder', () => {
+    // The model has to know a fallback image is not the whole page, and that a
+    // failed screenshot is a signal to collect other evidence rather than retry.
+    expect(SKILL_CONTENT).toContain('截图与降级')
+    expect(SKILL_CONTENT).toContain('fallback: "visible-tab"')
+    expect(SKILL_CONTENT).toContain('不要反复硬试截图')
+  })
 })
 
 describe('registerChromeSkill', () => {
