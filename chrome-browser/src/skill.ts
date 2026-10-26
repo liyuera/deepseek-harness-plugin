@@ -34,7 +34,7 @@ export const SKILL_CONTENT: string = `# Chrome 浏览器(用户真实标签页)
 | \`chrome_navigate\` | 让某个标签页导航到 URL,默认等加载完成 |
 | \`chrome_open\` | 新开一个前台标签页,默认等加载完成;URL 只接受 http/https/file,其它 scheme 直接报错(不建僵尸标签页)。\`file://\` 还需要用户在 \`chrome://extensions\` 里给扩展开文件访问权限,读不到就是这个原因 |
 | \`chrome_close\` | 按 id 关闭一个标签页;**\`tabId\` 必填且不接受 \`active\`**——关掉用户正在看的那一页几乎总是错的 |
-| \`chrome_screenshot\` | 截图存成图片文件并返回路径。**要整页用 \`fullPage: true\`**;只要某个元素用 \`selector\`——两者都只调一次,不要靠滚动拼接。格式随连接而定(CDP 是 PNG、扩展桥是 JPEG),结果的 \`mime\` 说明实际格式 |
+| \`chrome_screenshot\` | 截图存成图片文件并返回路径。**要整页用 \`fullPage: true\`**;只要某个元素用 \`selector\`——两者都只调一次,不要靠滚动拼接。格式随连接而定(CDP 是 PNG、扩展桥是 JPEG),结果的 \`mime\` 说明实际格式。**标签页已打开 DevTools 时自动退回可视区域截图**:结果带 \`fallback: "visible-tab"\` 和 \`warning\`,\`fullPage\`/\`selector\` 范围不生效(\`viewportOnly: true\`) |
 | \`chrome_click\` | 按 CSS 选择器点击(可选全部匹配元素),返回实际派发点击的元素数并报告不可点原因 |
 | \`chrome_hover\` | 悬停到元素上,展开只在 hover 时出现的菜单/工具条 |
 | \`chrome_type\` | 按 CSS 选择器聚焦并输入文本(默认先清空) |
@@ -133,8 +133,13 @@ export const SKILL_CONTENT: string = `# Chrome 浏览器(用户真实标签页)
   Enter 提交靠显式 \`requestSubmit()\` 兜底(\`chrome_press\` 会报告 \`submitted\`);依赖真实按键序列
   (组合键、输入法)或真实指针的组件仍可能不响应,这些场景退回 \`chrome_eval\`。
 - **操作的是用户真实标签页**:用户可能同时在操作同一个页面;
-  写操作前确认目标,不要在用户正在输入的页面上抢焦点。截图走调试通道,不会切换标签页,
+  写操作前确认目标,不要在用户正在输入的页面上抢焦点。截图优先走调试通道,不会切换标签页,
   但会在该标签页显示「正在调试」提示条。
+- **DevTools 打开时截图自动回退**:调试通道被 DevTools 占用时,\`chrome_screenshot\` 退回
+  \`chrome.tabs.captureVisibleTab\` 的可视区域截图,结果带 \`fallback: "visible-tab"\` 和 \`warning\`。
+  回退图只有视口、可能是一帧旧画面、\`fullPage\`/\`selector\` 范围不生效,而且**只拍该窗口当前活动标签页**
+  (目标不在前台会明确报错)。看到 \`fallback\` 时不要把它当成整页/元素截图;要精确截图就请用户关掉
+  DevTools 后重试,不要靠裁剪或滚动拼接去补。
 - **只开自己能收尾的标签页**:\`chrome_open\` 建的页面记得用 \`chrome_close\` 关掉。
   用户没要求时不要动他已有的标签页。
 - **截图只返回文件路径**,视觉内容要用 \`read_image\` 再读一次。

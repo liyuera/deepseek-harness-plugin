@@ -188,7 +188,10 @@ export function screenshotResult(outcome) {
         return undefined;
     const bytes = num(value, 'bytes');
     const size = bytes === undefined ? '' : ` · ${Math.max(1, Math.round(bytes / 1024))} KB`;
-    return result(`截图 ${baseName(path)}${size}`, path);
+    // DevTools occupied the debugger, so this is the viewport-only fallback: say
+    // so on the card rather than letting the image read as the requested capture.
+    const fallback = str(value, 'fallback') === 'visible-tab' ? ' · 可视区域(DevTools 占用)' : '';
+    return result(`截图 ${baseName(path)}${size}${fallback}`, path);
 }
 /** `chrome_click` pending call. */
 export function clickCall(args) {

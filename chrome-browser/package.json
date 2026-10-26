@@ -1,7 +1,7 @@
 {
   "name": "@liyuera/dsh-chrome-browser",
   "description": "Chrome browser control for dsh: list the user's tabs, read page text or the actionable elements, navigate, click/hover/type, wait for elements, evaluate JS, capture screenshots and read console output through the extension bridge or the Chrome DevTools Protocol, plus an @ menu source listing the live tabs and a browser skill",
-  "version": "0.6.6",
+  "version": "0.6.7",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",

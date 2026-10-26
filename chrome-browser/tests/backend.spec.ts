@@ -563,3 +563,39 @@ describe('ExtensionBackend', () => {
     expect(backend.isConnected()).toBe(false)
   })
 })
+
+describe('screenshot results', () => {
+  /** Ask for one screenshot and answer it with `data`; returns the backend's answer. */
+  async function capture(data: Record<string, unknown>): Promise<unknown> {
+    const { backend, socket } = makeBackend(5000)
+    const outcome = backend.screenshot('7', { fullPage: true })
+    await new Promise(resolve => setTimeout(resolve, 10))
+    const sent = JSON.parse(socket.lastServerText()!) as {
+      commands: Array<{ seq: number; op: string; args: Record<string, unknown> }>
+    }
+    expect(sent.commands[0]).toMatchObject({ op: 'screenshot', args: { tabId: '7', fullPage: true } })
+    socket.feed(FakeSocket.clientText(JSON.stringify({
+      kind: 'results',
+      results: [{ seq: sent.commands[0]!.seq, ok: true, data }],
+    })))
+    return outcome
+  }
+
+  it('passes on the visible-window fallback the extension reports', async () => {
+    // The extension cannot carry the image inline here, so the fallback flag is
+    // the only way the host learns the capture is not what was asked for.
+    await expect(capture({ path: '/tmp/shot.jpg', mime: 'image/jpeg', fallback: 'visible-tab', viewportOnly: true }))
+      .resolves.toEqual({
+        data: '',
+        path: '/tmp/shot.jpg',
+        mime: 'image/jpeg',
+        fallback: 'visible-tab',
+        viewportOnly: true,
+      })
+  })
+
+  it('does not invent a fallback on the debugger path', async () => {
+    await expect(capture({ path: '/tmp/shot.jpg', mime: 'image/jpeg' }))
+      .resolves.toEqual({ data: '', path: '/tmp/shot.jpg', mime: 'image/jpeg' })
+  })
+})

@@ -7,6 +7,9 @@
  * do not cover that scheme. Nothing could close it either, so retired test tabs
  * accumulated with no way to tidy them up.
  */
+import { mkdtempSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import type { BackendTab, BrowserBackend, ClickOutcome } from '../src/backend.ts'
@@ -103,6 +106,49 @@ describe('chrome_screenshot', () => {
     const { definition, calls } = tool('chrome_screenshot')
     await definition.execute({ tabId: '7', fullPage: true, selector: '#main' }, {} as never)
     expect(calls.shots).toEqual([{ tabId: '7', fullPage: true, selector: '#main' }])
+  })
+
+  it('warns when DevTools forced the viewport-only fallback', async () => {
+    // A usable image still comes back, but the result must not read as the
+    // full-page capture that was asked for.
+    const source = join(mkdtempSync(join(tmpdir(), 'dsh-fallback-')), 'shot.jpg')
+    writeFileSync(source, Buffer.from([0xff, 0xd8, 0xff]))
+    const fixture = backend()
+    const found = chromeToolDefinitions(
+      {
+        ...fixture.backend,
+        screenshot: async () => ({
+          data: '',
+          path: source,
+          mime: 'image/jpeg',
+          fallback: 'visible-tab' as const,
+          viewportOnly: true,
+        }),
+      } as unknown as BrowserBackend,
+      resolveChromeConfig({}), new ConsoleLog(), new HelpChannel(),
+    ).find(definition => definition.name === 'chrome_screenshot')
+    if (found === undefined) throw new Error('chrome_screenshot is not registered')
+    const value = await found.execute({ tabId: '7', fullPage: true }, {} as never) as {
+      fallback?: string
+      warning?: string
+      path?: string
+      mime?: string
+    }
+    expect(value.fallback).toBe('visible-tab')
+    expect(value.warning).toContain('可视区域')
+    expect(value.warning).toContain('整页')
+    expect(value.path).toMatch(/\.jpg$/)
+    expect(value.mime).toBe('image/jpeg')
+  })
+
+  it('stays quiet when the debugger produced the image', async () => {
+    const { definition } = tool('chrome_screenshot')
+    const value = await definition.execute({ tabId: '7' }, {} as never) as {
+      fallback?: string
+      warning?: string
+    }
+    expect(value.fallback).toBeUndefined()
+    expect(value.warning).toBeUndefined()
   })
 })
 

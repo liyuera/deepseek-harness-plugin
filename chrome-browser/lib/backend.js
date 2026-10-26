@@ -518,11 +518,19 @@ export class ExtensionBackend {
             fullPage: options?.fullPage === true,
             ...(options?.selector === undefined ? {} : { selector: options.selector }),
         });
-        return result?.path !== undefined
-            ? (result.mime !== undefined
-                ? { data: '', path: result.path, mime: result.mime }
-                : { data: '', path: result.path })
-            : { data: '' };
+        if (result?.path === undefined)
+            return { data: '' };
+        const outcome = { data: '', path: result.path };
+        if (result.mime !== undefined)
+            outcome.mime = result.mime;
+        // Absent on the normal route. Present when DevTools owned the debugger and
+        // the visible-window capture had to stand in for it.
+        if (result.fallback === 'visible-tab') {
+            outcome.fallback = 'visible-tab';
+            if (result.viewportOnly === true)
+                outcome.viewportOnly = true;
+        }
+        return outcome;
     }
     async startConsole(tabId) {
         // The extension attaches its debugger and forwards events; it also persists

@@ -7,6 +7,10 @@
  * looking at another application, and returns the PREVIOUS frame once the window
  * merely stops repainting — a stale image with nothing in the result to say so.
  * Both were observed against a real browser.
+ *
+ * The visible-window call survives as the fallback for the one case where the
+ * debugger cannot be used at all — DevTools already owns the tab. That path and
+ * its reported caveats live in tests/screenshot-fallback.spec.ts.
  */
 import { describe, expect, it } from 'vitest'
 import { loadExtensionFunction } from './support/extension-source.ts'

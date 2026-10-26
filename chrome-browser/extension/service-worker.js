@@ -240,7 +240,7 @@ const SUPPORTED_OPS = [
  * user stayed on a stale extension with nothing to show for it. Only a value
  * carried by the loaded code can tell the host which code is loaded.
  */
-const BUILD_HASH = '5705d1300af6088a998545e83bf2bc3ce58c5ae69de7d4983ad32fc10b1cc6bb'
+const BUILD_HASH = '0fee982aaf70d918a88a88b4228d1daabd5885af9b5e043c0a6e120a36df58e6'
 
 /** Introduce this worker: what it runs, what it can answer, and which code it is. */
 async function hello() {
@@ -591,18 +591,16 @@ async function run(command) {
       return { id: tab.id, title: tab.title || '', url: tab.url || '', active: true }
     }
     case 'screenshot': {
-      // Through the debugger, not `chrome.tabs.captureVisibleTab`: that one
-      // needs the window visible and painting, so it fails with "image readback
-      // failed" while the user is looking at something else — and when the
-      // window merely stops repainting it returns the PREVIOUS frame with no
-      // sign that it did. Page.captureScreenshot has neither problem.
-      const base64 = await captureViaDebugger(Number(command.args.tabId), {
+      // Debugger first: it renders the tab, so background tabs and the whole
+      // page work. Only when DevTools owns that tab's debugger does the
+      // visible-window capture stand in — and that answer says so.
+      const shot = await takeScreenshot(Number(command.args.tabId), {
         fullPage: command.args.fullPage === true,
         selector: typeof command.args.selector === 'string' ? command.args.selector : undefined,
       })
       // Image bytes travel back as a plain HTTP POST, never as a WS JSON frame:
       // an oversized frame closed the bridge right after a successful capture.
-      const blob = await (await fetch('data:image/jpeg;base64,' + base64)).blob()
+      const blob = await (await fetch(shot.dataUrl)).blob()
       const upload = await fetch(`${hostOrigin}/chrome-browser/ext/upload`, {
         method: 'POST',
         headers: { 'content-type': 'application/octet-stream' },
@@ -610,7 +608,11 @@ async function run(command) {
       })
       const body = await upload.json()
       if (body.ok !== true) throw new Error(body.error || '截图上传失败')
-      return { path: body.path, mime: 'image/jpeg' }
+      return {
+        path: body.path,
+        mime: 'image/jpeg',
+        ...(shot.fallback ? { fallback: 'visible-tab', viewportOnly: shot.viewportOnly } : {}),
+      }
     }
     case 'trace': {
       const data = await chrome.storage.local.get({ trace: [] })
@@ -717,6 +719,116 @@ async function captureViaDebugger(tabId, options) {
         // Already detached or the tab is gone: that is the state we wanted.
         if (!/not attached|No tab/i.test(String(error && error.message))) throw error
       }
+    }
+  }
+}
+
+/**
+ * How long a visible-tab capture may stay pending before it is abandoned.
+ *
+ * A minimized or hidden window can make `captureVisibleTab` never settle, and
+ * this worker runs the bridge's commands one at a time — one stuck promise
+ * would hang every later command, not just the screenshot.
+ */
+const VISIBLE_CAPTURE_TIMEOUT_MS = 10_000
+
+/**
+ * Failures that mean DevTools already owns the tab's debugger.
+ *
+ * The first alternative is that refusal's own message; the second is what
+ * `chrome.debugger.attach` answers when DevTools came in between the target
+ * listing and the attach. Everything else — a missing tab, a page Chrome does
+ * not let the extension capture — is not a reason to photograph the window.
+ */
+const DEBUGGER_OWNED = /已被另一个调试器占用|Another debugger is already attached/iu
+
+/**
+ * Whether a capture failure is DevTools owning the tab, not a broken page.
+ * @param error - whatever the debugger path threw.
+ * @returns whether the visible-window fallback is worth trying.
+ */
+function debuggerOwnedByDevTools(error) {
+  return DEBUGGER_OWNED.test(String((error && error.message) || error))
+}
+
+/**
+ * Capture the window's visible tab as a data URL.
+ *
+ * The only capture Chrome still allows while DevTools owns the tab's debugger.
+ * It reads back the window's painted surface instead of rendering the tab, so
+ * it needs the window visible, can answer with a previous frame while the page
+ * is not repainting, and it always photographs whichever tab is active in the
+ * window — hence the active-tab refusal rather than a silently wrong image.
+ * @param tabId - the tab to capture.
+ * @returns the image as a `data:` URL.
+ */
+async function captureVisibleTab(tabId) {
+  const id = Number(tabId)
+  if (!Number.isInteger(id)) throw new Error(`无效的标签页 id:${String(tabId)}`)
+  const tab = await chrome.tabs.get(id)
+  if (tab.active !== true) {
+    throw new Error(
+      '该标签页不在前台——DevTools 占用调试通道时,可视区域截图只能拍该窗口的当前标签页;'
+      + '请切到该标签页或关闭 DevTools 后重试',
+    )
+  }
+  const dataUrl = await new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error('可视区域截图超时(10s),请确认窗口可见且没有最小化')),
+      VISIBLE_CAPTURE_TIMEOUT_MS,
+    )
+    chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: SCREENSHOT_QUALITY }).then(
+      image => {
+        clearTimeout(timer)
+        resolve(image)
+      },
+      error => {
+        clearTimeout(timer)
+        reject(error)
+      },
+    )
+  })
+  if (typeof dataUrl !== 'string' || !/^data:image\//u.test(dataUrl)) {
+    throw new Error('截图失败:可视区域通道没有返回图像数据')
+  }
+  return dataUrl
+}
+
+/**
+ * Capture one tab, through the debugger when it can attach and through the
+ * visible window when DevTools owns that debugger.
+ *
+ * DevTools and `chrome.debugger` cannot share a tab, and DevTools is exactly
+ * when a screenshot is most useful — so this falls back rather than only
+ * telling the user to close it. The fallback cannot honour `fullPage` or
+ * `selector`, and its image can be a stale frame; both facts travel with the
+ * answer so a viewport never silently passes for the whole page.
+ * @param tabId - the tab to capture.
+ * @param options - what to cover, as `chrome_screenshot` asked.
+ * @returns the image data URL, whether the fallback produced it, and whether
+ *   the fallback could not honour the requested scope.
+ */
+async function takeScreenshot(tabId, options) {
+  try {
+    const base64 = await captureViaDebugger(tabId, options)
+    return { dataUrl: 'data:image/jpeg;base64,' + base64, fallback: false, viewportOnly: false }
+  } catch (error) {
+    if (!debuggerOwnedByDevTools(error)) throw error
+    try {
+      return {
+        dataUrl: await captureVisibleTab(tabId),
+        fallback: true,
+        viewportOnly: options !== undefined && (
+          options.fullPage === true
+          || (typeof options.selector === 'string' && options.selector !== '')
+        ),
+      }
+    } catch (visibleError) {
+      // Keep the DevTools cause in the message: the fallback failing for its own
+      // reason (hidden window, background tab) does not remove the conflict, and
+      // closing DevTools still fixes both.
+      const reason = String((visibleError && visibleError.message) || visibleError)
+      throw new Error(`该标签页被另一个调试器占用(例如已打开 DevTools),调试通道无法截图;可视区域回退也失败:${reason}`)
     }
   }
 }

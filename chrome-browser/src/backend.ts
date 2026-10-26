@@ -48,6 +48,29 @@ export interface ScreenshotOptions {
 }
 
 /**
+ * One captured screenshot.
+ *
+ * `data` carries base64 on the CDP backend; the extension bridge uploads the
+ * bytes and answers with a host `path` instead, so exactly one of the two is
+ * populated.
+ */
+export interface ScreenshotOutcome {
+  /** Base64 image bytes, or '' when `path` carries the file. */
+  data: string
+  /** File on the host, for the extension bridge's out-of-band upload. */
+  path?: string
+  /** Actual encoding, so a JPEG is never handed over under a `.png` name. */
+  mime?: string
+  /**
+   * Present when DevTools owned the tab's debugger and the viewport-only
+   * fallback had to stand in for the debugger capture.
+   */
+  fallback?: 'visible-tab'
+  /** True when the fallback could not honour the requested fullPage/selector. */
+  viewportOnly?: boolean
+}
+
+/**
  * Longest edge a capture may produce, in device pixels.
  *
  * A page can be far taller than this, and a texture beyond the GPU's limit
@@ -317,7 +340,7 @@ export interface BrowserBackend {
    */
   waitFor(tabId: string, selector: string, state: WaitState, timeoutMs: number): Promise<boolean>
   type(tabId: string, selector: string, text: string, clear: boolean): Promise<void>
-  screenshot(tabId: string, options?: ScreenshotOptions): Promise<{ data: string; path?: string; mime?: string }>
+  screenshot(tabId: string, options?: ScreenshotOptions): Promise<ScreenshotOutcome>
   /** Begin forwarding one tab's console output to the sink; idempotent. */
   startConsole(tabId: string): Promise<void>
   /** Stop forwarding one tab's console output; idempotent. */
@@ -798,7 +821,7 @@ export class ExtensionBackend implements BrowserBackend {
     if (done !== true) throw new Error(`chrome_type: no element matched selector "${selector}"`)
   }
 
-  async screenshot(tabId: string, options?: ScreenshotOptions): Promise<{ data: string; path?: string; mime?: string }> {
+  async screenshot(tabId: string, options?: ScreenshotOptions): Promise<ScreenshotOutcome> {
     // The extension uploads the image bytes over plain HTTP back to the host
     // and returns only the file path: a large base64 frame inside a WS JSON
     // message closed the bridge right after a successful capture.
@@ -806,12 +829,17 @@ export class ExtensionBackend implements BrowserBackend {
       tabId,
       fullPage: options?.fullPage === true,
       ...(options?.selector === undefined ? {} : { selector: options.selector }),
-    }) as { path?: string; mime?: string } | null
-    return result?.path !== undefined
-      ? (result.mime !== undefined
-          ? { data: '', path: result.path, mime: result.mime }
-          : { data: '', path: result.path })
-      : { data: '' }
+    }) as { path?: string; mime?: string; fallback?: string; viewportOnly?: boolean } | null
+    if (result?.path === undefined) return { data: '' }
+    const outcome: ScreenshotOutcome = { data: '', path: result.path }
+    if (result.mime !== undefined) outcome.mime = result.mime
+    // Absent on the normal route. Present when DevTools owned the debugger and
+    // the visible-window capture had to stand in for it.
+    if (result.fallback === 'visible-tab') {
+      outcome.fallback = 'visible-tab'
+      if (result.viewportOnly === true) outcome.viewportOnly = true
+    }
+    return outcome
   }
 
   async startConsole(tabId: string): Promise<void> {
@@ -1168,7 +1196,7 @@ export class CdpBackend implements BrowserBackend {
     })
   }
 
-  async screenshot(tabId: string, options?: ScreenshotOptions): Promise<{ data: string; path?: string; mime?: string }> {
+  async screenshot(tabId: string, options?: ScreenshotOptions): Promise<ScreenshotOutcome> {
     return this.withTab(tabId, async endpoint => {
       const beyond = options?.fullPage === true || options?.selector !== undefined
       const clip = options?.selector !== undefined

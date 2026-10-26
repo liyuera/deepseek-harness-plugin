@@ -11,7 +11,7 @@ Chrome 浏览器控制插件(host + 浏览器半边):通过 Chrome 扩展桥(默
 | `chrome_navigate` | 标签页导航到 URL(默认等待 `readyState=complete`) |
 | `chrome_open` | 新开前台标签页;**默认等加载完成**(`readyState=complete`,上限 `waitLoadMs`)后返回,返回的标题已是加载后的标题。**URL 只接受 http/https/file**,其它 scheme 在开标签页**之前**就报错 |
 | `chrome_close` | 按 id 关闭一个标签页;**`tabId` 必填,不接受 `active`**——关掉用户正在看的那一页几乎总是错的 |
-| `chrome_screenshot` | 截图落盘,返回路径/字节数/mime;模型用 `read_image` 查看。**`fullPage: true` 一次拍完整页**,`selector` 只拍某个元素(等同 DevTools 的「截取节点屏幕截图」) |
+| `chrome_screenshot` | 截图落盘,返回路径/字节数/mime;模型用 `read_image` 查看。**`fullPage: true` 一次拍完整页**,`selector` 只拍某个元素(等同 DevTools 的「截取节点屏幕截图」)。**该标签页已打开 DevTools 时自动退回可视区域截图**,结果带 `fallback` 与 `warning`(见下) |
 | `chrome_click` | CSS 选择器 `element.click()`(可选 `all` 批量)。返回**实际派发点击**的元素数(不是匹配到的数量),并报告「存在但不可点」的原因 |
 | `chrome_hover` | 悬停到元素上,展开只在 hover 时出现的菜单/工具条 |
 | `chrome_type` | 聚焦输入框并输入文本(默认先全选替换) |
@@ -278,7 +278,7 @@ Chrome 不会重读「加载已解压」扩展的文件,所以插件自己补了
 
 于是 **npm 升级插件后不用再碰 `chrome://extensions`**。
 
-**扩展 0.5.0 / 0.5.1 / 0.5.2 升级会自动重载**:0.5.0 加了 `webmcp-list` / `webmcp-call` 两个 op,0.5.1 改了重连逻辑,0.5.2 加了僵尸宿主检测;这几版都没动 `WS_URLS` 与桥端口(仍拨 21987),改的只是各自的代码与 `BUILD_HASH`。已经连着 21987 的扩展会被现有自动更新握手用 `chrome.runtime.reload()` 重读磁盘,升到对应版本;升级到 0.6.5(扩展 0.5.2)同样不需要手动重载。下面的手动重载只针对从 0.4.1/19387 跨端口升级的那一次。
+**扩展 0.5.0 / 0.5.1 / 0.5.2 / 0.5.3 升级会自动重载**:0.5.0 加了 `webmcp-list` / `webmcp-call` 两个 op,0.5.1 改了重连逻辑,0.5.2 加了僵尸宿主检测,0.5.3 加了 DevTools 占用时的截图回退;这几版都没动 `WS_URLS` 与桥端口(仍拨 21987),改的只是各自的代码与 `BUILD_HASH`。已经连着 21987 的扩展会被现有自动更新握手用 `chrome.runtime.reload()` 重读磁盘,升到对应版本;升级到 0.6.7(扩展 0.5.3)同样不需要手动重载。下面的手动重载只针对从 0.4.1/19387 跨端口升级的那一次。
 
 **例外:首次升级到 21987 这一版**。自动重载握手要求扩展已经连着桥;旧扩展(0.4.1)拨的还是 19387/3080,桌面应用的 dsh 端口每次启动随机,旧扩展没有可用地址,够不到 21987,连不上就收不到握手,所以桌面应用升级后第一次要手动重载(步骤见[安装 → 2](#2-装配套-chrome-扩展));源码启动的 `pnpm dsh web` 在 3080 上仍可能让旧扩展经备用地址连上并自动完成重载,没自动恢复时同样手动重载一次。重载后扩展拨 21987,后续升级恢复自动;新装用户加载的已经是新扩展,没有这一步。
 
@@ -433,8 +433,8 @@ DSH_CHROME_SMOKE=1 npx vitest run tests/smoke.spec.ts   # headless Chrome 全链
 ```sh
 # 1. 改 chrome-browser/package.json 的 version,提交并 push main
 # 2. 打 tag 并 push,触发 .github/workflows/publish-chrome-browser.yml
-git tag chrome-browser-v0.6.6
-git push origin chrome-browser-v0.6.6
+git tag chrome-browser-v0.6.7
+git push origin chrome-browser-v0.6.7
 ```
 
 workflow 在 `chrome-browser/` 里跑 `npm publish --access public`,tag 与 `package.json` 版本不一致会直接失败;公开仓库 + 公开包会自动生成 provenance 证明。npm 侧的一次性配置(已完成):包 Settings → Trusted Publisher → GitHub Actions,`liyuera` / `deepseek-harness-plugin` / `publish-chrome-browser.yml`,并勾上 **Allow npm publish**;创建后 2 天内必须完成一次成功发布来验证配置,Publishing access 已设为最严格的「disallow bypass 2fa tokens」——token 不能发布,但 trusted publisher 不受影响。若 workflow 报 `ENEEDAUTH`,先核对 workflow 文件名、owner/repo 是否与 npm 配置完全一致,以及是否勾了 Allow npm publish。
@@ -476,8 +476,9 @@ workflow 在 `chrome-browser/` 里跑 `npm publish --access public`,tag 与 `pac
 - **`chrome_close` 不猜目标**:`tabId` 是必填的精确 id。省略或写 `active` 都会报错——关掉「用户当前正在看的标签页」几乎总是错的。关闭窗口的最后一个标签页会连带关闭该窗口。
 - **扩展自动更新依赖 `chrome.runtime.reload()` 能读到磁盘上的新文件**:这是该 API 的预期行为,但已加载的解压扩展由 Chrome 缓存,所以插件**只尝试一次**并在失败时明确报告,而不是无限重载。状态见 `/chrome-browser/ext/status`。
 - **`chrome_screenshot` 默认只拍视口**:整页要显式传 `fullPage: true`(一次调用完成,不要靠滚动拼接——拼接会重复固定元素、接缝错位,而且很难对齐)。`selector` 拍单个元素,元素在首屏之下也照样能拍对。
-- **`chrome_screenshot` 会在该标签页显示调试提示条**:它走 `chrome.debugger` 的 `Page.captureScreenshot`(与 CDP 后端同一条路),因此在标签页处于后台时照样可用,也**不会返回陈旧帧**。代价是 Chrome 在该标签页顶部显示「正在调试」提示条,且已打开 DevTools 时无法附着(会明确报错)。如果该标签页已被 `chrome_console` 采集,则复用同一会话,不产生第二次附着。
-- ~~截图要求窗口可见~~:旧实现走 `chrome.tabs.captureVisibleTab`,窗口被遮挡时报 `image readback failed`,窗口停止重绘时**返回上一帧**(实测两张相隔数秒的截图逐字节相同,而返回的路径与字节数不会告诉你它是陈旧的)。已改为调试通道。
+- **`chrome_screenshot` 优先走调试通道**:`chrome.debugger` 的 `Page.captureScreenshot`(与 CDP 后端同一条路)在标签页处于后台时照样可用,也**不会返回陈旧帧**。代价是 Chrome 在该标签页顶部显示「正在调试」提示条。如果该标签页已被 `chrome_console` 采集,则复用同一会话,不产生第二次附着。
+- **DevTools 占用该标签页时自动回退到可视区域截图**:DevTools 与 `chrome.debugger` 不能共用同一个标签页,而调试时恰恰最需要截图,所以截图会退回 `chrome.tabs.captureVisibleTab`,并把实际发生的事写进结果:`fallback: "visible-tab"` + `warning`;`fullPage` / `selector` 指定的范围在回退下**不生效**(`viewportOnly: true`),只拍该窗口当前标签页的**可视区域**。回退通道读的是窗口已绘制的画面:窗口被遮挡时可能报 `image readback failed`,页面停止重绘时**可能返回上一帧**,且目标标签页必须在前台。要精确截图就关掉 DevTools 后重试。
+- ~~截图要求窗口可见~~:旧实现只走 `chrome.tabs.captureVisibleTab`,窗口被遮挡时报 `image readback failed`,窗口停止重绘时**返回上一帧**(实测两张相隔数秒的截图逐字节相同,而返回的路径与字节数不会告诉你它是陈旧的)。现在调试通道优先,只有 DevTools 占用时才回退,且回退结果会自我声明,不再静默。
 - **活动状态条是轮询的**:客户端每秒发一次本地回环 GET。将来若接入会话事件流可以去掉轮询,目前用的是插件已有的路由机制。
 - **人工求助依赖宿主的提问服务**:`chrome_request_help` 在 `ctx.userQuestions` 缺席的组合、以及被委派的子 agent 里不可用(会明确报错)。
 - **文本读取只覆盖主框架**的 `innerText`(iframe 内容不在其中)。

@@ -25,6 +25,28 @@ export interface ScreenshotOptions {
     /** Capture one element instead, matched by CSS selector. */
     selector?: string;
 }
+/**
+ * One captured screenshot.
+ *
+ * `data` carries base64 on the CDP backend; the extension bridge uploads the
+ * bytes and answers with a host `path` instead, so exactly one of the two is
+ * populated.
+ */
+export interface ScreenshotOutcome {
+    /** Base64 image bytes, or '' when `path` carries the file. */
+    data: string;
+    /** File on the host, for the extension bridge's out-of-band upload. */
+    path?: string;
+    /** Actual encoding, so a JPEG is never handed over under a `.png` name. */
+    mime?: string;
+    /**
+     * Present when DevTools owned the tab's debugger and the viewport-only
+     * fallback had to stand in for the debugger capture.
+     */
+    fallback?: 'visible-tab';
+    /** True when the fallback could not honour the requested fullPage/selector. */
+    viewportOnly?: boolean;
+}
 /** One tab as tools and the picker see it. */
 export interface BackendTab {
     id: string;
@@ -223,11 +245,7 @@ export interface BrowserBackend {
      */
     waitFor(tabId: string, selector: string, state: WaitState, timeoutMs: number): Promise<boolean>;
     type(tabId: string, selector: string, text: string, clear: boolean): Promise<void>;
-    screenshot(tabId: string, options?: ScreenshotOptions): Promise<{
-        data: string;
-        path?: string;
-        mime?: string;
-    }>;
+    screenshot(tabId: string, options?: ScreenshotOptions): Promise<ScreenshotOutcome>;
     /** Begin forwarding one tab's console output to the sink; idempotent. */
     startConsole(tabId: string): Promise<void>;
     /** Stop forwarding one tab's console output; idempotent. */
@@ -343,11 +361,7 @@ export declare class ExtensionBackend implements BrowserBackend {
     select(tabId: string, selector: string, value: string): Promise<SelectOutcome>;
     waitFor(tabId: string, selector: string, state: WaitState, timeoutMs: number): Promise<boolean>;
     type(tabId: string, selector: string, text: string, clear: boolean): Promise<void>;
-    screenshot(tabId: string, options?: ScreenshotOptions): Promise<{
-        data: string;
-        path?: string;
-        mime?: string;
-    }>;
+    screenshot(tabId: string, options?: ScreenshotOptions): Promise<ScreenshotOutcome>;
     startConsole(tabId: string): Promise<void>;
     stopConsole(tabId: string): Promise<void>;
     dispose(): void;
@@ -425,11 +439,7 @@ export declare class CdpBackend implements BrowserBackend {
     select(tabId: string, selector: string, value: string): Promise<SelectOutcome>;
     waitFor(tabId: string, selector: string, state: WaitState, timeoutMs: number): Promise<boolean>;
     type(tabId: string, selector: string, text: string, clear: boolean): Promise<void>;
-    screenshot(tabId: string, options?: ScreenshotOptions): Promise<{
-        data: string;
-        path?: string;
-        mime?: string;
-    }>;
+    screenshot(tabId: string, options?: ScreenshotOptions): Promise<ScreenshotOutcome>;
     /**
      * Clip rectangle covering the whole page, scaled down when it would not fit.
      *

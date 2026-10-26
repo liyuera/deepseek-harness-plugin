@@ -285,6 +285,19 @@ describe('completed cards', () => {
     expect(body(view)).toBe('/tmp/dsh-chrome-shots/1-3.png')
   })
 
+  it('says so on the card when DevTools forced the viewport-only fallback', () => {
+    const view = definitions().get('chrome_screenshot')?.presentResult?.(
+      SAMPLE_ARGS.chrome_screenshot,
+      outcome({
+        tabId: '3',
+        path: '/tmp/dsh-chrome-shots/1-3.jpg',
+        bytes: 204_800,
+        fallback: 'visible-tab',
+      }),
+    )
+    expect(view?.title).toBe('截图 1-3.jpg · 200 KB · 可视区域(DevTools 占用)')
+  })
+
   it('reports how many elements a click reached', () => {
     const view = definitions().get('chrome_click')?.presentResult?.(
       SAMPLE_ARGS.chrome_click,
