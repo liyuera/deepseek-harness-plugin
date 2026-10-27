@@ -577,6 +577,15 @@ export class ExtensionBackend implements BrowserBackend {
   /** What the extension last said about itself; null before its first hello. */
   private extension: { version: string; ops: readonly string[]; build: string } | null = null
   /**
+   * Tabs this host is still capturing. Sent to a newly connected extension so
+   * it can detach captures left over from a previous host — a restarted host
+   * holds none, and the debug bar must not survive the session that asked for
+   * it. Kept in step with {@link startConsole} / {@link stopConsole}.
+   */
+  private readonly consoles = new Set<string>()
+  /** Whether the currently attached extension has been sent `console-sync`. */
+  private consoleSynced = false
+  /**
    * The stale build stamp an automatic reload was last asked for, or null.
    *
    * Keyed by stamp rather than by attempt: a reload that cannot move the
@@ -620,6 +629,9 @@ export class ExtensionBackend implements BrowserBackend {
 
   /** The WS upgrade route calls this after a successful handshake. */
   attach(socket: Duplex, head: Buffer): void {
+    // A new connection has its own capture set to reconcile, whoever wrote the
+    // previous one.
+    this.consoleSynced = false
     // A reconnecting client may attach while another (stale) socket is still
     // registered; replace it without leaking the previous connection.
     if (this.conn !== null) this.conn.close()
@@ -848,10 +860,19 @@ export class ExtensionBackend implements BrowserBackend {
   async startConsole(tabId: string): Promise<void> {
     // The extension attaches its debugger and forwards events; it also persists
     // the capture set, so a service worker that Chrome suspends re-arms it.
-    await this.push('console-start', { tabId })
+    // Remember it here as well: a reconnected extension is told which captures
+    // this host still holds, and detaches every other one.
+    this.consoles.add(tabId)
+    try {
+      await this.push('console-start', { tabId })
+    } catch (error) {
+      this.consoles.delete(tabId)
+      throw error
+    }
   }
 
   async stopConsole(tabId: string): Promise<void> {
+    this.consoles.delete(tabId)
     await this.push('console-stop', { tabId })
   }
 
@@ -912,6 +933,7 @@ export class ExtensionBackend implements BrowserBackend {
       ? message.ops.filter((op): op is string => typeof op === 'string')
       : []
     this.extension = { version, ops, build }
+    this.reconcileConsoles()
     const expected = extensionStamp(import.meta.url)
     if (build === '' || expected === '' || build === expected) {
       this.reloadIneffective = false
@@ -934,6 +956,23 @@ export class ExtensionBackend implements BrowserBackend {
       () => { this.reloadAskedFor = build },
       () => undefined,
     )
+  }
+
+  /**
+   * Send the host's capture set to a freshly connected extension, once.
+   *
+   * The extension persists console captures across service-worker suspensions
+   * and re-arms them on every reconnect — including a reconnect to a NEW host
+   * process, which holds no buffers and would silently receive events nobody
+   * reads while Chrome keeps showing its "debugging this browser" bar. Naming
+   * the set lets the extension detach the leftovers. Extensions older than the
+   * op keep the old re-arm behaviour.
+   */
+  private reconcileConsoles(): void {
+    if (this.consoleSynced || this.extension === null) return
+    if (!this.extension.ops.includes('console-sync')) return
+    this.consoleSynced = true
+    void this.push('console-sync', { tabs: [...this.consoles] }).catch(() => undefined)
   }
 
   /**

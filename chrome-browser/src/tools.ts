@@ -241,6 +241,44 @@ export function chromeToolDefinitions(
   consoleLog: ConsoleLog,
   help: HelpChannel,
 ): ToolDefinition[] {
+  /**
+   * Console captures that stop being read are released automatically.
+   *
+   * A capture holds Chrome's debugger, so Chrome shows its "debugging this
+   * browser" bar until someone calls `stop`. A model that forgot to can leave
+   * that bar (and the debugger attachment) for the rest of the session — a
+   * capture nobody reads is not evidence anyone is using. The buffer is KEPT:
+   * the timeout ends new arrivals, it does not throw away what was collected.
+   */
+  const idleTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  const idleReleased = new Set<string>()
+
+  const idleLabel = config.consoleIdleMs >= 60_000
+    ? `${Math.round(config.consoleIdleMs / 60_000)} 分钟`
+    : `${config.consoleIdleMs} 毫秒`
+
+  const clearIdleTimer = (tabId: string): void => {
+    const timer = idleTimers.get(tabId)
+    if (timer !== undefined) {
+      clearTimeout(timer)
+      idleTimers.delete(tabId)
+    }
+  }
+
+  const armIdleTimer = (tabId: string): void => {
+    clearIdleTimer(tabId)
+    if (!(config.consoleIdleMs > 0)) return
+    const timer = setTimeout(() => {
+      idleTimers.delete(tabId)
+      idleReleased.add(tabId)
+      // Best effort: the tab may be gone, and the capture is over either way.
+      void backend.stopConsole(tabId).catch(() => undefined)
+    }, config.consoleIdleMs)
+    // A pending capture timer must not hold the host process open by itself.
+    ;(timer as { unref?: () => void }).unref?.()
+    idleTimers.set(tabId, timer)
+  }
+
   return [
     defineTool({
       name: 'chrome_tabs',
@@ -804,9 +842,11 @@ export function chromeToolDefinitions(
         + 'observe, because nothing is recorded retroactively: action=start attaches the debugger and buffers (Chrome '
         + 'shows a "debugging this browser" bar on that tab until action=stop), action=read returns entries after '
         + '`since` together with a `cursor` to pass as the next `since`, and action=stop ends capture and drops the '
-        + 'buffer. Browser-raised messages (failed requests, CSP refusals, deprecations) are included — a wrapper '
-        + 'around console() would miss them. The buffer is bounded per tab and never written to the session log; '
-        + '`dropped` counts entries evicted before you read them.',
+        + 'buffer. A capture that is not read for the configured idle bound is released automatically so the debugger '
+        + 'bar cannot outlive its use: the buffer is kept, the next read reports `detached: "idle"`, and a new '
+        + 'action=start resumes it. Browser-raised messages (failed requests, CSP refusals, deprecations) are '
+        + 'included — a wrapper around console() would miss them. The buffer is bounded per tab and never written to '
+        + 'the session log; `dropped` counts entries evicted before you read them.',
       parameters: {
         action: {
           type: 'string',
@@ -826,9 +866,13 @@ export function chromeToolDefinitions(
         if (args.action === 'start') {
           await backend.startConsole(tabId)
           consoleLog.track(tabId)
+          idleReleased.delete(tabId)
+          armIdleTimer(tabId)
           return { tabId, capturing: true, capturingTabs: consoleLog.tracked() } as unknown as JsonValue
         }
         if (args.action === 'stop') {
+          clearIdleTimer(tabId)
+          idleReleased.delete(tabId)
           await backend.stopConsole(tabId)
           consoleLog.release(tabId)
           return { tabId, capturing: false } as unknown as JsonValue
@@ -843,12 +887,24 @@ export function chromeToolDefinitions(
             + ' you want to observe, then action=read',
           )
         }
+        // An idle-released capture keeps its entries but no longer forwards new
+        // ones; the read says so instead of looking like a live capture.
+        const idle = idleReleased.has(tabId)
+        if (!idle) armIdleTimer(tabId)
         return {
           tabId,
           entries: page.entries,
           retained: page.retained,
           dropped: page.dropped,
           cursor: page.cursor,
+          ...(idle
+            ? {
+                capturing: false,
+                detached: 'idle',
+                note: `采集在 ${idleLabel} 无读取后已自动结束并释放 Chrome 调试器;已捕获的日志仍保留,`
+                  + '需要继续采集请重新 action=start',
+              }
+            : {}),
         } as unknown as JsonValue
       },
     }),

@@ -49,6 +49,12 @@ export interface ChromePluginConfig {
     /** Screenshot output directory; defaults to <tmp>/dsh-chrome-shots. */
     screenshotDir?: string;
     /**
+     * chrome_console idle bound in milliseconds (300000; 0 disables). A capture
+     * with no read for this long releases Chrome's debugger automatically; the
+     * entries already collected stay readable.
+     */
+    consoleIdleMs?: number;
+    /**
      * Loopback port of this plugin's own extension bridge (21987). The shipped
      * extension dials it and cannot discover another; `0` asks the OS for a free
      * port (tests and diagnostics only).

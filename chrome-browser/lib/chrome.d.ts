@@ -18,6 +18,16 @@ export type ChromeMode = 'user' | 'owned';
  * client used to, at 19387) would make the two contend for the bind.
  */
 export declare const DEFAULT_BRIDGE_PORT = 21987;
+/**
+ * How long one console capture may go without a read before the host releases
+ * its debugger, milliseconds (0 disables the auto-release).
+ *
+ * A capture holds Chrome's debugger, and Chrome shows a "debugging this
+ * browser" bar the whole time. Five minutes without a single read means the
+ * capture is no longer being used — the bar must not outlive the need for it.
+ * The captured entries stay readable; only new ones stop arriving.
+ */
+export declare const DEFAULT_CONSOLE_IDLE_MS: number;
 /** Fully-resolved plugin configuration (schema defaults already applied). */
 export interface ResolvedChromeConfig {
     /** Backend: `extension` (real Chrome via the extension bridge, default) or `cdp`. */
@@ -46,6 +56,8 @@ export interface ResolvedChromeConfig {
     waitLoadMs: number;
     /** Directory for screenshot files. */
     screenshotDir: string;
+    /** chrome_console idle bound, milliseconds (0 = capture never auto-releases). */
+    consoleIdleMs: number;
     /**
      * Loopback port of the plugin's own extension bridge. `0` lets the OS pick
      * one (tests and diagnostics only — the shipped extension cannot find it).

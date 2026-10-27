@@ -44,7 +44,7 @@ export const SKILL_CONTENT: string = `# Chrome 浏览器(用户真实标签页)
 | \`chrome_webmcp_list\` | 列出该页声明的 **WebMCP 工具**(名称/说明/JSON Schema/安全注解);\`available: false\` 表示浏览器没开 WebMCP 或列表失败,退回 DOM 工具;\`available: true\` 且 \`tools: []\` 表示页面有 API 但当前没注册工具 |
 | \`chrome_webmcp_call\` | 执行一个 WebMCP 工具(页面自己实现的动作,比点 DOM 稳);\`pending: true\` 表示已激活但等用户操作,不要重试;对象结果会以 JSON 字符串返回,需要自行解析 |
 | \`chrome_wait\` | 等元素达到 visible / hidden / attached / detached;\`satisfied: false\` 表示超时,不是成功 |
-| \`chrome_console\` | 采集/读取控制台(start / read / stop),含浏览器自己抛的错误 |
+| \`chrome_console\` | 采集/读取控制台(start / read / stop),含浏览器自己抛的错误。**start 会占用调试器,用完必须 stop**;5 分钟无读取会自动释放调试器(日志保留,read 返回 \`detached: "idle"\`) |
 | \`chrome_request_help\` | 请用户做只有人能做的事(登录/验证码),等答复;\`completed: false\` 表示用户跳过,不要重试 |
 
 ## 什么时候用
@@ -107,6 +107,7 @@ export const SKILL_CONTENT: string = `# Chrome 浏览器(用户真实标签页)
 | 读到的内容明显不全 | 只覆盖主框架的 \`innerText\`;iframe 与大量隐藏内容不在其中,必要时用 \`chrome_eval\` 取。 |
 | 页面没反应,但说不清为什么 | **先 \`chrome_console { action: 'start' }\`,再复现,再 \`action: 'read'\`**。采集不回溯,所以必须在使用之前开。控制台里有资源加载失败、CSP 拦截这类浏览器自己抛的错误——\`chrome_eval\` 看不到它们。 |
 | \`chrome_console\` 报 \`not being captured\` | 没 start。顺序是 start → 操作 → read,不是「出问题了再回头看」。 |
+| \`chrome_console\` 的 read 返回 \`detached: "idle"\` | 采集因 5 分钟无读取被自动结束、调试器已释放,**已捕获的日志仍在**返回的 \`entries\` 里——不要以为没采到、不要连续重试 read;要继续采集就重新 \`action: 'start'\`。 |
 | \`chrome_console\` 报标签页已被占用 | 该标签页已打开 DevTools。让用户关掉 DevTools 再试。 |
 | \`chrome_screenshot\` 报错,或结果带 \`fallback\` | 工具已经自动降级过(见「截图与降级」)。带 \`fallback\` 的图只有可视区域、可能是旧帧、指定范围可能没生效;**两级都失败时不要连续重试截图**,改用 \`chrome_eval\` 量尺寸/样式、\`chrome_read\` 读文本作为替代证据,并告诉用户要关 DevTools 或把窗口切到前台。 |
 
@@ -149,6 +150,11 @@ export const SKILL_CONTENT: string = `# Chrome 浏览器(用户真实标签页)
   控制台有 \`chrome_console\`,但**不回溯**:必须在复现之前 start。
 - **控制台缓冲有上限且会丢**:每标签页最多 200 条 / 256 KB,同时最多采集 5 个标签页;
   \`read\` 返回的 \`dropped\` 是被淘汰的条数。桥断开期间的消息直接丢失。
+- **控制台采集会自己退出**:\`start\` 会占用 Chrome 调试器(标签页顶部显示「正在调试」条),
+  **用完立刻 \`action: 'stop'\`**。忘了 stop 也不会一直占着:宿主 5 分钟没有 \`read\` 会自动结束采集
+  并释放调试器(已捕获日志保留,下次 read 返回 \`detached: "idle"\` + note,继续采集要重新 start);
+  宿主进程断开 60 秒后扩展会自动挂断;重启的宿主还会用 \`console-sync\` 让扩展丢弃上一进程遗留的采集。
+  看到 \`detached\` 不代表日志丢了——先读 buffer,不要重复 start 再抱怨采集不回溯。
 - **按键、悬停、下拉的事件是合成的**:送达页面监听器,但不产生浏览器默认行为。
   Enter 提交靠显式 \`requestSubmit()\` 兜底(\`chrome_press\` 会报告 \`submitted\`);依赖真实按键序列
   (组合键、输入法)或真实指针的组件仍可能不响应,这些场景退回 \`chrome_eval\`。

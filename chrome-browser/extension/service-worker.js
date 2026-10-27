@@ -71,6 +71,7 @@ function connect() {
     retryMs = 1000
     disconnectedAt = 0
     lastHostMessageAt = Date.now()
+    touchHostSeen()
     hostOrigin = url.replace(/^ws/u, 'http').replace(/\/chrome-browser\/ext\/ws$/u, '')
     trace('open ' + url)
     hello()
@@ -80,6 +81,7 @@ function connect() {
   }
   ws.onmessage = (event) => {
     lastHostMessageAt = Date.now()
+    touchHostSeen()
     void handle(event.data)
   }
   ws.onerror = () => { /* onclose follows */ }
@@ -204,7 +206,11 @@ setInterval(() => {
 
 chrome.alarms.create('dsh-bridge', { periodInMinutes: 0.5 })
 chrome.alarms.onAlarm.addListener(alarm => {
-  if (alarm.name === 'dsh-bridge' && (socket === null || socket.readyState !== 1)) connect()
+  if (alarm.name !== 'dsh-bridge') return
+  if (socket === null || socket.readyState !== 1) connect()
+  // A wake-up is the one place that also runs after the worker was suspended;
+  // use it to release captures whose host is gone for good.
+  void releaseCapturesIfHostGone()
 })
 chrome.runtime.onStartup.addListener(() => connect())
 chrome.runtime.onInstalled.addListener(() => connect())
@@ -225,7 +231,7 @@ chrome.windows.onFocusChanged.addListener(() => wakeBridge())
  */
 const SUPPORTED_OPS = [
   'list-tabs', 'read', 'inventory', 'wait', 'hover', 'press', 'select', 'eval',
-  'click', 'type', 'console-start', 'console-stop', 'close', 'navigate', 'open',
+  'click', 'type', 'console-start', 'console-stop', 'console-sync', 'close', 'navigate', 'open',
   'screenshot', 'trace', 'reload', 'webmcp-list', 'webmcp-call',
 ]
 
@@ -240,10 +246,11 @@ const SUPPORTED_OPS = [
  * user stayed on a stale extension with nothing to show for it. Only a value
  * carried by the loaded code can tell the host which code is loaded.
  */
-const BUILD_HASH = '943df6ac41fdd0029c907516df85edfe2ae9ba40b6d1917cf87fd93934534519'
+const BUILD_HASH = 'ce156c79ef2fb6695fc38377b924e3a83cb0240c35876eb36d94a5aeca6ec2a6'
 
 /** Introduce this worker: what it runs, what it can answer, and which code it is. */
 async function hello() {
+  touchHostSeen()
   send({
     kind: 'hello',
     version: chrome.runtime.getManifest().version,
@@ -349,6 +356,98 @@ async function consoleTabs() {
 
 async function setConsoleTabs(tabs) {
   await chrome.storage.session.set({ [CONSOLE_TABS_KEY]: tabs })
+}
+
+/** storage.session key: when the host last proved it was reachable (epoch ms). */
+const HOST_SEEN_KEY = 'hostSeenAt'
+
+/**
+ * How long a persisted console capture survives without a reachable host.
+ *
+ * A capture holds Chrome's debugger. If the host vanished (app quit, plugin
+ * unloaded), nothing will ever read that capture again, and the "debugging this
+ * browser" bar would stay until Chrome happens to suspend this worker. A minute
+ * is long enough for a restarted host to reconnect and re-arm, and short enough
+ * that a dead consumer cannot leave a tab in debug mode.
+ */
+const CONSOLE_BRIDGE_GRACE_MS = 60_000
+
+let hostSeenWrittenAt = 0
+
+/** Persist "a host is alive", throttled to one write per 10s. */
+function touchHostSeen() {
+  const now = Date.now()
+  if (now - hostSeenWrittenAt < 10_000) return
+  hostSeenWrittenAt = now
+  chrome.storage.session.set({ [HOST_SEEN_KEY]: now }).catch(() => undefined)
+}
+
+/**
+ * Detach console captures whose host has not been seen within the grace bound.
+ *
+ * Runs from the alarm and on boot, so it also executes after a suspended worker
+ * wakes — a plain timer would die with the worker and never detach anything.
+ */
+async function releaseCapturesIfHostGone() {
+  const tabs = await consoleTabs()
+  if (tabs.length === 0) return
+  let seen = 0
+  try {
+    const data = await chrome.storage.session.get(HOST_SEEN_KEY)
+    seen = typeof data[HOST_SEEN_KEY] === 'number' ? data[HOST_SEEN_KEY] : 0
+  } catch {
+    seen = 0
+  }
+  if (seen !== 0 && Date.now() - seen <= CONSOLE_BRIDGE_GRACE_MS) return
+  await setConsoleTabs([])
+  for (const id of tabs) {
+    try {
+      await chrome.debugger.detach({ tabId: id })
+    } catch {
+      // Already detached, or the tab is gone: that is the state we wanted.
+    }
+    trace('console-release-stale-host ' + id)
+  }
+}
+
+/**
+ * Drop persisted captures the host does not know about.
+ *
+ * Re-arming happens on every bridge open, including a reconnect to a host that
+ * RESTARTED and therefore holds no buffers. The host names the captures it
+ * still owns; everything else is a leftover from a previous host and must be
+ * detached, or Chrome keeps showing "debugging this browser" for a capture
+ * nobody will ever read.
+ * @param tabs - tab ids the host still captures.
+ * @returns how many were kept and how many were dropped.
+ */
+async function syncConsole(tabs) {
+  const keep = new Set((Array.isArray(tabs) ? tabs : []).map(Number))
+  const have = await consoleTabs()
+  const kept = have.filter(id => keep.has(id))
+  const drop = have.filter(id => !keep.has(id))
+  const missing = [...keep].filter(id => !kept.includes(id))
+  await setConsoleTabs(kept)
+  for (const id of drop) {
+    try {
+      await chrome.debugger.detach({ tabId: id })
+    } catch {
+      // Already detached, or the tab is gone: that is the state we wanted.
+    }
+    trace('console-sync-drop ' + id)
+  }
+  // The host still holds a buffer for these: the extension lost the session
+  // (worker restarted) and must re-attach instead of letting the capture die.
+  let restored = 0
+  for (const id of missing) {
+    try {
+      await startConsole(id)
+      restored += 1
+    } catch (error) {
+      trace('console-sync-restore-failed ' + id + ' ' + String((error && error.message) || error).slice(0, 60))
+    }
+  }
+  return { kept: kept.length + restored, dropped: drop.length, restored }
 }
 
 /**
@@ -570,6 +669,8 @@ async function run(command) {
       return startConsole(command.args.tabId)
     case 'console-stop':
       return stopConsole(command.args.tabId)
+    case 'console-sync':
+      return syncConsole(command.args.tabs)
     case 'reload': {
       // Answer first: `chrome.runtime.reload()` tears this worker down, so a
       // result sent after it would never leave. The delay lets the frame flush.
@@ -1496,4 +1597,7 @@ function typeInto(selector, text, clear) {
   return true
 }
 
+// Release captures from a host that is gone before dialling the new one: a
+// wake-up after a crash must not keep the debug bar alive on its own.
+void releaseCapturesIfHostGone()
 connect()

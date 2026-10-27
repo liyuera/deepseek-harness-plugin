@@ -21,7 +21,7 @@ Chrome 浏览器控制插件(host + 浏览器半边):通过 Chrome 扩展桥(默
 | `chrome_webmcp_list` | 列出当前标签页声明的 **WebMCP 工具**(name / title / description / origin / `inputSchema` / `annotations`);浏览器没有 WebMCP API 面(Chrome 未启用)或列表失败时返回 `available: false` + `reason`,退回 DOM 工具;页面有 API 但没注册工具(包括页面没实现 WebMCP)时是 `available: true` + 空 `tools`。只读、并发安全(见 [WebMCP 小节](#webmcp页面声明的工具)) |
 | `chrome_webmcp_call` | 按 `name` + `input`(符合该工具 JSON Schema 的参数对象)调用页面自己实现的工具;**`pending: true` 表示声明式表单在等用户点提交,不要重试**;`navigated: true` 表示调用触发了页面跳转;页面报错会 throw;`result` 上限 200k 字符,**对象结果以 JSON 字符串返回,模型需自己 parse** |
 | `chrome_wait` | 等元素达到某个状态(`visible` / `hidden` / `attached` / `detached`);**`satisfied: false` 表示超时,不是成功** |
-| `chrome_console` | 采集/读取某个标签页的控制台(`action: start / read / stop`);**必须在页面出问题之前 start**,含浏览器自身抛的错误(资源加载失败、CSP 拦截) |
+| `chrome_console` | 采集/读取某个标签页的控制台(`action: start / read / stop`);**必须在页面出问题之前 start**,含浏览器自身抛的错误(资源加载失败、CSP 拦截)。**start 会占用调试器**;5 分钟无读取会自动释放并保留日志(见[采集的代价与自动退出](#采集的代价与自动退出)) |
 | `chrome_request_help` | 停下来请用户做只有人能做的事(登录、验证码、二次验证),等用户答复;`completed: false` 表示用户跳过了,不要重试 |
 | `@` 标签页分组 | 在输入框敲 `@` 时列出实时标签页(行内是「标题 + URL」),选中插入一个引用芯片;发送后消息里只有这个引用,标签页的 URL 与 tabId 由宿主注入一条上下文消息给模型 |
 | **活动状态条** | 会话标题栏末尾**常驻**的淡色胶囊:空闲显示「Chrome 就绪」,调用中显示当前动作与标签页,失败短暂变红 |
@@ -139,9 +139,21 @@ chrome_console { action: 'stop', tabId }         ← 收尾
 - **不落盘**:缓冲只在宿主进程内存里,不写会话日志。只有模型显式 `read` 回来的内容才会进入对话记录——和 `chrome_read` 的暴露面一样。
 - `stop`、插件卸载、标签页关闭都会释放缓冲。
 
-#### 采集的代价
+#### 采集的代价与自动退出
 
 扩展后端用 `chrome.debugger` 附着到被采集的那个标签页,所以**只有那一个标签页顶部会出现 Chrome 的「已开始调试此浏览器」提示条**,`stop` 后消失。模型不会对你没让它采集的标签页这么做。
+
+**这条提示条不会无限期留着**——即便模型忘了 `stop`,`chrome.debugger` 也有自动退出路径:
+
+| 触发 | 行为 |
+| --- | --- |
+| 显式 `action: 'stop'` | 立即 detach、释放缓冲,提示条消失 |
+| `consoleIdleMs`(默认 5 分钟)内没有任何 `read` | 宿主自动 `stopConsole`,释放调试器与提示条;**已捕获的日志保留**,下次 `read` 返回 `detached: "idle"` + `note`,需要继续采集就重新 `start`(可用配置 `consoleIdleMs: 0` 关闭) |
+| 宿主进程断开超过 60 秒 | 扩展在 alarm/boot 时 detach 所有采集并清空持久化的采集集合(没人会再来读它) |
+| 宿主重启后扩展重连 | 新宿主通过 `console-sync` 下发自己仍持有的采集集合;扩展把上一进程遗留、宿主不认识的采集全部 detach,并按宿主持有的集合补挂 |
+| 标签页关闭 | Chrome 自己 detach,提示条随标签页消失 |
+
+`console-sync` 是扩展 0.5.5 新增的 op;旧扩展(0.5.4 及以前)不支持时宿主会跳过这一步,其余自动退出路径照常。
 
 CDP 后端不涉及扩展,直接在一次长驻 CDP 会话上订阅事件。
 
@@ -278,7 +290,7 @@ Chrome 不会重读「加载已解压」扩展的文件,所以插件自己补了
 
 于是 **npm 升级插件后不用再碰 `chrome://extensions`**。
 
-**扩展 0.5.0 / 0.5.1 / 0.5.2 / 0.5.3 / 0.5.4 升级会自动重载**:0.5.0 加了 `webmcp-list` / `webmcp-call` 两个 op,0.5.1 改了重连逻辑,0.5.2 加了僵尸宿主检测,0.5.3/0.5.4 加了截图降级;这几版都没动 `WS_URLS` 与桥端口(仍拨 21987),改的只是各自的代码与 `BUILD_HASH`。已经连着 21987 的扩展会被现有自动更新握手用 `chrome.runtime.reload()` 重读磁盘,升到对应版本;升级到 0.6.8(扩展 0.5.4)同样不需要手动重载。下面的手动重载只针对从 0.4.1/19387 跨端口升级的那一次。
+**扩展 0.5.0 / 0.5.1 / 0.5.2 / 0.5.3 / 0.5.4 / 0.5.5 升级会自动重载**:0.5.0 加了 `webmcp-list` / `webmcp-call` 两个 op,0.5.1 改了重连逻辑,0.5.2 加了僵尸宿主检测,0.5.3/0.5.4 加了截图降级,0.5.5 加了采集的自动退出(`console-sync`、宿主失联释放);这几版都没动 `WS_URLS` 与桥端口(仍拨 21987),改的只是各自的代码与 `BUILD_HASH`。已经连着 21987 的扩展会被现有自动更新握手用 `chrome.runtime.reload()` 重读磁盘,升到对应版本;升级到 0.6.9(扩展 0.5.5)同样不需要手动重载。下面的手动重载只针对从 0.4.1/19387 跨端口升级的那一次。
 
 **例外:首次升级到 21987 这一版**。自动重载握手要求扩展已经连着桥;旧扩展(0.4.1)拨的还是 19387/3080,桌面应用的 dsh 端口每次启动随机,旧扩展没有可用地址,够不到 21987,连不上就收不到握手,所以桌面应用升级后第一次要手动重载(步骤见[安装 → 2](#2-装配套-chrome-扩展));源码启动的 `pnpm dsh web` 在 3080 上仍可能让旧扩展经备用地址连上并自动完成重载,没自动恢复时同样手动重载一次。重载后扩展拨 21987,后续升级恢复自动;新装用户加载的已经是新扩展,没有这一步。
 
@@ -402,6 +414,7 @@ $DSH_HOME/profiles/<profile>/node_modules/@liyuera/dsh-chrome-browser/extension/
         waitLoadMs: 8000      # chrome_navigate 加载等待
         timeoutMs: 15000      # 单命令/就绪超时
         screenshotDir: null   # 默认 <tmp>/dsh-chrome-shots
+        consoleIdleMs: 300000 # chrome_console 无读取自动释放调试器的时限(毫秒;0 = 不自动释放)
 ```
 
 `bridgePort` 是扩展要拨的固定回环端口(默认 **21987**,插件自有端口,理由见[浏览器连接模式](#浏览器连接模式)):dsh web server 的实际监听端口与它不同时,插件在这个端口上另起一个只服务扩展的 HTTP/WS 服务;相同时不另起 listener,由 dsh web server 应答。`bridgePort: 0` 交给系统分配,扩展不知道实际端口,只用于测试/诊断。`backend: 'cdp'` 不启动固定桥,扩展面路由只在 dsh web server 上。
@@ -433,8 +446,8 @@ DSH_CHROME_SMOKE=1 npx vitest run tests/smoke.spec.ts   # headless Chrome 全链
 ```sh
 # 1. 改 chrome-browser/package.json 的 version,提交并 push main
 # 2. 打 tag 并 push,触发 .github/workflows/publish-chrome-browser.yml
-git tag chrome-browser-v0.6.8
-git push origin chrome-browser-v0.6.8
+git tag chrome-browser-v0.6.9
+git push origin chrome-browser-v0.6.9
 ```
 
 workflow 在 `chrome-browser/` 里跑 `npm publish --access public`,tag 与 `package.json` 版本不一致会直接失败;公开仓库 + 公开包会自动生成 provenance 证明。npm 侧的一次性配置(已完成):包 Settings → Trusted Publisher → GitHub Actions,`liyuera` / `deepseek-harness-plugin` / `publish-chrome-browser.yml`,并勾上 **Allow npm publish**;创建后 2 天内必须完成一次成功发布来验证配置,Publishing access 已设为最严格的「disallow bypass 2fa tokens」——token 不能发布,但 trusted publisher 不受影响。若 workflow 报 `ENEEDAUTH`,先核对 workflow 文件名、owner/repo 是否与 npm 配置完全一致,以及是否勾了 Allow npm publish。

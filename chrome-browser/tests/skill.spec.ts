@@ -97,6 +97,14 @@ describe('chrome-browser skill identity', () => {
     expect(SKILL_CONTENT).toContain('fallback: "visible-tab"')
     expect(SKILL_CONTENT).toContain('不要反复硬试截图')
   })
+
+  it('documents how console capture exits', () => {
+    // A capture holds the debugger (and Chrome's debug bar): stop is mandatory,
+    // and the automatic releases are what save a model that forgot.
+    expect(SKILL_CONTENT).toContain('控制台采集会自己退出')
+    expect(SKILL_CONTENT).toContain('detached: "idle"')
+    expect(SKILL_CONTENT).toContain('console-sync')
+  })
 })
 
 describe('registerChromeSkill', () => {

@@ -307,6 +307,15 @@ export declare class ExtensionBackend implements BrowserBackend {
     /** What the extension last said about itself; null before its first hello. */
     private extension;
     /**
+     * Tabs this host is still capturing. Sent to a newly connected extension so
+     * it can detach captures left over from a previous host — a restarted host
+     * holds none, and the debug bar must not survive the session that asked for
+     * it. Kept in step with {@link startConsole} / {@link stopConsole}.
+     */
+    private readonly consoles;
+    /** Whether the currently attached extension has been sent `console-sync`. */
+    private consoleSynced;
+    /**
      * The stale build stamp an automatic reload was last asked for, or null.
      *
      * Keyed by stamp rather than by attempt: a reload that cannot move the
@@ -392,6 +401,17 @@ export declare class ExtensionBackend implements BrowserBackend {
      * hand. `chrome.runtime.reload()` is the only thing that re-reads them.
      */
     private noteExtensionHello;
+    /**
+     * Send the host's capture set to a freshly connected extension, once.
+     *
+     * The extension persists console captures across service-worker suspensions
+     * and re-arms them on every reconnect — including a reconnect to a NEW host
+     * process, which holds no buffers and would silently receive events nobody
+     * reads while Chrome keeps showing its "debugging this browser" bar. Naming
+     * the set lets the extension detach the leftovers. Extensions older than the
+     * op keep the old re-arm behaviour.
+     */
+    private reconcileConsoles;
     /**
      * Refuse an op the connected extension does not advertise.
      *

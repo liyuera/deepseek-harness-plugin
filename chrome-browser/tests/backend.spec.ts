@@ -64,8 +64,13 @@ class FakeSocket extends EventEmitter {
   lastServerText(): string | undefined {
     for (let i = this.written.length - 1; i >= 0; i--) {
       const frame = this.written[i]!
-      const payload = frame.subarray(2)
-      if ((frame[0]! & 0x0f) === 0x1) return payload.toString('utf8')
+      if ((frame[0]! & 0x0f) !== 0x1) continue
+      // Server frames carry a payload length, never a mask: 7 bits inline or a
+      // 16/64-bit extended length after the opcode byte.
+      const short = frame[1]!
+      if (short < 126) return frame.subarray(2).toString('utf8')
+      if (short === 126) return frame.subarray(4).toString('utf8')
+      return frame.subarray(10).toString('utf8')
     }
     return undefined
   }
@@ -382,6 +387,78 @@ describe('ExtensionBackend', () => {
   function hello(socket: FakeSocket, build: string, ops: string[], version = '0.0.1'): void {
     socket.feed(FakeSocket.clientText(JSON.stringify({ kind: 'hello', version, ops, build })))
   }
+
+  /** Every command in every server frame written so far, in send order. */
+  function sentCommands(socket: FakeSocket): Array<{ seq: number; op: string; args?: unknown }> {
+    const commands: Array<{ seq: number; op: string; args?: unknown }> = []
+    for (const frame of socket.written) {
+      if ((frame[0]! & 0x0f) !== 0x1) continue
+      const short = frame[1]!
+      const payload = short < 126 ? frame.subarray(2) : short === 126 ? frame.subarray(4) : frame.subarray(10)
+      const message = JSON.parse(payload.toString('utf8')) as {
+        kind?: string
+        commands?: Array<{ seq: number; op: string; args?: unknown }>
+      }
+      if (message.kind === 'commands' && Array.isArray(message.commands)) commands.push(...message.commands)
+    }
+    return commands
+  }
+
+  /** Acknowledge the named commands so their promises settle. */
+  function ack(socket: FakeSocket, commands: Array<{ seq: number; op: string }>): void {
+    socket.feed(FakeSocket.clientText(JSON.stringify({
+      kind: 'results',
+      results: commands.map(command => ({ seq: command.seq, ok: true, data: { tabId: '7' } })),
+    })))
+  }
+
+  it('tells a reconnected extension which captures the host still holds', async () => {
+    const ops = ['list-tabs', 'reload', 'console-start', 'console-stop', 'console-sync']
+    const { backend, socket } = makeBackend()
+    const build = backend.extensionStatus().expectedBuild
+    hello(socket, build, ops)
+    await new Promise(resolve => setTimeout(resolve, 10))
+    // The first connection reconciles to an empty set.
+    ack(socket, sentCommands(socket).filter(command => command.op === 'console-sync'))
+    await new Promise(resolve => setTimeout(resolve, 10))
+
+    const started = backend.startConsole('7')
+    await new Promise(resolve => setTimeout(resolve, 10))
+    const start = sentCommands(socket).find(command => command.op === 'console-start')
+    expect(start).toBeDefined()
+    ack(socket, [start!])
+    await expect(started).resolves.toBeUndefined()
+
+    // A reconnected extension re-armed whatever storage.session held — possibly
+    // a capture from a host process that no longer exists. The host names its
+    // own set so the extension can detach the leftovers.
+    socket.emit('close')
+    backend.detach()
+    const socket2 = new FakeSocket()
+    backend.attach(socket2 as never, Buffer.alloc(0))
+    hello(socket2, build, ops)
+    await new Promise(resolve => setTimeout(resolve, 10))
+    const sync = sentCommands(socket2).find(command => command.op === 'console-sync')
+    expect(sync).toBeDefined()
+    expect(JSON.stringify(sync!.args)).toBe('{"tabs":["7"]}')
+  })
+
+  it('does not send console-sync to an extension that predates the op', async () => {
+    // Older extensions re-arm captures on reconnect and have no way to drop
+    // them; sending the op would only earn a capability error.
+    const ops = ['list-tabs', 'console-start', 'console-stop']
+    const { backend, socket } = makeBackend()
+    const build = backend.extensionStatus().expectedBuild
+    hello(socket, build, ops)
+    await new Promise(resolve => setTimeout(resolve, 10))
+    socket.emit('close')
+    backend.detach()
+    const socket2 = new FakeSocket()
+    backend.attach(socket2 as never, Buffer.alloc(0))
+    hello(socket2, build, ops)
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(sentCommands(socket2).some(command => command.op === 'console-sync')).toBe(false)
+  })
 
   it('refuses an op the extension does not advertise, naming the real cause', async () => {
     // Sending it anyway earns `unknown op` from the extension: an internal error

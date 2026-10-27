@@ -13,7 +13,7 @@
 import z from '@deepseek-ai/schemastery';
 import { ActivityTracker, withActivity } from "./activity.js";
 import { buildBackend } from "./backend.js";
-import { DEFAULT_BRIDGE_PORT, resolveChromeConfig } from "./chrome.js";
+import { DEFAULT_BRIDGE_PORT, DEFAULT_CONSOLE_IDLE_MS, resolveChromeConfig } from "./chrome.js";
 import { ConsoleLog } from "./console-log.js";
 import { installExtensionBridge } from "./bridge.js";
 import { HelpChannel, registerHelpChannel } from "./help.js";
@@ -45,6 +45,7 @@ export const Config = z.object({
     waitLoadMs: z.number().step(1).min(0).default(8000),
     timeoutMs: z.number().step(1).min(100).default(15000),
     screenshotDir: z.string(),
+    consoleIdleMs: z.number().step(1).min(0).default(DEFAULT_CONSOLE_IDLE_MS),
     bridgePort: z.number().step(1).min(0).max(65535).default(DEFAULT_BRIDGE_PORT),
 });
 /**

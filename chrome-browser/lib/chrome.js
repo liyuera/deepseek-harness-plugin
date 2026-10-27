@@ -19,6 +19,16 @@ import { cdpEndpoint, websocketSocket, } from "./cdp.js";
  * client used to, at 19387) would make the two contend for the bind.
  */
 export const DEFAULT_BRIDGE_PORT = 21987;
+/**
+ * How long one console capture may go without a read before the host releases
+ * its debugger, milliseconds (0 disables the auto-release).
+ *
+ * A capture holds Chrome's debugger, and Chrome shows a "debugging this
+ * browser" bar the whole time. Five minutes without a single read means the
+ * capture is no longer being used — the bar must not outlive the need for it.
+ * The captured entries stay readable; only new ones stop arriving.
+ */
+export const DEFAULT_CONSOLE_IDLE_MS = 5 * 60_000;
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 /** Page expression resolving the favicon url (first icon link wins). */
 const FAVICON_EXPRESSION = `(() => {
@@ -254,6 +264,7 @@ export function resolveChromeConfig(config, _platform = process.platform) {
         readTextLimit: config.readTextLimit ?? 30000,
         waitLoadMs: config.waitLoadMs ?? 8000,
         screenshotDir: config.screenshotDir ?? defaultScreenshotDir(),
+        consoleIdleMs: config.consoleIdleMs ?? DEFAULT_CONSOLE_IDLE_MS,
         bridgePort: config.bridgePort ?? DEFAULT_BRIDGE_PORT,
     };
 }

@@ -16,7 +16,7 @@ import type { PreStepDecision } from '@deepseek-ai/dsh-agent'
 import z from '@deepseek-ai/schemastery'
 import { ActivityTracker, withActivity } from './activity.ts'
 import { buildBackend } from './backend.ts'
-import { DEFAULT_BRIDGE_PORT, resolveChromeConfig } from './chrome.ts'
+import { DEFAULT_BRIDGE_PORT, DEFAULT_CONSOLE_IDLE_MS, resolveChromeConfig } from './chrome.ts'
 import type { ChromeMode, ResolvedChromeConfig } from './chrome.ts'
 import { ConsoleLog } from './console-log.ts'
 import { installExtensionBridge } from './bridge.ts'
@@ -64,6 +64,12 @@ export interface ChromePluginConfig {
   /** Screenshot output directory; defaults to <tmp>/dsh-chrome-shots. */
   screenshotDir?: string
   /**
+   * chrome_console idle bound in milliseconds (300000; 0 disables). A capture
+   * with no read for this long releases Chrome's debugger automatically; the
+   * entries already collected stay readable.
+   */
+  consoleIdleMs?: number
+  /**
    * Loopback port of this plugin's own extension bridge (21987). The shipped
    * extension dials it and cannot discover another; `0` asks the OS for a free
    * port (tests and diagnostics only).
@@ -84,6 +90,7 @@ export const Config: z<ChromePluginConfig> = z.object({
   waitLoadMs: z.number().step(1).min(0).default(8000),
   timeoutMs: z.number().step(1).min(100).default(15000),
   screenshotDir: z.string(),
+  consoleIdleMs: z.number().step(1).min(0).default(DEFAULT_CONSOLE_IDLE_MS),
   bridgePort: z.number().step(1).min(0).max(65535).default(DEFAULT_BRIDGE_PORT),
 })
 
