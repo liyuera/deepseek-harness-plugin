@@ -11,10 +11,18 @@
  *          -> close the domain from the fiber disposer
  *
  *   GET  /bug-workflow/api/health    -> { ok, domainOpenedAt, tickets }
- *   GET  /bug-workflow/api/snapshot  -> { ok, workspace, settings, platform, tickets, serverTime }
+ *   GET  /bug-workflow/api/snapshot  -> { ok, workspace, settings, platform, dicts, tickets, serverTime }
  *   POST /bug-workflow/api/action    -> { ok, ticket } | { ok:false, code, message, ticket? }
  *   POST /bug-workflow/api/settings  -> { ok, settings }
  *   POST /bug-workflow/api/platform-token -> { ok, tokenPresent }
+ *   POST /bug-workflow/api/sync      -> { ok, synced, created, updated, total, filtered, lastSyncAt }
+ *
+ * Sync wiring (P2 Task 4): `createSyncService()` reads the token from
+ * `ctx.credentials`, maps platform tasks into the v2 ticket store, and persists
+ * the dictionaries/last-sync status in `meta`. `ctx.interval(600_000)` runs it
+ * for the most recently created live session cwd, but only while a token is
+ * present; every failure is captured in `meta['platform.lastSyncError']` and
+ * never thrown out of the timer.
  *
  * Failure policy: `webServer` is the only hard dependency, so the plugin still
  * loads in a profile without storage. The `credentials` service is read
@@ -36,14 +44,19 @@
  */
 import { closeDomain, openDomain, settingsSchema, ticketSchema } from './src/host/domain.js';
 import { createTokenStore } from './src/host/credentials.js';
+import { createPlatformClient } from './src/host/platform.js';
 import {
   registerRoutes,
   registerUnavailableRoutes,
 } from './src/host/routes.js';
 import { createStore } from './src/host/store.js';
+import { createSyncService } from './src/host/sync.js';
 import { resolveWorkspace } from './src/host/workspace.js';
 
 export const inject = ['webServer'];
+
+/** Periodic platform sync interval (10 minutes). */
+export const AUTO_SYNC_INTERVAL_MS = 600_000;
 
 /**
  * Write-boundary validators handed to the store. These are the domain's real
@@ -131,12 +144,33 @@ export function apply(ctx) {
         // without. Absent credentials -> tokenPresent:false + 503 on writes.
         const tokenStore = createTokenStore(readCredentials(storageCtx));
 
+        // Sync engine: token from credentials, platform client over the
+        // workspace's `platformBaseUrl`. `createPlatformClient` throws for an
+        // invalid baseUrl; the sync service catches that (invalid config) and
+        // never lets it reach the routes/timer.
+        const sync = createSyncService({
+          store,
+          tokenStore,
+          getSettings: (cwd) => store.getSettings(cwd),
+          platformClientFor: (settings, token) => createPlatformClient({
+            baseUrl: settings.platformBaseUrl,
+            token,
+          }),
+          clock,
+        });
+
+        // Automatic sync is registered BEFORE the real routes are mounted: if
+        // the optional timer service misbehaves, the catch path still owns the
+        // fallback route set (never real handlers over a closed domain).
+        registerAutoSync(storageCtx, sync);
+
         stage = 'register-routes';
         health.stage = stage;
         const mounted = mountApi(() => registerRoutes(ctx, {
           store,
           workspace,
           tokenStore,
+          sync,
           clock,
           domainOpenedAt: handle.openedAt,
           // Full request errors stay in the host log; only clipped summaries
@@ -231,4 +265,93 @@ function logRequestFailure(context, entry) {
 
 function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Register the 10-minute auto-sync tick.
+ *
+ * `timer` is read optionally (`ctx.get('timer')`) rather than injected: an
+ * absent timer service only disables auto-sync, it must not hold back the
+ * storage routes. The service's `interval(callback, delay)` returns a disposer;
+ * wrapping it in `ctx.effect` ties it to this fiber.
+ */
+function registerAutoSync(context, syncService) {
+  const timer = readTimer(context);
+  if (timer === null) {
+    try {
+      context?.logger?.warn?.('bug-workflow: timer service unavailable, auto-sync disabled');
+    } catch {
+      // Diagnostics only.
+    }
+    return;
+  }
+
+  context.effect(
+    () => timer.interval(() => {
+      void runAutoSync(context, syncService);
+    }, AUTO_SYNC_INTERVAL_MS),
+    'bug-workflow: platform auto-sync',
+  );
+}
+
+/**
+ * Optional `timer` service lookup. Accessing `context.interval` directly throws
+ * "cannot get property \"timer\" without inject" on this runtime, so the
+ * documented optional service access is used instead.
+ */
+function readTimer(context) {
+  try {
+    const timer = typeof context?.get === 'function' ? context.get('timer') : undefined;
+    if (timer !== null && typeof timer === 'object' && typeof timer.interval === 'function') {
+      return timer;
+    }
+  } catch {
+    // An unavailable/broken timer service only disables auto-sync.
+  }
+  return null;
+}
+
+/**
+ * One auto-sync tick. Skips silently when no token is configured or no live
+ * session exposes a cwd; `syncService.run()` itself returns a structured
+ * failure (also persisted in meta), so nothing is ever thrown to the timer.
+ */
+async function runAutoSync(context, syncService) {
+  try {
+    const status = await syncService.status();
+    if (status?.tokenPresent !== true) return;
+
+    const cwd = latestLiveCwd(context.sessions);
+    if (cwd === null) return;
+
+    await syncService.run(cwd);
+  } catch (error) {
+    try {
+      context.logger?.warn?.('bug-workflow: 自动同步失败', error);
+    } catch {
+      // Diagnostics only: a broken logger must not reject the timer.
+    }
+  }
+}
+
+/**
+ * cwd of the most recently created live session that carries one. Sessions are
+ * listed in creation order, so the newest session is the "last known" target;
+ * no live session means there is nothing to sync for.
+ */
+function latestLiveCwd(sessions) {
+  try {
+    if (sessions === null || typeof sessions !== 'object' || typeof sessions.list !== 'function') {
+      return null;
+    }
+    const list = sessions.list();
+    if (!Array.isArray(list)) return null;
+    for (let index = list.length - 1; index >= 0; index -= 1) {
+      const cwd = list[index]?.header?.cwd;
+      if (typeof cwd === 'string' && cwd.trim() !== '') return cwd;
+    }
+  } catch {
+    // A failing session store must not break the timer.
+  }
+  return null;
 }

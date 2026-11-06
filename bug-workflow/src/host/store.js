@@ -67,6 +67,23 @@ export const ACTION_KEY_PREFIX = 'action:';
 /** Upper bound of persisted action results (oldest evicted first). */
 export const MAX_ACTION_RESULTS = 500;
 
+/** Meta key holding the mapped platform dictionaries (Task 4). */
+export const PLATFORM_DICTS_KEY = 'platform.dicts';
+
+/** Dictionary groups exposed by `/snapshot`; every group is always an array. */
+export const DICT_GROUPS = Object.freeze(['status', 'type', 'priority']);
+
+/** Ticket fields a platform sync is allowed to overwrite on an existing row. */
+const SYNCED_TICKET_FIELDS = Object.freeze([
+  'title',
+  'type',
+  'status',
+  'version',
+  'priority',
+  'assignee',
+  'url',
+]);
+
 /** Workspace settings defaults; also the schema key list in `domain.js`. */
 export const DEFAULT_SETTINGS = Object.freeze({
   platformBaseUrl: 'https://ecard.htwisdom.cn',
@@ -352,7 +369,160 @@ export function createStore(domain, clock = defaultClock, options = {}) {
     return structuredClone(validated);
   }
 
-  return { list, get, snapshot, create, applyAction, getSettings, putSettings };
+  /**
+   * Merge platform-synced records into the ticket table (P2 Task 4).
+   *
+   * Each record carries `{ code, title, type, status, version, priority,
+   * assignee, url, source:'platform', platform }` where `platform` is the
+   * domain-v2 snapshot. An existing ticket keeps its local workflow state
+   * (`workflow`, `blockedFrom`, `blockedReason`, `plan`, `branch`, `mr`,
+   * `fixes`, `timeline`, `createdAt`) and only the display fields plus
+   * `platform` are refreshed. A new ticket starts at `inbox` through
+   * `initialTicket()`. Every merged record is validated with the injected
+   * `validateTicket` BEFORE any `put`, so a schema-invalid sync result cannot
+   * leave a partially updated table behind. Duplicate codes in one batch are
+   * collapsed last-wins.
+   *
+   * @param {object[]} records mapped platform records
+   * @param {string} [now] ISO 8601 timestamp for `updatedAt`/`createdAt`
+   * @returns {Promise<{created: number, updated: number}>}
+   * @throws {StoreError} `invalid-input` for malformed batches, `invalid-payload`
+   *   when a merged record fails the domain schema
+   */
+  async function upsertPlatformRecords(records, now) {
+    if (!Array.isArray(records)) {
+      throw new StoreError('invalid-input', '平台同步记录必须是数组');
+    }
+    const at = now === undefined ? readNow(clock) : normalizeTimestamp(now);
+
+    // Dedupe by code: the same ticket must never be counted as both created and
+    // updated in one run.
+    const byCode = new Map();
+    for (const raw of records) {
+      if (!isPlainObject(raw)) {
+        throw new StoreError('invalid-input', '平台同步记录必须是对象');
+      }
+      const code = normalizeCode(raw.code);
+      if (code === undefined) {
+        throw new StoreError('invalid-input', '平台同步记录缺少工单编号');
+      }
+      if (!isPlainObject(raw.platform)) {
+        throw new StoreError('invalid-payload', `工单 ${code} 缺少平台快照`);
+      }
+      byCode.set(code, raw);
+    }
+
+    const pending = [];
+    let created = 0;
+    let updated = 0;
+
+    for (const [code, record] of byCode) {
+      const existing = readTicket(code);
+      if (existing.reason === 'invalid') {
+        throw new StoreError('invalid-record', `工单 ${code} 的存储记录损坏，请人工检查`);
+      }
+
+      let next;
+      if (existing.ok) {
+        next = cloneTicket(existing.ticket);
+        for (const field of SYNCED_TICKET_FIELDS) {
+          if (record[field] !== undefined) next[field] = record[field];
+        }
+        next.source = 'platform';
+        next.platform = record.platform;
+        next.updatedAt = at;
+        updated += 1;
+      } else {
+        next = withPlatformDefaults(
+          initialTicket(
+            {
+              code,
+              ...pickSyncedFields(record),
+            },
+            at,
+          ),
+        );
+        next.source = 'platform';
+        next.platform = record.platform;
+        created += 1;
+      }
+
+      // A board ticket without a display title is unusable; the platform name
+      // normally wins, the code is only the last-resort fallback.
+      if (typeof next.title !== 'string' || next.title.trim() === '') next.title = code;
+
+      const checked = checkTicket(next);
+      if (!checked.ok) throw new StoreError(checked.code, checked.message);
+      pending.push([code, checked.ticket]);
+    }
+
+    for (const [code, ticket] of pending) {
+      await tickets.put(code, ticket);
+    }
+
+    return { created, updated };
+  }
+
+  /**
+   * Read one `meta` record's value. Meta rows are `{ at, value }` envelopes;
+   * the raw envelope never leaves the store. Corrupted entries count as absent.
+   *
+   * @param {string} key meta key
+   * @returns {unknown} the stored value, or undefined
+   */
+  function getMeta(key) {
+    if (typeof key !== 'string' || key.trim() === '') return undefined;
+    const record = metaTable.get(key);
+    return isPlainObject(record) ? record.value : undefined;
+  }
+
+  /**
+   * Persist one `meta` value. `at` orders eviction for the action ledger and is
+   * irrelevant for the platform status keys; wall-clock `Date.now()` is enough.
+   *
+   * @param {string} key non-empty meta key
+   * @param {unknown} value JSON-safe value (`null` clears a stored error)
+   */
+  async function setMeta(key, value) {
+    if (typeof key !== 'string' || key.trim() === '') {
+      throw new StoreError('invalid-input', 'meta key 必须是非空字符串');
+    }
+    await metaTable.put(key, { at: Date.now(), value });
+    return value;
+  }
+
+  /**
+   * Mapped platform dictionaries for the board filters. Always returns all
+   * three groups as arrays, so the snapshot/client never special-cases a
+   * missing dictionary.
+   *
+   * @returns {{status: object[], type: object[], priority: object[]}}
+   */
+  function getDicts() {
+    return normalizeDicts(getMeta(PLATFORM_DICTS_KEY));
+  }
+
+  /** Validate and persist the mapped dictionaries; returns the normalized copy. */
+  async function setDicts(dicts) {
+    const normalized = normalizeDicts(dicts);
+    await setMeta(PLATFORM_DICTS_KEY, normalized);
+    return normalized;
+  }
+
+  return {
+    list,
+    get,
+    snapshot,
+    create,
+    applyAction,
+    getSettings,
+    putSettings,
+    upsertPlatformRecords,
+    getMeta,
+    setMeta,
+    getDicts,
+    setDicts,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -508,6 +678,46 @@ function pickCreateFields(input) {
     if (typeof input[field] === 'string') picked[field] = input[field];
   }
   return picked;
+}
+
+/** Same projection for a synced platform record (`null` stays `null`). */
+function pickSyncedFields(record) {
+  const picked = {};
+  for (const field of SYNCED_TICKET_FIELDS) {
+    const value = record[field];
+    if (typeof value === 'string' || value === null) picked[field] = value;
+  }
+  return picked;
+}
+
+/** Validate an injected "now" timestamp; the store only persists ISO strings. */
+function normalizeTimestamp(value) {
+  if (typeof value === 'string' && !Number.isNaN(Date.parse(value))) return value;
+  throw new StoreError('invalid-input', 'now 必须是 ISO 8601 时间字符串');
+}
+
+/**
+ * Normalize a `{status,type,priority}` dictionary map to the snapshot shape.
+ * Unknown groups are dropped, non-array groups become empty, and every entry is
+ * reduced to `{key,value,color}` with string values. Missing dictionaries are
+ * NOT an error: the board simply shows no filter options.
+ */
+function normalizeDicts(raw) {
+  const normalized = { status: [], type: [], priority: [] };
+  if (!isPlainObject(raw)) return normalized;
+
+  for (const group of DICT_GROUPS) {
+    const entries = raw[group];
+    if (!Array.isArray(entries)) continue;
+    normalized[group] = entries
+      .filter((entry) => isPlainObject(entry) && typeof entry.key === 'string' && entry.key !== '')
+      .map((entry) => ({
+        key: entry.key,
+        value: typeof entry.value === 'string' ? entry.value : '',
+        color: typeof entry.color === 'string' ? entry.color : '',
+      }));
+  }
+  return normalized;
 }
 
 function failure(code, message) {

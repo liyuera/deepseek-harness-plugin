@@ -4,10 +4,12 @@
  * Routes (all exact, all JSON, all same-origin/loopback only):
  *
  *   GET  /bug-workflow/api/health          -> { ok, domainOpenedAt, tickets }
- *   GET  /bug-workflow/api/snapshot        -> { ok, workspace, settings, platform, tickets, serverTime }
+ *   GET  /bug-workflow/api/snapshot        -> { ok, workspace, settings, platform, dicts, tickets, serverTime }
  *   POST /bug-workflow/api/action          -> { ok, ticket } | { ok:false, code, message, ticket? }
  *   POST /bug-workflow/api/settings        -> { ok, settings }
  *   POST /bug-workflow/api/platform-token  -> { ok, tokenPresent } (token is only written, never read back)
+ *   POST /bug-workflow/api/sync            -> { ok, synced, created, updated, total, filtered, lastSyncAt }
+ *                                              | { ok:false, code, message }
  *
  * `createHandlers({ store, workspace, clock, tokenStore })` is pure over its dependencies so
  * the tests can drive real `IncomingMessage`-shaped fake requests. `index.js`
@@ -55,6 +57,7 @@ export const API_PATHS = Object.freeze({
   action: '/bug-workflow/api/action',
   settings: '/bug-workflow/api/settings',
   platformToken: '/bug-workflow/api/platform-token',
+  sync: '/bug-workflow/api/sync',
 });
 
 /** Request-body cap for POST routes (64 KiB). */
@@ -79,6 +82,7 @@ const ROUTE_METHODS = Object.freeze({
   action: 'POST',
   settings: 'POST',
   platformToken: 'POST',
+  sync: 'POST',
 });
 
 /** Store failure code -> HTTP status. Unknown codes are protocol bugs -> 500. */
@@ -92,6 +96,24 @@ const STORE_ERROR_STATUS = Object.freeze({
   'duplicate-code': 409,
   'not-found': 404,
   'invalid-record': 500,
+});
+
+/**
+ * Sync failure code -> HTTP status. Upstream 401 is the only error the user can
+ * fix by re-entering the token; every other upstream/network failure is a 502
+ * (bad gateway) and unexpected service failures are 500.
+ */
+const SYNC_ERROR_STATUS = Object.freeze({
+  'no-platform-token': 400,
+  'invalid-platform-config': 400,
+  'unknown-workspace': 400,
+  'platform-unauthorized': 401,
+  'platform-network': 502,
+  'platform-http': 502,
+  'platform-not-found': 502,
+  'platform-bad-response': 502,
+  'invalid-request': 502,
+  internal: 500,
 });
 
 /** Explicit allow-list of loopback Host header values (with optional port). */
@@ -111,17 +133,20 @@ const LOOPBACK_REMOTE_ADDRESSES = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1
  * @param {{resolve: (sessionId: string) => {path: string|null, configured: boolean}}} deps.workspace
  * @param {object|null} [deps.tokenStore] `createTokenStore()` result; when null
  *   the snapshot reports `tokenPresent:false` and the token route answers 503
+ * @param {object|null} [deps.sync] `createSyncService()` result; when null the
+ *   sync route answers 503 and the snapshot falls back to token presence only
  * @param {() => string} [deps.clock] ISO 8601 server time for snapshots
  * @param {number|null} [deps.domainOpenedAt] domain open timestamp for health
  * @param {number} [deps.bodyTimeoutMs] POST body read deadline (default 10 s)
  * @param {((entry: {event: string, error: unknown}) => void)|null} [deps.log]
  *   optional host logger; receives full errors that are hidden from responses
- * @returns {{health: Function, snapshot: Function, action: Function, settings: Function, platformToken: Function}}
+ * @returns {{health: Function, snapshot: Function, action: Function, settings: Function, platformToken: Function, sync: Function}}
  */
 export function createHandlers({
   store,
   workspace,
   tokenStore = null,
+  sync = null,
   clock = defaultClock,
   domainOpenedAt = null,
   bodyTimeoutMs = BODY_TIMEOUT_MS,
@@ -139,6 +164,14 @@ export function createHandlers({
     }
   }
   const tokenStoreSafe = tokenStore === undefined ? null : tokenStore;
+  if (sync !== null && sync !== undefined) {
+    for (const method of ['run', 'status']) {
+      if (typeof sync[method] !== 'function') {
+        throw new TypeError(`createHandlers() sync.${method} must be a function`);
+      }
+    }
+  }
+  const syncService = sync === undefined ? null : sync;
   if (typeof clock !== 'function') {
     throw new TypeError('createHandlers() requires clock to be a function');
   }
@@ -188,13 +221,10 @@ export function createHandlers({
         ok: true,
         workspace: resolved,
         settings: store.getSettings(resolved.path),
-        platform: {
-          tokenPresent: await readTokenPresent(tokenStoreSafe),
-          // Task 4 owns the sync engine; keep the final snapshot shape from
-          // day one so the client never has to special-case an absent object.
-          lastSyncAt: null,
-          lastSyncError: null,
-        },
+        // Task 4: platform status + dictionaries. Both readers degrade to
+        // safe defaults so a failing sync/meta read cannot take down the board.
+        platform: await readPlatformStatus(syncService, tokenStoreSafe),
+        dicts: readDicts(store),
         tickets: snapshot.tickets,
         serverTime: clock(),
       });
@@ -298,6 +328,69 @@ export function createHandlers({
     }),
 
     /**
+     * Run the platform → ticket-store sync for the caller's workspace. The
+     * workspace cwd (not the session id) keys both the settings record and the
+     * per-cwd single-flight in the sync service. Every failure is a structured
+     * code; the mapping is in `SYNC_ERROR_STATUS` (no token/config 400,
+     * upstream 401, network/upstream 502, unexpected 500).
+     */
+    sync: safe(async (req, res) => {
+      if (!guard(req, res, ROUTE_METHODS.sync)) return;
+      if (!guardJsonContentType(req, res)) return;
+      if (!guardOrigin(req, res)) return;
+
+      const body = await readJsonBody(req, bodyTimeoutMs);
+      if (!body.ok) {
+        sendError(res, body.status, body.code, body.message);
+        if (body.destroyRequest === true) destroyRequest(req);
+        return;
+      }
+      const input = body.value;
+
+      const sessionId = normalizeSessionId(input.sessionId);
+      if (sessionId === undefined) {
+        sendError(res, 400, 'missing-session', '缺少有效的 sessionId');
+        return;
+      }
+
+      if (syncService === null) {
+        sendError(res, 503, 'sync-unavailable', '平台同步服务不可用，请稍后重试');
+        return;
+      }
+
+      const resolved = normalizeWorkspace(workspace.resolve(sessionId));
+      if (resolved.path === null) {
+        // The platform base URL/project code live in workspace settings; an
+        // unbound session would silently sync against the default real platform.
+        sendError(res, 400, 'unknown-workspace', '无法确定工作区路径，无法同步平台工单');
+        return;
+      }
+
+      const result = await syncService.run(resolved.path);
+      if (result?.ok === true) {
+        sendJsonSafe(res, 200, {
+          ok: true,
+          synced: numberOrZero(result.synced),
+          created: numberOrZero(result.created),
+          updated: numberOrZero(result.updated),
+          total: numberOrZero(result.total),
+          filtered: numberOrZero(result.filtered),
+          lastSyncAt: typeof result.lastSyncAt === 'string' ? result.lastSyncAt : null,
+        });
+        return;
+      }
+
+      const code = typeof result?.code === 'string' ? result.code : 'internal';
+      const status = SYNC_ERROR_STATUS[code] ?? 500;
+      sendError(
+        res,
+        status,
+        code,
+        clipMessage(typeof result?.message === 'string' ? result.message : '平台同步失败'),
+      );
+    }),
+
+    /**
      * Write or clear the platform token. The body is `{sessionId, token}`:
      * a string stores it, `null` clears it. Nothing from the credential store
      * is ever echoed: the response carries only `{ok, tokenPresent}`.
@@ -364,7 +457,7 @@ export function createHandlers({
 }
 
 /**
- * Register the five real routes on `ctx.webServer` and return a disposer.
+ * Register the six real routes on `ctx.webServer` and return a disposer.
  *
  * The caller must have opened the domain and built the store already. Register
  * this only after disposing `registerUnavailableRoutes()`: duplicate exact paths
@@ -372,7 +465,7 @@ export function createHandlers({
  *
  * @param {object} ctx Cordis context carrying `webServer`
  * @param {object} deps same deps as {@link createHandlers}
- * @returns {() => void} idempotent disposer removing all five routes
+ * @returns {() => void} idempotent disposer removing all six routes
  */
 export function registerRoutes(ctx, deps) {
   const webServer = getWebServer(ctx);
@@ -392,7 +485,7 @@ export function registerRoutes(ctx, deps) {
  *
  * @param {object} ctx Cordis context carrying `webServer`
  * @param {{status?: string, stage?: string, error?: string}} [health] shared health state
- * @returns {() => void} idempotent disposer removing all five routes
+ * @returns {() => void} idempotent disposer removing all six routes
  */
 export function registerUnavailableRoutes(ctx, health = {}) {
   const webServer = getWebServer(ctx);
@@ -410,6 +503,7 @@ export function registerUnavailableRoutes(ctx, health = {}) {
     action: unavailableHandler(ROUTE_METHODS.action, health),
     settings: unavailableHandler(ROUTE_METHODS.settings, health),
     platformToken: unavailableHandler(ROUTE_METHODS.platformToken, health),
+    sync: unavailableHandler(ROUTE_METHODS.sync, health),
   };
   return registerHandlers(webServer, handlers);
 }
@@ -547,6 +641,74 @@ async function readTokenPresent(tokenStore) {
   } catch {
     return false;
   }
+}
+
+/**
+ * Snapshot `platform` object. The sync service is the source of truth for both
+ * token presence and the last-sync meta; without it (or if its status read
+ * throws) the snapshot degrades to token presence + null timestamps so the
+ * board keeps rendering.
+ */
+async function readPlatformStatus(syncService, tokenStore) {
+  if (syncService !== null && syncService !== undefined) {
+    try {
+      const status = await syncService.status();
+      if (isPlainObject(status)) {
+        return {
+          tokenPresent: status.tokenPresent === true,
+          lastSyncAt: typeof status.lastSyncAt === 'string' ? status.lastSyncAt : null,
+          lastSyncError: typeof status.lastSyncError === 'string' ? status.lastSyncError : null,
+        };
+      }
+    } catch {
+      // Fall through to the token-only default.
+    }
+  }
+  return {
+    tokenPresent: await readTokenPresent(tokenStore),
+    lastSyncAt: null,
+    lastSyncError: null,
+  };
+}
+
+/**
+ * Snapshot `dicts` object. Always all three groups as arrays (the client never
+ * special-cases a missing dictionary); a store without `getDicts()` (fake store
+ * in tests, older host) or a corrupted meta record reads as empty.
+ */
+function readDicts(store) {
+  const empty = emptyDicts();
+  if (typeof store.getDicts !== 'function') return empty;
+
+  let dicts;
+  try {
+    dicts = store.getDicts();
+  } catch {
+    return empty;
+  }
+
+  const out = emptyDicts();
+  for (const group of ['status', 'type', 'priority']) {
+    const entries = isPlainObject(dicts) ? dicts[group] : undefined;
+    if (!Array.isArray(entries)) continue;
+    out[group] = entries
+      .filter((entry) => isPlainObject(entry) && typeof entry.key === 'string')
+      .map((entry) => ({
+        key: entry.key,
+        value: typeof entry.value === 'string' ? entry.value : '',
+        color: typeof entry.color === 'string' ? entry.color : '',
+      }));
+  }
+  return out;
+}
+
+function emptyDicts() {
+  return { status: [], type: [], priority: [] };
+}
+
+/** Coerce a sync stat to a non-negative integer; anything else counts as 0. */
+function numberOrZero(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0;
 }
 
 /** A response writer that also survives a client that already disconnected. */
