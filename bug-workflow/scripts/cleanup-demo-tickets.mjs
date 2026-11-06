@@ -48,13 +48,14 @@ import {
   fsyncSync,
   openSync,
   readFileSync,
+  realpathSync,
   renameSync,
   statSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 
 const USAGE = [
   'usage: node bug-workflow/scripts/cleanup-demo-tickets.mjs --codes <CODE[,CODE…]> [options]',
@@ -212,6 +213,7 @@ export function writeStorageAtomic(storagePath, storage) {
   );
   const body = `${JSON.stringify(storage, null, 2)}\n`;
   let fd;
+  let renamed = false;
   try {
     fd = openSync(tempPath, 'wx', 0o600);
     writeFileSync(fd, body, 'utf8');
@@ -225,6 +227,9 @@ export function writeStorageAtomic(storagePath, storage) {
       throw new Error('temp file round-trip lost the bug_workflow unit');
     }
     renameSync(tempPath, storagePath);
+    // From here on the destination already holds the new content; the caller
+    // must not claim the original file is untouched if this chmod fails.
+    renamed = true;
     chmodSync(storagePath, 0o600);
   } catch (error) {
     if (fd !== undefined) {
@@ -238,6 +243,11 @@ export function writeStorageAtomic(storagePath, storage) {
       if (existsSync(tempPath)) unlinkSync(tempPath);
     } catch {
       // Best effort.
+    }
+    try {
+      error.renamed = renamed;
+    } catch {
+      // A frozen/non-extensible error still propagates; `renamed` is advisory.
     }
     throw error;
   }
@@ -271,7 +281,11 @@ function main(argv) {
   }
 
   let storage;
+  let readStat;
   try {
+    // Stat before reading: `--write` compares this with a pre-write stat so a
+    // concurrent editor (or a still-running host) cannot be silently clobbered.
+    readStat = statSync(storagePath);
     storage = readStorage(storagePath);
   } catch (error) {
     console.error(`cleanup-demo-tickets: ${error.message}`);
@@ -315,6 +329,28 @@ function main(argv) {
     return 0;
   }
 
+  console.log('');
+  console.log('WARNING: --write replaces the storage file.');
+  console.log('Quit DSH completely first: a running host keeps the domain in memory and');
+  console.log('will overwrite this file from its in-memory state (losing this cleanup).');
+
+  let currentStat;
+  try {
+    currentStat = statSync(storagePath);
+  } catch (error) {
+    console.error(`cleanup-demo-tickets: cannot stat storage before writing: ${error.message}`);
+    console.error('Refusing to write; the file was not changed and no backup was made.');
+    return 1;
+  }
+  if (currentStat.mtimeMs !== readStat.mtimeMs || currentStat.size !== readStat.size) {
+    console.error('cleanup-demo-tickets: storage changed after it was read; refusing to write.');
+    console.error(`  read: mtime=${new Date(readStat.mtimeMs).toISOString()} size=${readStat.size}`);
+    console.error(`  now:  mtime=${new Date(currentStat.mtimeMs).toISOString()} size=${currentStat.size}`);
+    console.error('Make sure DSH is quit and nothing else writes this file, then re-run.');
+    console.error('The file was not changed and no backup was made.');
+    return 1;
+  }
+
   const mode = statSync(storagePath).mode & 0o777;
   const backupPath = `${storagePath}.bak-${timestampForBackup()}`;
   copyFileSync(storagePath, backupPath);
@@ -326,27 +362,58 @@ function main(argv) {
     writeStorageAtomic(storagePath, next);
   } catch (error) {
     console.error(`cleanup-demo-tickets: write failed: ${error.message}`);
-    console.error(`Original file untouched; backup: ${backupPath}`);
+    console.error(`backup: ${backupPath}`);
+    if (error.renamed === true) {
+      console.error('the storage file was already replaced before this failure (the atomic rename succeeded);');
+      console.error('restore the backup above if the new content is not what you want.');
+    } else {
+      console.error('the storage file was not replaced (the failure happened before the atomic rename);');
+      console.error('the original file is unchanged, and the backup above is a copy of it.');
+    }
     return 1;
   }
 
   const check = readStorage(storagePath);
   const remaining = Object.keys(check.tables.tickets);
   const leftover = removedCodes.filter((code) => remaining.includes(code));
-  if (leftover.length > 0) {
-    console.error(`cleanup-demo-tickets: verification failed, still present: ${leftover.join(', ')}`);
-    console.error(`Original file untouched; backup: ${backupPath}`);
+  const expectedRemaining = totalTickets - removedCodes.length;
+  if (leftover.length > 0 || remaining.length !== expectedRemaining) {
+    console.error('cleanup-demo-tickets: post-rename verification failed.');
+    if (leftover.length > 0) {
+      console.error(`  still present: ${leftover.join(', ')}`);
+    }
+    if (remaining.length !== expectedRemaining) {
+      console.error(`  ticket count is ${remaining.length}, expected ${expectedRemaining}`);
+    }
+    console.error('the storage file has already been replaced by the write above;');
+    console.error(`backup of the pre-write file: ${backupPath}`);
     return 1;
   }
 
   console.log('');
   console.log(`Removed ${removedCodes.length} ticket(s): ${removedCodes.join(', ')}`);
+  console.log(`verified: removed code(s) absent, ${remaining.length} ticket(s) remain`);
   console.log(`tickets: ${remaining.length} remaining (was ${totalTickets})`);
   console.log(`backup:  ${backupPath}`);
   console.log(`mode:    ${(statSync(storagePath).mode & 0o777).toString(8)} (was ${mode.toString(8)})`);
   return 0;
 }
 
-if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
+/**
+ * True when this module is the process entry point. Compares real paths so a
+ * symlinked invocation (`ln -s … cleanup.mjs && ./cleanup.mjs`) still runs
+ * `main`; Node resolves the ESM entry symlink, but `argv[1]` stays as typed.
+ */
+function isMainModule() {
+  const entry = process.argv[1];
+  if (entry === undefined) return false;
+  try {
+    return realpathSync(entry) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isMainModule()) {
   process.exitCode = main(process.argv.slice(2));
 }

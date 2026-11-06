@@ -52,10 +52,10 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 | 字典筛选 | 平台 `teamTaskStatus/teamTaskType/teamTaskPriority` 写入 snapshot `dicts`，驱动列表状态/类型筛选（保留平台颜色点）；字典未覆盖的旧值仍可筛选 |
 | 平台信息 | 列表显示来源 Badge（平台/手动）与平台类型/状态；详情显示类型/状态/负责人/版本/项目/描述摘要 + 「在平台打开」外链（仅 `http(s)`） |
 | 错误映射 | token 缺失/配置错误 400、token 失效 401、网络/上游 502、未知 500；界面给出可操作提示 |
-| 自动同步 | 有 token 时每 10 分钟对最近 live 会话的工作区执行一次同步（单飞，不会与手动同步并发）；**本项未在 live 观察到 tick** |
+| 自动同步 | 有 token 时每 10 分钟对最近 live 会话的工作区执行一次同步；单飞是**按 cwd 的**——自动同步选中最近 live 会话的 cwd，手动同步用的是当前会话的 cwd，**同一工作区内**才会合并，不同工作区各自独立、可以并发；**本项未在 live 观察到 tick** |
 | 测试 | 191 个用例（credentials / domain v2 / platform 客户端 / sync / routes / client 映射） |
 
-> **动作映射的维护约束（每期必读）**：按钮只来自 `bug-workflow/client.js` 的 `ACTION_BY_STATE` 字面量（按 `workflow` 的静态列表）；宿主 `canApply` 是转移的权威，但两者是**两份独立数据**。`test/client-action-map.test.js` 只做单向校验（map → host：每个映射动作在该状态必须被 `canApply` 接受），**不校验 host → map**，所以新增宿主动作不会自动出现按钮。每加/改一个动作，必须同步更新该映射并运行 `node --test bug-workflow/test/*.test.js`。已知两处偏差：① `mr_open` 且 `mr.rounds = 3` 时看板仍显示 `review_requests_changes`，点击后被宿主拒绝（409 `review-rounds-exhausted` → 工单进入 `blocked`）；② 宿主支持 `block`（任意非终态可执行），但看板没有「阻塞」按钮。
+> **动作映射的维护约束（每期必读）**：按钮只来自 `bug-workflow/client.js` 的 `ACTION_BY_STATE` 字面量（按 `workflow` 的静态列表）；宿主 `canApply` 是转移的权威，但两者是**两份独立数据**。`test/client-action-map.test.js` 只做单向校验（map → host：每个映射动作在该状态必须被 `canApply` 接受），**不校验 host → map**，所以新增宿主动作不会自动出现按钮。每加/改一个动作，必须同步更新该映射并运行 `node --test bug-workflow/test/*.test.js`。已知一处偏差：宿主支持 `block`（任意非终态可执行），但看板没有「阻塞」按钮。review 轮次上限已由映射处理，不再是偏差：`review_requests_changes` 声明 `maxRounds: 3`，`mr.rounds = 3` 时该按钮在界面上禁用并显示「轮次已耗尽」提示，不会发出必然被拒的请求；宿主仍是权威（绕过 UI 直接 POST 仍返回 409 `review-rounds-exhausted`，工单进入 `blocked`）。
 
 **P2 之后仍是「假引擎」的部分**：平台工单的同步/导入是真的 HTTP 数据，但「开始分析 → 方案 → 修复 → 建 MR → review → 合并」仍由看板按钮手工 POST 假 payload 驱动，不调用子代理、GitLab 或 worktree，也没有状态写回。
 
@@ -67,10 +67,11 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 2. 在平台页面打开开发者工具 → Console，读取：
 
    ```js
-   localStorage.getItem('app/access-token')
+   // P0 实测键名带命名空间；页面版本不同时回退到无前缀键
+   localStorage.getItem('app/access-token') ?? localStorage.getItem('access-token')
    ```
 
-   P0 实测的完整键名是 **`app/access-token`**（纯字符串，不是 JWT）；若你的页面版本只有 `access-token`，以实际键名为准。
+   P0 实测的完整键名是 **`app/access-token`**（纯字符串，不是 JWT）；看板内 token 提示文案只写了 `access-token`，是简写。**两个键都试，以页面实际存在的为准**：先 `app/access-token`，再回退 `access-token`。
 3. 复制返回值。**不要把 token 发到聊天、issue、日志或提交到 git**；本插件只需要它在宿主凭据里。
 
 ### 2. 配置步骤（看板设置）
@@ -87,7 +88,7 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 
 ### 3. 同步语义
 
-- 取数：`GET /user-auth-info` 拿当前用户 id → 分页 `GET /task?refHandlerPersonId=<id>&size=100&descs=createdTime`（上限 1000 条 / 12 页）→ `GET /dict/business/dictionary`（状态/类型/优先级三组）。字典失败会中止整次同步，避免「工单已更新、筛选字典还是旧的」。
+- 取数：`GET /user-auth-info` 拿当前用户 id → 分页 `GET /task?refHandlerPersonId=<id>&size=100&descs=createdTime`（上限 1000 条 / 12 页）→ `GET /dict/business/dictionary`（状态/类型/优先级三组）。**上游 `getDicts()` 失败**发生在任何工单 upsert 之前，会中止整次同步、工单不变；但 **`store.setDicts()` 在工单 upsert 之后执行**：若这次存储写失败，同步返回 `internal`（`lastSyncAt` 不写、`lastSyncError` 记录），而工单可能已更新、筛选字典仍是旧的——存在这个部分成功窗口，不是「整次同步原子回滚」。
 - 过滤：`platformProjectCode` 非空时只 upsert 前缀匹配的工单，其余计入 `filtered`；空则全部。
 - 合并：已存在的工单只更新标题/类型/状态/优先级/版本/负责人/URL/平台快照/`updatedAt`，**保留** `workflow`、`blocked*`、`plan`、`branch`、`mr`、`fixes`、`timeline`、`createdAt`；新工单从 `inbox` 开始、`source:'platform'`。
 - 元数据：`meta['platform.lastSyncAt']`、`meta['platform.lastSyncError']`、`meta['platform.dicts']`；成功同步会清空 `lastSyncError`。
@@ -213,7 +214,7 @@ P2 **未对真实平台执行**同步/导入（无真实 token，用户不在场
     --codes YGFNXDJRFWDJSYJJYY-647,YGFNXDJRFWDJSYJJYY-648,HTSMART-12 --write
   ```
 
-  脚本会校验 domain/JSON、只删 `source:'platform'` 且 URL 为 loopback 的工单、写 `0600` 备份、用同目录临时文件 + fsync + 原子 rename 落盘；运行中的宿主会用内存状态覆盖外部编辑，所以**必须退出 DSH**。
+  脚本会校验 domain/JSON、只删 `source:'platform'` 且 URL 为 loopback 的工单、写 `0600` 备份、用同目录临时文件 + fsync + 原子 rename 落盘；`--write` 会先打印「退出 DSH」警告，并在文件于读取后被改动时拒绝写入。原子 rename 之后原文件即被替换：若 rename 后的 chmod 或回读校验失败，脚本会打印备份路径与「文件已被替换」，不会声称「原文件未动」。运行中的宿主会用内存状态覆盖外部编辑，所以**必须退出 DSH**。
 
 ## 安全边界
 
@@ -235,6 +236,7 @@ P2 **未对真实平台执行**同步/导入（无真实 token，用户不在场
 - **无删除/归档/按工作区隔离**：`done` 工单仍保存在 `tickets` 表但列表隐藏；没有归档视图；切换项目编码不会 prune 旧工单；`tickets` 仍是 profile 全局。
 - **导入不更新 lastSyncAt**：导入是 upsert，不是同步；标题栏的「上次同步」不会因导入刷新。
 - **设置校验只在客户端**：`branchUser`/`commitType` 的服务端仍是空串可接受（见「打包与交接」）。
+- **`workspace.configured` 只表示「会话解析到了目录」**：不代表设置已保存。`store.getSettings(cwd)` 对没保存过的 cwd 也返回默认值，看板无法区分「默认值」与「显式保存过的默认值」；设置面板按该标志放行，不等于用户配置过该工作区（`client.js` 的 `configured` 判定仍是这一语义）。
 - **app 重启未验证**：只验证了 host 半边「移除 → 重装」热重载后数据保留。
 - **未接 locale**：文案硬编码中文，`locale/*.json` 尚未提供。
 - **`lastSyncError` 不会因清 token 自动清除**：只有下一次成功同步才会清空；`lastSyncAt` 在恢复设置/停止 mock 后仍是上一次成功同步时间。
