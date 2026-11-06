@@ -19,6 +19,11 @@
  *     `workspace.configured === true`. A rejected action (409/415/403/500) shows
  *     a retryable banner with the server `code` and `message`; nothing throws out
  *     of the slot.
+ *   - workspace settings open as an in-panel overlay (Esc closes, focus returns
+ *     to the header button) and save with `POST /bug-workflow/api/settings`.
+ *     The host binds settings to the session's workspace cwd, so when the
+ *     snapshot reports `workspace.configured === false` the panel still opens
+ *     read-only with the save button disabled and an explicit hint.
  *   - `PanelErrorBoundary` keeps a render failure from blanking the whole slot.
  *
  * The client never re-implements the state machine: action buttons are derived
@@ -39,6 +44,7 @@ window.__ModuleLoader__.load({
     const API = Object.freeze({
       snapshot: '/bug-workflow/api/snapshot',
       action: '/bug-workflow/api/action',
+      settings: '/bug-workflow/api/settings',
     });
 
     /** Poll cadence in milliseconds (P1 contract: every 3 s). */
@@ -104,7 +110,7 @@ window.__ModuleLoader__.load({
     const MAX_REVIEW_ROUNDS = 3;
 
     /** Shown whenever the session has no workspace: every mutation is gated. */
-    const UNBOUND_WORKSPACE_HINT = '当前会话未绑定工作区，暂不能写入；请在已绑定工作区的会话中使用（Task 5 将提供设置入口）';
+    const UNBOUND_WORKSPACE_HINT = '当前会话未绑定工作区，暂不能写入；请先在会话工作区打开「Bug 看板」（设置同样需要已绑定的工作区）';
 
     // <client-action-map>
     /**
@@ -240,6 +246,98 @@ window.__ModuleLoader__.load({
       done: [],
     };
     // </client-action-map>
+
+    // ---------------------------------------------------------------------
+    // Workspace settings (the host stores them per workspace cwd)
+    // ---------------------------------------------------------------------
+
+    /** Settings contract defaults, mirrored from `src/host/store.js`. */
+    const SETTINGS_DEFAULTS = Object.freeze({
+      platformProjectCode: '',
+      gitlabProjectPath: '',
+      branchUser: 'ly',
+      gitlabReviewer: '',
+      commitType: 'fix',
+      lintCommand: '',
+      testCommand: '',
+      devCommand: '',
+      previewUrl: '',
+    });
+
+    /** Settings keys in contract order (payload and dirty comparison order). */
+    const SETTINGS_KEYS = Object.freeze(Object.keys(SETTINGS_DEFAULTS));
+
+    /**
+     * The nine settings fields, Chinese label + one-line help. `required` marks
+     * the fields the board refuses to submit empty (the host would still accept
+     * them, but P2 uses them for branch/commit generation).
+     */
+    const SETTINGS_FIELDS = Object.freeze([
+      {
+        key: 'platformProjectCode',
+        label: '平台项目编码',
+        hint: '平台项目编码，如 YGFNXDJRFWDJSYJJYY',
+        placeholder: 'YGFNXDJRFWDJSYJJYY',
+      },
+      {
+        key: 'gitlabProjectPath',
+        label: 'GitLab 项目路径',
+        hint: 'GitLab 项目路径 group/project；留空表示未配置',
+        placeholder: 'group/project',
+      },
+      {
+        key: 'branchUser',
+        label: '个人分支后缀',
+        hint: '个人分支后缀，如 ly',
+        placeholder: 'ly',
+        required: true,
+      },
+      {
+        key: 'gitlabReviewer',
+        label: 'GitLab Reviewer',
+        hint: 'Reviewer 用户名，如 zhangsan，可留空',
+        placeholder: 'zhangsan',
+      },
+      {
+        key: 'commitType',
+        label: '提交信息前缀',
+        hint: '提交信息前缀，默认 fix',
+        placeholder: 'fix',
+        required: true,
+      },
+      {
+        key: 'lintCommand',
+        label: 'Lint 命令',
+        hint: 'Lint 命令，可留空',
+        placeholder: 'pnpm lint',
+      },
+      {
+        key: 'testCommand',
+        label: '测试命令',
+        hint: '测试命令，可留空',
+        placeholder: 'pnpm test',
+      },
+      {
+        key: 'devCommand',
+        label: '启动命令',
+        hint: '启动命令，可留空',
+        placeholder: 'pnpm dev',
+      },
+      {
+        key: 'previewUrl',
+        label: '预览地址',
+        hint: '预览地址，可留空',
+        placeholder: 'http://127.0.0.1:5173',
+      },
+    ]);
+
+    /** `group/project`, two non-empty segments without whitespace. */
+    const GITLAB_PROJECT_PATH_RE = /^[^/\s]+\/[^/\s]+$/;
+
+    const SETTINGS_SAVE_HINT = '设置按工作区保存，未保存的修改会在关闭面板后丢弃';
+    const SETTINGS_UNBOUND_HINT = '当前会话未绑定工作区，设置无法保存：请先在会话工作区打开「Bug 看板」后再保存。';
+    const SETTINGS_LOADING_HINT = '正在读取工作区信息，读取完成前无法保存设置。';
+    const SETTINGS_NO_SESSION_HINT = '缺少会话上下文，无法保存设置。';
 
     // ---------------------------------------------------------------------
     // Theme tokens (all colors come from --dsw-alias-*; fallbacks are neutral)
@@ -493,6 +591,71 @@ window.__ModuleLoader__.load({
           : [],
         serverTime: typeof value.serverTime === 'string' ? value.serverTime : null,
       };
+    }
+
+    /**
+     * Normalize a settings record to the nine contract fields. Values are kept
+     * verbatim (trimming happens only on save); a missing field takes its
+     * documented default, an empty string stays empty so required-field
+     * validation can report it.
+     */
+    function normalizeSettings(raw) {
+      const source = raw !== null && typeof raw === 'object' ? raw : {};
+      const next = {};
+      for (const key of SETTINGS_KEYS) {
+        const value = source[key];
+        next[key] = typeof value === 'string' ? value : SETTINGS_DEFAULTS[key];
+      }
+      return next;
+    }
+
+    /** Snapshot (`{settings}`) or null -> a complete settings draft. */
+    function settingsFromSnapshot(snapshot) {
+      if (snapshot === null || typeof snapshot !== 'object') return normalizeSettings(null);
+      return normalizeSettings(snapshot.settings);
+    }
+
+    /** The exact POST body: every field present, trimmed, string-typed. */
+    function settingsPayload(draft) {
+      const source = draft !== null && typeof draft === 'object' ? draft : {};
+      const payload = {};
+      for (const key of SETTINGS_KEYS) {
+        const value = source[key];
+        payload[key] = typeof value === 'string' ? value.trim() : '';
+      }
+      return payload;
+    }
+
+    function settingsEqual(a, b) {
+      if (a === b) return true;
+      if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object') return false;
+      for (const key of SETTINGS_KEYS) {
+        if (a[key] !== b[key]) return false;
+      }
+      return true;
+    }
+
+    /**
+     * Field errors for a settings draft. Empty `gitlabProjectPath` means "not
+     * configured" and is valid; `branchUser` and `commitType` must not be empty;
+     * command/preview fields may be empty.
+     */
+    function validateSettings(draft) {
+      const value = draft !== null && typeof draft === 'object' ? draft : {};
+      const errors = {};
+      const projectPath = typeof value.gitlabProjectPath === 'string'
+        ? value.gitlabProjectPath.trim()
+        : '';
+      if (projectPath !== '' && !GITLAB_PROJECT_PATH_RE.test(projectPath)) {
+        errors.gitlabProjectPath = '格式应为 group/project（两段、不含空格）；留空表示未配置';
+      }
+      if (typeof value.branchUser !== 'string' || value.branchUser.trim() === '') {
+        errors.branchUser = '个人分支后缀不能为空';
+      }
+      if (typeof value.commitType !== 'string' || value.commitType.trim() === '') {
+        errors.commitType = '提交信息前缀不能为空';
+      }
+      return errors;
     }
 
     function errorCodeText(error) {
@@ -995,6 +1158,289 @@ window.__ModuleLoader__.load({
           }, busy === true ? '处理中…' : (isReason ? '确认驳回' : '确认'))));
     }
 
+    /** One workspace-settings row: label, one-line help, input, inline error. */
+    function SettingsField({ field, value, error, disabled, inputRef, onChange }) {
+      const invalid = typeof error === 'string' && error !== '';
+      return h('label', {
+        style: { display: 'flex', flexDirection: 'column', gap: 3, minWidth: 0 },
+      },
+        h('span', {
+          style: { display: 'flex', alignItems: 'baseline', gap: 6, flexWrap: 'wrap', minWidth: 0 },
+        },
+          h('span', {
+            style: { fontSize: 12, fontWeight: 600, lineHeight: '18px', color: C.text },
+          }, textOf(field.label)),
+          field.required === true
+            ? h('span', {
+              style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary },
+            }, '必填')
+            : null),
+        h('span', {
+          style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary, wordBreak: 'break-word' },
+        }, textOf(field.hint)),
+        h('input', {
+          ref: inputRef,
+          type: 'text',
+          value: typeof value === 'string' ? value : '',
+          onChange: (event) => onChange(field.key, event.target.value),
+          placeholder: textOf(field.placeholder),
+          disabled: disabled === true,
+          'aria-label': textOf(field.label),
+          'aria-invalid': invalid ? 'true' : undefined,
+          spellCheck: false,
+          style: {
+            font: 'inherit',
+            fontSize: 12,
+            lineHeight: '18px',
+            padding: '4px 8px',
+            borderRadius: 6,
+            border: `0.5px solid ${invalid ? C.error : C.borderStrong}`,
+            background: 'transparent',
+            color: C.text,
+            width: '100%',
+            minWidth: 0,
+            boxSizing: 'border-box',
+            opacity: disabled === true ? 0.55 : 1,
+          },
+        }),
+        invalid
+          ? h('span', {
+            role: 'alert',
+            style: { fontSize: 11, lineHeight: '16px', color: C.error, wordBreak: 'break-word' },
+          }, textOf(error))
+          : null);
+    }
+
+    /**
+     * In-panel settings overlay (same board view, not a new tab).
+     *
+     * Opens read-only when the session has no bound workspace: the hint names
+     * the reason and the save button stays disabled. Esc closes (unless a save
+     * is in flight), Tab is trapped inside the panel, and the first field is
+     * focused on open; the board returns focus to the header button on close.
+     */
+    function SettingsPanel({
+      draft,
+      errors,
+      dirty,
+      saving,
+      configured,
+      sessionMissing,
+      workspaceKnown,
+      workspacePath,
+      onChange,
+      onSave,
+      onCancel,
+    }) {
+      const panelRef = React.useRef(null);
+      const firstInputRef = React.useRef(null);
+      const canSave = sessionMissing !== true && configured === true;
+
+      React.useEffect(() => {
+        const node = firstInputRef.current;
+        if (node === null || node === undefined || typeof node.focus !== 'function') return;
+        try {
+          node.focus();
+        } catch {
+          // Focus is best-effort; the panel still works.
+        }
+      }, []);
+
+      React.useEffect(() => {
+        if (typeof window === 'undefined' || window === null) return undefined;
+        const onKeyDown = (event) => {
+          if (event.key !== 'Escape') return;
+          event.preventDefault();
+          if (saving === true) return;
+          onCancel();
+        };
+        window.addEventListener('keydown', onKeyDown);
+        return () => window.removeEventListener('keydown', onKeyDown);
+      }, [onCancel, saving]);
+
+      const trapTab = (event) => {
+        if (event.key !== 'Tab') return;
+        const node = panelRef.current;
+        if (node === null || node === undefined || typeof node.querySelectorAll !== 'function') return;
+        let focusable;
+        try {
+          focusable = Array.from(node.querySelectorAll('input, button, a[href], select, textarea'));
+        } catch {
+          return;
+        }
+        const enabled = focusable.filter((item) => item.disabled !== true);
+        if (enabled.length === 0) return;
+        const first = enabled[0];
+        const last = enabled[enabled.length - 1];
+        if (event.shiftKey === true && event.target === first) {
+          event.preventDefault();
+          try { last.focus(); } catch { /* best-effort */ }
+        } else if (event.shiftKey !== true && event.target === last) {
+          event.preventDefault();
+          try { first.focus(); } catch { /* best-effort */ }
+        }
+      };
+
+      const hint = sessionMissing === true
+        ? SETTINGS_NO_SESSION_HINT
+        : (workspaceKnown !== true
+          ? SETTINGS_LOADING_HINT
+          : (configured !== true ? SETTINGS_UNBOUND_HINT : SETTINGS_SAVE_HINT));
+      const hintTone = sessionMissing === true || workspaceKnown !== true || configured !== true
+        ? TONES.warn
+        : TONES.neutral;
+      const workspaceLine = sessionMissing === true
+        ? '缺少会话上下文'
+        : (workspaceKnown !== true
+          ? '正在读取工作区…'
+          : (workspacePath === null ? '未绑定工作区' : `工作区：${baseName(workspacePath)}`));
+
+      return h('div', {
+        ref: panelRef,
+        role: 'dialog',
+        'aria-modal': 'true',
+        'aria-label': '工作区设置',
+        'data-bug-board-settings': 'panel',
+        onKeyDown: trapTab,
+        style: {
+          position: 'absolute',
+          inset: 0,
+          zIndex: 10,
+          display: 'flex',
+          flexDirection: 'column',
+          minWidth: 0,
+          minHeight: 0,
+          background: 'var(--dsw-alias-bg-base, var(--dsw-alias-bg-layer-1, transparent))',
+          color: C.text,
+          boxSizing: 'border-box',
+        },
+      },
+        h('div', {
+          style: {
+            display: 'flex',
+            alignItems: 'flex-start',
+            gap: 8,
+            padding: '10px 12px',
+            borderBottom: `0.5px solid ${C.border}`,
+            flex: '0 0 auto',
+            minWidth: 0,
+          },
+        },
+          h('div', {
+            style: { flex: '1 1 auto', minWidth: 0, display: 'flex', flexDirection: 'column', gap: 2 },
+          },
+            h('div', {
+              style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', minWidth: 0 },
+            },
+              h('div', {
+                style: { fontSize: 13, fontWeight: 600, lineHeight: '19px', color: C.text },
+              }, '设置'),
+              dirty === true ? h(Badge, { label: '未保存', tone: 'warn' }) : null),
+            h('div', {
+              title: workspacePath === null || workspacePath === undefined ? undefined : workspacePath,
+              style: {
+                fontSize: 11,
+                lineHeight: '16px',
+                color: C.textTertiary,
+                whiteSpace: 'nowrap',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+              },
+            }, workspaceLine)),
+          h('button', {
+            type: 'button',
+            onClick: onCancel,
+            disabled: saving === true,
+            style: smallButtonStyle(saving === true),
+          }, '关闭')),
+        h('div', {
+          role: 'note',
+          style: {
+            margin: '8px 12px 0',
+            padding: '6px 8px',
+            border: `0.5px solid ${hintTone.border}`,
+            borderRadius: 6,
+            background: hintTone.background,
+            color: hintTone.color,
+            fontSize: 11,
+            lineHeight: '16px',
+            flex: '0 0 auto',
+            minWidth: 0,
+            wordBreak: 'break-word',
+            boxSizing: 'border-box',
+          },
+        }, hint),
+        h('div', {
+          style: {
+            flex: '1 1 auto',
+            minHeight: 0,
+            minWidth: 0,
+            overflowY: 'auto',
+            overflowX: 'hidden',
+            padding: '10px 12px',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 10,
+            boxSizing: 'border-box',
+          },
+        }, SETTINGS_FIELDS.map((field, index) => h(SettingsField, {
+          key: field.key,
+          field,
+          value: draft[field.key],
+          error: errors[field.key],
+          disabled: saving === true,
+          inputRef: index === 0 ? firstInputRef : undefined,
+          onChange,
+        }))),
+        h('div', {
+          style: {
+            flex: '0 0 auto',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 6,
+            padding: '10px 12px',
+            borderTop: `0.5px solid ${C.border}`,
+            background: C.surface,
+            minWidth: 0,
+            boxSizing: 'border-box',
+          },
+        },
+          h('div', {
+            style: {
+              display: 'flex',
+              alignItems: 'center',
+              gap: 6,
+              flexWrap: 'wrap',
+              fontSize: 11,
+              lineHeight: '16px',
+              color: C.textTertiary,
+              minWidth: 0,
+            },
+          },
+            dirty === true
+              ? h('span', {
+                role: 'status',
+                style: { color: TONES.warn.color },
+              }, '有未保存的修改')
+              : h('span', null, '无未保存修改'),
+            h('span', { style: { marginLeft: 'auto' } }, 'Esc 关闭')),
+          h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 6 } },
+            h('button', {
+              type: 'button',
+              onClick: onCancel,
+              disabled: saving === true,
+              style: smallButtonStyle(saving === true),
+            }, '取消'),
+            h('button', {
+              type: 'button',
+              onClick: onSave,
+              disabled: saving === true || !canSave,
+              'aria-busy': saving === true || undefined,
+              title: canSave ? '保存设置' : hint,
+              style: primaryButtonStyle(saving === true || !canSave),
+            }, saving === true ? '保存中…' : '保存'))));
+    }
+
     function BoardHeader({
       snapshot,
       refreshing,
@@ -1005,12 +1451,16 @@ window.__ModuleLoader__.load({
       typeOptions,
       filters,
       manualCode,
+      settingsOpen,
+      settingsBusy,
+      settingsButtonRef,
       onManualCodeChange,
       onManualAdd,
       onToggleFilter,
       onClearFilters,
       onRefresh,
       onCreateDemo,
+      onToggleSettings,
     }) {
       const workspace = snapshot === null ? null : snapshot.workspace;
       const path = workspace !== null && typeof workspace.path === 'string' ? workspace.path : null;
@@ -1064,6 +1514,16 @@ window.__ModuleLoader__.load({
             disabled: refreshing || disabled || sessionMissing,
             style: smallButtonStyle(refreshing || disabled || sessionMissing),
           }, refreshing ? '同步中…' : '刷新'),
+          h('button', {
+            ref: settingsButtonRef,
+            type: 'button',
+            onClick: onToggleSettings,
+            disabled: disabled || sessionMissing || settingsBusy === true,
+            'aria-expanded': settingsOpen === true ? 'true' : 'false',
+            'aria-label': '设置',
+            title: sessionMissing ? '缺少会话上下文，无法打开设置' : '工作区设置',
+            style: smallButtonStyle(disabled || sessionMissing || settingsBusy === true),
+          }, '设置'),
           h('button', {
             type: 'button',
             onClick: onCreateDemo,
@@ -1612,13 +2072,24 @@ window.__ModuleLoader__.load({
       const [flash, setFlash] = React.useState(null);
       const [manualCode, setManualCode] = React.useState('');
       const [pendingRequest, setPendingRequest] = React.useState(null);
+      const [settingsOpen, setSettingsOpen] = React.useState(false);
+      const [settingsDraft, setSettingsDraft] = React.useState(() => normalizeSettings(null));
+      const [settingsErrors, setSettingsErrors] = React.useState({});
+      const [settingsSaving, setSettingsSaving] = React.useState(false);
       const busyRef = React.useRef(false);
       const mutationControllerRef = React.useRef(null);
+      const settingsButtonRef = React.useRef(null);
+      const settingsSavingRef = React.useRef(false);
+      const settingsTouchedRef = React.useRef(false);
+      const settingsDraftRef = React.useRef(settingsDraft);
+      settingsDraftRef.current = settingsDraft;
 
       const snapshot = polling.data;
       const tickets = snapshot === null ? [] : snapshot.tickets;
       const configured = snapshot !== null && snapshot.workspace.configured === true;
       const canWrite = sessionId !== null && configured;
+      const settingsBaseline = React.useMemo(() => settingsFromSnapshot(snapshot), [snapshot]);
+      const settingsDirty = settingsOpen === true && !settingsEqual(settingsDraft, settingsBaseline);
 
       React.useEffect(() => {
         if (selectedCode === null || snapshot === null) return;
@@ -1630,6 +2101,17 @@ window.__ModuleLoader__.load({
         const timer = setTimeout(() => setFlash(null), 4000);
         return () => clearTimeout(timer);
       }, [flash]);
+
+      // While the panel is open and untouched, follow the polled settings
+      // (including the first snapshot if the panel was opened during loading).
+      // Any edit stops the sync so a poll can never overwrite the user's draft.
+      React.useEffect(() => {
+        if (settingsOpen !== true || snapshot === null) return;
+        if (settingsTouchedRef.current) return;
+        const next = settingsFromSnapshot(snapshot);
+        settingsDraftRef.current = next;
+        setSettingsDraft((current) => (settingsEqual(current, next) ? current : next));
+      }, [settingsOpen, snapshot]);
 
       // Abort an in-flight mutation when the tab unmounts: no write may land
       // after the board is gone, and no state update should follow the abort.
@@ -1645,7 +2127,7 @@ window.__ModuleLoader__.load({
         }
       }, []);
 
-      const postAction = React.useCallback(async (body) => {
+      const postMutation = React.useCallback(async (path, body) => {
         if (mutationControllerRef.current !== null) {
           try {
             mutationControllerRef.current.abort();
@@ -1656,7 +2138,7 @@ window.__ModuleLoader__.load({
         const controller = typeof AbortController === 'function' ? new AbortController() : null;
         mutationControllerRef.current = controller;
         try {
-          return await api.post(API.action, body, controller === null ? undefined : controller.signal);
+          return await api.post(path, body, controller === null ? undefined : controller.signal);
         } catch (error) {
           return {
             ok: false,
@@ -1668,6 +2150,101 @@ window.__ModuleLoader__.load({
           if (mutationControllerRef.current === controller) mutationControllerRef.current = null;
         }
       }, []);
+
+      const focusSettingsButton = React.useCallback(() => {
+        try {
+          const node = settingsButtonRef.current;
+          if (node !== null && node !== undefined && typeof node.focus === 'function') node.focus();
+        } catch {
+          // Focus restore is best-effort.
+        }
+      }, []);
+
+      const closeSettings = React.useCallback(() => {
+        if (settingsSavingRef.current) return;
+        settingsTouchedRef.current = false;
+        setSettingsOpen(false);
+        setSettingsErrors({});
+        focusSettingsButton();
+      }, [focusSettingsButton]);
+
+      const openSettings = React.useCallback(() => {
+        if (busyRef.current || settingsSavingRef.current) return;
+        const initial = settingsFromSnapshot(snapshot);
+        settingsDraftRef.current = initial;
+        settingsTouchedRef.current = false;
+        setPendingRequest(null);
+        setSettingsDraft(initial);
+        setSettingsErrors({});
+        setSettingsOpen(true);
+      }, [snapshot]);
+
+      const toggleSettings = React.useCallback(() => {
+        if (settingsOpen === true) closeSettings();
+        else openSettings();
+      }, [closeSettings, openSettings, settingsOpen]);
+
+      const updateSettingsField = React.useCallback((key, value) => {
+        if (typeof key !== 'string') return;
+        settingsTouchedRef.current = true;
+        const next = { ...settingsDraftRef.current, [key]: typeof value === 'string' ? value : '' };
+        settingsDraftRef.current = next;
+        setSettingsDraft(next);
+        setSettingsErrors((current) => {
+          if (Object.keys(current).length === 0) return current;
+          return validateSettings(next);
+        });
+      }, []);
+
+      const saveSettings = React.useCallback(async () => {
+        if (settingsSavingRef.current || busyRef.current) return;
+        if (sessionId === null || configured !== true) return;
+
+        const payload = settingsPayload(settingsDraftRef.current);
+        const errors = validateSettings(payload);
+        if (Object.keys(errors).length > 0) {
+          setSettingsErrors(errors);
+          return;
+        }
+
+        setSettingsErrors({});
+        setActionError(null);
+        setFlash(null);
+        settingsSavingRef.current = true;
+        busyRef.current = true;
+        setSettingsSaving(true);
+
+        try {
+          const result = await postMutation(API.settings, { sessionId, settings: payload });
+          if (result.aborted === true) return;
+
+          if (!result.ok) {
+            setActionError(toErrorView(result));
+            return;
+          }
+
+          const saved = normalizeSettings(
+            result.data !== null && typeof result.data === 'object' ? result.data.settings : payload,
+          );
+          settingsDraftRef.current = saved;
+          setSettingsDraft(saved);
+          settingsTouchedRef.current = false;
+          setSettingsErrors({});
+          setSettingsOpen(false);
+          setFlash('设置已保存');
+          focusSettingsButton();
+
+          try {
+            await polling.refresh();
+          } catch {
+            // The polling banner (or the next poll) reports a failed refresh.
+          }
+        } finally {
+          settingsSavingRef.current = false;
+          busyRef.current = false;
+          setSettingsSaving(false);
+        }
+      }, [configured, focusSettingsButton, polling, postMutation, sessionId]);
 
       const executeAction = React.useCallback(async (descriptor, ticket, reason) => {
         if (!descriptor || !ticket || busyRef.current || typeof ticket.code !== 'string') return;
@@ -1686,7 +2263,7 @@ window.__ModuleLoader__.load({
         setFlash(null);
 
         try {
-          const result = await postAction({
+          const result = await postMutation(API.action, {
             sessionId,
             actionId: createActionId(),
             code: ticket.code,
@@ -1716,7 +2293,7 @@ window.__ModuleLoader__.load({
           busyRef.current = false;
           setBusyAction(null);
         }
-      }, [configured, polling, postAction, sessionId]);
+      }, [configured, polling, postMutation, sessionId]);
 
       const requestAction = React.useCallback((descriptor, ticket) => {
         if (!descriptor || !ticket || busyRef.current) return;
@@ -1746,7 +2323,7 @@ window.__ModuleLoader__.load({
 
         const code = createDemoCode();
         try {
-          const result = await postAction({
+          const result = await postMutation(API.action, {
             sessionId,
             actionId: createActionId(),
             code,
@@ -1772,7 +2349,7 @@ window.__ModuleLoader__.load({
           busyRef.current = false;
           setBusyAction(null);
         }
-      }, [configured, polling, postAction, sessionId]);
+      }, [configured, polling, postMutation, sessionId]);
 
       const requestCreateDemo = React.useCallback(() => {
         if (busyRef.current || sessionId === null || configured !== true) return;
@@ -1805,7 +2382,7 @@ window.__ModuleLoader__.load({
         setFlash(null);
 
         try {
-          const result = await postAction({
+          const result = await postMutation(API.action, {
             sessionId,
             actionId: createActionId(),
             code,
@@ -1831,7 +2408,7 @@ window.__ModuleLoader__.load({
           busyRef.current = false;
           setBusyAction(null);
         }
-      }, [configured, manualCode, polling, postAction, sessionId]);
+      }, [configured, manualCode, polling, postMutation, sessionId]);
 
       const confirmPendingAction = React.useCallback((reason) => {
         const request = pendingRequest;
@@ -1952,6 +2529,7 @@ window.__ModuleLoader__.load({
       return h('div', {
         'data-bug-board': 'root',
         'data-bug-board-view': selectedTicket === null ? 'list' : 'detail',
+        'data-bug-board-settings-open': settingsOpen === true ? 'true' : 'false',
         style: {
           display: 'flex',
           flexDirection: 'column',
@@ -1976,12 +2554,16 @@ window.__ModuleLoader__.load({
           typeOptions,
           filters,
           manualCode,
+          settingsOpen,
+          settingsBusy: settingsSaving,
+          settingsButtonRef,
           onManualCodeChange: setManualCode,
           onManualAdd: addManualTicket,
           onToggleFilter: toggleFilter,
           onClearFilters: clearFilters,
           onRefresh: polling.refresh,
           onCreateDemo: requestCreateDemo,
+          onToggleSettings: toggleSettings,
         }),
         showBanner
           ? h(ErrorBanner, {
@@ -2023,23 +2605,49 @@ window.__ModuleLoader__.load({
           }),
         h('div', {
           style: {
+            position: 'relative',
             flex: '1 1 auto',
             minHeight: 0,
-            overflowY: 'auto',
-            overflowX: 'hidden',
-            padding: '10px 12px 18px',
+            minWidth: 0,
+            display: 'flex',
             boxSizing: 'border-box',
           },
-        }, selectedTicket === null
-          ? content
-          : h(TicketDetail, {
-            ticket: selectedTicket,
-            snapshot,
-            busyAction,
-            locked: !canWrite,
-            onAction: (descriptor) => requestAction(descriptor, selectedTicket),
-            onBack: () => setSelectedCode(null),
-          })));
+        },
+          h('div', {
+            style: {
+              flex: '1 1 auto',
+              minHeight: 0,
+              minWidth: 0,
+              overflowY: 'auto',
+              overflowX: 'hidden',
+              padding: '10px 12px 18px',
+              boxSizing: 'border-box',
+            },
+          }, selectedTicket === null
+            ? content
+            : h(TicketDetail, {
+              ticket: selectedTicket,
+              snapshot,
+              busyAction,
+              locked: !canWrite,
+              onAction: (descriptor) => requestAction(descriptor, selectedTicket),
+              onBack: () => setSelectedCode(null),
+            })),
+          settingsOpen === true
+            ? h(SettingsPanel, {
+              draft: settingsDraft,
+              errors: settingsErrors,
+              dirty: settingsDirty,
+              saving: settingsSaving,
+              configured,
+              sessionMissing: sessionId === null,
+              workspaceKnown: snapshot !== null,
+              workspacePath: snapshot === null ? null : snapshot.workspace.path,
+              onChange: updateSettingsField,
+              onSave: saveSettings,
+              onCancel: closeSettings,
+            })
+            : null));
     }
 
     /**
