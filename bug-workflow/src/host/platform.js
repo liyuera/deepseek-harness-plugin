@@ -11,22 +11,43 @@
  *     paginated `task`, `task/detailByTaskCode/<code>`, `dict/business/
  *     dictionary?codes=…`, `remark/list` and `file/list` (POST).
  *
- * Every method resolves to a result object rather than throwing:
+ * Contract at a glance:
  *
- *   { ok: true, data }                                  on success
- *   { ok: false, code, status?, message }               on any expected failure
+ *   - `createPlatformClient` validates configuration eagerly. An invalid
+ *     `baseUrl` makes the factory THROW a `PlatformError`
+ *     (`code:'invalid-base-url'`) before any fetch, so callers must
+ *     try/catch it (or pre-validate with `normalizeBaseUrl`). Request methods,
+ *     by contrast, never throw for expected failures and always resolve to a
+ *     result object:
  *
- * Error codes:
+ *       { ok: true, data }                                  on success
+ *       { ok: false, code, status?, message }               on any expected failure
  *
- *   invalid-base-url     configuration error; thrown by `createPlatformClient`
- *                        before any request is made (also returned by
- *                        `normalizeBaseUrl`)
- *   invalid-request      missing/blank required argument (e.g. no assigneeId)
- *   platform-unauthorized HTTP 401 (or envelope code 401) — token rejected
- *   platform-not-found    HTTP 404 (or envelope code 404) — unknown task/route
- *   platform-http        any other non-2xx status, or a failure envelope
- *   platform-bad-response non-JSON body, non-object envelope, missing `data`
- *   platform-network     fetch rejection: connection failure, abort or timeout
+ *   - Error taxonomy:
+ *
+ *       invalid-base-url      thrown by `createPlatformClient` (also returned
+ *                              by `normalizeBaseUrl`) — configuration error
+ *       invalid-request        missing/blank required argument, bad paging
+ *       platform-unauthorized  HTTP 401 or envelope `code:401` — token rejected
+ *       platform-not-found     HTTP 404 or envelope `code:404` — unknown task/route
+ *       platform-http          any other non-2xx status; or an HTTP 2xx
+ *                              failure envelope (`success:false` / `code!==200`)
+ *       platform-bad-response  non-JSON body, non-object envelope, missing
+ *                              `data`, or a shape the method cannot use
+ *       platform-network       fetch rejection: connection failure, TLS error,
+ *                              abort/timeout, or a blocked redirect (below)
+ *
+ *   - A 2xx failure envelope deliberately keeps `status:200` (the real HTTP
+ *     status) and adds `upstreamCode` (the envelope's numeric `code`). A
+ *     consumer such as Task 4 MUST NOT derive 502 from `status` alone; check
+ *     `code === 'platform-http'` together with `status`/`upstreamCode`.
+ *
+ *   - Redirects are never followed: every fetch sets `redirect:'error'`, so a
+ *     3xx response rejects and maps to `platform-network` instead of
+ *     forwarding `Htwisdom-Auth` to the `Location` origin. (A custom
+ *     `fetchImpl` that returns a 3xx Response without rejecting is mapped to
+ *     `platform-http` with that status; the built-in fetch never does that
+ *     under `redirect:'error'`.)
  *
  * Security invariants:
  *
@@ -233,6 +254,12 @@ export function createPlatformClient(options = {}) {
         method,
         headers,
         body: payload,
+        // Fail closed. Node's fetch follows redirects by default and forwards
+        // custom headers (including Htwisdom-Auth) to the redirect target,
+        // even cross-origin. `redirect:'error'` makes fetch reject instead;
+        // the catch below maps that to platform-network and the token never
+        // reaches another origin.
+        redirect: 'error',
         // Node 22's fetch supports AbortSignal.timeout; the platform mock only
         // adds latency, so the timeout is normally exercised by tests.
         signal: AbortSignal.timeout(timeoutMs),
@@ -420,6 +447,12 @@ function invalidBaseUrl(message) {
   return { ok: false, code: 'invalid-base-url', message };
 }
 
+/**
+ * Map an HTTP status to a failure before the body is parsed. 3xx normally never
+ * reaches this helper because `call()` uses `redirect:'error'` (fetch rejects,
+ * which becomes platform-network); a custom fetchImpl returning a 3xx Response
+ * directly is reported as platform-http rather than followed.
+ */
 function failureForStatus(status) {
   if (status === 401) return failure('platform-unauthorized', MESSAGE.unauthorized, 401);
   if (status === 404) return failure('platform-not-found', MESSAGE.notFound, 404);
