@@ -24,6 +24,7 @@ import {
   registerRoutes,
   registerUnavailableRoutes,
 } from '../src/host/routes.js';
+import { PLATFORM_TOKEN_REF, createTokenStore } from '../src/host/credentials.js';
 import { DEFAULT_SETTINGS, createStore } from '../src/host/store.js';
 import { MAX_REVIEW_ROUNDS, initialTicket } from '../src/host/state-machine.js';
 import { resolveWorkspace } from '../src/host/workspace.js';
@@ -370,13 +371,61 @@ function settingsBody(overrides = {}) {
   });
 }
 
+function platformTokenBody(overrides = {}) {
+  return JSON.stringify({
+    sessionId: SESSION_ID,
+    token: 'p2-dummy-token',
+    ...overrides,
+  });
+}
+
+/** Fake credentials service used by the token-store integration. */
+function createFakeCredentials(initial = {}) {
+  const values = new Map(Object.entries(initial));
+  const calls = { set: [], resolve: [], describe: [], unset: [] };
+  return {
+    values,
+    calls,
+    async set(ref, value) {
+      calls.set.push({ ref, value });
+      values.set(ref, value);
+    },
+    async resolve(ref) {
+      calls.resolve.push(ref);
+      if (!values.has(ref)) return undefined;
+      return { value: values.get(ref), source: 'file' };
+    },
+    async describe(ref) {
+      calls.describe.push(ref);
+      return values.has(ref)
+        ? { configured: true, source: 'file', writable: true }
+        : { configured: false, writable: true };
+    },
+    async unset(ref) {
+      calls.unset.push(ref);
+      values.delete(ref);
+    },
+  };
+}
+
+function tokenFixture(initial = {}) {
+  const credentials = createFakeCredentials(initial);
+  return { credentials, tokenStore: createTokenStore(credentials) };
+}
+
 function handlersWith({
   store = createFakeStore(),
   workspace = createWorkspace(),
+  tokenStore = createTokenStore(createFakeCredentials()),
   clock = () => SERVER_TIME,
   domainOpenedAt = OPENED_AT,
 } = {}) {
-  return { store, workspace, handlers: createHandlers({ store, workspace, clock, domainOpenedAt }) };
+  return {
+    store,
+    workspace,
+    tokenStore,
+    handlers: createHandlers({ store, workspace, tokenStore, clock, domainOpenedAt }),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -475,10 +524,39 @@ test('GET /snapshot composes workspace, settings, tickets and serverTime', async
     ok: true,
     workspace: { path: WORKSPACE, configured: true },
     settings: DEFAULT_SETTINGS,
+    platform: { tokenPresent: false, lastSyncAt: null, lastSyncError: null },
     tickets: [ticket],
     serverTime: SERVER_TIME,
   });
   assert.deepEqual(store.calls.getSettings, [WORKSPACE]);
+});
+
+test('GET /snapshot reports tokenPresent from credentials without exposing the token', async () => {
+  const { credentials, tokenStore } = tokenFixture({ [PLATFORM_TOKEN_REF]: 'p2-dummy-token' });
+  const { handlers } = handlersWith({ tokenStore });
+  const { res, json } = await call(handlers.snapshot, { url: snapshotUrl() });
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(json.platform, {
+    tokenPresent: true,
+    lastSyncAt: null,
+    lastSyncError: null,
+  });
+  assert.equal(JSON.stringify(json).includes('p2-dummy-token'), false);
+  // Presence is a status read: the snapshot never resolves the value.
+  assert.deepEqual(credentials.calls.resolve, []);
+});
+
+test('GET /snapshot keeps tokenPresent false when credentials is unavailable', async () => {
+  const { handlers } = handlersWith({ tokenStore: createTokenStore(undefined) });
+  const { res, json } = await call(handlers.snapshot, { url: snapshotUrl() });
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(json.platform, {
+    tokenPresent: false,
+    lastSyncAt: null,
+    lastSyncError: null,
+  });
 });
 
 test('GET /snapshot returns an unbound workspace for an unknown live session', async () => {
@@ -964,6 +1042,137 @@ test('POST /settings never throws when the store throws an unexpected error', as
 });
 
 // ---------------------------------------------------------------------------
+// Platform token
+// ---------------------------------------------------------------------------
+
+test('POST /platform-token writes the string into credentials and answers only tokenPresent', async () => {
+  const { credentials, tokenStore } = tokenFixture();
+  const store = createFakeStore();
+  const { handlers } = handlersWith({ store, tokenStore });
+  const { res, json } = await call(handlers.platformToken, {
+    method: 'POST',
+    url: API_PATHS.platformToken,
+    body: platformTokenBody(),
+  });
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(json, { ok: true, tokenPresent: true });
+  assert.deepEqual(credentials.calls.set, [
+    { ref: PLATFORM_TOKEN_REF, value: 'p2-dummy-token' },
+  ]);
+  assert.equal(credentials.values.get(PLATFORM_TOKEN_REF), 'p2-dummy-token');
+  // The ticket store is not involved, and the response never echoes the token.
+  assert.equal(store.calls.applyAction.length, 0);
+  assert.equal(store.calls.putSettings.length, 0);
+  assert.equal(JSON.stringify(json).includes('p2-dummy-token'), false);
+});
+
+test('POST /platform-token with token:null clears the credential', async () => {
+  const { credentials, tokenStore } = tokenFixture({ [PLATFORM_TOKEN_REF]: 'p2-dummy-token' });
+  const { handlers } = handlersWith({ tokenStore });
+  const { res, json } = await call(handlers.platformToken, {
+    method: 'POST',
+    url: API_PATHS.platformToken,
+    body: platformTokenBody({ token: null }),
+  });
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(json, { ok: true, tokenPresent: false });
+  assert.deepEqual(credentials.calls.unset, [PLATFORM_TOKEN_REF]);
+  assert.equal(credentials.values.has(PLATFORM_TOKEN_REF), false);
+  assert.equal(JSON.stringify(json).includes('p2-dummy-token'), false);
+});
+
+test('POST /platform-token rejects a missing, non-string or empty token with 400', async () => {
+  for (const [label, token] of [
+    ['missing', undefined],
+    ['number', 42],
+    ['object', { token: 'x' }],
+    ['array', ['x']],
+    ['empty', ''],
+    ['blank', '   '],
+  ]) {
+    const { credentials, tokenStore } = tokenFixture();
+    const { handlers } = handlersWith({ tokenStore });
+    const body = platformTokenBody();
+    const parsed = JSON.parse(body);
+    if (token === undefined) delete parsed.token;
+    else parsed.token = token;
+    const { res, json } = await call(handlers.platformToken, {
+      method: 'POST',
+      url: API_PATHS.platformToken,
+      body: JSON.stringify(parsed),
+    });
+
+    assert.equal(res.statusCode, 400, label);
+    assert.equal(json.ok, false, label);
+    assert.equal(json.code, 'invalid-token', label);
+    assert.equal(credentials.calls.set.length, 0, label);
+  }
+});
+
+test('POST /platform-token requires a sessionId', async () => {
+  const { credentials, tokenStore } = tokenFixture();
+  const { handlers } = handlersWith({ tokenStore });
+  const { res, json } = await call(handlers.platformToken, {
+    method: 'POST',
+    url: API_PATHS.platformToken,
+    body: platformTokenBody({ sessionId: undefined }),
+  });
+
+  assert.equal(res.statusCode, 400);
+  assert.equal(json.code, 'missing-session');
+  assert.equal(credentials.calls.set.length, 0);
+});
+
+test('POST /platform-token accepts an unbound session (the token is profile-global)', async () => {
+  const { credentials, tokenStore } = tokenFixture();
+  const { handlers } = handlersWith({ tokenStore });
+  const { res, json } = await call(handlers.platformToken, {
+    method: 'POST',
+    url: API_PATHS.platformToken,
+    body: platformTokenBody({ sessionId: UNBOUND_SESSION_ID }),
+  });
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(json, { ok: true, tokenPresent: true });
+  assert.equal(credentials.values.get(PLATFORM_TOKEN_REF), 'p2-dummy-token');
+});
+
+test('POST /platform-token answers 503 credentials-unavailable when credentials is absent', async () => {
+  const { handlers } = handlersWith({ tokenStore: createTokenStore(undefined) });
+
+  for (const token of ['p2-dummy-token', null]) {
+    const { res, json } = await call(handlers.platformToken, {
+      method: 'POST',
+      url: API_PATHS.platformToken,
+      body: platformTokenBody({ token }),
+    });
+    assert.equal(res.statusCode, 503, String(token));
+    assert.equal(json.code, 'credentials-unavailable', String(token));
+    assert.equal(JSON.stringify(json).includes('p2-dummy-token'), false);
+  }
+});
+
+test('POST /platform-token maps an unexpected token-store failure to 500 internal', async () => {
+  const tokenStore = {
+    async get() { return null; },
+    async set() { throw new Error('disk full'); },
+    async clear() {},
+    async present() { return false; },
+  };
+  const { handlers } = handlersWith({ tokenStore });
+  const { res, json } = await call(handlers.platformToken, {
+    method: 'POST',
+    url: API_PATHS.platformToken,
+    body: platformTokenBody(),
+  });
+
+  assert.equal(res.statusCode, 500);
+  assert.equal(json.code, 'internal');
+});
+
+// ---------------------------------------------------------------------------
 // Host / method guards
 // ---------------------------------------------------------------------------
 
@@ -974,6 +1183,7 @@ test('every route rejects a non-loopback Host with 403', async () => {
     ['snapshot', 'GET', snapshotUrl(), undefined],
     ['action', 'POST', API_PATHS.action, actionBody()],
     ['settings', 'POST', API_PATHS.settings, settingsBody()],
+    ['platformToken', 'POST', API_PATHS.platformToken, platformTokenBody()],
   ];
   for (const [name, method, url, body] of cases) {
     const { res, json } = await call(handlers[name], {
@@ -1022,6 +1232,7 @@ test('every route rejects the wrong HTTP method with 405 and an Allow header', a
     ['snapshot', 'POST', API_PATHS.snapshot, 'GET'],
     ['action', 'GET', API_PATHS.action, 'POST'],
     ['settings', 'GET', API_PATHS.settings, 'POST'],
+    ['platformToken', 'GET', API_PATHS.platformToken, 'POST'],
   ];
   for (const [name, method, url, allow] of cases) {
     const { res, json } = await call(handlers[name], { method, url });
@@ -1038,6 +1249,7 @@ test('every route rejects the wrong HTTP method with 405 and an Allow header', a
 const POST_ROUTES = [
   ['action', API_PATHS.action, () => actionBody()],
   ['settings', API_PATHS.settings, () => settingsBody()],
+  ['platformToken', API_PATHS.platformToken, () => platformTokenBody()],
 ];
 
 test('POST routes reject non-JSON media types with 415 before reading the body', async () => {
@@ -1151,6 +1363,7 @@ test('every route rejects a non-loopback remote address with 403', async () => {
     ['snapshot', 'GET', snapshotUrl(), undefined],
     ['action', 'POST', API_PATHS.action, () => actionBody()],
     ['settings', 'POST', API_PATHS.settings, () => settingsBody()],
+    ['platformToken', 'POST', API_PATHS.platformToken, () => platformTokenBody()],
   ];
   for (const [name, method, url, body] of cases) {
     for (const remoteAddress of ['10.0.0.7', '::2', '::ffff:10.0.0.7', '127.0.0.2', null]) {
@@ -1221,7 +1434,7 @@ async function callRegistered(webServer, path, options) {
   return call(handler, options);
 }
 
-test('registerRoutes() mounts all four exact routes and returns a disposer', async () => {
+test('registerRoutes() mounts all five exact routes and returns a disposer', async () => {
   const webServer = createFakeWebServer();
   const { store, workspace } = handlersWith();
   const dispose = registerRoutes(
@@ -1272,6 +1485,13 @@ test('registerUnavailableRoutes() keeps health 500/503 and other routes 503 unti
   });
   assert.equal(action.res.statusCode, 503);
   assert.equal(action.json.code, 'storage-unavailable');
+
+  const platformToken = await callRegistered(webServer, API_PATHS.platformToken, {
+    method: 'POST',
+    body: platformTokenBody(),
+  });
+  assert.equal(platformToken.res.statusCode, 503);
+  assert.equal(platformToken.json.code, 'storage-unavailable');
 
   dispose();
   assert.equal(webServer.routes.size, 0);
