@@ -204,7 +204,8 @@ async function main() {
   const task = detail.json?.data ?? null;
   const taskCode = typeof task?.taskCode === 'string' ? task.taskCode : options.issue;
   if (detail.status === 200 && task) record('detailByTaskCode', true, `${Object.keys(task).length} fields`);
-  else if (detail.status !== 200) record('detailByTaskCode', false, `status ${detail.status}`);
+  else if (detail.status === 200) record('detailByTaskCode', false, 'empty data');
+  else record('detailByTaskCode', false, `status ${detail.status}`);
 
   // 3. dictionaries (the endpoint rejects empty input with HTTP 400 "字典编码不可为空").
   const dictPath = '/api/htwisdom-system/dict/business/dictionary';
@@ -214,6 +215,8 @@ async function main() {
       console.log(`  dict ${code}: ${shapeOf(entries)}`);
     }
     record('dict/business/dictionary', true, Object.keys(dict.json.data).join(','));
+  } else if (dict.status === 200) {
+    record('dict/business/dictionary', false, 'unexpected data shape');
   } else {
     record('dict/business/dictionary', false, `status ${dict.status}`);
   }
@@ -223,7 +226,8 @@ async function main() {
   const remarkParams = { refTaskCode: taskCode, remarkType: '001_TASK' };
   const remark = probeLine(`${remarkPath}?refTaskCode=${taskCode}&remarkType=001_TASK`, await requestWithFallback(ctx, remarkPath, remarkParams));
   if (remark.status === 200 && Array.isArray(remark.json?.data)) record('remark/list', true, `${remark.json.data.length} remarks`);
-  else if (remark.status !== 200) record('remark/list', false, `status ${remark.status}`);
+  else if (remark.status === 200) record('remark/list', false, 'unexpected data shape');
+  else record('remark/list', false, `status ${remark.status}`);
 
   // 5. "my issues" page list (found via the platform's own XHR traffic).
   const listPath = '/api/htwisdom-team/task';
@@ -234,7 +238,9 @@ async function main() {
     const recordKeys = page.records[0] && typeof page.records[0] === 'object' ? Object.keys(page.records[0]).length : 0;
     console.log(`  page: total=${page.total} current=${page.current} size=${page.size} returned=${page.records.length} recordKeys=${recordKeys}`);
     record('task list', true, `total=${page.total}`);
-  } else if (list.status !== 200) {
+  } else if (list.status === 200) {
+    record('task list', false, 'unexpected page shape');
+  } else {
     record('task list', false, `status ${list.status}`);
   }
 
