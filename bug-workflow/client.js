@@ -29,6 +29,8 @@
  * The client never re-implements the state machine: action buttons are derived
  * from the declarative `ACTION_BY_STATE` map (extracted and cross-checked
  * against `src/host/state-machine.js` by `test/client-action-map.test.js`).
+ * `actionUnavailableHint` applies the map's declarative `maxRounds` cap so a
+ * button the host would reject (409 + block) is disabled with a hint instead.
  * The host remains the authority on transitions (an illegal one comes back as a
  * 409 and is reported in the UI).
  */
@@ -116,7 +118,9 @@ window.__ModuleLoader__.load({
     /**
      * Action buttons per workflow state (the exact P1 mapping).
      * `tone` drives styling, `confirm` is the confirmation text, `input`
-     * declares an in-component text input, and `payload` is the fixed body.
+     * declares an in-component text input, `payload` is the fixed body, and
+     * `maxRounds` disables the button once `ticket.mr.rounds` reaches that cap
+     * (see `actionUnavailableHint` below).
      * Kept as a pure JSON-like literal (strings/arrays/objects only, no
      * functions) so `test/client-action-map.test.js` can extract and evaluate
      * it verbatim and cross-check it against the host state machine.
@@ -136,6 +140,23 @@ window.__ModuleLoader__.load({
           label: '分析完成',
           confirm: '确认分析已完成并提交方案待审？',
           tone: 'primary',
+          // Demo plan payload, fields per the host plan schema
+          // (`src/host/domain.js`). Without it the state machine leaves
+          // `ticket.plan` null and `approve_plan` would approve an empty plan,
+          // so the demo chain would never show a real plan on the board.
+          payload: {
+            plan: {
+              summary: '演示方案：修复演示文件中的空值分支',
+              rootCause: '演示根因：演示文件缺少空值兜底',
+              approach: '补充空值兜底并添加回归用例',
+              changedFiles: ['src/demo.ts'],
+              risks: ['演示风险：影响范围仅限演示文件'],
+              testPlan: '运行 node --test 并人工点检演示页面',
+              generatedAt: '2026-11-07T00:00:00.000Z',
+              approvedAt: null,
+              rejectedReason: null,
+            },
+          },
         },
       ],
       plan_review: [
@@ -189,6 +210,10 @@ window.__ModuleLoader__.load({
           label: '模拟 Review 需修改',
           confirm: '确认模拟 Review 要求修改？将生成一条演示阻塞问题。',
           tone: 'plain',
+          // Declarative cap mirrored from the host state machine: at
+          // `mr.rounds >= maxRounds` the host answers 409 and blocks the
+          // ticket, so the board disables the button instead of sending it.
+          maxRounds: 3,
           payload: {
             blockingIssues: [
               {
@@ -246,6 +271,28 @@ window.__ModuleLoader__.load({
       done: [],
     };
     // </client-action-map>
+
+    // <client-action-availability>
+    /**
+     * Availability rule for one `ACTION_BY_STATE` descriptor.
+     *
+     * A descriptor may declare `maxRounds`; once `ticket.mr.rounds` reaches it
+     * the button must be disabled, because the host rejects the action with
+     * 409 `review-rounds-exhausted` and blocks the ticket as a side effect.
+     * Returns the disabled hint, or `null` when the button stays available.
+     *
+     * Kept as a pure function literal between markers so
+     * `test/client-action-map.test.js` can extract it with `vm` and exercise
+     * the rounds rule without a DOM.
+     */
+    const actionUnavailableHint = (descriptor, ticket) => {
+      const maxRounds = descriptor === null || descriptor === undefined ? null : descriptor.maxRounds;
+      if (typeof maxRounds !== 'number' || !Number.isFinite(maxRounds)) return null;
+      const rounds = typeof ticket?.mr?.rounds === 'number' ? ticket.mr.rounds : 0;
+      if (rounds < maxRounds) return null;
+      return `Review 修复轮次已耗尽（${Math.min(rounds, maxRounds)}/${maxRounds}），请人工处理`;
+    };
+    // </client-action-availability>
 
     // ---------------------------------------------------------------------
     // Workspace settings (the host stores them per workspace cwd)
@@ -1611,30 +1658,48 @@ window.__ModuleLoader__.load({
           : null);
     }
 
-    function ActionBar({ actions, busyAction, onAction, locked }) {
+    function ActionBar({ actions, ticket, busyAction, onAction, locked }) {
       const list = Array.isArray(actions) ? actions : [];
       if (list.length === 0) return null;
       const isLocked = locked === true;
       const disabled = busyAction !== null || isLocked;
-      return h('div', {
-        style: { display: 'flex', flexWrap: 'wrap', gap: 6, minWidth: 0 },
-        role: 'group',
-        'aria-label': '工单动作',
-      }, list.map((descriptor) => {
+      const buttons = [];
+      const hints = [];
+      for (const descriptor of list) {
         const busy = busyAction === descriptor.action;
-        return h('button', {
+        const unavailable = actionUnavailableHint(descriptor, ticket);
+        const itemDisabled = disabled || unavailable !== null;
+        if (unavailable !== null) {
+          hints.push(h('div', {
+            key: `hint-${descriptor.action}`,
+            role: 'note',
+            style: { fontSize: 11, lineHeight: '16px', color: C.error },
+          }, unavailable));
+        }
+        buttons.push(h('button', {
           key: `action-${descriptor.action}`,
           type: 'button',
-          disabled,
+          disabled: itemDisabled,
           'aria-busy': busy || undefined,
-          'aria-disabled': isLocked || undefined,
+          'aria-disabled': isLocked || unavailable !== null ? true : undefined,
           onClick: () => {
             if (typeof onAction === 'function') onAction(descriptor);
           },
-          style: actionButtonStyle(descriptor.tone, disabled),
-          title: isLocked ? UNBOUND_WORKSPACE_HINT : textOf(descriptor.confirm),
-        }, busy ? '处理中…' : textOf(descriptor.label));
-      }));
+          style: actionButtonStyle(descriptor.tone, itemDisabled),
+          title: isLocked
+            ? UNBOUND_WORKSPACE_HINT
+            : (unavailable === null ? textOf(descriptor.confirm) : unavailable),
+        }, busy ? '处理中…' : textOf(descriptor.label)));
+      }
+      return h('div', {
+        style: { display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 },
+      },
+        h('div', {
+          style: { display: 'flex', flexWrap: 'wrap', gap: 6, minWidth: 0 },
+          role: 'group',
+          'aria-label': '工单动作',
+        }, buttons),
+        hints);
     }
 
     function TicketRow({ ticket, selected, onSelect, snapshot }) {
@@ -1984,6 +2049,7 @@ window.__ModuleLoader__.load({
       const planReview = ticket.workflow === 'plan_review';
       const actionBar = h(ActionBar, {
         actions,
+        ticket,
         busyAction,
         locked,
         onAction,
