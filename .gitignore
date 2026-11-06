@@ -2,3 +2,5 @@ node_modules/
 *.tsbuildinfo
 
 .superpowers/
+.tmp/
+bug-workflow/.tmp/
