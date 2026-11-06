@@ -19,6 +19,7 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 - `desktop` 是桌面应用独占的 profile；源码启动的 `pnpm dsh web` 使用 `web`。GUI 里也可在 **设置 → 插件 → 添加插件** 完成。
 - 安装/重装后重载 profile：新装 client 半边通常需要重启桌面应用；开发期只改宿主半边时，可对 bundle 执行「移除 → 重装」热重载（P1/P2 验收即用此法，数据不丢）。client 代码更新后还需刷新页面。
 - P2 只在 **DSH 0.2.2-rc.1**（desktop profile）上验收；`@deepseek-ai/dsh-storage-domain` / `zod` 声明为 peerDependencies（由宿主提供），但当前版本范围仍是 `"*"`，尚未锁到验证过的版本——**发布前必须收窄**（见「打包与交接」）。
+- **v2 domain 的兼容性依赖宿主 storage-json 实现**：v1→v2 迁移用了 single-layout 的 `compatibleVersions:[1]`，本机 DSH **源码 checkout**（HEAD `7f395a13`）的 `packages/storage/storage-json/src/format.ts` 只在 per-record 层支持该字段，single-layout `parse()` 会拒绝；只有**已安装的 0.2.2-rc.1 运行时**（app.asar）实测能打开 v2 domain。用源码重建/更旧版本 DSH 运行插件时，v1 storage 文件可能 `version-mismatch` 而无法打开看板；重建/升级后必须重新验证迁移。
 - 卸载：`dsh plugin --profile desktop remove @liyuera/dsh-bug-workflow`。卸载不删除工单数据，也不会清除平台 token。
 
 ## 入口
@@ -37,10 +38,10 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 | 工单详情 | 工单字段；方案卡（摘要/根因/方案/改动文件/风险/测试建议，通过/驳回）；修复与测试区；MR/Review 卡（轮次、阻塞项、结论）；最近 20 条时间线 |
 | 动作按钮 | 由 client 内 `ACTION_BY_STATE` 字面量按 `workflow` 渲染（**不是**由宿主 `canApply` 派生）；全部二次确认（`window.confirm`，缺失时用内联确认）；POST 带唯一 `actionId`，宿主幂等重放 |
 | 状态机 | 12 个状态、16 个动作（含 `block`/`retry`/`reject_plan`）；review 变更轮次上限 3 轮，第 4 次请求由宿主转为 `blocked` |
-| 持久化 | storageDomain domain `bug_workflow` v2（兼容 v1）：`tickets` / `settings` / `meta` 三表；写前用真 zod schema 校验；`meta` 是 actionId 幂等账本（最多 500 条） |
-| 设置面板 | 同页面 overlay，11 个字段（P2 增加平台连接），按工作区 cwd 保存；`Esc` 关闭、焦点返回、未保存修改丢弃 |
+| 持久化 | storageDomain domain `bug_workflow` v2（兼容 v1）：`tickets` / `settings` / `meta` 三表；写前用真 zod schema 校验；`meta` 是 actionId 幂等账本（最多 500 条）；所有写方法经 store 内单进程写队列串行化，平台同步 upsert 不会覆盖并发落地的本地动作 |
+| 设置面板 | 同页面 overlay，11 个字段（P2 增加平台连接），按工作区 cwd 保存；`Esc` 关闭、焦点返回、未保存修改丢弃；「保存 token」会先持久化同一面板里未保存的设置草稿，再保存 token |
 | 安全守卫 | 仅本机回环 socket + `Host` 白名单；POST 仅 `application/json`；`Origin` 必须同源；64 KiB / 10 s 限制；错误消息裁剪 |
-| 测试（P1+P2） | `node --test bug-workflow/test/*.test.js`，P2 收尾时 191 个用例全绿 |
+| 测试（P1+P2） | `node --test bug-workflow/test/*.test.js`，P2 收尾时 197 个用例全绿 |
 
 ### P2 平台接入
 
@@ -53,7 +54,7 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 | 平台信息 | 列表显示来源 Badge（平台/手动）与平台类型/状态；详情显示类型/状态/负责人/版本/项目/描述摘要 + 「在平台打开」外链（仅 `http(s)`） |
 | 错误映射 | token 缺失/配置错误 400、token 失效 401、网络/上游 502、未知 500；界面给出可操作提示 |
 | 自动同步 | 有 token 时每 10 分钟对最近 live 会话的工作区执行一次同步；单飞是**按 cwd 的**——自动同步选中最近 live 会话的 cwd，手动同步用的是当前会话的 cwd，**同一工作区内**才会合并，不同工作区各自独立、可以并发；**本项未在 live 观察到 tick** |
-| 测试 | 191 个用例（credentials / domain v2 / platform 客户端 / sync / routes / client 映射） |
+| 测试 | 197 个用例（credentials / domain v2 / platform 客户端 / sync / routes / client 映射；含 store 写串行化竞态用例） |
 
 > **动作映射的维护约束（每期必读）**：按钮只来自 `bug-workflow/client.js` 的 `ACTION_BY_STATE` 字面量（按 `workflow` 的静态列表）；宿主 `canApply` 是转移的权威，但两者是**两份独立数据**。`test/client-action-map.test.js` 只做单向校验（map → host：每个映射动作在该状态必须被 `canApply` 接受），**不校验 host → map**，所以新增宿主动作不会自动出现按钮。每加/改一个动作，必须同步更新该映射并运行 `node --test bug-workflow/test/*.test.js`。已知一处偏差：宿主支持 `block`（任意非终态可执行），但看板没有「阻塞」按钮。review 轮次上限已由映射处理，不再是偏差：`review_requests_changes` 声明 `maxRounds: 3`，`mr.rounds = 3` 时该按钮在界面上禁用并显示「轮次已耗尽」提示，不会发出必然被拒的请求；宿主仍是权威（绕过 UI 直接 POST 仍返回 409 `review-rounds-exhausted`，工单进入 `blocked`）。
 
@@ -80,7 +81,7 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 
 1. **平台地址**：默认 `https://ecard.htwisdom.cn`。只接受 `http(s)`，拒绝内嵌用户名/密码；开发时可填 mock 的 `http://127.0.0.1:<port>`。
 2. **平台项目编码**：例如 `YGFNXDJRFWDJSYJJYY`。同步只保留 `taskCode` 以 `<编码>-` 开头的工单；留空 = 全部。按编号导入不受该过滤限制。
-3. **平台 token**：粘贴上一步的 token →「保存 token」。状态点显示「token 已配置 / 未配置」；「清除」只删托管层凭据（环境变量 fallback 可能让状态仍为已配置，见「已知限制」）。
+3. **平台 token**：粘贴上一步的 token →「保存 token」。状态点显示「token 已配置 / 未配置」；「清除」只删托管层凭据（环境变量 fallback 可能让状态仍为已配置，见「已知限制」）。**保存 token 会把同一面板里尚未保存的设置修改先校验并保存**（避免关面板丢弃平台地址后 token 仍绑定旧域名）；设置校验或保存失败时 token 不会保存、面板保持打开并显示错误。
 4. **同步**：token + 已绑定工作区时可用；成功提示「已同步：新增 X / 更新 Y」，标题栏显示上次同步时间/错误。
 5. **从平台导入**：在「从平台导入」输入编号（或复用旧的手动添加入口）→ 宿主按编号请求平台详情并 upsert；成功后自动选中该工单。
 
@@ -229,7 +230,9 @@ P2 **未对真实平台执行**同步/导入（无真实 token，用户不在场
 ## 已知限制
 
 - **真实平台未验证**：P2 的同步/导入只对 mock 跑通；真实 token、TLS/网关/WAF、分页字段类型/`size` 上限、评论编码、`file/list` 结构都未对真实平台实测。
-- **GUI 未目视验收**：client inspect 在本轮超时（`Slots.listSubTree` / `Theme.listTokens` 均 10 s timeout），没有截图/点击/窄宽布局验证；client 侧仅由 `node --check`、静态/渲染 harness（未提交）与代码审阅保证。
+- **GUI 未目视验收**：client inspect 在本轮超时（`Slots.listSubTree` / `Theme.listTokens` 均 10 s timeout），没有截图/点击/窄宽布局验证；client 侧仅由 `node --check`、静态/渲染 harness（未提交）与代码审阅保证。P2 退出标准「看板可见真实结构工单 + 字典筛选可用」因此只能算**部分完成（数据层已证明；GUI 视觉/首次点击未验证；用户最终验收）**。
+- **v2 domain 迁移依赖安装版 storage-json**：本机 DSH 源码 checkout 的 single-unit 解析器不接受 `compatibleVersions`，只有已安装的 0.2.2-rc.1 运行时实测打开了 v2 domain。源码构建/更旧 DSH 可能因 `version-mismatch` 打不开看板，重建/升级后必须复验（详见「安装」）。
+- **写队列只保证单进程串行**：`store.create/applyAction/upsertPlatformRecords/putSettings/setMeta/setDicts` 经同一个 store 实例的 promise 链串行化（读操作不加锁），解决同一 host 进程内「同步/导入 upsert 覆盖本地动作」的竞争。跨进程/多窗口同时写同一个 storage 文件仍是最后写入者赢，没有文件锁；DSH desktop 是单 host 进程，因此正常使用不受影响。
 - **状态写回未实现**：`writebackStatus` 只是布尔设置，默认关；P2 不向平台写。
 - **600s 自动同步未观察到 tick**：只验证了 timer 服务可获取、重载不抛错；`run()` 正确性由单测覆盖。
 - **演示工单 URL 已失效**：647/648/HTSMART-12 的 `platform.url` 指向已停止的 mock；再次同步/导入会更新（需 mock 或真实平台）。
@@ -247,7 +250,7 @@ P2 **未对真实平台执行**同步/导入（无真实 token，用户不在场
 无构建步骤：host 是纯 ESM JavaScript，client 是自包含 React bundle（只 `require('react')`，由宿主 module table 提供）。
 
 ```sh
-# 全部单元测试（在仓库根目录执行）——P2 收尾 191/191
+# 全部单元测试（在仓库根目录执行）——P2 收尾 197/197
 node --test bug-workflow/test/*.test.js
 
 # 语法/静态检查
@@ -276,7 +279,7 @@ curl -s 'http://127.0.0.1:49254/bug-workflow/api/snapshot?sessionId=<session-id>
 | `src/host/domain.js` | zod schema、`bug_workflow` domain 声明与打开/关闭、v1→v2 归一化 |
 | `src/host/domain-spec.js` | 无依赖的 schema/spec 构造（供 plain Node 与 Electron 契约测试复用） |
 | `src/host/ticket-defaults.js` | v2 工单默认值（`source:'manual'`、`platform:null`） |
-| `src/host/store.js` | TicketStore：工单 CRUD、动作、设置、字典、平台 upsert、actionId 幂等账本 |
+| `src/host/store.js` | TicketStore：工单 CRUD、动作、设置、字典、平台 upsert、actionId 幂等账本、单进程写队列 |
 | `src/host/credentials.js` | 平台 token 的 credentials 封装（get/set/clear/present） |
 | `src/host/platform.js` | 平台 HTTP 客户端（fetch、15 s 超时、结构化错误、不跟随重定向） |
 | `src/host/sync.js` | 同步引擎与按编号导入（分页、项目过滤、映射、upsert、lastSync 元数据） |
