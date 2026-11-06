@@ -1,11 +1,28 @@
 /**
  * Storage domain declaration and lifecycle for the Bug workflow plugin.
  *
- * Domain `bug_workflow` (version 1) owns three tables:
+ * Domain `bug_workflow` (version 2) owns three tables:
  *
  *   tickets   value = persisted Ticket (matches `state-machine.js`)
  *   settings  value = workspace settings keyed by cwd
  *   meta      value = { at, value } ledger for actionId idempotency
+ *
+ * Versioning policy (domain v2):
+ *
+ *   - `version` is the current domain format version; `compatibleVersions`
+ *     lists older versions whose records this schema still accepts. The JSON
+ *     single-layout backend reads a v1 file when v1 is listed, upgrades the
+ *     in-memory unit, and stamps the next write as v2.
+ *   - An INCOMPATIBLE change (removed/retyped field, new required data that old
+ *     rows cannot supply) MUST bump `version` and add the previous version to
+ *     `compatibleVersions`; an old version's schema is never edited in place.
+ *   - An ADDITIVE-with-defaults change keeps old records readable (`source` and
+ *     `platform` here use `.default()`), so it needs no migration code: v1 rows
+ *     parse, gain the defaults, and persist them on their next write.
+ *   - Schema violations fail loud: `invalidRecords` is deliberately not set to
+ *     `'backup-and-skip'`, because tickets and settings are authoritative user
+ *     data. A bad record must stop the open with `invalid-record` instead of
+ *     silently disappearing.
  *
  * Both `@deepseek-ai/dsh-storage-domain` and `zod` are imported as bare
  * specifiers and declared in the bundle's `peerDependencies`. The running host
@@ -35,7 +52,9 @@ import {
 
 /** Domain identity. The name must satisfy UNIT_NAME_RE (/^[a-z][a-z0-9_]*$/). */
 export const DOMAIN_NAME = 'bug_workflow';
-export const DOMAIN_VERSION = 1;
+export const DOMAIN_VERSION = 2;
+/** Older on-disk versions this schema still accepts (v1 has no source/platform). */
+export const COMPATIBLE_VERSIONS = Object.freeze([1]);
 
 /** `already-open` retry budget for a fiber that races its predecessor's close. */
 const OPEN_ATTEMPTS = 10;
@@ -87,6 +106,34 @@ const mrSchema = z.looseObject({
   rounds: z.number().int().nonnegative(),
 });
 
+/**
+ * Platform snapshot carried by a synced ticket (domain v2). It is a
+ * point-in-time copy of the platform record, not the local workflow state:
+ * `statusKey`/`statusName` describe the platform side, which is deliberately
+ * separate from `ticket.workflow` (the local state machine). `project*` and
+ * `assignee*` are nullable because the platform can omit them; unknown keys
+ * are kept so a future platform field can ride along without a domain bump.
+ */
+export const platformSchema = z.looseObject({
+  taskId: z.string(),
+  taskCode: z.string(),
+  typeKey: z.string(),
+  typeName: z.string(),
+  statusKey: z.string(),
+  statusName: z.string(),
+  priorityKey: z.string(),
+  priorityName: z.string(),
+  versionKey: z.string(),
+  versionName: z.string(),
+  projectId: nullableString,
+  projectName: nullableString,
+  assigneeId: nullableString,
+  assigneeName: nullableString,
+  description: z.string(),
+  url: z.string(),
+  syncedAt: z.number().int().nonnegative(),
+});
+
 /** Persisted Ticket. `looseObject` keeps unknown keys so a future field survives a load. */
 export const ticketSchema = z.looseObject({
   code: z.string().min(1),
@@ -97,6 +144,9 @@ export const ticketSchema = z.looseObject({
   priority: nullableString,
   assignee: nullableString,
   url: nullableString,
+  // Domain v2. Defaults keep v1 records readable and match `withPlatformDefaults`.
+  source: z.enum(['platform', 'manual']).default('manual'),
+  platform: platformSchema.nullable().default(null),
   workflow: z.enum(STATES),
   blockedFrom: z.enum(STATES).nullable(),
   blockedReason: nullableString,
@@ -113,10 +163,18 @@ export const ticketSchema = z.looseObject({
  * Workspace settings record. Fields default from DEFAULT_SETTINGS so a record
  * written by an older version (or a partial hand edit) still opens: forward
  * compatibility is handled by filling missing keys, not by failing the domain.
+ * The value type follows the default (`writebackStatus` is boolean; the rest
+ * are strings), which is the same derivation the store uses at its write
+ * boundary.
  */
 export const settingsSchema = z.looseObject(
   Object.fromEntries(
-    Object.entries(DEFAULT_SETTINGS).map(([field, fallback]) => [field, z.string().default(fallback)]),
+    Object.entries(DEFAULT_SETTINGS).map(([field, fallback]) => [
+      field,
+      typeof fallback === 'boolean'
+        ? z.boolean().default(fallback)
+        : z.string().default(fallback),
+    ]),
   ),
 );
 
@@ -135,6 +193,7 @@ export const metaSchema = z.looseObject({
 export const domainSpec = defineDomain({
   name: DOMAIN_NAME,
   version: DOMAIN_VERSION,
+  compatibleVersions: COMPATIBLE_VERSIONS,
   tables: {
     [TICKETS_TABLE]: domainTable(ticketSchema),
     [SETTINGS_TABLE]: domainTable(settingsSchema),

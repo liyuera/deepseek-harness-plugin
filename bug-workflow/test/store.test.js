@@ -130,7 +130,13 @@ function strictTicket(ticket) {
 /** Domain-schema double for settings; same contract as `strictTicket`. */
 function strictSettings(settings) {
   for (const [field, value] of Object.entries(settings)) {
-    if (typeof value !== 'string') throw new Error(`settings.${field} 必须是字符串`);
+    // Domain v2 adds one boolean setting; every other declared field is a string.
+    const expected = DEFAULT_SETTINGS[field] === true || DEFAULT_SETTINGS[field] === false
+      ? 'boolean'
+      : 'string';
+    if (typeof value !== expected) {
+      throw new Error(`settings.${field} 必须是${expected === 'boolean' ? '布尔值' : '字符串'}`);
+    }
   }
   return cloneJson(settings);
 }
@@ -162,9 +168,14 @@ test('create() persists an inbox ticket and snapshot() reports it', async () => 
   assert.equal(created.ticket.createdAt, T1);
   assert.equal(created.ticket.updatedAt, T1);
   assert.equal(created.ticket.timeline.length, 1);
+  // Domain v2 write-side defaults: manual tickets are explicit, never implied.
+  assert.equal(created.ticket.source, 'manual');
+  assert.equal(created.ticket.platform, null);
 
   const persisted = domain.table('tickets').get('BUG-1');
   assert.deepEqual(persisted, created.ticket);
+  assert.equal(persisted.source, 'manual');
+  assert.equal(persisted.platform, null);
 
   assert.deepEqual(store.get('BUG-1'), created.ticket);
   const snapshot = store.snapshot();
@@ -487,6 +498,9 @@ test('getSettings() returns defaults until putSettings() writes a workspace reco
   const defaults = store.getSettings('/workspace/a');
   assert.deepEqual(defaults, DEFAULT_SETTINGS);
   assert.notEqual(defaults, DEFAULT_SETTINGS, 'callers must not receive the shared default object');
+  // Domain v2 settings defaults.
+  assert.equal(defaults.platformBaseUrl, 'https://ecard.htwisdom.cn');
+  assert.equal(defaults.writebackStatus, false);
 
   const saved = await store.putSettings('/workspace/a', {
     gitlabProjectPath: 'group/project',
@@ -495,6 +509,8 @@ test('getSettings() returns defaults until putSettings() writes a workspace reco
   assert.equal(saved.gitlabProjectPath, 'group/project');
   assert.equal(saved.branchUser, 'zs');
   assert.equal(saved.commitType, 'fix');
+  assert.equal(saved.platformBaseUrl, 'https://ecard.htwisdom.cn');
+  assert.equal(saved.writebackStatus, false);
   assert.deepEqual(store.getSettings('/workspace/a'), saved);
 
   assert.deepEqual(domain.table('settings').get('/workspace/a'), saved);
@@ -504,6 +520,11 @@ test('getSettings() returns defaults until putSettings() writes a workspace reco
   assert.equal(merged.gitlabProjectPath, 'group/project', 'partial updates keep saved fields');
   assert.equal(merged.testCommand, 'npm test');
   assert.deepEqual(store.getSettings('/workspace/a'), merged);
+
+  const toggled = await store.putSettings('/workspace/a', { writebackStatus: true });
+  assert.equal(toggled.writebackStatus, true, 'the boolean platform setting is writable');
+  assert.equal(toggled.testCommand, 'npm test');
+  assert.deepEqual(store.getSettings('/workspace/a'), toggled);
 });
 
 test('getSettings() falls back to defaults when the workspace is unknown or empty', () => {
@@ -536,6 +557,10 @@ test('putSettings() reports unknown-workspace and invalid-settings as structured
   await assert.rejects(store.putSettings('/workspace/a', null), expectCode('invalid-settings'));
   await assert.rejects(
     store.putSettings('/workspace/a', { branchUser: 42 }),
+    expectCode('invalid-settings'),
+  );
+  await assert.rejects(
+    store.putSettings('/workspace/a', { writebackStatus: 'no' }),
     expectCode('invalid-settings'),
   );
   await assert.rejects(

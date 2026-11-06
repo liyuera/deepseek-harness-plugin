@@ -41,6 +41,7 @@ import {
   apply,
   initialTicket,
 } from './state-machine.js';
+import { withPlatformDefaults } from './ticket-defaults.js';
 
 /**
  * Structured error thrown by store APIs that cannot return a result object
@@ -68,6 +69,7 @@ export const MAX_ACTION_RESULTS = 500;
 
 /** Workspace settings defaults; also the schema key list in `domain.js`. */
 export const DEFAULT_SETTINGS = Object.freeze({
+  platformBaseUrl: 'https://ecard.htwisdom.cn',
   platformProjectCode: '',
   gitlabProjectPath: '',
   branchUser: 'ly',
@@ -77,6 +79,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
   testCommand: '',
   devCommand: '',
   previewUrl: '',
+  writebackStatus: false,
 });
 
 /** Ticket fields accepted from `create()` input; everything else is ignored. */
@@ -224,7 +227,10 @@ export function createStore(domain, clock = defaultClock, options = {}) {
     }
 
     const at = readNow(clock);
-    const ticket = initialTicket({ ...pickCreateFields(input), code }, at);
+    // Domain v2: every created ticket states its provenance explicitly. The
+    // defaults live in a dependency-free module so the plain-Node tests cover
+    // them; the zod schema declares the same fallbacks for v1 records at open.
+    const ticket = withPlatformDefaults(initialTicket({ ...pickCreateFields(input), code }, at));
     // A ticket without a title is unusable on the board; fall back to the code.
     if (typeof ticket.title !== 'string' || ticket.title.trim() === '') {
       ticket.title = code;
@@ -331,8 +337,12 @@ export function createStore(domain, clock = defaultClock, options = {}) {
     for (const field of Object.keys(DEFAULT_SETTINGS)) {
       const value = input[field];
       if (value === undefined) continue;
-      if (typeof value !== 'string') {
-        throw new StoreError('invalid-settings', `settings.${field} 必须是字符串`);
+      const expected = settingsFieldType(field);
+      if (typeof value !== expected) {
+        throw new StoreError(
+          'invalid-settings',
+          `settings.${field} 必须是${expected === 'boolean' ? '布尔值' : '字符串'}`,
+        );
       }
       next[field] = value;
     }
@@ -455,10 +465,20 @@ function mergeSettings(raw) {
   if (isPlainObject(raw)) {
     for (const field of Object.keys(DEFAULT_SETTINGS)) {
       const value = raw[field];
-      if (typeof value === 'string') merged[field] = value;
+      if (typeof value === settingsFieldType(field)) merged[field] = value;
     }
   }
   return merged;
+}
+
+/**
+ * Runtime type of one declared settings field, derived from its default:
+ * domain v2 adds the boolean `writebackStatus`, everything else stays a string.
+ * The matching zod schema in `domain.js` uses the same derivation, so the store
+ * boundary and the on-open schema cannot disagree about a field's type.
+ */
+function settingsFieldType(field) {
+  return typeof DEFAULT_SETTINGS[field] === 'boolean' ? 'boolean' : 'string';
 }
 
 function normalizeCode(code) {
