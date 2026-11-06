@@ -16,7 +16,7 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 
 - `desktop` 是桌面应用独占的 profile；源码启动的 `pnpm dsh web` 使用 `web`。GUI 里也可在 **设置 → 插件 → 添加插件** 完成。
 - 安装/重装后重载 profile：新装 client 半边通常需要重启桌面应用；开发期只改宿主半边时，可对 bundle 执行「移除 → 重装」热重载（P1 验收即用此法，数据不丢）。client 代码更新后还需刷新页面。
-- 需要 dsh 0.2.2-rc.1 及兼容的 `@deepseek-ai/dsh-storage-domain` / `zod`（声明为 peerDependencies，由宿主提供）。
+- P1 只在 **DSH 0.2.2-rc.1**（desktop profile）上验收；`@deepseek-ai/dsh-storage-domain` / `zod` 声明为 peerDependencies（由宿主提供），但当前版本范围是 `"*"`，尚未锁到验证过的版本——P2 发布前必须收窄（见「P2 打包与交接」）。
 - 卸载：`dsh plugin --profile desktop remove @liyuera/dsh-bug-workflow`。卸载不删除工单数据。
 
 ## 入口
@@ -31,12 +31,14 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 | --- | --- |
 | 看板列表 | 工作区名/绑定状态、状态与类型筛选、手动输入编号建单、演示建单、刷新、3 秒轮询；`done` 工单从进行中列表隐藏 |
 | 工单详情 | 工单字段；方案卡（摘要/根因/方案/改动文件/风险/测试建议，通过/驳回）；修复与测试区；MR/Review 卡（轮次、阻塞项、结论）；最近 20 条时间线 |
-| 动作按钮 | 按当前 `workflow` 与 `canApply` 渲染，全部二次确认（`window.confirm`，缺失时用内联确认）；POST 带唯一 `actionId`，宿主幂等重放 |
+| 动作按钮 | 由 client 内 `ACTION_BY_STATE` 字面量按 `workflow` 渲染（**不是**由宿主 `canApply` 派生）；全部二次确认（`window.confirm`，缺失时用内联确认）；POST 带唯一 `actionId`，宿主幂等重放 |
 | 状态机 | 12 个状态、16 个动作（含 `block`/`retry`/`reject_plan`）；review 变更轮次上限 3 轮，第 4 次请求由宿主转为 `blocked` |
 | 持久化 | storageDomain domain `bug_workflow` v1：`tickets` / `settings` / `meta` 三表；写前用真 zod schema 校验；`meta` 是 actionId 幂等账本（最多 500 条） |
 | 设置面板 | 同页面 overlay，9 个字段，按工作区 cwd 保存；`Esc` 关闭、焦点返回、未保存修改丢弃 |
 | 安全守卫 | 仅本机回环 socket + `Host` 白名单；POST 仅 `application/json`；`Origin` 必须同源；64 KiB / 10 s 限制；错误消息裁剪 |
 | 测试 | `node --test bug-workflow/test/*.test.js`，101 个用例全绿 |
+
+> **动作映射的维护约束（P2 必读）**：按钮只来自 `bug-workflow/client.js` 的 `ACTION_BY_STATE` 字面量（按 `workflow` 的静态列表）；宿主 `canApply` 是转移的权威，但两者是**两份独立数据**。`test/client-action-map.test.js` 只做单向校验（map → host：每个映射动作在该状态必须被 `canApply` 接受），**不校验 host → map**，所以新增宿主动作不会自动出现按钮。P2 每加/改一个动作，必须同步更新该映射并运行 `node --test bug-workflow/test/*.test.js`。已知两处偏差：① `mr_open` 且 `mr.rounds = 3` 时看板仍显示 `review_requests_changes`，点击后被宿主拒绝（409 `review-rounds-exhausted` → 工单进入 `blocked`）；② 宿主支持 `block`（任意非终态可执行），但 P1 看板没有「阻塞」按钮。
 
 P1 的「假引擎」含义：分析完成、修复完成、建 MR、review 结论、合并等都由看板按钮手工 POST 假 payload 驱动，不会调用平台、GitLab 或子代理。
 
@@ -48,6 +50,12 @@ P1 的「假引擎」含义：分析完成、修复完成、建 MR、review 结�
 | P3 | 分析子代理 + 真实方案审核/驳回重跑 |
 | P4 | 修复子代理 + worktree、lint/test、人工测试与视觉留证 |
 | P5 | GitLab 交付：分支、MR 创建、review 轮询、回修、合并检测、完成归档、状态写回 |
+
+> **P2 打包与交接（P1 遗留语义，勿当成已实现契约）**：
+> - **打包**：`package.json` 的 peerDependencies（`@deepseek-ai/dsh-storage-domain`、`zod`）都是 `"*"`，且**没有 `license` 字段**（`private: true`）。P2 发布前必须把 peer 收窄到实际验证过的范围、补 `license`，并按 `files` 清单做一次 `npm pack --dry-run` 检查（`locale/*.json` 目录尚未创建，导出仍写在那里）。
+> - **`review_fix_done` 的 `verdict`**：只把 `workflow` 推回 `mr_open`，`mr.verdict` 保持 `changes`，直到 `review_pass` 才变 `pass`；P2/P5 若用 `verdict` 判定「已修复 / 可合并」，必须先定义重置语义（或改用逐轮记录）。
+> - **`fixes` payload**：见「已知限制」——宿主只校验 `z.array(z.unknown())`，元素形状是 P1 客户端约定，不是 host-enforced contract。
+> - **设置「必填」**：`branchUser` / `commitType` 的必填校验只在 `client.js`（`validateSettings`）；宿主 `settingsSchema` 为 `z.string().default(...)`，`POST /api/settings` 会接受空串。P2 若要求服务端保证，需在 host 补校验与测试。
 
 ## 设置字段
 
@@ -103,7 +111,7 @@ P1 的「假引擎」含义：分析完成、修复完成、建 MR、review 结�
 - **视觉/交互验收未完成**：右栏 tab 的 guide/渲染、300–600px 窄宽布局、Electron 下 `window.confirm`/焦点行为未在本轮目视验证；client Slots inspect 在验收时 10 s 超时。详见 findings。
 - **app 重启未验证**：只验证了宿主半边「移除 → 重装」热重载后数据保留。
 - **`workspace.configured` 只表示会话解析到了目录**，不表示已保存设置；P2 若要区分「已绑定」需另加状态。
-- **无 GitLab/平台调用**：`mr`、`plan`、`fixes` 的 payload 形状是 P1 契约，P2–P5 adapter 负责映射真实 API。
+- **无 GitLab/平台调用**：`plan` / `mr` 有宿主 zod schema，`fixes` 只校验为数组（`z.array(z.unknown())`）——元素形状只是 P1 看板客户端的约定，不是宿主强制契约；P2–P5 adapter 负责映射真实 API，并在接修复子代理前补 `fixes` 的 host schema。
 
 ## 开发
 
@@ -137,4 +145,4 @@ curl -s 'http://127.0.0.1:49254/bug-workflow/api/snapshot?sessionId=<session-id>
 
 ## 许可
 
-内部私有包（`private: true`，`UNLICENSED`），仅用于本人 DSH profile；未发布 npm、未授予再分发许可。
+内部私有包（`private: true`），仅用于本人 DSH profile；未发布 npm、未授予再分发许可。注意：`package.json` **当前没有 `license` 字段**（不是 `UNLICENSED` 声明），P2 发布前应补上（见「P2 打包与交接」）。
