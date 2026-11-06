@@ -503,7 +503,6 @@ function createFakeAnalysis({ start, status } = {}) {
         return { running: [], errors: {} };
       },
     },
-    runner: {},
   };
 }
 
@@ -1359,7 +1358,7 @@ test('POST /analyze reports a duplicate running analysis without a second runner
     },
   };
   const service = createAnalysisService({ store, runner, clock: () => SERVER_TIME });
-  const { handlers } = handlersWith({ store, analysis: { service, runner } });
+  const { handlers } = handlersWith({ store, analysis: { service } });
 
   const body = analyzeBody({ code: 'BUG-DUP' });
   const first = call(handlers.analyze, { method: 'POST', url: API_PATHS.analyze, body });
@@ -1420,7 +1419,6 @@ test('POST /analyze maps analysis failures to 404/409/503/500', async () => {
     ['ticket-not-found', 404],
     ['invalid-state', 409],
     ['analysis-unavailable', 503],
-    ['no-live-agent', 503],
     ['invalid-transition', 409],
     ['internal', 500],
   ];

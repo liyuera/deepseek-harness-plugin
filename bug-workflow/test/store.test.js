@@ -626,6 +626,96 @@ test('two concurrent applyAction calls are serialized in call order', async () =
   assert.equal(second.ticket.workflow, 'plan_review');
 });
 
+test('applyAction() applies expectedWorkflow inside the write queue', async () => {
+  const entered = deferred();
+  const release = deferred();
+  let pauseArmed = false;
+  const domain = createFakeDomain({
+    beforePut: async (table, key) => {
+      if (!pauseArmed || table !== 'tickets' || key !== 'EXPECT-1') return;
+      pauseArmed = false;
+      entered.resolve();
+      await release.promise;
+    },
+  });
+  const store = createStrictStore(domain, clockFrom(T1, T2, T3));
+  await store.create({ code: 'EXPECT-1' });
+
+  // Park the inbox -> analyzing write; the persisted workflow is still `inbox`.
+  pauseArmed = true;
+  const startPromise = store.applyAction('EXPECT-1', 'start_analysis', {}, { actionId: 'expected-start' });
+  await entered.promise;
+
+  // This guard is checked AFTER the queued write runs, so at enqueue time the
+  // ticket still looks `inbox`; only an in-critical-section check can see
+  // `analyzing` and apply the block.
+  const blockPromise = store.applyAction(
+    'EXPECT-1',
+    'block',
+    { reason: 'manual-stop', actor: 'system' },
+    { actionId: 'expected-block', expectedWorkflow: 'analyzing' },
+  );
+  await flushEventLoop();
+  assert.equal(domain.table('tickets').get('EXPECT-1').workflow, 'inbox');
+
+  release.resolve();
+  const [started, blocked] = await Promise.all([startPromise, blockPromise]);
+
+  assert.equal(started.ok, true);
+  assert.equal(blocked.ok, true);
+  assert.equal(blocked.ticket.workflow, 'blocked');
+  assert.equal(blocked.ticket.blockedFrom, 'analyzing');
+  assert.deepEqual(blocked.ticket.timeline.map((event) => event.kind), [
+    'created',
+    'start_analysis',
+    'blocked',
+  ]);
+});
+
+test('applyAction() refuses a stale expectedWorkflow without writing or memoizing', async () => {
+  const domain = createFakeDomain();
+  const store = createStrictStore(domain, clockFrom(T1, T2, T3));
+  await store.create({ code: 'EXPECT-2' });
+
+  const stale = await store.applyAction(
+    'EXPECT-2',
+    'block',
+    { reason: 'late-failure', actor: 'system' },
+    { actionId: 'expected-stale', expectedWorkflow: 'analyzing' },
+  );
+
+  assert.equal(stale.ok, false);
+  assert.equal(stale.code, 'stale-workflow');
+  assert.equal(typeof stale.message, 'string');
+  const ticket = domain.table('tickets').get('EXPECT-2');
+  assert.equal(ticket.workflow, 'inbox');
+  assert.deepEqual(ticket.timeline.map((event) => event.kind), ['created']);
+  // No idempotency ledger entry: a later replay must be able to retry for real.
+  assert.equal(domain.table('meta').get('action:expected-stale'), undefined);
+
+  // Callers that do not pass the guard keep the legacy behaviour: `block` is
+  // legal from `inbox` in the state machine and must still apply.
+  const blocked = await store.applyAction('EXPECT-2', 'block', { reason: 'manual-stop', actor: 'user' });
+  assert.equal(blocked.ok, true);
+  assert.equal(blocked.ticket.workflow, 'blocked');
+});
+
+test('applyAction() validates expectedWorkflow as a non-empty string', async () => {
+  const domain = createFakeDomain();
+  const store = createStrictStore(domain, () => T1);
+  await store.create({ code: 'EXPECT-3' });
+
+  const rejected = await store.applyAction(
+    'EXPECT-3',
+    'start_analysis',
+    {},
+    { expectedWorkflow: '   ' },
+  );
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.code, 'invalid-input');
+  assert.equal(store.get('EXPECT-3').workflow, 'inbox');
+});
+
 test('concurrent actionId retries replay the first result only once', async () => {
   const domain = createFakeDomain();
   let validations = 0;

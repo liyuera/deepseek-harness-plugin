@@ -25,19 +25,25 @@
  *     starts a subagent and never writes a partial ticket.
  *   - The background job never rejects: runner failures are mapped to a static
  *     block reason + static message, stored in `meta['analysis.error:<code>']`.
- *     A failure after the ticket left `analyzing` only records the error; it
- *     never blocks a ticket that has already moved on (`block` is legal from
- *     many workflows, so the failure path additionally requires `analyzing`).
+ *     The `block` write carries `expectedWorkflow:'analyzing'`, checked by the
+ *     store INSIDE its write-queue critical section: a failure that lands after
+ *     the ticket advanced (even if the service's own read was still stale)
+ *     returns `stale-workflow` and only records the static error meta. `block`
+ *     is legal from many workflows, so the guard is what prevents a regression.
  *   - Before `analysis_done` the persisted ticket is re-read and checked with
  *     `canApply()`. A stale result (the ticket was blocked/approved/dismissed
  *     while the child was running) is discarded with a static meta error; the
  *     state machine remains the only writer of the workflow.
  *   - Error messages are static Chinese strings: runner messages, internal
  *     details and stacks never reach `meta` or the snapshot.
- *   - `dispose()` aborts every running job and drains them: it returns a
- *     promise that settles when the aborted jobs' terminal writes have been
- *     attempted (bounded, so a stuck runner cannot hang unload). Idempotent.
- *     The host must await it before closing the storage domain.
+ *   - `dispose()` marks every running entry `cancelled` and only then aborts
+ *     it. A cancelled job performs NO terminal write: plugin unload / app quit
+ *     is not an analysis failure, so the ticket stays `analyzing` with no
+ *     `analysis.error` meta and the next host load restarts it through the
+ *     orphan path. `dispose()` returns a promise that settles when the
+ *     aborted jobs have settled (bounded, so a stuck runner cannot hang
+ *     unload). Idempotent. The host awaits it before closing the storage
+ *     domain.
  *   - `start()` re-checks `disposed` after every await and never launches a job
  *     once teardown began.
  *
@@ -145,10 +151,15 @@ export function createAnalysisService({
       return failure('invalid-code', '缺少有效的工单编号 code');
     }
 
-    const ticket = readTicket(key);
-    if (ticket === undefined) {
-      return failure('ticket-not-found', `工单 ${key} 不存在`);
+    const found = readTicket(key);
+    if (!found.ok) {
+      // A read failure is a host problem (500), never a 404: only a genuinely
+      // missing record may tell the user the ticket does not exist.
+      return found.reason === 'error'
+        ? failure('internal', '读取工单失败，请重试')
+        : failure('ticket-not-found', `工单 ${key} 不存在`);
     }
+    const ticket = found.ticket;
 
     // Duplicate click / concurrent request for the same ticket: never launch a
     // second subagent. Every branch below reserves the entry BEFORE its first
@@ -278,9 +289,13 @@ export function createAnalysisService({
     return { ok: true, running: true, workflow: 'analyzing' };
   }
 
-  /** Reserve the running entry before the first await of a start branch. */
+  /**
+   * Reserve the running entry before the first await of a start branch.
+   * `cancelled` is owned by `dispose()`: once set, the background job must not
+   * write any terminal state (unload is not a failure).
+   */
   function reserve(key) {
-    const entry = { controller: new AbortController(), startedAt: readNow() };
+    const entry = { controller: new AbortController(), cancelled: false };
     running.set(key, entry);
     return entry;
   }
@@ -323,12 +338,14 @@ export function createAnalysisService({
   }
 
   /**
-   * Abort every running job and drain it: the returned promise settles once
-   * the aborted jobs have attempted their terminal writes (block + meta), or
-   * after `drainTimeoutMs` when a runner ignores its abort signal. The host
-   * awaits this before closing the storage domain, so a terminal write cannot
-   * silently land on a closed domain. Idempotent: repeated calls return the
-   * same in-flight drain promise.
+   * Cancel every running job and drain it. Each entry is marked `cancelled`
+   * BEFORE the abort, so the job's failure handler writes neither `block` nor
+   * an error meta: the ticket stays `analyzing` and a later host load can
+   * restart it. The returned promise settles once the aborted jobs have
+   * settled, or after `drainTimeoutMs` when a runner ignores its abort signal.
+   * The host awaits this before closing the storage domain, so no late write
+   * can land on a closed domain. Idempotent: repeated calls return the same
+   * in-flight drain promise.
    *
    * @returns {Promise<void>}
    */
@@ -338,6 +355,8 @@ export function createAnalysisService({
     const entries = [...running.values()];
     running.clear();
     for (const entry of entries) {
+      // Mark first: the runner's abort path may settle synchronously.
+      entry.cancelled = true;
       try {
         entry.controller.abort();
       } catch {
@@ -353,7 +372,7 @@ export function createAnalysisService({
   /**
    * Fire-and-forget background job. `run()` never throws (catch-all), its
    * completion always releases the running entry, and the promise stays in
-   * `jobs` until the terminal write settles so `dispose()` can drain it.
+   * `jobs` until the job settles so `dispose()` can drain it.
    */
   function launchJob({ entry, key, sessionId, cwd, ticket }) {
     const job = run({ entry, key, sessionId, cwd, ticket });
@@ -383,6 +402,11 @@ export function createAnalysisService({
       result = { ok: false, code: 'analysis-failed' };
     }
 
+    // Teardown cancelled this analysis: unload/app quit is not a failure. Do
+    // not block the ticket and do not persist an error; the orphan path on the
+    // next host load restarts it from `analyzing`.
+    if (entry.cancelled === true) return;
+
     try {
       if (result?.ok === true) {
         await applyAnalysisResult(key, result.plan);
@@ -399,7 +423,7 @@ export function createAnalysisService({
   /** Apply a successful plan, or discard it when the ticket moved on. */
   async function applyAnalysisResult(key, plan) {
     const current = readTicket(key);
-    if (current !== undefined && canApply(current, 'analysis_done').ok) {
+    if (current.ok && canApply(current.ticket, 'analysis_done').ok) {
       const applied = await store.applyAction(key, 'analysis_done', {
         plan,
         actor: 'agent',
@@ -414,26 +438,28 @@ export function createAnalysisService({
 
   /**
    * Block the ticket and persist the static reason. `block` is legal from many
-   * workflows (plan_review, fixing, ...), so a late failure is gated on the
-   * ticket still being in `analyzing`: a ticket that already advanced must not
-   * regress. In that case only the static error meta is recorded.
+   * workflows (plan_review, fixing, ...), so the write carries
+   * `expectedWorkflow:'analyzing'`: the store re-reads the ticket inside its
+   * write-queue critical section and refuses the write with `stale-workflow`
+   * when it already advanced. That closes the TOCTOU window a lock-free read
+   * here would leave open (read `analyzing` -> advance lands -> block
+   * regresses the ticket). On a stale refusal only the static meta is written.
    */
   async function applyAnalysisFailure(key, runnerCode) {
     const reason = RUNNER_CODE_TO_REASON[runnerCode] ?? 'analysis-failed';
     const message = ANALYSIS_REASON_MESSAGES[reason] ?? ANALYSIS_REASON_MESSAGES['analysis-failed'];
 
-    const current = readTicket(key);
-    if (
-      current !== undefined
-      && current.workflow === 'analyzing'
-      && canApply(current, 'block').ok
-    ) {
-      try {
-        await store.applyAction(key, 'block', { reason, actor: 'system' });
-      } catch {
-        // A block that lost a race is not an error: the meta error below still
-        // tells the user what happened, and the workflow stays untouched.
-      }
+    try {
+      await store.applyAction(
+        key,
+        'block',
+        { reason, actor: 'system' },
+        { expectedWorkflow: 'analyzing' },
+      );
+    } catch {
+      // A block that lost a race (or a closing store) is not an error: the
+      // meta error below still tells the user what happened, and the workflow
+      // stays untouched.
     }
     await rememberError(key, message);
   }
@@ -477,14 +503,22 @@ export function createAnalysisService({
     if (running.get(key) === entry) running.delete(key);
   }
 
+  /**
+   * Read the persisted ticket, distinguishing "missing" from "read failed".
+   * A thrown store read is an unexpected host error (`start()` maps it to
+   * 500); only a genuinely absent/invalid record may be reported as 404.
+   */
   function readTicket(key) {
     let ticket;
     try {
       ticket = store.get(key);
     } catch {
-      return undefined;
+      return { ok: false, reason: 'error' };
     }
-    return isPlainObject(ticket) && typeof ticket.workflow === 'string' ? ticket : undefined;
+    if (!isPlainObject(ticket) || typeof ticket.workflow !== 'string') {
+      return { ok: false, reason: 'missing' };
+    }
+    return { ok: true, ticket };
   }
 
   function runnerAvailable() {

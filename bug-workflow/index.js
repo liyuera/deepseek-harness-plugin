@@ -26,8 +26,8 @@
  * opened store. The runner is built even when those services are absent: it
  * reports `available() === false`, so `/analyze` answers 503 `analysis-unavailable`
  * instead of failing the whole plugin. The service is disposed and drained
- * (aborted jobs' terminal writes awaited, bounded) before the storage domain
- * closes; a stuck runner cannot hang unload.
+ * (cancelled jobs are marked so they write no false failure; the drain is
+ * bounded) before the storage domain closes; a stuck runner cannot hang unload.
  *
  * Sync wiring (P2 Task 4): `createSyncService()` reads the token from
  * `ctx.credentials`, maps platform tasks into the v2 ticket store, and persists
@@ -192,7 +192,7 @@ export function apply(ctx) {
           // analysis-service.js; P3 exposes no host setting for it. Pass
           // `{ timeoutMs }` here to change it.
           analysisService = createAnalysisService({ store, runner, clock });
-          analysis = { service: analysisService, runner };
+          analysis = { service: analysisService };
         } catch (error) {
           analysisService = undefined;
           logWarning(storageCtx, 'bug-workflow: 分析服务初始化失败', error);
@@ -228,7 +228,7 @@ export function apply(ctx) {
           // The fiber was disposed while the domain was opening; no request can
           // reach these handlers any more, so release the domain immediately
           // instead of leaving a handle behind. Drain any analysis job before
-          // closing the domain so its terminal write cannot be lost.
+          // closing the domain so an in-flight job write cannot land on it.
           await analysisService?.dispose();
           await closeDomain(handle);
           return handle;

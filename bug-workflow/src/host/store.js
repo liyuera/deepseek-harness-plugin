@@ -310,10 +310,20 @@ export function createStore(domain, clock = defaultClock, options = {}) {
    * one critical section, so a retry racing the original replay sees the first
    * persisted result instead of running the state machine twice.
    *
+   * `options.expectedWorkflow` is an optimistic concurrency guard for callers
+   * that must not regress a ticket which advanced while they were deciding.
+   * It is checked AFTER the queued function starts, i.e. against the ticket as
+   * it is when this action's turn arrives — never against an earlier
+   * lock-free read. On mismatch the call returns `{ok:false,
+   * code:'stale-workflow'}` without writing the ticket or the action ledger.
+   * A replayed `actionId` still returns its persisted result (that transition
+   * already happened), so idempotent retries keep working.
+   *
    * @param {string} rawCode ticket code
    * @param {string} action protocol action
    * @param {object} [payload] action payload
-   * @param {{actionId?:string}} [options] idempotency key
+   * @param {{actionId?:string, expectedWorkflow?:string}} [options] idempotency key
+   *   and optional in-queue workflow guard
    * @returns {Promise<{ok:true, ticket:object} | {ok:false, code:string, message:string}>}
    */
   function applyAction(rawCode, action, payload = {}, options = {}) {
@@ -344,6 +354,14 @@ export function createStore(domain, clock = defaultClock, options = {}) {
       }
     }
 
+    let expectedWorkflow;
+    if (options !== undefined && options !== null && options.expectedWorkflow !== undefined) {
+      expectedWorkflow = normalizeCode(options.expectedWorkflow);
+      if (expectedWorkflow === undefined) {
+        return failure('invalid-input', 'expectedWorkflow 必须是非空字符串');
+      }
+    }
+
     if (action === 'create') {
       const input = isPlainObject(payload) ? { ...payload, code } : { code };
       // Already inside this call's critical section: never re-enter withWrite()
@@ -360,6 +378,16 @@ export function createStore(domain, clock = defaultClock, options = {}) {
       return found.reason === 'invalid'
         ? failure('invalid-record', `工单 ${code} 的存储记录损坏，请人工检查`)
         : failure('not-found', `工单 ${code} 不存在`);
+    }
+
+    // The guard MUST live inside the queue: a caller that read the ticket
+    // outside the lock may have seen an older workflow. Returning before
+    // `apply()` leaves both the ticket and the ledger untouched.
+    if (expectedWorkflow !== undefined && found.ticket.workflow !== expectedWorkflow) {
+      return failure(
+        'stale-workflow',
+        `工单 ${code} 已不在 ${expectedWorkflow} 状态（当前 ${found.ticket.workflow}）`,
+      );
     }
 
     let next;

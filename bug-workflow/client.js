@@ -43,7 +43,9 @@
  *     legacy `/action` route. A 200 is treated only as "the request was
  *     accepted" — progress comes from the polled `snapshot.analysis.running`
  *     set, because an orphaned `analyzing` ticket with no live agent can still
- *     answer 200 and block moments later. The detail view therefore shows the
+ *     answer 200 and block moments later. A 503 on this route only means the
+ *     analysis service is unavailable (unwired host / missing subagents or
+ *     agents services), never "no live Agent". The detail view therefore shows the
  *     「AI 分析中…」 elapsed timer only while the code is in that set, and an
  *     interrupted notice plus 「重新分析」 when it is not (the host restarts
  *     orphaned and blocked-from-analyzing tickets through the same route).
@@ -342,12 +344,12 @@ window.__ModuleLoader__.load({
      * render the raw code: the host keeps messages static on purpose, and the
      * board is the only place a Chinese hint can be attached to the reason.
      */
-    const ANALYSIS_REASON_LABELS = Object.freeze({
+    const ANALYSIS_REASON_LABELS = Object.freeze(Object.assign(Object.create(null), {
       'analysis-failed': '分析失败，可重新分析',
       'analysis-timeout': '分析超时，可重新分析',
       'no-live-agent': '当前没有可用的会话 Agent',
       'analysis-bad-output': 'AI 输出格式不正确，可重新分析',
-    });
+    }));
 
     /** Live progress copy (elapsed time is appended from the local timer). */
     const ANALYSIS_RUNNING_HINT = 'AI 分析中…（最长约 10 分钟，可继续做其他操作）';
@@ -376,27 +378,49 @@ window.__ModuleLoader__.load({
      * messages are already static; the hint tells the user what to do next.
      * Statuses are the fallback for a host that returns a code we do not know.
      */
-    const ANALYSIS_ERROR_HINTS = Object.freeze({
+    const ANALYSIS_ERROR_HINTS = Object.freeze(Object.assign(Object.create(null), {
       'ticket-not-found': '工单不存在',
       'not-found': '工单不存在',
       'invalid-state': '当前状态不能分析，请刷新',
       'invalid-transition': '当前状态不能分析，请刷新',
-      'analysis-unavailable': '当前没有可用的会话 Agent（请在有活动会话的窗口中操作）',
-      'no-live-agent': '当前没有可用的会话 Agent（请在有活动会话的窗口中操作）',
+      // 503 / analysis-unavailable only means the analysis service itself is
+      // unavailable (unwired host or missing subagents/agents services). A
+      // missing live Agent is NOT a 503: the host accepts the request (200) and
+      // later blocks the ticket with `blockedReason:'no-live-agent'`, which the
+      // detail view renders from the ticket, not from this route error.
+      'analysis-unavailable': '分析服务不可用，请稍后重试',
       'unknown-workspace': '工单编号/工作区无效',
       'invalid-code': '工单编号/工作区无效',
       'invalid-input': '工单编号/工作区无效',
       'invalid-payload': '工单编号/工作区无效',
       'missing-session': '缺少会话上下文，无法分析',
-    });
+    }));
 
     /** Product-status fallback for `POST /api/analyze` (400/404/409/503). */
-    const ANALYSIS_STATUS_HINTS = Object.freeze({
+    const ANALYSIS_STATUS_HINTS = Object.freeze(Object.assign(Object.create(null), {
       400: '工单编号/工作区无效',
       404: '工单不存在',
       409: '当前状态不能分析，请刷新',
-      503: '当前没有可用的会话 Agent（请在有活动会话的窗口中操作）',
-    });
+      503: '分析服务不可用，请稍后重试',
+    }));
+
+    /**
+     * Own-property lookup for the analysis copy maps. `blockedReason` and the
+     * host error code are untrusted strings: with a plain object index,
+     * `'__proto__'`/`'constructor'`/`'toString'` would return
+     * Object.prototype/a function instead of copy, which crashes the render.
+     * The maps are null-prototype objects, and every read goes through
+     * `Object.hasOwn` as a second guard.
+     */
+    function ownAnalysisValue(map, key) {
+      if (typeof key !== 'string' && typeof key !== 'number') return undefined;
+      return Object.hasOwn(map, key) ? map[key] : undefined;
+    }
+
+    /** Persisted block reason -> static client copy (never a prototype value). */
+    function analysisReasonLabel(reason) {
+      return ownAnalysisValue(ANALYSIS_REASON_LABELS, reason);
+    }
 
     // ---------------------------------------------------------------------
     // Workspace settings (the host stores them per workspace cwd)
@@ -837,15 +861,17 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * True when a `blocked` ticket was blocked by the analysis flow: either the
-     * documented `analysis-*`/`no-live-agent` reason, or a block taken directly
-     * from `analyzing` (the service only blocks from there on analysis failure).
+     * True when a `blocked` ticket was blocked by the analysis flow. The host
+     * only blocks an analysis failure from `analyzing` (the cleanup write is
+     * guarded by `expectedWorkflow:'analyzing'`), so `blockedFrom` is the
+     * contract. The reason alone is NOT enough: an `analysis-*` code can be
+     * present on a legacy/corrupted record blocked from another workflow, and
+     * the 「重新分析」 button would then offer a dead end (the client-side
+     * defense in depth required by the P3 whole-branch review).
      */
     function isAnalysisBlock(ticket) {
       if (ticket === null || typeof ticket !== 'object' || ticket.workflow !== 'blocked') return false;
-      if (ticket.blockedFrom === 'analyzing') return true;
-      return typeof ticket.blockedReason === 'string'
-        && ANALYSIS_REASON_LABELS[ticket.blockedReason] !== undefined;
+      return ticket.blockedFrom === 'analyzing';
     }
 
     /** Static failure copy for a blocked analysis (never the raw reason code). */
@@ -853,7 +879,7 @@ window.__ModuleLoader__.load({
       const reason = ticket !== null && typeof ticket === 'object' && typeof ticket.blockedReason === 'string'
         ? ticket.blockedReason
         : '';
-      const mapped = ANALYSIS_REASON_LABELS[reason];
+      const mapped = analysisReasonLabel(reason);
       if (mapped !== undefined) return mapped;
       if (typeof serverError === 'string' && serverError !== '') return clip(serverError, 300);
       return '分析失败，可重新分析';
@@ -865,7 +891,7 @@ window.__ModuleLoader__.load({
         ? ticket.blockedReason
         : '';
       if (reason === '') return '未记录';
-      return ANALYSIS_REASON_LABELS[reason] ?? clip(reason, 300);
+      return analysisReasonLabel(reason) ?? clip(reason, 300);
     }
 
     function safeHttpUrl(value) {
@@ -1184,8 +1210,8 @@ window.__ModuleLoader__.load({
      */
     function analyzeErrorView(result) {
       const view = toErrorView(result);
-      const hint = ANALYSIS_ERROR_HINTS[view.code]
-        ?? (view.status === null ? null : ANALYSIS_STATUS_HINTS[view.status])
+      const hint = ownAnalysisValue(ANALYSIS_ERROR_HINTS, view.code)
+        ?? (view.status === null ? undefined : ownAnalysisValue(ANALYSIS_STATUS_HINTS, view.status))
         ?? null;
       return {
         ...view,
@@ -2985,9 +3011,8 @@ window.__ModuleLoader__.load({
      *
      * Three mutually exclusive renderings, all driven by the polled snapshot:
      *   - `analyzing` + `analysis.running` has the code: live progress copy plus
-     *     a local elapsed timer (the demo `analysis_done` button is hidden by
-     *     the caller while this is true, so the fake completion cannot be
-     *     clicked mid-run);
+     *     a local elapsed timer (the caller hides the demo `analysis_done`
+     *     button for every `analyzing` ticket, running or interrupted);
      *   - `analyzing` without a running job: an interrupted analysis (crash,
      *     host reload, or a start whose background job already settled) with a
      *     「重新分析」 button that re-POSTs `/api/analyze` (the host restarts the
@@ -3040,8 +3065,13 @@ window.__ModuleLoader__.load({
         },
           h('div', { style: { fontSize: 12, fontWeight: 600, color: TONES.info.color, lineHeight: '18px' } },
             ANALYSIS_RUNNING_HINT),
-          h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textSecondary } },
-            `已运行 ${formatElapsed(elapsed)}`),
+          // The elapsed counter updates every second; keep it out of the
+          // polite live region so screen readers announce the analysis start
+          // and completion, not one message per tick.
+          h('div', {
+            'aria-live': 'off',
+            style: { fontSize: 11, lineHeight: '16px', color: C.textSecondary },
+          }, `已运行 ${formatElapsed(elapsed)}`),
           h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary } },
             '分析在后台进行，可继续做其他操作；完成后工单会进入「方案待审」。'));
       }
@@ -3103,13 +3133,15 @@ window.__ModuleLoader__.load({
 
     function TicketDetail({ ticket, snapshot, busyAction, locked, onAction, onBack }) {
       // UI-only filters (the action-map literal and its contract test stay
-      // untouched): the demo 「分析完成」 button is hidden while a real analysis
-      // is running, and the generic 「重试」 is replaced by the analysis
-      // restart button for a ticket blocked by the analysis flow.
+      // untouched): the demo 「分析完成」 button is hidden for EVERY `analyzing`
+      // ticket — running or interrupted — because that transition belongs to
+      // the real analysis job. P4 must remove the demo action from the map
+      // itself. The generic 「重试」 is replaced by the analysis restart button
+      // for a ticket blocked by the analysis flow.
       const analysisRunning = ticket.workflow === 'analyzing' && analysisRunningFor(snapshot, ticket.code);
       const analysisBlock = isAnalysisBlock(ticket);
       const actions = (ACTION_BY_STATE[ticket.workflow] ?? []).filter((descriptor) => {
-        if (analysisRunning && descriptor.action === 'analysis_done') return false;
+        if (ticket.workflow === 'analyzing' && descriptor.action === 'analysis_done') return false;
         if (analysisBlock && descriptor.action === 'retry') return false;
         return true;
       });

@@ -45,8 +45,11 @@
  *   the blocked ticket (spec §12: exhausted rounds become a blocked ticket).
  *
  * P3 `/analyze` mapping: `ticket-not-found` 404, `invalid-state` 409,
- * `no-live-agent`/`analysis-unavailable` 503 (no wired analysis service or no
- * live session Agent), `unknown-workspace`/`invalid-code` 400, anything else 500.
+ * `analysis-unavailable` 503 ONLY when the analysis service is not wired or
+ * `runner.available()` is false (missing `subagents`/`agents` services). A
+ * missing live session Agent is NOT a 503: the route accepts the request
+ * (200), and the background job later blocks the ticket with `no-live-agent`.
+ * `unknown-workspace`/`invalid-code` 400, anything else 500.
  * The snapshot always carries `analysis:{running, errors}` (empty when the
  * analysis service is not wired) so the client never special-cases a missing
  * key.
@@ -162,7 +165,9 @@ const ANALYSIS_ERROR_STATUS = Object.freeze({
   'invalid-code': 400,
   'invalid-input': 400,
   'invalid-payload': 400,
-  'no-live-agent': 503,
+  // 503 means "the analysis service itself is unavailable" (unwired host or
+  // missing subagents/agents services), never "no live Agent": that failure
+  // happens after the accepted 200 and blocks the ticket with `no-live-agent`.
   'analysis-unavailable': 503,
   internal: 500,
 });
@@ -191,10 +196,10 @@ const LOOPBACK_REMOTE_ADDRESSES = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1
  *   sync route answers 503 and the snapshot falls back to token presence only
  * @param {((cwd: string|null, code: string) => Promise<object>)|null} [deps.importTask]
  *   `createSyncService().importTask`; when null an import request answers 503
- * @param {{service: object, runner?: object}|null} [deps.analysis]
- *   `createAnalysisService()` result (+ optional runner) for `POST /analyze` and
- *   the snapshot `analysis` block; when null `/analyze` answers 503
- *   `analysis-unavailable` and the snapshot reports empty analysis state
+ * @param {{service: object}|null} [deps.analysis]
+ *   `createAnalysisService()` result for `POST /analyze` and the snapshot
+ *   `analysis` block; when null `/analyze` answers 503 `analysis-unavailable`
+ *   and the snapshot reports empty analysis state
  * @param {() => string} [deps.clock] ISO 8601 server time for snapshots
  * @param {number|null} [deps.domainOpenedAt] domain open timestamp for health
  * @param {number} [deps.bodyTimeoutMs] POST body read deadline (default 10 s)
@@ -406,8 +411,9 @@ export function createHandlers({
      * `running:true` rather than a second subagent. The service also restarts a
      * ticket that is already `analyzing` (crash orphan) or blocked from
      * `analyzing` (failure retry), so the client can always call this route
-     * directly. No-live-agent and an unwired analysis service are retryable
-     * 503s.
+     * directly. Only an unwired analysis service (or missing subagents/agents
+     * services) is a retryable 503; a missing live Agent is a background
+     * failure that blocks the ticket with `no-live-agent`.
      */
     analyze: safe(async (req, res) => {
       if (!guard(req, res, ROUTE_METHODS.analyze)) return;

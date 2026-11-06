@@ -37,8 +37,12 @@ function cloneJson(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
 }
 
-/** Minimal in-memory storage-domain double (same contract as store.test.js). */
-function createFakeDomain() {
+/**
+ * Minimal in-memory storage-domain double (same contract as store.test.js).
+ * `beforePut(table, key, value)` is an optional test hook awaited at the start
+ * of a `put`, so one queued write can be parked deterministically.
+ */
+function createFakeDomain({ beforePut } = {}) {
   const tables = new Map();
   return {
     name: 'bug_workflow',
@@ -52,6 +56,7 @@ function createFakeDomain() {
       return {
         get: (key) => cloneJson(records.get(key)),
         put: async (key, value) => {
+          if (typeof beforePut === 'function') await beforePut(name, key, value);
           records.set(key, cloneJson(value));
         },
         delete: async (key) => records.delete(key),
@@ -398,6 +403,21 @@ test('start() propagates a structured store failure instead of throwing', async 
   assert.deepEqual(service.status().running, []);
 });
 
+test('start() maps an unexpected store read failure to internal, not ticket-not-found', async () => {
+  const { store, service, runner } = setup();
+  await createTicket(store);
+  store.get = () => {
+    throw new Error('storage read failed');
+  };
+
+  const result = await service.start(SESSION_ID, CWD, 'BUG-1');
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'internal');
+  assert.equal(typeof result.message, 'string');
+  assert.equal(runner.calls.length, 0);
+  assert.deepEqual(service.status().running, []);
+});
+
 // ---------------------------------------------------------------------------
 // Restart semantics (P3 Task 2 review findings)
 //
@@ -618,6 +638,76 @@ test('a late failure never blocks a ticket that already advanced past analyzing'
   );
 });
 
+test('a failure queued behind an advance cannot regress the advanced ticket', async () => {
+  const pending = deferred();
+  const runner = createFakeRunner({ run: () => pending.promise });
+  const entered = deferred();
+  const release = deferred();
+  let pauseArmed = false;
+  const domain = createFakeDomain({
+    beforePut: async (table, key) => {
+      if (!pauseArmed || table !== 'tickets' || key !== 'BUG-1') return;
+      pauseArmed = false;
+      entered.resolve();
+      await release.promise;
+    },
+  });
+  const store = createStore(domain, () => T1);
+  const service = createAnalysisService({
+    store,
+    runner,
+    clock: createServiceClock(),
+    timeoutMs: 5_000,
+  });
+  await createTicket(store);
+  await service.start(SESSION_ID, CWD, 'BUG-1');
+
+  // Park the plan_review write inside the store queue. The persisted ticket is
+  // still `analyzing`, which is exactly the stale view the old failure path
+  // read before it queued its `block`.
+  pauseArmed = true;
+  const advance = store.applyAction(
+    'BUG-1',
+    'analysis_done',
+    { plan: makePlan(), actor: 'agent' },
+    { actionId: 'race-advance' },
+  );
+  await entered.promise;
+
+  // Record the failure's block enqueue so the test knows it read + queued while
+  // the advance was still paused (the block then waits behind that write).
+  const blockQueued = deferred();
+  let blockSeen = false;
+  const originalApply = store.applyAction.bind(store);
+  store.applyAction = (...args) => {
+    if (!blockSeen && args[1] === 'block') {
+      blockSeen = true;
+      blockQueued.resolve(args);
+    }
+    return originalApply(...args);
+  };
+
+  pending.resolve({ ok: false, code: 'analysis-failed', message: 'late boom' });
+  await blockQueued.promise;
+  assert.equal(store.get('BUG-1').workflow, 'analyzing', 'the advance is still parked');
+
+  release.resolve();
+  await advance;
+  await waitForIdle(service);
+
+  const ticket = store.get('BUG-1');
+  assert.equal(ticket.workflow, 'plan_review');
+  assert.equal(ticket.blockedFrom, null);
+  assert.equal(ticket.blockedReason, null);
+  assert.equal(ticket.timeline.some((entry) => entry.kind === 'blocked'), false);
+  // The failure is still visible as static metadata; only the state write is
+  // refused because the ticket already advanced.
+  assert.equal(
+    store.getMeta(ANALYSIS_ERROR_META_PREFIX + 'BUG-1'),
+    '分析子代理执行失败，请重试',
+  );
+});
+
 // ---------------------------------------------------------------------------
 // Robustness / dispose
 // ---------------------------------------------------------------------------
@@ -651,7 +741,7 @@ test('a rejecting runner never surfaces out of the background job', async () => 
   }
 });
 
-test('dispose() aborts running work, clears running and is idempotent', async () => {
+test('dispose() aborts running work without turning teardown into an analysis failure', async () => {
   const runner = createFakeRunner({
     run: ({ signal }) => new Promise((resolve) => {
       signal.addEventListener('abort', () => {
@@ -679,21 +769,26 @@ test('dispose() aborts running work, clears running and is idempotent', async ()
   assert.equal(after.ok, false);
   assert.equal(after.code, 'analysis-unavailable');
 
-  // The drain settles only after the aborted job's terminal write is persisted.
+  // Unload is not a real analysis failure: the ticket stays `analyzing` (the
+  // next host load restarts it through the orphan path) and no false error is
+  // persisted for the user.
   await drained;
-  assert.equal(store.get('BUG-1').workflow, 'blocked');
-  assert.equal(store.get('BUG-1').blockedReason, 'analysis-failed');
-  assert.equal(
-    store.getMeta(ANALYSIS_ERROR_META_PREFIX + 'BUG-1'),
-    '分析子代理执行失败，请重试',
-  );
+  const ticket = store.get('BUG-1');
+  assert.equal(ticket.workflow, 'analyzing');
+  assert.equal(ticket.blockedFrom, null);
+  assert.equal(ticket.timeline.some((entry) => entry.kind === 'blocked'), false);
+  assert.equal(store.getMeta(ANALYSIS_ERROR_META_PREFIX + 'BUG-1'), undefined);
+  assert.deepEqual(service.status().errors, {});
 });
 
-test('dispose() drains an aborted job before resolving, even with slow store writes', async () => {
+test('dispose() waits for the aborted job to settle before resolving', async () => {
   const runner = createFakeRunner({
     run: ({ signal }) => new Promise((resolve) => {
       signal.addEventListener('abort', () => {
-        resolve({ ok: false, code: 'analysis-failed', message: 'aborted' });
+        // Deliberate delay: a dispose() that resolved right after abort() would
+        // resolve before the runner had settled, so the test can tell them
+        // apart. No terminal write follows a cancelled job (asserted below).
+        setTimeout(() => resolve({ ok: false, code: 'analysis-failed', message: 'aborted' }), 25);
       }, { once: true });
     }),
   });
@@ -701,37 +796,25 @@ test('dispose() drains an aborted job before resolving, even with slow store wri
   await createTicket(store);
   await service.start(SESSION_ID, CWD, 'BUG-1');
 
-  // Simulate the teardown race: the abort-triggered block + meta writes are
-  // still in flight when the domain would otherwise be closed. A dispose()
-  // that merely fired abort() would resolve before these writes land.
-  const originalApply = store.applyAction.bind(store);
-  const originalSetMeta = store.setMeta.bind(store);
-  store.applyAction = async (...args) => {
-    await delay(10);
-    return originalApply(...args);
-  };
-  store.setMeta = async (...args) => {
-    await delay(10);
-    return originalSetMeta(...args);
-  };
-
+  const startedAt = Date.now();
   const drained = service.dispose();
   assert.equal(typeof drained?.then, 'function');
   assert.deepEqual(service.status().running, []);
   assert.equal(store.get('BUG-1').workflow, 'analyzing');
 
+  let settled = false;
+  drained.then(() => { settled = true; });
+  await delay(5);
+  assert.equal(settled, false, 'dispose() must not resolve before the aborted runner settles');
+
   await drained;
+  assert.ok(Date.now() - startedAt >= 15, 'the drain must include the runner settlement');
   const ticket = store.get('BUG-1');
-  assert.equal(ticket.workflow, 'blocked');
-  assert.equal(ticket.blockedFrom, 'analyzing');
-  assert.equal(ticket.blockedReason, 'analysis-failed');
-  assert.equal(
-    store.getMeta(ANALYSIS_ERROR_META_PREFIX + 'BUG-1'),
-    '分析子代理执行失败，请重试',
-  );
+  assert.equal(ticket.workflow, 'analyzing');
+  assert.equal(store.getMeta(ANALYSIS_ERROR_META_PREFIX + 'BUG-1'), undefined);
 });
 
-test('dispose() still settles when a closing store refuses the terminal write', async () => {
+test('dispose() leaves no terminal write for a cancelled analysis', async () => {
   const runner = createFakeRunner({
     run: ({ signal }) => new Promise((resolve) => {
       signal.addEventListener('abort', () => {
@@ -743,18 +826,59 @@ test('dispose() still settles when a closing store refuses the terminal write', 
   await createTicket(store);
   await service.start(SESSION_ID, CWD, 'BUG-1');
 
-  // A store that is already closing rejects every write; the drain must still
-  // settle (the ticket is simply left for the next host load to reconcile).
-  store.applyAction = async () => {
+  const writes = [];
+  store.applyAction = async (...args) => {
+    writes.push(['applyAction', args[1]]);
     throw new Error('domain closed');
   };
-  store.setMeta = async () => {
+  store.setMeta = async (...args) => {
+    writes.push(['setMeta', args[0]]);
     throw new Error('domain closed');
   };
 
   await service.dispose();
+  assert.deepEqual(writes, [], 'a cancelled analysis must not write a false failure');
   assert.deepEqual(service.status().running, []);
   assert.equal(store.get('BUG-1').workflow, 'analyzing');
+  assert.equal(store.getMeta(ANALYSIS_ERROR_META_PREFIX + 'BUG-1'), undefined);
+});
+
+test('a dispose-cancelled analysis is restartable through the orphan path', async () => {
+  const runner = createFakeRunner({
+    run: ({ signal }) => new Promise((resolve) => {
+      signal.addEventListener('abort', () => {
+        resolve({ ok: false, code: 'analysis-failed', message: 'aborted' });
+      }, { once: true });
+    }),
+  });
+  const { store, service } = setup({ runner });
+  await createTicket(store);
+  await service.start(SESSION_ID, CWD, 'BUG-1');
+  await service.dispose();
+
+  // Simulate the next host load: a fresh service instance over the same store
+  // sees `analyzing` with no in-memory job and restarts it without a second
+  // start_analysis transition.
+  const restartedRunner = createFakeRunner();
+  const restartedService = createAnalysisService({
+    store,
+    runner: restartedRunner,
+    clock: createServiceClock(),
+    timeoutMs: 5_000,
+  });
+  const restarted = await restartedService.start(SESSION_ID, CWD, 'BUG-1');
+  assert.deepEqual(restarted, { ok: true, running: true, workflow: 'analyzing' });
+  assert.equal(restartedRunner.calls.length, 1);
+
+  await waitForIdle(restartedService);
+  const ticket = store.get('BUG-1');
+  assert.equal(ticket.workflow, 'plan_review');
+  assert.equal(
+    ticket.timeline.filter((entry) => entry.kind === 'start_analysis').length,
+    1,
+    'the orphan restart must not write a second start_analysis',
+  );
+  assert.equal(store.getMeta(ANALYSIS_ERROR_META_PREFIX + 'BUG-1'), undefined);
 });
 
 test('dispose() is bounded when a runner ignores the abort signal', async () => {
