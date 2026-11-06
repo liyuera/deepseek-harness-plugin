@@ -33,6 +33,16 @@
  * `StoreError` with `code: 'unknown-workspace'` when the caller has no
  * workspace path and `code: 'invalid-settings'` when the record fails the
  * domain settings schema; Task 3 maps those to HTTP responses.
+ *
+ * Write serialization (P2 whole-branch review): every mutating public method
+ * runs its whole read-modify-write inside one in-process queue (`withWrite`).
+ * Without it, a platform sync/import that read an existing ticket and parked on
+ * `tickets.put()` could overwrite a local action that landed in between: the
+ * action's `workflow`/`timeline` would silently revert to the stale clone (the
+ * reviewer reproduced exactly that). Reads stay lock-free against the domain's
+ * synchronous in-memory tables. The queue serializes one store instance, i.e.
+ * one host process; two processes writing the same storage file are still
+ * last-write-wins (DSH desktop is a single host process).
  */
 
 import {
@@ -154,6 +164,28 @@ export function createStore(domain, clock = defaultClock, options = {}) {
   const actionOrder = readActionOrder(metaTable);
 
   /**
+   * In-process write queue: one promise-chain tail shared by every mutating
+   * method. KvTable reads are synchronous but `put`/`delete` are asynchronous,
+   * so two interleaved read-modify-writes can each build a clone from the same
+   * old row and the later `put` silently wins. Platform sync/import does
+   * exactly this shape (read ticket → await put), which is how a local action
+   * could be overwritten after the sync started. Keeping the whole method
+   * (including the actionId ledger check and write) on the tail makes the
+   * operations atomic with respect to each other, in call order.
+   *
+   * A rejected write must not wedge the chain: the tail handed to the next
+   * write is always a fulfilled promise, while the rejected caller still
+   * receives its own rejection from the returned promise.
+   */
+  let writeTail = Promise.resolve();
+
+  function withWrite(fn) {
+    const result = writeTail.then(() => fn());
+    writeTail = result.then(noop, noop);
+    return result;
+  }
+
+  /**
    * Read the raw persisted ticket for `code` with a minimal shape check. A
    * record that fails the check is reported instead of silently treated as
    * absent, so a corrupted row can never be overwritten by `create()`.
@@ -223,7 +255,18 @@ export function createStore(domain, clock = defaultClock, options = {}) {
     return { tickets: rows, total: rows.length, invalid };
   }
 
-  async function create(rawInput) {
+  /**
+   * Create a manual ticket. Queued: the duplicate check and the put are one
+   * critical section, so two racing creates cannot both pass the check.
+   *
+   * @param {object} rawInput ticket fields; `code` is required
+   * @returns {Promise<{ok:true, ticket:object} | {ok:false, code:string, message:string}>}
+   */
+  function create(rawInput) {
+    return withWrite(() => createUnlocked(rawInput));
+  }
+
+  async function createUnlocked(rawInput) {
     const input = isPlainObject(rawInput) ? rawInput : undefined;
     if (input === undefined) return failure('invalid-input', '工单数据必须是对象');
 
@@ -260,7 +303,24 @@ export function createStore(domain, clock = defaultClock, options = {}) {
     return { ok: true, ticket: cloneTicket(checked.ticket) };
   }
 
-  async function applyAction(rawCode, action, payload = {}, options = {}) {
+  /**
+   * Apply one state-machine action to an existing ticket, optionally
+   * idempotent through `options.actionId`. Queued as a whole: the ledger
+   * lookup, the ticket read, the transition, the put and the ledger write are
+   * one critical section, so a retry racing the original replay sees the first
+   * persisted result instead of running the state machine twice.
+   *
+   * @param {string} rawCode ticket code
+   * @param {string} action protocol action
+   * @param {object} [payload] action payload
+   * @param {{actionId?:string}} [options] idempotency key
+   * @returns {Promise<{ok:true, ticket:object} | {ok:false, code:string, message:string}>}
+   */
+  function applyAction(rawCode, action, payload = {}, options = {}) {
+    return withWrite(() => applyActionUnlocked(rawCode, action, payload, options));
+  }
+
+  async function applyActionUnlocked(rawCode, action, payload = {}, options = {}) {
     const code = normalizeCode(rawCode);
     if (code === undefined) return failure('invalid-input', '工单编号不能为空');
 
@@ -286,7 +346,9 @@ export function createStore(domain, clock = defaultClock, options = {}) {
 
     if (action === 'create') {
       const input = isPlainObject(payload) ? { ...payload, code } : { code };
-      const created = await create(input);
+      // Already inside this call's critical section: never re-enter withWrite()
+      // (the promise chain would wait on itself and deadlock).
+      const created = await createUnlocked(input);
       if (created.ok && actionId !== undefined) {
         await rememberActionResult(actionId, code, action, created);
       }
@@ -340,7 +402,21 @@ export function createStore(domain, clock = defaultClock, options = {}) {
     return mergeSettings(settingsTable.get(cwd));
   }
 
-  async function putSettings(rawCwd, input) {
+  /**
+   * Persist workspace settings. Queued: the merge-from-current read and the put
+   * are one critical section, so two concurrent partial updates cannot drop
+   * each other's field.
+   *
+   * @param {string} rawCwd workspace cwd
+   * @param {object} input settings fields to merge over the stored record
+   * @returns {Promise<object>} the persisted settings
+   * @throws {StoreError} `unknown-workspace` / `invalid-settings`
+   */
+  function putSettings(rawCwd, input) {
+    return withWrite(() => putSettingsUnlocked(rawCwd, input));
+  }
+
+  async function putSettingsUnlocked(rawCwd, input) {
     const cwd = normalizeCwd(rawCwd);
     if (cwd === undefined) {
       // Task 3 maps this to its "workspace not resolved" HTTP response.
@@ -389,7 +465,11 @@ export function createStore(domain, clock = defaultClock, options = {}) {
    * @throws {StoreError} `invalid-input` for malformed batches, `invalid-payload`
    *   when a merged record fails the domain schema
    */
-  async function upsertPlatformRecords(records, now) {
+  function upsertPlatformRecords(records, now) {
+    return withWrite(() => upsertPlatformRecordsUnlocked(records, now));
+  }
+
+  async function upsertPlatformRecordsUnlocked(records, now) {
     if (!Array.isArray(records)) {
       throw new StoreError('invalid-input', '平台同步记录必须是数组');
     }
@@ -483,7 +563,11 @@ export function createStore(domain, clock = defaultClock, options = {}) {
    * @param {string} key non-empty meta key
    * @param {unknown} value JSON-safe value (`null` clears a stored error)
    */
-  async function setMeta(key, value) {
+  function setMeta(key, value) {
+    return withWrite(() => setMetaUnlocked(key, value));
+  }
+
+  async function setMetaUnlocked(key, value) {
     if (typeof key !== 'string' || key.trim() === '') {
       throw new StoreError('invalid-input', 'meta key 必须是非空字符串');
     }
@@ -503,9 +587,15 @@ export function createStore(domain, clock = defaultClock, options = {}) {
   }
 
   /** Validate and persist the mapped dictionaries; returns the normalized copy. */
-  async function setDicts(dicts) {
+  function setDicts(dicts) {
+    return withWrite(() => setDictsUnlocked(dicts));
+  }
+
+  async function setDictsUnlocked(dicts) {
     const normalized = normalizeDicts(dicts);
-    await setMeta(PLATFORM_DICTS_KEY, normalized);
+    // Queued write calling the unlocked meta writer: never re-enter withWrite()
+    // from inside a critical section.
+    await setMetaUnlocked(PLATFORM_DICTS_KEY, normalized);
     return normalized;
   }
 
@@ -723,6 +813,9 @@ function normalizeDicts(raw) {
 function failure(code, message) {
   return { ok: false, code, message };
 }
+
+/** Settle-handler used to keep the write queue tail fulfilled after a rejection. */
+function noop() {}
 
 function cloneTicket(ticket) {
   return structuredClone(ticket);

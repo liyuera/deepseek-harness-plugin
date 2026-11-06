@@ -46,8 +46,12 @@ function cloneJson(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
 }
 
-/** In-memory Domain double, identical to `store.test.js` (JSON round-trip). */
-function createFakeDomain() {
+/**
+ * In-memory Domain double, identical to `store.test.js` (JSON round-trip).
+ * `beforePut(table, key, value)` is an optional test hook awaited at the start
+ * of a `put`, used to pause one sync write deterministically.
+ */
+function createFakeDomain({ beforePut } = {}) {
   const tables = new Map();
   return {
     table(name) {
@@ -59,6 +63,7 @@ function createFakeDomain() {
       return {
         get: (key) => cloneJson(records.get(key)),
         put: async (key, value) => {
+          if (typeof beforePut === 'function') await beforePut(name, key, value);
           records.set(key, cloneJson(value));
         },
         delete: async (key) => records.delete(key),
@@ -85,6 +90,25 @@ function createFakeDomain() {
 function clockFrom(...times) {
   let index = 0;
   return () => times[Math.min(index++, times.length - 1)];
+}
+
+/** A promise plus its settle functions; used to pause a fake write deterministically. */
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+/**
+ * Let every already-scheduled microtask (and one macrotask) run. Not a sleep:
+ * it proves deterministically that a queued write has NOT executed yet.
+ */
+function flushEventLoop() {
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
 /**
@@ -190,7 +214,7 @@ function createFakePlatform({
 
 /** Wire the real store + fake platform + sync service for one test. */
 function createSetup(options = {}) {
-  const domain = createFakeDomain();
+  const domain = options.domain ?? createFakeDomain();
   const store = createStore(domain, () => STORE_TIME, {
     validateTicket: options.validateTicket ?? strictTicket,
   });
@@ -424,6 +448,56 @@ test('second run updates display fields but preserves workflow and timeline', as
   assert.equal(after.updatedAt, T2);
   assert.equal(after.platform.syncedAt, Date.parse(T2));
   assert.equal(store.list().length, 2);
+});
+
+test('sync.run() racing a local action preserves the action', async () => {
+  const entered = deferred();
+  const release = deferred();
+  let pauseArmed = false;
+  const domain = createFakeDomain({
+    beforePut: async (table, key) => {
+      if (!pauseArmed || table !== 'tickets' || key !== `${PROJECT_CODE}-647`) return;
+      pauseArmed = false;
+      entered.resolve();
+      await release.promise;
+    },
+  });
+  const clock = clockFrom(T1, T2);
+  const { store, sync, tasks } = createSetup({ domain, clock });
+
+  const first = await sync.run(CWD);
+  assert.equal(first.created, 2);
+  // Make the second upsert observably different from the local ticket state.
+  tasks[0].taskName = '工单列表筛选后分页显示为空（已更新）';
+
+  pauseArmed = true;
+  const second = sync.run(CWD);
+  // The upsert built the merged clones and is now parked on tickets.put(647).
+  await entered.promise;
+
+  const action = store.applyAction(`${PROJECT_CODE}-647`, 'start_analysis', {});
+  await flushEventLoop();
+  assert.equal(
+    domain.table('tickets').get(`${PROJECT_CODE}-647`).workflow,
+    'inbox',
+    'the action must queue behind the paused sync upsert',
+  );
+  assert.equal(domain.table('tickets').get(`${PROJECT_CODE}-647`).timeline.length, 1);
+
+  release.resolve();
+  const [synced, applied] = await Promise.all([second, action]);
+
+  assert.equal(synced.ok, true);
+  assert.equal(synced.updated, 2);
+  assert.equal(applied.ok, true);
+  const ticket = domain.table('tickets').get(`${PROJECT_CODE}-647`);
+  assert.equal(ticket.title, '工单列表筛选后分页显示为空（已更新）');
+  assert.equal(ticket.platform.syncedAt, Date.parse(T2));
+  assert.equal(ticket.workflow, 'analyzing', 'the sync must not resurrect the pre-action clone');
+  assert.equal(ticket.timeline.length, 2);
+  assert.equal(ticket.timeline[1].kind, 'start_analysis');
+  // The action's write is the last one: the sync's own metadata still lands.
+  assert.equal(store.getMeta(LAST_SYNC_AT_KEY), T2);
 });
 
 test('an empty platformProjectCode keeps every record and reports nothing filtered', async () => {
