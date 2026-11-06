@@ -135,6 +135,38 @@ function flushMicrotasks() {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
+/** Manually settle a promise later (late activation / late result scenarios). */
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((onResolve, onReject) => {
+    resolve = onResolve;
+    reject = onReject;
+  });
+  return { promise, resolve, reject };
+}
+
+/**
+ * Collect `unhandledRejection` events for one scenario. Node reports the event
+ * after the current microtask checkpoint, so `stop()` must be awaited before
+ * `reasons` is inspected; it also removes the listener so a failing assertion
+ * cannot leak it into later tests.
+ */
+function captureUnhandledRejections() {
+  const reasons = [];
+  const listener = (reason) => reasons.push(reason);
+  process.on('unhandledRejection', listener);
+  return {
+    reasons,
+    async stop() {
+      await flushMicrotasks();
+      await flushMicrotasks();
+      process.removeListener('unhandledRejection', listener);
+      return reasons;
+    },
+  };
+}
+
 /** Run the happy path with the given result payload and return the runner result. */
 async function runWithResult(result) {
   const { activation, state } = createFakeActivation({ result });
@@ -252,7 +284,17 @@ test('runAnalysis() starts one caller-delivery spawn activation under the matchi
   for (const [field, value] of Object.entries(PLAN)) {
     assert.deepEqual(result.plan[field], value, `plan.${field} must survive the run`);
   }
-  assert.equal(typeof result.plan.generatedAt, 'number');
+  assert.equal(typeof result.plan.generatedAt, 'string', 'generatedAt must be an ISO string');
+  assert.equal(
+    Number.isNaN(Date.parse(result.plan.generatedAt)),
+    false,
+    'generatedAt must be a parseable date',
+  );
+  assert.equal(
+    new Date(result.plan.generatedAt).toISOString(),
+    result.plan.generatedAt,
+    'generatedAt must be a canonical ISO timestamp',
+  );
   assert.equal(result.childId, 'child-1');
   assert.equal(typeof result.elapsedMs, 'number');
   assert.ok(result.elapsedMs >= 0);
@@ -327,7 +369,7 @@ test('runAnalysis() returns analysis-bad-output for unparseable or invalid plans
     JSON.stringify({ ...PLAN, risks: [1, 2] }),
     JSON.stringify({ ...PLAN, approach: '' }),
     JSON.stringify({ ...PLAN, summary: 42 }),
-    JSON.stringify({ ...PLAN, testPlan: '   ' }),
+    JSON.stringify({ ...PLAN, testPlan: 42 }),
   ];
 
   for (const [index, text] of invalid.entries()) {
@@ -342,6 +384,162 @@ test('runAnalysis() returns analysis-bad-output for unparseable or invalid plans
     );
     assert.equal(state.disposeCalls, 1, `invalid case #${index} must dispose`);
   }
+});
+
+test('runAnalysis() accepts an empty testPlan while still requiring a string', async () => {
+  for (const testPlan of ['', '   ']) {
+    const { outcome, state } = await runWithResult({
+      output: [{ type: 'text', text: JSON.stringify({ ...PLAN, testPlan }) }],
+      stopReason: 'completed',
+    });
+    assert.equal(outcome.ok, true, `testPlan ${JSON.stringify(testPlan)} must be allowed`);
+    assert.equal(outcome.plan.testPlan, testPlan);
+    assert.equal(state.disposeCalls, 1);
+  }
+});
+
+test('runAnalysis() fails on a non-completed stopReason even with parseable output', async () => {
+  for (const stopReason of ['aborted', 'error', 'max-tokens', 'refusal']) {
+    const { outcome, state } = await runWithResult({
+      output: [{ type: 'text', text: PLAN_TEXT }],
+      stopReason,
+    });
+    assert.deepEqual(
+      outcome,
+      { ok: false, code: 'analysis-failed', message: '分析子代理执行失败，请重试' },
+      `stopReason ${stopReason} must fail`,
+    );
+    assert.equal(state.disposeCalls, 1, `stopReason ${stopReason} must dispose`);
+  }
+
+  const completed = await runWithResult({
+    output: [{ type: 'text', text: PLAN_TEXT }],
+    stopReason: 'completed',
+  });
+  assert.equal(completed.outcome.ok, true, 'a completed child must still parse');
+});
+
+test('runAnalysis() rejects an activation without a usable childId', async () => {
+  const expected = {
+    ok: false,
+    code: 'analysis-failed',
+    message: '分析子代理执行失败，请重试',
+  };
+  const missing = createFakeActivation();
+  delete missing.activation.childId;
+  const wrappers = [missing];
+  for (const childId of [null, '', '   ', 42]) {
+    wrappers.push(createFakeActivation({ childId }));
+  }
+
+  for (const [index, { activation, state }] of wrappers.entries()) {
+    const runner = createRunner({
+      agents: createFakeAgents({ roots: [{ id: 'session-root' }] }),
+      subagents: createFakeSubagents({ activation }),
+    });
+    const outcome = await runner.runAnalysis({ sessionId: 'session-root', ticket: TICKET });
+    assert.deepEqual(outcome, expected, `childId case #${index} must fail`);
+    assert.equal(state.disposeCalls, 1, `childId case #${index} must dispose`);
+  }
+});
+
+test('runAnalysis() observes a late activation result so abort leaves no unhandled rejection', async () => {
+  const capture = captureUnhandledRejections();
+  try {
+    const start = deferred();
+    const result = deferred();
+    let disposeCalls = 0;
+    const activation = {
+      childId: 'child-late',
+      messageId: 'message-late',
+      result: result.promise,
+      dispose() {
+        disposeCalls += 1;
+        return Promise.resolve();
+      },
+    };
+    const subagents = {
+      calls: [],
+      startActivation(spec) {
+        this.calls.push(spec);
+        return start.promise;
+      },
+    };
+    const live = new AbortController();
+    const runner = createRunner({
+      agents: createFakeAgents({ roots: [{ id: 'session-root' }] }),
+      subagents,
+    });
+
+    const pending = runner.runAnalysis({
+      sessionId: 'session-root',
+      ticket: TICKET,
+      signal: live.signal,
+    });
+    queueMicrotask(() => live.abort());
+    const outcome = await pending;
+    assert.deepEqual(outcome, {
+      ok: false,
+      code: 'analysis-failed',
+      message: '分析子代理执行失败，请重试',
+    });
+
+    // The activation is published only after the run already ended. The late
+    // handler must observe its result and dispose it exactly once.
+    start.resolve(activation);
+    await flushMicrotasks();
+    assert.equal(disposeCalls, 1, 'the late activation must be disposed');
+
+    result.reject(new Error('late result rejection'));
+  } finally {
+    await capture.stop();
+  }
+  assert.deepEqual(capture.reasons, [], 'a late result rejection must not be unhandled');
+});
+
+test('runAnalysis() observes the result promise when abort wins before the result race', async () => {
+  const capture = captureUnhandledRejections();
+  try {
+    const result = deferred();
+    let disposeCalls = 0;
+    const live = new AbortController();
+    const activation = {
+      childId: 'child-aborted',
+      // Reading `result` is the last synchronous hook between start resolution
+      // and the result race, so this aborts exactly in that window.
+      get result() {
+        live.abort();
+        return result.promise;
+      },
+      dispose() {
+        disposeCalls += 1;
+        return Promise.resolve();
+      },
+    };
+    const subagents = createFakeSubagents({ activation });
+    const runner = createRunner({
+      agents: createFakeAgents({ roots: [{ id: 'session-root' }] }),
+      subagents,
+    });
+
+    const outcome = await runner.runAnalysis({
+      sessionId: 'session-root',
+      ticket: TICKET,
+      signal: live.signal,
+    });
+    assert.deepEqual(outcome, {
+      ok: false,
+      code: 'analysis-failed',
+      message: '分析子代理执行失败，请重试',
+    });
+    assert.equal(live.signal.aborted, true, 'the caller abort must be observed');
+    assert.equal(disposeCalls, 1, 'the aborted activation must be disposed');
+
+    result.reject(new Error('result rejected after abort'));
+  } finally {
+    await capture.stop();
+  }
+  assert.deepEqual(capture.reasons, [], 'an aborted result rejection must not be unhandled');
 });
 
 test('runAnalysis() maps a timeout to analysis-timeout and aborts the signal', async () => {
@@ -546,18 +744,29 @@ test('buildAnalysisPrompt() truncates the description at 4000 characters', () =>
   assert.equal([...body].length, 4_000, 'the rendered description must be at most 4000 characters');
 });
 
-test('extractJsonPlan() returns the first balanced JSON object', () => {
+test('extractJsonPlan() returns the first parseable balanced JSON object', () => {
   assert.deepEqual(extractJsonPlan(`前言\n\`\`\`json\n${PLAN_TEXT}\n\`\`\`\n后记`), PLAN);
   assert.deepEqual(
     extractJsonPlan(`结果：${JSON.stringify({ ...PLAN, summary: '带 } 和 { 的摘要' })} 结束`),
     { ...PLAN, summary: '带 } 和 { 的摘要' },
   );
   assert.deepEqual(extractJsonPlan('{"a":1} {"b":2}'), { a: 1 });
+  assert.deepEqual(extractJsonPlan('{"a":{"nested":1}} 后 {"b":2}'), { a: { nested: 1 } });
   assert.deepEqual(extractJsonPlan(`\`\`\`json\n{"ok":true}\n\`\`\``), { ok: true });
   assert.deepEqual(
     extractJsonPlan('```js\nconst config = {"not":"the plan"};\n```\n```json\n{"ok":true}\n```'),
     { ok: true },
     'a json-tagged fence must win over an earlier generic code fence',
+  );
+  assert.deepEqual(
+    extractJsonPlan('示例 {不是 JSON}，真正的结果：{"ok":true}'),
+    { ok: true },
+    'a malformed balanced object must not hide a later valid one',
+  );
+  assert.deepEqual(
+    extractJsonPlan('```json\n{不是 JSON}\n```\n真正的结果：{"ok":true}'),
+    { ok: true },
+    'a malformed fenced body must not hide a later valid object',
   );
 });
 

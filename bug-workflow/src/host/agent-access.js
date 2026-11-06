@@ -38,9 +38,11 @@
  *     contained).
  *   - Every failure is `{ ok:false, code, message }` with a static Chinese
  *     message. Child errors, diagnostics, and stacks never reach the caller.
- *   - The result text is parsed strictly (first balanced JSON object, fenced or
- *     embedded) and validated field-by-field. Invalid output is never guessed
- *     into a plan: it becomes `analysis-bad-output`.
+ *   - The result text is parsed strictly (the first parseable balanced JSON
+ *     object, fenced or embedded) and validated field-by-field. Invalid output
+ *     is never guessed into a plan: it becomes `analysis-bad-output`.
+ *   - A child that does not finish cleanly (`stopReason` other than
+ *     `'completed'`) is a failure even when its text looks parseable.
  */
 
 /** Default analysis budget (matches the P3 plan: about ten minutes). */
@@ -65,8 +67,14 @@ const JSON_FENCED_BLOCK_RE = /```[ \t]*json[ \t]*\r?\n?([\s\S]*?)```/i;
 /** Any other ``` fence, kept as a fallback for unlabelled/labelled output. */
 const ANY_FENCED_BLOCK_RE = /```[ \t]*(?:javascript|js)?[ \t]*\r?\n?([\s\S]*?)```/i;
 
-/** Plan fields the model must fill with a non-empty string. */
-const NONEMPTY_STRING_FIELDS = Object.freeze(['summary', 'rootCause', 'approach', 'testPlan']);
+/** Plan fields that must be non-empty strings. */
+const NONEMPTY_STRING_FIELDS = Object.freeze(['summary', 'rootCause', 'approach']);
+
+/**
+ * Plan fields that must be strings but may be empty. Domain v2 declares
+ * `testPlan: z.string()`, so the model is allowed to return `''`.
+ */
+const ALLOW_EMPTY_STRING_FIELDS = Object.freeze(['testPlan']);
 
 /** Plan fields the model must fill with an array of strings. */
 const STRING_ARRAY_FIELDS = Object.freeze(['changedFiles', 'risks']);
@@ -237,7 +245,9 @@ export function createAgentRunner(options = {}) {
       );
       // An abort can win the race while the start call is still settling. Keep
       // the activation reference anyway so it is always disposed; if the run
-      // already finished, dispose it from this late handler instead.
+      // already finished, dispose it from this late handler instead. Disposal
+      // also observes `activation.result`, so a late result rejection cannot
+      // become an unhandled rejection after the run returned.
       starting.then(
         (value) => {
           if (finished) disposeQuietly(value);
@@ -246,20 +256,34 @@ export function createAgentRunner(options = {}) {
         () => {},
       );
       activation = await raceWithAbort(starting, controller.signal);
-      if (!isObjectLike(activation) || activation.result === undefined || activation.result === null) {
+      if (!isObjectLike(activation)
+        || typeof activation.childId !== 'string'
+        || activation.childId.trim() === '') {
+        return failure('analysis-failed', MESSAGE.failed);
+      }
+      if (activation.result === undefined || activation.result === null) {
         return failure('analysis-failed', MESSAGE.failed);
       }
 
       const settled = await raceWithAbort(Promise.resolve(activation.result), controller.signal);
+      // A child that aborted, errored, hit the token cap, or refused never
+      // produced a trustworthy plan: never parse its (possibly partial) output
+      // as a success. A missing stopReason is tolerated for robustness (bare
+      // string fakes), but every present non-completed value is a failure.
+      if (isObjectLike(settled)
+        && typeof settled.stopReason === 'string'
+        && settled.stopReason !== 'completed') {
+        return failure('analysis-failed', MESSAGE.failed);
+      }
       const plan = validatePlan(extractJsonPlan(extractResultText(settled)));
       if (plan === null) return failure('analysis-bad-output', MESSAGE.badOutput);
 
       return {
         ok: true,
-        // Keep the model's extra keys and stamp the generation time (epoch ms).
-        // Domain v2 stores `plan.generatedAt` as an ISO string, so Task 2's
-        // analysis service must normalize this value before `analysis_done`.
-        plan: { ...plan, generatedAt: Date.now() },
+        // Keep the model's extra keys and stamp the generation time as an ISO
+        // string: domain v2 declares `generatedAt: z.string().nullable()` and
+        // `analysis_done` copies this value straight into the stored plan.
+        plan: { ...plan, generatedAt: new Date().toISOString() },
         childId: activation.childId,
         elapsedMs: Date.now() - startedAt,
       };
@@ -343,12 +367,13 @@ export function buildAnalysisPrompt(ticket, cwd) {
 }
 
 /**
- * Extract the first balanced `{...}` JSON object from model output.
+ * Extract the first parseable balanced `{...}` JSON object from model output.
  *
  * Handles ```json fenced blocks (the fence is preferred when present), leading
- * or trailing prose, and braces inside JSON strings. The returned value is the
- * parsed object; malformed JSON or output without a balanced object yields
- * `null` (never throws).
+ * or trailing prose, and braces inside JSON strings. Malformed balanced objects
+ * are skipped and the search continues, so an invalid example before the real
+ * plan does not hide it. The first object that parses as a plain JSON object is
+ * returned; output without one yields `null` (never throws).
  *
  * @param {string} text raw child text
  * @returns {object | null}
@@ -361,13 +386,13 @@ export function extractJsonPlan(text) {
   const fenced = JSON_FENCED_BLOCK_RE.exec(trimmed) ?? ANY_FENCED_BLOCK_RE.exec(trimmed);
   const candidates = fenced === null ? [trimmed] : [fenced[1], trimmed];
   for (const candidate of candidates) {
-    const json = firstBalancedObject(candidate);
-    if (json === null) continue;
-    try {
-      const parsed = JSON.parse(json);
-      if (isPlainObject(parsed)) return parsed;
-    } catch {
-      // A malformed fenced body must not hide a valid object elsewhere.
+    for (const json of balancedObjects(candidate)) {
+      try {
+        const parsed = JSON.parse(json);
+        if (isPlainObject(parsed)) return parsed;
+      } catch {
+        // A malformed object must not hide a valid one later in the text.
+      }
     }
   }
   return null;
@@ -380,9 +405,17 @@ export function extractJsonPlan(text) {
 /**
  * Race `promise` against an AbortSignal. The abort path rejects with a private
  * sentinel; the caller maps it from `abortCause` (timeout vs caller abort).
+ *
+ * When the signal is already aborted, the race is lost before it starts, but
+ * the raced promise still gets an inert rejection observer: its result may
+ * reject later (abort between start resolution and the result race) and must
+ * never surface as an unhandled rejection.
  */
 function raceWithAbort(promise, signal) {
-  if (signal.aborted) return Promise.reject(RUN_ABORTED);
+  if (signal.aborted) {
+    observeQuietly(promise);
+    return Promise.reject(RUN_ABORTED);
+  }
 
   return new Promise((resolve, reject) => {
     const onAbort = () => {
@@ -443,12 +476,16 @@ function joinBlockText(blocks) {
 /**
  * Validate the plan contract. Extra keys are preserved (the caller spreads the
  * object), but the six required fields must be present and well typed.
+ * `testPlan` may be an empty string (domain v2 allows it).
  */
 function validatePlan(candidate) {
   if (!isPlainObject(candidate)) return null;
 
   for (const field of NONEMPTY_STRING_FIELDS) {
     if (typeof candidate[field] !== 'string' || candidate[field].trim() === '') return null;
+  }
+  for (const field of ALLOW_EMPTY_STRING_FIELDS) {
+    if (typeof candidate[field] !== 'string') return null;
   }
   for (const field of STRING_ARRAY_FIELDS) {
     const values = candidate[field];
@@ -458,10 +495,25 @@ function validatePlan(candidate) {
   return candidate;
 }
 
-/** Find the first balanced object substring, respecting JSON strings/escapes. */
-function firstBalancedObject(source) {
+/** Yield every balanced `{...}` substring of `source`, in order. */
+function* balancedObjects(source) {
+  if (typeof source !== 'string') return;
+  let from = 0;
+  while (from < source.length) {
+    const found = firstBalancedObject(source, from);
+    if (found === null) return;
+    yield found.text;
+    from = found.end;
+  }
+}
+
+/**
+ * Find the first balanced object substring at or after `fromIndex`, returning
+ * `{ text, end }` so the caller can continue with the next object.
+ */
+function firstBalancedObject(source, fromIndex = 0) {
   if (typeof source !== 'string') return null;
-  const start = source.indexOf('{');
+  const start = source.indexOf('{', fromIndex);
   if (start < 0) return null;
 
   let depth = 0;
@@ -486,7 +538,7 @@ function firstBalancedObject(source) {
     }
     if (character === '}') {
       depth -= 1;
-      if (depth === 0) return source.slice(start, index + 1);
+      if (depth === 0) return { text: source.slice(start, index + 1), end: index + 1 };
     }
   }
   return null;
@@ -536,9 +588,17 @@ function failure(code, message) {
   return { ok: false, code, message };
 }
 
-/** Call the activation disposer without letting cleanup alter the outcome. */
+/**
+ * Call the activation disposer without letting cleanup alter the outcome.
+ *
+ * Cleanup means the runner will not consume `result` on this path, so the
+ * result promise is observed first: a late rejection (a child that settles
+ * after an abort) must not become an unhandled rejection.
+ */
 function disposeQuietly(activation) {
-  if (!isObjectLike(activation) || typeof activation.dispose !== 'function') return;
+  if (!isObjectLike(activation)) return;
+  observeResultQuietly(activation);
+  if (typeof activation.dispose !== 'function') return;
   try {
     const pending = activation.dispose();
     if (pending !== null && typeof pending === 'object' && typeof pending.catch === 'function') {
@@ -546,6 +606,25 @@ function disposeQuietly(activation) {
     }
   } catch {
     // Cleanup failures are deliberately contained: the analysis result stands.
+  }
+}
+
+/** Attach an inert rejection handler to `activation.result` when present. */
+function observeResultQuietly(activation) {
+  try {
+    observeQuietly(activation.result);
+  } catch {
+    // A throwing result getter must not break cleanup.
+  }
+}
+
+/** Attach an inert rejection handler to a promise-like value (never throws). */
+function observeQuietly(value) {
+  if (value === null || typeof value !== 'object') return;
+  try {
+    if (typeof value.catch === 'function') value.catch(() => {});
+  } catch {
+    // A hostile thenable must not break cancellation.
   }
 }
 
