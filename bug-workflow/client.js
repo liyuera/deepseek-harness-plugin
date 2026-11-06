@@ -12,14 +12,20 @@
  *     and ignores stale/aborted responses; unmount stops the timer.
  *   - every write goes through `POST /bug-workflow/api/action` with
  *     `Content-Type: application/json`, a fresh idempotency `actionId`, and a
- *     `window.confirm` confirmation. A rejected action (409/415/403/500) shows a
- *     retryable banner with the server `code` and `message`; nothing throws out
+ *     confirmation. `window.confirm` is used when available; when it is absent
+ *     the board renders its own confirm panel instead of silently proceeding.
+ *     `reject_plan` always uses the inline reason input (Electron disables the
+ *     platform prompt API). Every mutation is gated on the snapshot's
+ *     `workspace.configured === true`. A rejected action (409/415/403/500) shows
+ *     a retryable banner with the server `code` and `message`; nothing throws out
  *     of the slot.
  *   - `PanelErrorBoundary` keeps a render failure from blanking the whole slot.
  *
  * The client never re-implements the state machine: action buttons are derived
- * from the persisted `workflow` and the host remains the authority on
- * transitions (an illegal one comes back as a 409 and is reported in the UI).
+ * from the declarative `ACTION_BY_STATE` map (extracted and cross-checked
+ * against `src/host/state-machine.js` by `test/client-action-map.test.js`).
+ * The host remains the authority on transitions (an illegal one comes back as a
+ * 409 and is reported in the UI).
  */
 
 window.__ModuleLoader__.load({
@@ -97,22 +103,19 @@ window.__ModuleLoader__.load({
     /** Review round budget mirrored from the host state machine. */
     const MAX_REVIEW_ROUNDS = 3;
 
-    /** P1 fake-review blocking issue used by `review_requests_changes`. */
-    const DEMO_BLOCKING_ISSUES = Object.freeze([
-      Object.freeze({
-        file: 'src/demo.ts',
-        level: '中',
-        problem: 'P1 演示问题',
-        suggestion: '演示建议',
-      }),
-    ]);
+    /** Shown whenever the session has no workspace: every mutation is gated. */
+    const UNBOUND_WORKSPACE_HINT = '当前会话未绑定工作区，暂不能写入；请在已绑定工作区的会话中使用（Task 5 将提供设置入口）';
 
+    // <client-action-map>
     /**
      * Action buttons per workflow state (the exact P1 mapping).
-     * `tone` drives styling, `confirm` is the `window.confirm` text, `prompt`
-     * asks for a free-text payload field, and `payload` is the fixed body.
+     * `tone` drives styling, `confirm` is the confirmation text, `input`
+     * declares an in-component text input, and `payload` is the fixed body.
+     * Kept as a pure JSON-like literal (strings/arrays/objects only, no
+     * functions) so `test/client-action-map.test.js` can extract and evaluate
+     * it verbatim and cross-check it against the host state machine.
      */
-    const WORKFLOW_ACTIONS = Object.freeze({
+    const ACTION_BY_STATE = {
       inbox: [
         {
           action: 'start_analysis',
@@ -139,8 +142,8 @@ window.__ModuleLoader__.load({
         {
           action: 'reject_plan',
           label: '驳回方案',
-          confirm: '确认驳回该方案？',
-          prompt: '请输入驳回原因（取消则不驳回）',
+          confirm: '驳回该方案并进入人工处理？',
+          input: 'reason',
           tone: 'danger',
         },
       ],
@@ -167,20 +170,33 @@ window.__ModuleLoader__.load({
           confirm: '确认提交 MR？',
           tone: 'primary',
         },
-      ],
-      mr_open: [
         {
           action: 'mr_created',
           label: '模拟 MR 已创建',
           confirm: '确认模拟 MR 已创建？',
           tone: 'plain',
         },
+      ],
+      mr_open: [
         {
           action: 'review_requests_changes',
           label: '模拟 Review 需修改',
           confirm: '确认模拟 Review 要求修改？将生成一条演示阻塞问题。',
           tone: 'plain',
-          payload: { blockingIssues: DEMO_BLOCKING_ISSUES },
+          payload: {
+            blockingIssues: [
+              {
+                fid: 'demo-1',
+                file: 'src/demo.ts',
+                level: '中',
+                gateCategory: '逻辑错误',
+                location: 'src/demo.ts:1-2',
+                problem: 'P1 演示问题',
+                suggestion: '演示建议',
+                blocking: true,
+              },
+            ],
+          },
         },
         {
           action: 'review_pass',
@@ -222,7 +238,8 @@ window.__ModuleLoader__.load({
         },
       ],
       done: [],
-    });
+    };
+    // </client-action-map>
 
     // ---------------------------------------------------------------------
     // Theme tokens (all colors come from --dsw-alias-*; fallbacks are neutral)
@@ -512,20 +529,17 @@ window.__ModuleLoader__.load({
       return `P1-${stamp}-${salt}`;
     }
 
+    /**
+     * Three-state confirmation: `true`/`false` from the platform dialog, or
+     * `null` when no usable `window.confirm` exists (Electron/embedded webview).
+     * Callers must treat `null` as "render the in-component confirm" — never as
+     * an automatic yes.
+     */
     function confirmDialog(message) {
       try {
-        if (typeof window === 'undefined' || typeof window.confirm !== 'function') return true;
-        return window.confirm(message);
-      } catch {
-        return true;
-      }
-    }
-
-    /** Returns the entered string, or null when the user cancelled the prompt. */
-    function promptDialog(message) {
-      try {
-        if (typeof window === 'undefined' || typeof window.prompt !== 'function') return '';
-        return window.prompt(message, '');
+        if (typeof window === 'undefined' || window === null) return null;
+        if (typeof window.confirm !== 'function') return null;
+        return window.confirm(message) === true;
       } catch {
         return null;
       }
@@ -614,8 +628,8 @@ window.__ModuleLoader__.load({
       get(path, signal) {
         return requestJson(path, { method: 'GET', signal });
       },
-      post(path, body) {
-        return requestJson(path, { method: 'POST', body });
+      post(path, body, signal) {
+        return requestJson(path, { method: 'POST', body, signal });
       },
     });
 
@@ -894,13 +908,105 @@ window.__ModuleLoader__.load({
         }, format(value))));
     }
 
+    /**
+     * In-component fallback for the platform prompt dialog and for a missing
+     * `window.confirm`.
+     * `mode:'reason'` renders a reason input (Enter submits, Esc cancels); empty
+     * input is normalized to the documented default by the caller.
+     */
+    function ActionDialog({ request, busy, onCancel, onConfirm }) {
+      const isReason = request !== null && request.mode === 'reason';
+      const [reason, setReason] = React.useState('');
+      const inputRef = React.useRef(null);
+
+      React.useEffect(() => {
+        if (!isReason) return;
+        try {
+          if (inputRef.current !== null && typeof inputRef.current.focus === 'function') inputRef.current.focus();
+        } catch {
+          // Focus is best-effort; the dialog still works.
+        }
+      }, [isReason]);
+
+      const submit = () => {
+        if (busy === true) return;
+        onConfirm(isReason ? reason : undefined);
+      };
+
+      return h('form', {
+        'data-bug-board-dialog': isReason ? 'reason' : 'confirm',
+        onSubmit: (event) => {
+          event.preventDefault();
+          submit();
+        },
+        onKeyDown: (event) => {
+          if (event.key !== 'Escape') return;
+          event.preventDefault();
+          onCancel();
+        },
+        style: {
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 7,
+          padding: '9px 12px',
+          borderBottom: `0.5px solid ${C.border}`,
+          background: C.surfaceAlt,
+          flex: '0 0 auto',
+          minWidth: 0,
+        },
+      },
+        h('div', {
+          style: { fontSize: 12, lineHeight: '18px', color: C.text, fontWeight: 600, wordBreak: 'break-word' },
+        }, textOf(request === null ? undefined : request.descriptor.confirm, '确认执行该动作？')),
+        isReason
+          ? h('input', {
+            ref: inputRef,
+            type: 'text',
+            value: reason,
+            onChange: (event) => setReason(event.target.value),
+            placeholder: '驳回原因（可留空，默认「未填写驳回原因」）',
+            'aria-label': '驳回原因',
+            disabled: busy === true,
+            style: {
+              font: 'inherit',
+              fontSize: 12,
+              lineHeight: '18px',
+              padding: '3px 8px',
+              borderRadius: 6,
+              border: `0.5px solid ${C.borderStrong}`,
+              background: 'transparent',
+              color: C.text,
+              minWidth: 0,
+              boxSizing: 'border-box',
+            },
+          })
+          : null,
+        h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 6 } },
+          h('button', {
+            type: 'button',
+            onClick: onCancel,
+            disabled: busy === true,
+            style: smallButtonStyle(busy === true),
+          }, '取消'),
+          h('button', {
+            type: 'submit',
+            disabled: busy === true,
+            style: primaryButtonStyle(busy === true),
+          }, busy === true ? '处理中…' : (isReason ? '确认驳回' : '确认'))));
+    }
+
     function BoardHeader({
       snapshot,
       refreshing,
       busy,
+      configured,
+      sessionId,
       statusOptions,
       typeOptions,
       filters,
+      manualCode,
+      onManualCodeChange,
+      onManualAdd,
       onToggleFilter,
       onClearFilters,
       onRefresh,
@@ -908,14 +1014,20 @@ window.__ModuleLoader__.load({
     }) {
       const workspace = snapshot === null ? null : snapshot.workspace;
       const path = workspace !== null && typeof workspace.path === 'string' ? workspace.path : null;
+      const sessionMissing = sessionId === null;
+      const writable = !sessionMissing && configured === true;
       const name = path !== null && path !== '' ? baseName(path) : (snapshot === null ? '加载工作区…' : '未绑定工作区');
-      const subtitle = snapshot === null
-        ? '正在读取本工作区看板…'
-        : (path === null
-          ? '该会话没有工作区目录，看板仍显示本机全部工单'
-          : (refreshing ? '同步中…' : `Bug 工作流 · 每 ${POLL_INTERVAL_MS / 1000} 秒自动同步`));
+      const subtitle = sessionMissing
+        ? '缺少会话上下文，当前为只读展示'
+        : (snapshot === null
+          ? '正在读取本工作区看板…'
+          : (path === null
+            ? '该会话没有工作区目录，看板仍显示本机全部工单'
+            : (refreshing ? '同步中…' : `Bug 工作流 · 每 ${POLL_INTERVAL_MS / 1000} 秒自动同步`)));
       const hasFilters = filters.status.length > 0 || filters.type.length > 0;
       const disabled = busy !== null;
+      const code = typeof manualCode === 'string' ? manualCode : '';
+      const manualDisabled = disabled || !writable || code.trim() === '';
 
       return h('header', {
         style: {
@@ -929,7 +1041,7 @@ window.__ModuleLoader__.load({
           minWidth: 0,
         },
       },
-        h('div', { style: { display: 'flex', alignItems: 'flex-start', gap: 8, minWidth: 0 } },
+        h('div', { style: { display: 'flex', flexWrap: 'wrap', alignItems: 'flex-start', gap: 8, minWidth: 0 } },
           h('div', { style: { flex: '1 1 auto', minWidth: 0 } },
             h('div', {
               title: path === null ? undefined : path,
@@ -949,15 +1061,68 @@ window.__ModuleLoader__.load({
           h('button', {
             type: 'button',
             onClick: onRefresh,
-            disabled: refreshing || disabled,
-            style: smallButtonStyle(refreshing || disabled),
+            disabled: refreshing || disabled || sessionMissing,
+            style: smallButtonStyle(refreshing || disabled || sessionMissing),
           }, refreshing ? '同步中…' : '刷新'),
           h('button', {
             type: 'button',
             onClick: onCreateDemo,
-            disabled: disabled,
-            style: primaryButtonStyle(disabled),
+            disabled: disabled || !writable,
+            style: primaryButtonStyle(disabled || !writable),
           }, busy === 'create' ? '创建中…' : '添加演示工单')),
+        snapshot !== null && !sessionMissing && configured !== true
+          ? h('div', {
+            role: 'note',
+            style: {
+              padding: '6px 8px',
+              border: `0.5px solid ${TONES.warn.border}`,
+              borderRadius: 6,
+              background: TONES.warn.background,
+              color: TONES.warn.color,
+              fontSize: 11,
+              lineHeight: '16px',
+              minWidth: 0,
+            },
+          }, UNBOUND_WORKSPACE_HINT)
+          : null,
+        h('form', {
+          onSubmit: (event) => {
+            event.preventDefault();
+            if (!manualDisabled) onManualAdd();
+          },
+          'aria-label': '手动添加工单',
+          style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, minWidth: 0 },
+        },
+          h('input', {
+            type: 'text',
+            value: code,
+            onChange: (event) => onManualCodeChange(event.target.value),
+            placeholder: '输入工单编号',
+            'aria-label': '工单编号',
+            disabled: disabled || !writable,
+            style: {
+              font: 'inherit',
+              fontSize: 12,
+              lineHeight: '18px',
+              padding: '3px 8px',
+              borderRadius: 6,
+              border: `0.5px solid ${C.borderStrong}`,
+              background: 'transparent',
+              color: C.text,
+              flex: '1 1 120px',
+              minWidth: 0,
+              boxSizing: 'border-box',
+              opacity: disabled || !writable ? 0.55 : 1,
+            },
+          }),
+          h('button', {
+            type: 'submit',
+            disabled: manualDisabled,
+            style: smallButtonStyle(manualDisabled),
+          }, busy === 'manual-create' ? '添加中…' : '手动添加'),
+          h('span', {
+            style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary, minWidth: 0 },
+          }, '编号不能为空；重复编号会提示已存在')),
         h(FilterChips, {
           label: '状态',
           options: statusOptions,
@@ -986,10 +1151,11 @@ window.__ModuleLoader__.load({
           : null);
     }
 
-    function ActionBar({ actions, busyAction, onAction }) {
+    function ActionBar({ actions, busyAction, onAction, locked }) {
       const list = Array.isArray(actions) ? actions : [];
       if (list.length === 0) return null;
-      const disabled = busyAction !== null;
+      const isLocked = locked === true;
+      const disabled = busyAction !== null || isLocked;
       return h('div', {
         style: { display: 'flex', flexWrap: 'wrap', gap: 6, minWidth: 0 },
         role: 'group',
@@ -1001,11 +1167,12 @@ window.__ModuleLoader__.load({
           type: 'button',
           disabled,
           'aria-busy': busy || undefined,
+          'aria-disabled': isLocked || undefined,
           onClick: () => {
             if (typeof onAction === 'function') onAction(descriptor);
           },
           style: actionButtonStyle(descriptor.tone, disabled),
-          title: textOf(descriptor.confirm),
+          title: isLocked ? UNBOUND_WORKSPACE_HINT : textOf(descriptor.confirm),
         }, busy ? '处理中…' : textOf(descriptor.label));
       }));
     }
@@ -1352,12 +1519,13 @@ window.__ModuleLoader__.load({
         h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary } }, '处理完成后可点击「重试」回到阻塞前状态。'));
     }
 
-    function TicketDetail({ ticket, snapshot, busyAction, onAction, onBack }) {
-      const actions = WORKFLOW_ACTIONS[ticket.workflow] ?? [];
+    function TicketDetail({ ticket, snapshot, busyAction, locked, onAction, onBack }) {
+      const actions = ACTION_BY_STATE[ticket.workflow] ?? [];
       const planReview = ticket.workflow === 'plan_review';
       const actionBar = h(ActionBar, {
         actions,
         busyAction,
+        locked,
         onAction,
       });
 
@@ -1442,10 +1610,15 @@ window.__ModuleLoader__.load({
       const [busyAction, setBusyAction] = React.useState(null);
       const [actionError, setActionError] = React.useState(null);
       const [flash, setFlash] = React.useState(null);
+      const [manualCode, setManualCode] = React.useState('');
+      const [pendingRequest, setPendingRequest] = React.useState(null);
       const busyRef = React.useRef(false);
+      const mutationControllerRef = React.useRef(null);
 
       const snapshot = polling.data;
       const tickets = snapshot === null ? [] : snapshot.tickets;
+      const configured = snapshot !== null && snapshot.workspace.configured === true;
+      const canWrite = sessionId !== null && configured;
 
       React.useEffect(() => {
         if (selectedCode === null || snapshot === null) return;
@@ -1458,41 +1631,69 @@ window.__ModuleLoader__.load({
         return () => clearTimeout(timer);
       }, [flash]);
 
-      const executeAction = React.useCallback(async (descriptor, ticket) => {
-        if (!descriptor || !ticket || busyRef.current || typeof ticket.code !== 'string' || sessionId === null) return;
-        if (!confirmDialog(textOf(descriptor.confirm, '确认执行该动作？'))) return;
+      // Abort an in-flight mutation when the tab unmounts: no write may land
+      // after the board is gone, and no state update should follow the abort.
+      React.useEffect(() => () => {
+        const controller = mutationControllerRef.current;
+        mutationControllerRef.current = null;
+        if (controller !== null) {
+          try {
+            controller.abort();
+          } catch {
+            // Already settled.
+          }
+        }
+      }, []);
+
+      const postAction = React.useCallback(async (body) => {
+        if (mutationControllerRef.current !== null) {
+          try {
+            mutationControllerRef.current.abort();
+          } catch {
+            // Already settled.
+          }
+        }
+        const controller = typeof AbortController === 'function' ? new AbortController() : null;
+        mutationControllerRef.current = controller;
+        try {
+          return await api.post(API.action, body, controller === null ? undefined : controller.signal);
+        } catch (error) {
+          return {
+            ok: false,
+            code: 'client-error',
+            message: error instanceof Error ? error.message : String(error),
+            status: null,
+          };
+        } finally {
+          if (mutationControllerRef.current === controller) mutationControllerRef.current = null;
+        }
+      }, []);
+
+      const executeAction = React.useCallback(async (descriptor, ticket, reason) => {
+        if (!descriptor || !ticket || busyRef.current || typeof ticket.code !== 'string') return;
+        if (sessionId === null || configured !== true) return;
 
         let payload = descriptor.payload === undefined || descriptor.payload === null ? {} : descriptor.payload;
-        if (typeof descriptor.prompt === 'string' && descriptor.prompt !== '') {
-          const answer = promptDialog(descriptor.prompt);
-          if (answer === null) return;
-          const reason = typeof answer === 'string' ? answer.trim() : '';
-          payload = { ...payload, reason: reason === '' ? '未填写驳回原因' : reason };
+        if (descriptor.input === 'reason') {
+          const trimmed = typeof reason === 'string' ? reason.trim() : '';
+          payload = { ...payload, reason: trimmed === '' ? '未填写驳回原因' : trimmed };
         }
 
         busyRef.current = true;
+        setPendingRequest(null);
         setBusyAction(descriptor.action);
         setActionError(null);
         setFlash(null);
 
         try {
-          let result;
-          try {
-            result = await api.post(API.action, {
-              sessionId,
-              actionId: createActionId(),
-              code: ticket.code,
-              action: descriptor.action,
-              payload,
-            });
-          } catch (error) {
-            result = {
-              ok: false,
-              code: 'client-error',
-              message: error instanceof Error ? error.message : String(error),
-              status: null,
-            };
-          }
+          const result = await postAction({
+            sessionId,
+            actionId: createActionId(),
+            code: ticket.code,
+            action: descriptor.action,
+            payload,
+          });
+          if (result.aborted === true) return;
 
           if (result.ok) {
             const next = result.data && typeof result.data === 'object' ? result.data.ticket : null;
@@ -1515,36 +1716,44 @@ window.__ModuleLoader__.load({
           busyRef.current = false;
           setBusyAction(null);
         }
-      }, [polling, sessionId]);
+      }, [configured, polling, postAction, sessionId]);
+
+      const requestAction = React.useCallback((descriptor, ticket) => {
+        if (!descriptor || !ticket || busyRef.current) return;
+        if (sessionId === null || configured !== true) return;
+
+        if (descriptor.input === 'reason') {
+          setPendingRequest({ kind: 'action', mode: 'reason', descriptor, ticket });
+          return;
+        }
+        const answer = confirmDialog(textOf(descriptor.confirm, '确认执行该动作？'));
+        if (answer === null) {
+          setPendingRequest({ kind: 'action', mode: 'confirm', descriptor, ticket });
+          return;
+        }
+        if (answer === false) return;
+        executeAction(descriptor, ticket);
+      }, [configured, executeAction, sessionId]);
 
       const createDemoTicket = React.useCallback(async () => {
-        if (busyRef.current || sessionId === null) return;
-        if (!confirmDialog('创建一张 P1 演示工单？')) return;
+        if (busyRef.current || sessionId === null || configured !== true) return;
 
         busyRef.current = true;
+        setPendingRequest(null);
         setBusyAction('create');
         setActionError(null);
         setFlash(null);
 
         const code = createDemoCode();
         try {
-          let result;
-          try {
-            result = await api.post(API.action, {
-              sessionId,
-              actionId: createActionId(),
-              code,
-              action: 'create',
-              payload: { title: 'P1 演示工单', type: '缺陷', version: 'V0.0.1' },
-            });
-          } catch (error) {
-            result = {
-              ok: false,
-              code: 'client-error',
-              message: error instanceof Error ? error.message : String(error),
-              status: null,
-            };
-          }
+          const result = await postAction({
+            sessionId,
+            actionId: createActionId(),
+            code,
+            action: 'create',
+            payload: { title: 'P1 演示工单', type: '缺陷', version: 'V0.0.0' },
+          });
+          if (result.aborted === true) return;
 
           if (result.ok) {
             const created = result.data && typeof result.data === 'object' ? result.data.ticket : null;
@@ -1563,7 +1772,76 @@ window.__ModuleLoader__.load({
           busyRef.current = false;
           setBusyAction(null);
         }
-      }, [polling, sessionId]);
+      }, [configured, polling, postAction, sessionId]);
+
+      const requestCreateDemo = React.useCallback(() => {
+        if (busyRef.current || sessionId === null || configured !== true) return;
+        const message = '创建一张 P1 演示工单？';
+        const answer = confirmDialog(message);
+        if (answer === null) {
+          setPendingRequest({
+            kind: 'create-demo',
+            mode: 'confirm',
+            descriptor: { action: 'create', label: '添加演示工单', confirm: message },
+          });
+          return;
+        }
+        if (answer === false) return;
+        createDemoTicket();
+      }, [configured, createDemoTicket, sessionId]);
+
+      const addManualTicket = React.useCallback(async () => {
+        const code = manualCode.trim();
+        if (busyRef.current || sessionId === null || configured !== true) return;
+        if (code === '') {
+          setActionError({ code: 'missing-code', message: '请输入工单编号', status: null, stage: null });
+          return;
+        }
+
+        busyRef.current = true;
+        setPendingRequest(null);
+        setBusyAction('manual-create');
+        setActionError(null);
+        setFlash(null);
+
+        try {
+          const result = await postAction({
+            sessionId,
+            actionId: createActionId(),
+            code,
+            action: 'create',
+            payload: { code, title: `（待同步）${code}`, type: '缺陷', version: 'V0.0.0' },
+          });
+          if (result.aborted === true) return;
+
+          if (result.ok) {
+            const created = result.data && typeof result.data === 'object' ? result.data.ticket : null;
+            setManualCode('');
+            setFlash(`工单 ${created && typeof created.code === 'string' ? created.code : code} 已添加`);
+          } else {
+            setActionError(toErrorView(result));
+          }
+
+          try {
+            await polling.refresh();
+          } catch {
+            // The polling banner (or the next poll) reports a failed refresh.
+          }
+        } finally {
+          busyRef.current = false;
+          setBusyAction(null);
+        }
+      }, [configured, manualCode, polling, postAction, sessionId]);
+
+      const confirmPendingAction = React.useCallback((reason) => {
+        const request = pendingRequest;
+        if (request === null) return;
+        if (request.kind === 'create-demo') {
+          createDemoTicket();
+          return;
+        }
+        executeAction(request.descriptor, request.ticket, reason);
+      }, [createDemoTicket, executeAction, pendingRequest]);
 
       const toggleFilter = React.useCallback((kind, value) => {
         setFilters((current) => {
@@ -1579,14 +1857,23 @@ window.__ModuleLoader__.load({
         setFilters({ status: [], type: [] });
       }, []);
 
-      const statusOptions = React.useMemo(() => uniqueDimensions(tickets, 'status'), [tickets]);
-      const typeOptions = React.useMemo(() => uniqueDimensions(tickets, 'type'), [tickets]);
+      // `dismiss` moves a ticket to the terminal `done` state; keep it in the
+      // store (a just-dismissed detail still resolves) but hide it from the
+      // list and from filter options. Task 6's README should document this P1
+      // archive behaviour; the host state is never deleted here.
+      const activeTickets = React.useMemo(
+        () => tickets.filter((ticket) => ticket.workflow !== 'done'),
+        [tickets],
+      );
 
-      const visibleTickets = React.useMemo(() => tickets.filter((ticket) => {
+      const statusOptions = React.useMemo(() => uniqueDimensions(activeTickets, 'status'), [activeTickets]);
+      const typeOptions = React.useMemo(() => uniqueDimensions(activeTickets, 'type'), [activeTickets]);
+
+      const visibleTickets = React.useMemo(() => activeTickets.filter((ticket) => {
         if (filters.status.length > 0 && !filters.status.includes(dimensionValue(ticket.status))) return false;
         if (filters.type.length > 0 && !filters.type.includes(dimensionValue(ticket.type))) return false;
         return true;
-      }), [tickets, filters]);
+      }), [activeTickets, filters]);
 
       const selectedTicket = selectedCode === null
         ? null
@@ -1621,18 +1908,23 @@ window.__ModuleLoader__.load({
           busy: polling.refreshing,
           tone: 'danger',
         });
-      } else if (tickets.length === 0) {
+      } else if (activeTickets.length === 0) {
+        const archived = tickets.length > 0;
         content = h(StateNotice, {
-          title: '还没有工单',
-          message: 'P1 使用假引擎：点击下方按钮创建一张演示工单，然后在详情里按流程推进。',
+          title: archived ? '没有进行中的工单' : '还没有工单',
+          message: canWrite
+            ? (archived
+              ? '已完成（done）的工单会从列表中隐藏（宿主仍保留数据）；可以创建一张新的演示工单继续验收。'
+              : 'P1 使用假引擎：点击下方按钮创建一张演示工单，然后在详情里按流程推进。')
+            : `${archived ? '已完成（done）的工单会从列表中隐藏。' : '当前工作区还没有工单。'}${UNBOUND_WORKSPACE_HINT}`,
           actionLabel: busyAction === 'create' ? '创建中…' : '添加演示工单',
-          onAction: createDemoTicket,
-          busy: busyAction !== null,
+          onAction: requestCreateDemo,
+          busy: busyAction !== null || !canWrite,
         });
       } else if (visibleTickets.length === 0) {
         content = h(StateNotice, {
           title: '没有符合筛选条件的工单',
-          message: `共 ${tickets.length} 张工单，当前筛选条件下没有匹配项。`,
+          message: `共 ${activeTickets.length} 张进行中的工单，当前筛选条件下没有匹配项。`,
           actionLabel: '清除筛选',
           onAction: clearFilters,
         });
@@ -1641,7 +1933,7 @@ window.__ModuleLoader__.load({
           h('div', {
             style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, lineHeight: '16px', color: C.textTertiary },
           },
-            h('span', null, `共 ${tickets.length} 张 · 显示 ${visibleTickets.length} 张`),
+            h('span', null, `共 ${activeTickets.length} 张 · 显示 ${visibleTickets.length} 张`),
             filtersActive
               ? h('button', {
                 type: 'button',
@@ -1678,13 +1970,18 @@ window.__ModuleLoader__.load({
           snapshot,
           refreshing: polling.refreshing,
           busy: busyAction,
+          configured,
+          sessionId,
           statusOptions,
           typeOptions,
           filters,
+          manualCode,
+          onManualCodeChange: setManualCode,
+          onManualAdd: addManualTicket,
           onToggleFilter: toggleFilter,
           onClearFilters: clearFilters,
           onRefresh: polling.refresh,
-          onCreateDemo: createDemoTicket,
+          onCreateDemo: requestCreateDemo,
         }),
         showBanner
           ? h(ErrorBanner, {
@@ -1715,6 +2012,15 @@ window.__ModuleLoader__.load({
               flex: '0 0 auto',
             },
           }, flash),
+        pendingRequest === null
+          ? null
+          : h(ActionDialog, {
+            key: `${pendingRequest.kind}:${pendingRequest.ticket === undefined ? 'new' : pendingRequest.ticket.code}:${pendingRequest.descriptor.action}`,
+            request: pendingRequest,
+            busy: busyAction !== null,
+            onCancel: () => setPendingRequest(null),
+            onConfirm: confirmPendingAction,
+          }),
         h('div', {
           style: {
             flex: '1 1 auto',
@@ -1730,7 +2036,8 @@ window.__ModuleLoader__.load({
             ticket: selectedTicket,
             snapshot,
             busyAction,
-            onAction: (descriptor) => executeAction(descriptor, selectedTicket),
+            locked: !canWrite,
+            onAction: (descriptor) => requestAction(descriptor, selectedTicket),
             onBack: () => setSelectedCode(null),
           })));
     }
