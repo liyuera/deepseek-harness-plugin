@@ -4,7 +4,12 @@
  * The mock is imported directly (no child process) and listens on an ephemeral
  * loopback port, so the tests exercise the real `fetch` path end to end:
  * `Htwisdom-Auth` header, URL/query building, envelope unwrapping, pagination,
- * 401/404 mapping, remark decoding and POST bodies.
+ * 401/404/500 mapping, non-JSON bodies, remark decoding and POST bodies.
+ *
+ * Redirects get their own two-server regression: the mock never redirects, and
+ * `createPlatformClient` must reject a 302 instead of forwarding the token to
+ * the Location origin. A fetch double is kept only for the abort/timeout case,
+ * which cannot be made deterministic through a real server.
  *
  * The token only ever lives in this file's constants and in the
  * `Htwisdom-Auth` request header. The mock redacts it from `requests`, and the
@@ -14,6 +19,7 @@
 
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { createServer } from 'node:http';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
@@ -40,12 +46,16 @@ function readFixture(name) {
 
 const userFixture = readFixture('user.json');
 const tasksFixture = readFixture('tasks.json');
+const detailFixture = readFixture('detail.json');
 const dictsFixture = readFixture('dicts.json');
 const remarksFixture = readFixture('remarks.json');
 const filesFixture = readFixture('files.json');
 
 const TASK_CODE = 'YGFNXDJRFWDJSYJJYY-647';
 const OTHER_TASK_CODE = 'HTSMART-12';
+const SECOND_TASK_CODE = 'YGFNXDJRFWDJSYJJYY-648';
+const USER_PATH = '/api/htwisdom-system/user-auth-info';
+const DETAIL_PREFIX = '/api/htwisdom-team/task/detailByTaskCode/';
 
 /** Start a mock, run `fn(mock)`, and always close the server. */
 async function withMock(fn, options = {}) {
@@ -59,6 +69,32 @@ async function withMock(fn, options = {}) {
   } finally {
     await mock.close();
   }
+}
+
+/** Start a loopback test server on an ephemeral port and resolve the port. */
+function listenServer(server) {
+  return new Promise((resolve, reject) => {
+    const onError = (error) => {
+      server.off('listening', onListening);
+      reject(error);
+    };
+    const onListening = () => {
+      server.off('error', onError);
+      const address = server.address();
+      resolve(address.port);
+    };
+    server.once('error', onError);
+    server.once('listening', onListening);
+    server.listen(0, '127.0.0.1');
+  });
+}
+
+/** Close a test server and its sockets so no listener survives the test. */
+function closeServer(server) {
+  return new Promise((resolve) => {
+    if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
+    server.close(() => resolve());
+  });
 }
 
 /** fetch double that records calls and delegates to `handler`. */
@@ -105,7 +141,13 @@ test('all six endpoints return unwrapped data and send Htwisdom-Auth', async () 
 
     const detail = await client.getTask(TASK_CODE);
     assert.equal(detail.ok, true);
-    assert.deepEqual(detail.data, tasksFixture.find((task) => task.taskCode === TASK_CODE));
+    assert.deepEqual(detail.data, detailFixture[TASK_CODE]);
+    // Detail is its own P0 shape, not the list record verbatim.
+    assert.equal('refProjectName' in detail.data, false);
+    assert.equal('permission' in detail.data, false);
+
+    const listRecord = tasksFixture.find((task) => task.taskCode === TASK_CODE);
+    assert.equal('refProjectName' in listRecord, true);
 
     const dicts = await client.getDicts();
     assert.equal(dicts.ok, true);
@@ -126,7 +168,7 @@ test('all six endpoints return unwrapped data and send Htwisdom-Auth', async () 
       filesFixture.filter((file) => String(file.refBusinessId) === '6470001'),
     );
 
-    // Request contract: seven calls, path + query + method + body recorded.
+    // Request contract: six calls, path + query + method + body recorded.
     assert.equal(mock.requests.length, 6);
     assert.equal(mock.requests.every((request) => 'htwisdom-auth' in request.headers), true);
     assert.equal(mock.requests.every((request) => typeof request.headers['htwisdom-auth'] === 'string'), true);
@@ -137,8 +179,8 @@ test('all six endpoints return unwrapped data and send Htwisdom-Auth', async () 
     assert.equal(listRequest.query.refHandlerPersonId, String(userFixture.user.id));
     assert.equal(listRequest.query.descs, 'createdTime');
 
-    const detailRequest = mock.requests.find((request) => request.path.startsWith('/api/htwisdom-team/task/detailByTaskCode/'));
-    assert.equal(detailRequest.path, `/api/htwisdom-team/task/detailByTaskCode/${TASK_CODE}`);
+    const detailRequest = mock.requests.find((request) => request.path.startsWith(DETAIL_PREFIX));
+    assert.equal(detailRequest.path, `${DETAIL_PREFIX}${TASK_CODE}`);
 
     const dictRequest = mock.requests.find((request) => request.path === '/api/htwisdom-system/dict/business/dictionary');
     assert.equal(dictRequest.query.codes, DICT_CODES);
@@ -153,6 +195,20 @@ test('all six endpoints return unwrapped data and send Htwisdom-Auth', async () 
 
     // The mock stores fixtures, not the token; recorded requests must not leak it.
     assert.equal(JSON.stringify(mock.requests).includes(TOKEN), false);
+  });
+});
+
+test('getTask returns detail-shaped records, including a null description', async () => {
+  await withMock(async (mock) => {
+    const client = createPlatformClient({ baseUrl: mock.url, token: TOKEN });
+
+    const detail = await client.getTask(SECOND_TASK_CODE);
+    assert.equal(detail.ok, true);
+    assert.deepEqual(detail.data, detailFixture[SECOND_TASK_CODE]);
+    assert.equal(detail.data.description, null);
+    assert.equal(detail.data.milestoneList.length, 1);
+    assert.equal('refProjectName' in detail.data, false);
+    assert.equal('participants' in detail.data, false);
   });
 });
 
@@ -266,6 +322,7 @@ test('404 maps to platform-not-found and unknown paths stay 404 in the mock', as
 
     const unknown = await fetch(`${mock.url}/api/htwisdom-team/does-not-exist`, {
       headers: { 'Htwisdom-Auth': TOKEN },
+      redirect: 'error',
     });
     assert.equal(unknown.status, 404);
     const envelope = await unknown.json();
@@ -274,93 +331,82 @@ test('404 maps to platform-not-found and unknown paths stay 404 in the mock', as
   });
 });
 
-test('non-2xx status maps to platform-http with the status attached', async () => {
-  const { fetchImpl, calls } = stubFetch(() => jsonResponse({ code: 500, success: false, msg: '服务器异常' }, 500));
-  const client = createPlatformClient({
-    baseUrl: 'https://platform.example.com',
-    token: TOKEN,
-    fetchImpl,
+test('HTTP 500 from the real mock maps to platform-http with status 500', async () => {
+  await withMock(async (mock) => {
+    const client = createPlatformClient({ baseUrl: mock.url, token: TOKEN });
+
+    const result = await client.getUser();
+    assert.equal(result.ok, false);
+    assert.equal(result.code, 'platform-http');
+    assert.equal(result.status, 500);
+    assert.equal(JSON.stringify(result).includes(TOKEN), false);
+
+    assert.equal(mock.requests.length, 1);
+    assert.equal('htwisdom-auth' in mock.requests[0].headers, true);
+    assert.equal(mock.requests[0].headers.accept, 'application/json');
+  }, {
+    faults: {
+      [USER_PATH]: { status: 500, body: { code: 500, success: false, msg: '服务器异常' } },
+    },
   });
-
-  const result = await client.getUser();
-  assert.equal(result.ok, false);
-  assert.equal(result.code, 'platform-http');
-  assert.equal(result.status, 500);
-  assert.equal(JSON.stringify(result).includes(TOKEN), false);
-
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].init.headers['Htwisdom-Auth'] === TOKEN, true);
-  assert.equal(calls[0].init.headers.Accept, 'application/json');
 });
 
-test('envelope failures and malformed bodies map to platform-bad-response/platform-http', async () => {
+test('non-JSON and malformed envelopes from the real mock map to platform-bad-response', async () => {
   const cases = [
-    {
-      name: 'non-JSON body',
-      response: () => new Response('<html>gateway error</html>', { status: 200 }),
-      code: 'platform-bad-response',
-    },
-    {
-      name: 'JSON array instead of envelope',
-      response: () => jsonResponse([1, 2, 3]),
-      code: 'platform-bad-response',
-    },
-    {
-      name: 'envelope without data',
-      response: () => jsonResponse({ code: 200, success: true }),
-      code: 'platform-bad-response',
-    },
-    {
-      name: 'envelope without user',
-      response: () => jsonResponse({ code: 200, success: true, data: {} }),
-      code: 'platform-bad-response',
-    },
+    { name: 'non-JSON body', body: '<html>gateway error</html>' },
+    { name: 'JSON array instead of envelope', body: [1, 2, 3] },
+    { name: 'envelope without data', body: { code: 200, success: true } },
+    { name: 'envelope without user', body: { code: 200, success: true, data: {} } },
   ];
 
   for (const item of cases) {
-    const { fetchImpl } = stubFetch(item.response);
-    const client = createPlatformClient({
-      baseUrl: 'https://platform.example.com',
-      token: TOKEN,
-      fetchImpl,
+    await withMock(async (mock) => {
+      const client = createPlatformClient({ baseUrl: mock.url, token: TOKEN });
+      const result = await client.getUser();
+      assert.equal(result.ok, false, item.name);
+      assert.equal(result.code, 'platform-bad-response', item.name);
+      assert.equal(result.message.includes(TOKEN), false, item.name);
+      assert.equal(JSON.stringify(result).includes(TOKEN), false, item.name);
+    }, {
+      faults: { [USER_PATH]: { status: 200, body: item.body } },
     });
-    const result = await client.getUser();
-    assert.equal(result.ok, false, item.name);
-    assert.equal(result.code, item.code, item.name);
-    assert.equal(result.message.includes(TOKEN), false, item.name);
-    assert.equal(JSON.stringify(result).includes(TOKEN), false, item.name);
   }
 
   // A 2xx envelope that reports a business failure is an upstream HTTP error,
-  // not a malformed body; keep the upstream code for diagnostics.
-  const { fetchImpl } = stubFetch(() => jsonResponse({ code: 500, success: false, msg: '服务器异常' }, 200));
-  const client = createPlatformClient({
-    baseUrl: 'https://platform.example.com',
-    token: TOKEN,
-    fetchImpl,
-  });
-  const businessFailure = await client.getUser();
-  assert.equal(businessFailure.ok, false);
-  assert.equal(businessFailure.code, 'platform-http');
-  assert.equal(businessFailure.status, 200);
-  assert.equal(businessFailure.upstreamCode, 500);
-});
-
-test('fetch rejection and timeout map to platform-network', async () => {
-  const rejected = createPlatformClient({
-    baseUrl: 'https://platform.example.com',
-    token: TOKEN,
-    fetchImpl: async () => {
-      throw new TypeError('fetch failed');
+  // not a malformed body; keep the real HTTP status (200) and upstream code.
+  await withMock(async (mock) => {
+    const client = createPlatformClient({ baseUrl: mock.url, token: TOKEN });
+    const businessFailure = await client.getUser();
+    assert.equal(businessFailure.ok, false);
+    assert.equal(businessFailure.code, 'platform-http');
+    assert.equal(businessFailure.status, 200);
+    assert.equal(businessFailure.upstreamCode, 500);
+  }, {
+    faults: {
+      [USER_PATH]: { status: 200, body: { code: 500, success: false, msg: '服务器异常' } },
     },
   });
-  const network = await rejected.getUser();
-  assert.equal(network.ok, false);
-  assert.equal(network.code, 'platform-network');
-  assert.equal('status' in network, false);
-  assert.equal(JSON.stringify(network).includes(TOKEN), false);
+});
 
-  const { fetchImpl } = stubFetch((_url, init) => new Promise((resolve, reject) => {
+test('a connection failure maps to platform-network', async () => {
+  // A real socket that is reset after accept: no fetch double is involved.
+  const server = createServer();
+  server.on('connection', (socket) => socket.destroy());
+  const port = await listenServer(server);
+  try {
+    const client = createPlatformClient({ baseUrl: `http://127.0.0.1:${port}`, token: TOKEN });
+    const network = await client.getUser();
+    assert.equal(network.ok, false);
+    assert.equal(network.code, 'platform-network');
+    assert.equal('status' in network, false);
+    assert.equal(JSON.stringify(network).includes(TOKEN), false);
+  } finally {
+    await closeServer(server);
+  }
+});
+
+test('timeout aborts the request and maps to platform-network', async () => {
+  const { fetchImpl, calls } = stubFetch((_url, init) => new Promise((resolve, reject) => {
     // A ref'd timer keeps the event loop alive while we wait for the client's
     // AbortSignal; without it Node may exit before an unref'd timeout fires.
     // If the client never aborts, resolve a valid response so the assertion
@@ -388,13 +434,68 @@ test('fetch rejection and timeout map to platform-network', async () => {
   assert.equal(timeout.code, 'platform-network');
   assert.equal(JSON.stringify(timeout).includes(TOKEN), false);
   assert.ok(elapsed < 1000, `timeout should fire quickly, took ${elapsed}ms`);
+
+  // Every request is fail-closed and never sends cookies.
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].init.redirect, 'error');
+  assert.equal(calls[0].init.credentials, 'omit');
+});
+
+test('getUser never follows a redirect and never leaks Htwisdom-Auth cross-origin', async () => {
+  const stolenRequests = [];
+  const stealServer = createServer((request, response) => {
+    stolenRequests.push({ url: request.url, headers: { ...request.headers } });
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({
+      code: 200,
+      success: true,
+      data: { user: { id: 666, code: 'foreign', name: 'foreign' } },
+    }));
+  });
+  const stealPort = await listenServer(stealServer);
+
+  let redirectRequests = 0;
+  const redirectServer = createServer((_request, response) => {
+    redirectRequests += 1;
+    response.writeHead(302, { Location: `http://127.0.0.1:${stealPort}/steal` });
+    response.end();
+  });
+
+  try {
+    const redirectPort = await listenServer(redirectServer);
+    const client = createPlatformClient({
+      baseUrl: `http://127.0.0.1:${redirectPort}`,
+      token: TOKEN,
+    });
+    const result = await client.getUser();
+
+    assert.equal(redirectRequests, 1);
+    assert.equal(result.ok, false);
+    assert.equal(result.code, 'platform-network');
+    assert.equal(JSON.stringify(result).includes(TOKEN), false);
+
+    // Fail closed: the Location origin must not be contacted at all. Even if it
+    // were, the platform token must never appear in its recorded headers.
+    assert.equal(stolenRequests.length, 0, 'redirect target must not receive a request');
+    assert.equal(
+      stolenRequests.some((request) => 'htwisdom-auth' in request.headers),
+      false,
+      'redirect target must never receive Htwisdom-Auth',
+    );
+  } finally {
+    await closeServer(redirectServer);
+    await closeServer(stealServer);
+  }
 });
 
 test('mock rejects the dictionary endpoint without codes and the file endpoint with a bad body', async () => {
   await withMock(async (mock) => {
     const headers = { 'Htwisdom-Auth': TOKEN };
 
-    const dict = await fetch(`${mock.url}/api/htwisdom-system/dict/business/dictionary`, { headers });
+    const dict = await fetch(`${mock.url}/api/htwisdom-system/dict/business/dictionary`, {
+      headers,
+      redirect: 'error',
+    });
     assert.equal(dict.status, 400);
     const dictEnvelope = await dict.json();
     assert.equal(dictEnvelope.code, 400);
@@ -405,6 +506,7 @@ test('mock rejects the dictionary endpoint without codes and the file endpoint w
       method: 'POST',
       headers: { ...headers, 'Content-Type': 'application/json' },
       body: JSON.stringify({ refBusinessIdList: 'not-an-array' }),
+      redirect: 'error',
     });
     assert.equal(file.status, 400);
     const fileEnvelope = await file.json();
@@ -455,9 +557,11 @@ test('normalizeBaseUrl accepts http(s) + localhost and normalizes trailing slash
 
 test('createPlatformClient throws invalid-base-url before any fetch', () => {
   let fetches = 0;
+  // Sentinel only: reaching fetch at all is a test failure, so no response is
+  // fabricated here (the timeout case is the only fetch double in this file).
   const fetchImpl = async () => {
     fetches += 1;
-    return jsonResponse({ code: 200, success: true, data: {} });
+    throw new Error('fetch must not be called for an invalid baseUrl');
   };
 
   assert.throws(

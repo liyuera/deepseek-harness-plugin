@@ -20,6 +20,17 @@
  * returns MyBatis-style pagination with string-typed `total/size/current`
  * exactly as observed in P0.
  *
+ * List records (`tasks.json`) and detail records (`detail.json`, keyed by
+ * taskCode) are separate fixtures on purpose: P0 observed a 45-field detail
+ * shape without the list-only `refProjectName`, so detailByTaskCode must not
+ * echo the list record verbatim.
+ *
+ * Error-path test hook: `createMockPlatform` accepts a test-only `faults`
+ * option, `{ '<request path>': { status, body, contentType? } }`. A string
+ * `body` is sent raw (default `text/plain`); any other body is JSON-encoded.
+ * Faults are applied after auth and before normal routing, so tests can drive
+ * HTTP 500 and non-JSON responses through the real HTTP client/fetch path.
+ *
  * CLI:
  *   node bug-workflow/scripts/mock-platform.mjs --port 0 --token test-token \
  *     --fixtures bug-workflow/scripts/fixtures/platform
@@ -114,9 +125,11 @@ export function parseMockArgs(argv = []) {
  *
  * @param {object} [options]
  * @param {string} [options.token] accepted `Htwisdom-Auth` value
- * @param {string} [options.fixturesDir] directory with user/tasks/dicts/remarks/files JSON
+ * @param {string} [options.fixturesDir] directory with user/tasks/detail/dicts/remarks/files JSON
  * @param {number} [options.port] listen port, 0 picks a free one
  * @param {number} [options.latencyMs] artificial response latency
+ * @param {Record<string, {status: number, body: unknown, contentType?: string}>} [options.faults]
+ *   test-only overrides keyed by request path (applied after auth)
  * @returns {Promise<{url: string, port: number, close: () => Promise<void>, requests: object[]}>}
  */
 export async function createMockPlatform(options = {}) {
@@ -138,6 +151,10 @@ export async function createMockPlatform(options = {}) {
   if (!Number.isInteger(latencyMs) || latencyMs < 0 || latencyMs > 60_000) {
     throw new TypeError('createMockPlatform() latencyMs must be an integer between 0 and 60000');
   }
+
+  // Test-only error injection: lets the client's HTTP/non-JSON paths be
+  // exercised through the real server instead of a hand-rolled fetch double.
+  const faults = normalizeFaults(options.faults);
 
   const fixtures = loadFixtures(options.fixturesDir ?? DEFAULT_FIXTURES_DIR);
   /** @type {{method: string, path: string, query: object, headers: object, body: unknown}[]} */
@@ -197,6 +214,12 @@ export async function createMockPlatform(options = {}) {
     const method = request.method ?? 'GET';
     const path = requestUrl.pathname;
 
+    const fault = faults[path];
+    if (fault !== undefined) {
+      sendFault(response, fault);
+      return;
+    }
+
     if (method === 'GET' && path === '/api/htwisdom-system/user-auth-info') {
       sendJson(response, 200, successEnvelope({
         user: fixtures.user.user,
@@ -221,8 +244,8 @@ export async function createMockPlatform(options = {}) {
       } catch {
         taskCode = encoded;
       }
-      const task = fixtures.tasks.find((item) => item.taskCode === taskCode);
-      if (task === undefined) {
+      const task = fixtures.detail[taskCode];
+      if (!isPlainObject(task)) {
         sendJson(response, 404, failureEnvelope(404, '工单不存在'));
         return;
       }
@@ -273,11 +296,29 @@ export async function createMockPlatform(options = {}) {
 
   /** Delay/write one JSON envelope; skip if the client already aborted. */
   function sendJson(response, status, payload) {
-    const text = JSON.stringify(payload);
+    sendText(response, status, JSON.stringify(payload), 'application/json; charset=utf-8');
+  }
+
+  /** Send a test-only fault: string bodies stay raw, everything else is JSON. */
+  function sendFault(response, fault) {
+    if (typeof fault.body === 'string') {
+      sendText(response, fault.status, fault.body, fault.contentType ?? 'text/plain; charset=utf-8');
+      return;
+    }
+    sendText(
+      response,
+      fault.status,
+      JSON.stringify(fault.body),
+      fault.contentType ?? 'application/json; charset=utf-8',
+    );
+  }
+
+  /** Delay/write one raw body; skip if the client already aborted. */
+  function sendText(response, status, text, contentType) {
     const write = () => {
       if (response.writableEnded || response.destroyed) return;
       response.writeHead(status, {
-        'Content-Type': 'application/json; charset=utf-8',
+        'Content-Type': contentType,
         'Content-Length': Buffer.byteLength(text),
       });
       response.end(text);
@@ -323,6 +364,39 @@ export async function createMockPlatform(options = {}) {
 // Fixtures / endpoint helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Validate the test-only `faults` option. Faults are keyed by exact request
+ * path and applied after auth; a string body is sent raw, anything else JSON.
+ */
+function normalizeFaults(input) {
+  if (input === undefined) return {};
+  if (!isPlainObject(input)) {
+    throw new TypeError('createMockPlatform() faults must be an object keyed by request path');
+  }
+
+  const faults = {};
+  for (const [path, fault] of Object.entries(input)) {
+    if (typeof path !== 'string' || !path.startsWith('/')) {
+      throw new TypeError('createMockPlatform() fault paths must start with "/"');
+    }
+    if (!isPlainObject(fault)) {
+      throw new TypeError(`createMockPlatform() fault for ${path} must be an object`);
+    }
+    if (!Number.isInteger(fault.status) || fault.status < 200 || fault.status > 599) {
+      throw new TypeError(`createMockPlatform() fault status for ${path} must be an integer between 200 and 599`);
+    }
+    if (!('body' in fault)) {
+      throw new TypeError(`createMockPlatform() fault for ${path} must define body`);
+    }
+    if (fault.contentType !== undefined
+      && (typeof fault.contentType !== 'string' || fault.contentType.trim() === '')) {
+      throw new TypeError(`createMockPlatform() fault contentType for ${path} must be a non-empty string`);
+    }
+    faults[path] = { status: fault.status, body: fault.body, contentType: fault.contentType };
+  }
+  return faults;
+}
+
 function loadFixtures(fixturesDir) {
   if (typeof fixturesDir !== 'string' || fixturesDir.trim() === '') {
     throw new TypeError('createMockPlatform() fixturesDir must be a non-empty string');
@@ -332,6 +406,7 @@ function loadFixtures(fixturesDir) {
 
   const user = read('user.json');
   const tasks = read('tasks.json');
+  const detail = read('detail.json');
   const dicts = read('dicts.json');
   const remarks = read('remarks.json');
   const files = read('files.json');
@@ -342,11 +417,19 @@ function loadFixtures(fixturesDir) {
   for (const [name, value] of [['tasks.json', tasks], ['remarks.json', remarks], ['files.json', files]]) {
     if (!Array.isArray(value)) throw new TypeError(`${directory}/${name} must contain an array`);
   }
+  if (!isPlainObject(detail)) {
+    throw new TypeError(`${directory}/detail.json must contain an object keyed by taskCode`);
+  }
+  for (const [taskCode, record] of Object.entries(detail)) {
+    if (!isPlainObject(record)) {
+      throw new TypeError(`${directory}/detail.json entry ${taskCode} must be a detail object`);
+    }
+  }
   if (!isPlainObject(dicts)) {
     throw new TypeError(`${directory}/dicts.json must contain an object keyed by dict code`);
   }
 
-  return { user, tasks, dicts, remarks, files };
+  return { user, tasks, detail, dicts, remarks, files };
 }
 
 /**
@@ -475,8 +558,13 @@ async function main() {
   console.log(`MOCK_PLATFORM_URL=${mock.url}`);
 
   const shutdown = async () => {
-    await mock.close();
-    process.exit(0);
+    try {
+      await mock.close();
+    } finally {
+      // Always leave on SIGINT/SIGTERM, even if closing a socket failed:
+      // a verification run must not leave a mock listener behind.
+      process.exit(0);
+    }
   };
   process.once('SIGINT', shutdown);
   process.once('SIGTERM', shutdown);
