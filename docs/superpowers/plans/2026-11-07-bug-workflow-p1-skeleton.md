@@ -123,6 +123,7 @@ git commit -m "feat(bug-workflow): 工单状态机与协议常量"
 
 **Files:**
 - Modify: `bug-workflow/package.json`（peerDependencies + files）
+- Modify: `bug-workflow/index.js`（Task 2 只加最小 `/bug-workflow/api/health` 探针用于 live 验证依赖与 domain；Task 3 会扩展成完整接线）
 - Create: `bug-workflow/src/host/domain.js`、`bug-workflow/src/host/store.js`
 - Test: `bug-workflow/test/store.test.js`
 
@@ -132,11 +133,12 @@ git commit -m "feat(bug-workflow): 工单状态机与协议常量"
 
 - [ ] **Step 1: 验证依赖获取方式（spike 步骤，写进 report）**
 
-在临时脚本里实测两条路径，二选一写死：
-1. `package.json` 增加 `"peerDependencies": { "@deepseek-ai/dsh-storage-domain": "*", "@deepseek-ai/zod": "*" }`（zod 的包名以 app.asar 里实际为准；先 `ls`/`read` 确认）并 `import ... from '@deepseek-ai/dsh-storage-domain'`，用 `plugin_manager` remove→install 热重载后看 host 是否 `active`。
-2. 失败则实现 `src/host/domain-source.js`：`resolveDomainLib()` 依次尝试 bare import、`process.resourcesPath` 下的 `app.asar/dsh/node_modules/@deepseek-ai/dsh-storage-domain/lib/index.js`，失败抛出可诊断错误 `{ stage:'resolve-domain-lib', tried:[] }`；**禁止静默内联**。
+按以下顺序实测，选定一条并写死（每条都要在 live 安装环境验证，不能只看静态推断）：
+1. **首选：peerDependencies + bare import**。`package.json` 增加 `"peerDependencies": { "@deepseek-ai/dsh-storage-domain": "*", "zod": "*" }`（zod 的包名/版本以 app.asar 里实际为准；先确认），`domain.js` 里 `import { defineDomain } from '@deepseek-ai/dsh-storage-domain'` + `import { z } from 'zod'`；通过 Task 2 的临时 `/bug-workflow/api/health` 探针实测 host 能否 import、domain 能否 open。
+2. **备选：零依赖手写 spec**。若 peer/bare import 在 link 安装下不可用：不 import `defineDomain`，在 `domain.js` 里手工构造符合 `DomainSpec` 形状的对象（`name/version/tables`，每个表 `{ valueSchema: { parse(v) {…校验并返回 v…} } }`）直接交给 `ctx.storageDomain.open(spec)`；live 验证 open 成功且写入能落盘。此方案无运行时依赖，优先于任何 app.asar 路径解析。
+3. **最后手段：受控解析器**。仅当 (1)(2) 都失败：`src/host/domain-source.js` 的 `resolveDomainLib()` 依次尝试 bare import、Electron `process.resourcesPath` 下 `app.asar/dsh/node_modules/@deepseek-ai/dsh-storage-domain/lib/index.js`，失败抛可诊断错误 `{ stage:'resolve-domain-lib', tried:[] }`；**禁止静默内联 spec**，并在 report 标注 P2 必须收敛。
 
-在 report 里记录最终选择的方案与证据（导入成功/失败原文）。
+在 report 里记录最终方案、失败原文与 live 证据（health 响应）。
 
 - [ ] **Step 2: 写失败测试（store 用 fake domain）**
 
