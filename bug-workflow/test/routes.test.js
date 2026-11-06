@@ -432,6 +432,27 @@ function createFakeSync({ run, status, tokenStore = null } = {}) {
   };
 }
 
+/**
+ * Fake by-code import. The route only consumes `{ok, ticket}` or
+ * `{ok:false, code, message}`; `calls` records `{cwd, code}` so the routing
+ * tests can assert the resolved workspace and the trimmed code.
+ */
+function createFakeImportTask({ result } = {}) {
+  const calls = [];
+  async function importTask(cwd, code) {
+    calls.push({ cwd, code });
+    if (typeof result === 'function') return result(cwd, code);
+    if (result !== undefined) return clone(result);
+    return {
+      ok: true,
+      ticket: { code, title: '平台工单', source: 'platform', workflow: 'inbox' },
+      created: 1,
+      updated: 0,
+    };
+  }
+  return { importTask, calls };
+}
+
 /** Fake credentials service used by the token-store integration. */
 function createFakeCredentials(initial = {}) {
   const values = new Map(Object.entries(initial));
@@ -471,22 +492,30 @@ function handlersWith({
   workspace = createWorkspace(),
   tokenStore = createTokenStore(createFakeCredentials()),
   sync,
+  importTask,
   clock = () => SERVER_TIME,
   domainOpenedAt = OPENED_AT,
 } = {}) {
   // `sync: undefined` gets the default fake; `sync: null` exercises the
   // "sync service not wired" 503 path explicitly.
   const syncService = sync === undefined ? createFakeSync({ tokenStore }) : sync;
+  // `importTask: undefined` wires a working fake; `null` exercises the
+  // "import service not wired" 503 path.
+  const importTaskFn = importTask === undefined
+    ? createFakeImportTask().importTask
+    : importTask;
   return {
     store,
     workspace,
     tokenStore,
     sync: syncService,
+    importTask: importTaskFn,
     handlers: createHandlers({
       store,
       workspace,
       tokenStore,
       sync: syncService,
+      importTask: importTaskFn,
       clock,
       domainOpenedAt,
     }),
@@ -1056,6 +1085,128 @@ test('error responses clip unknown-action, internal and invalid-payload detail',
   assert.equal(invalidPayload.res.statusCode, 400);
   assert.equal(invalidPayload.json.code, 'invalid-payload');
   assert.ok(invalidPayload.json.message.length <= 300);
+});
+
+// ---------------------------------------------------------------------------
+// Action: import by code (P2 Task 5 fix)
+// ---------------------------------------------------------------------------
+
+test('POST /action create with payload.code imports by code instead of creating manually', async () => {
+  const importFake = createFakeImportTask();
+  const { store, handlers } = handlersWith({ importTask: importFake.importTask });
+  const { res, json } = await call(handlers.action, {
+    method: 'POST',
+    url: API_PATHS.action,
+    body: actionBody({
+      code: 'HTSMART-12',
+      action: 'create',
+      payload: { code: '  HTSMART-12  ' },
+    }),
+  });
+
+  assert.equal(res.statusCode, 200);
+  // The import path answers exactly {ok, ticket}; no local create stats leak.
+  assert.deepEqual(Object.keys(json).sort(), ['ok', 'ticket']);
+  assert.equal(json.ok, true);
+  assert.equal(json.ticket.code, 'HTSMART-12');
+  assert.equal(json.ticket.source, 'platform');
+  assert.deepEqual(importFake.calls, [{ cwd: WORKSPACE, code: 'HTSMART-12' }]);
+  // The host must never fall back to the local manual create when importing.
+  assert.equal(store.calls.applyAction.length, 0);
+});
+
+test('POST /action import maps failures to 400/401/404/502', async () => {
+  const cases = [
+    ['invalid-code', 400],
+    ['no-platform-token', 400],
+    ['invalid-platform-config', 400],
+    ['platform-unauthorized', 401],
+    ['platform-not-found', 404],
+    ['platform-network', 502],
+    ['platform-http', 502],
+    ['platform-bad-response', 502],
+    ['internal', 500],
+    ['something-unexpected', 500],
+  ];
+
+  for (const [code, status] of cases) {
+    const importFake = createFakeImportTask({
+      result: () => ({ ok: false, code, message: `导入失败 ${code}` }),
+    });
+    const { store, handlers } = handlersWith({ importTask: importFake.importTask });
+    const { res, json } = await call(handlers.action, {
+      method: 'POST',
+      url: API_PATHS.action,
+      body: actionBody({ code: 'HTSMART-12', action: 'create', payload: { code: 'HTSMART-12' } }),
+    });
+
+    assert.equal(res.statusCode, status, code);
+    assert.equal(json.ok, false, code);
+    assert.equal(json.code, code, code);
+    assert.equal(json.message, `导入失败 ${code}`, code);
+    assert.equal(store.calls.applyAction.length, 0, code);
+  }
+});
+
+test('POST /action import answers 503 storage-unavailable when importTask is not wired', async () => {
+  const { store, handlers } = handlersWith({ importTask: null });
+  const { res, json } = await call(handlers.action, {
+    method: 'POST',
+    url: API_PATHS.action,
+    body: actionBody({ code: 'HTSMART-12', action: 'create', payload: { code: 'HTSMART-12' } }),
+  });
+
+  assert.equal(res.statusCode, 503);
+  assert.equal(json.ok, false);
+  assert.equal(json.code, 'storage-unavailable');
+  assert.equal(store.calls.applyAction.length, 0);
+});
+
+test('POST /action create without payload.code keeps the local demo path', async () => {
+  const importFake = createFakeImportTask();
+  const { store, handlers } = handlersWith({ importTask: importFake.importTask });
+
+  const demo = await call(handlers.action, {
+    method: 'POST',
+    url: API_PATHS.action,
+    body: actionBody({ payload: { title: 'demo' } }),
+  });
+  assert.equal(demo.res.statusCode, 200);
+  assert.equal(demo.json.ticket.code, 'BUG-1');
+  assert.notEqual(demo.json.ticket.source, 'platform');
+
+  // A blank payload.code is not an import trigger either.
+  const blank = await call(handlers.action, {
+    method: 'POST',
+    url: API_PATHS.action,
+    body: actionBody({ actionId: 'act-2', payload: { code: '   ', title: 'demo-2' } }),
+  });
+  assert.equal(blank.res.statusCode, 200);
+  assert.equal(blank.json.ticket.code, 'BUG-1');
+
+  assert.equal(importFake.calls.length, 0);
+  assert.equal(store.calls.applyAction.length, 2);
+  assert.deepEqual(store.calls.applyAction.map((entry) => entry.action), ['create', 'create']);
+});
+
+test('POST /action only routes create + payload.code to importTask', async () => {
+  const importFake = createFakeImportTask();
+  const store = createFakeStore({ tickets: [inboxTicket('BUG-1')] });
+  const { handlers } = handlersWith({ store, importTask: importFake.importTask });
+  const { res, json } = await call(handlers.action, {
+    method: 'POST',
+    url: API_PATHS.action,
+    body: actionBody({
+      action: 'start_analysis',
+      actionId: 'act-import-guard',
+      payload: { code: 'HTSMART-12' },
+    }),
+  });
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(json.ticket.workflow, 'analyzing');
+  assert.equal(importFake.calls.length, 0);
+  assert.deepEqual(store.calls.applyAction.map((entry) => entry.action), ['start_analysis']);
 });
 
 // ---------------------------------------------------------------------------

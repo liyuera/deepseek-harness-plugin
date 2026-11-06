@@ -28,6 +28,9 @@ import {
 const TASK_FIXTURE = JSON.parse(
   readFileSync(new URL('../scripts/fixtures/platform/tasks.json', import.meta.url), 'utf8'),
 );
+const DETAIL_FIXTURE = JSON.parse(
+  readFileSync(new URL('../scripts/fixtures/platform/detail.json', import.meta.url), 'utf8'),
+);
 const DICT_FIXTURE = JSON.parse(
   readFileSync(new URL('../scripts/fixtures/platform/dicts.json', import.meta.url), 'utf8'),
 );
@@ -135,9 +138,10 @@ function createFakePlatform({
   baseUrl = BASE_URL,
   getUser,
   listMyTasks,
+  getTask,
   getDicts,
 } = {}) {
-  const calls = { user: 0, list: [], dicts: 0 };
+  const calls = { user: 0, list: [], task: [], dicts: 0 };
   const client = {
     baseUrl,
     async getUser() {
@@ -160,6 +164,20 @@ function createFakePlatform({
           current: String(page),
         },
       };
+    },
+    async getTask(code) {
+      calls.task.push(code);
+      if (typeof getTask === 'function') return getTask(code, calls);
+      const detail = DETAIL_FIXTURE[code];
+      if (detail === undefined) {
+        return {
+          ok: false,
+          code: 'platform-not-found',
+          status: 404,
+          message: '平台接口或资源不存在',
+        };
+      }
+      return { ok: true, data: cloneJson(detail) };
     },
     async getDicts() {
       calls.dicts += 1;
@@ -437,6 +455,238 @@ test('pagination merges every page and respects the reported total', async () =>
   assert.equal(result.total, 130);
   assert.deepEqual(fake.calls.list.map((call) => call.page), [1, 2]);
   assert.equal(store.list().length, 130);
+});
+
+// ---------------------------------------------------------------------------
+// By-code import
+// ---------------------------------------------------------------------------
+
+const IMPORT_CODE = `${PROJECT_CODE}-647`;
+
+test('importTask() maps the platform detail into a platform ticket with its url', async () => {
+  const { store, sync, fake, factoryCalls, settingsCalls } = createSetup();
+
+  const result = await sync.importTask(CWD, IMPORT_CODE);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.created, 1);
+  assert.equal(result.updated, 0);
+  assert.deepEqual(settingsCalls, [CWD]);
+  assert.equal(factoryCalls.length, 1);
+  assert.equal(factoryCalls[0].token, 'test-token');
+  // A by-code import never lists tasks or fetches dictionaries.
+  assert.equal(fake.calls.user, 0);
+  assert.equal(fake.calls.list.length, 0);
+  assert.equal(fake.calls.dicts, 0);
+  assert.deepEqual(fake.calls.task, [IMPORT_CODE]);
+
+  const ticket = result.ticket;
+  assert.equal(ticket.code, IMPORT_CODE);
+  assert.equal(ticket.source, 'platform');
+  assert.equal(ticket.workflow, 'inbox');
+  assert.equal(ticket.title, '工单列表筛选后分页显示为空');
+  assert.equal(ticket.type, '缺陷');
+  assert.equal(ticket.status, '进行中');
+  assert.equal(ticket.priority, '高');
+  assert.equal(ticket.version, 'V1.2.0');
+  assert.equal(ticket.assignee, '李昱');
+  assert.equal(
+    ticket.url,
+    `${BASE_URL}/HT_TEAM/project/${PROJECT_CODE}/issues?issueCode=${IMPORT_CODE}`,
+  );
+  assert.deepEqual(ticket.platform, {
+    taskId: '6470001',
+    taskCode: IMPORT_CODE,
+    typeKey: '001_BUG',
+    typeName: '缺陷',
+    statusKey: '002_DOING',
+    statusName: '进行中',
+    priorityKey: '001_HIGH',
+    priorityName: '高',
+    versionKey: '501',
+    versionName: 'V1.2.0',
+    // The detail fixture intentionally lacks the list-only refProjectName.
+    projectId: '1001',
+    projectName: null,
+    assigneeId: '10086',
+    assigneeName: '李昱',
+    description: DETAIL_FIXTURE[IMPORT_CODE].description,
+    url: ticket.url,
+    syncedAt: Date.parse(T1),
+  });
+  assert.deepEqual(store.get(IMPORT_CODE), ticket);
+  assert.deepEqual(store.list().map((row) => row.code), [IMPORT_CODE]);
+  // An import is not a sync: it must not fabricate last-sync metadata.
+  assert.equal(store.getMeta(LAST_SYNC_AT_KEY), undefined);
+  assert.equal(store.getMeta(LAST_SYNC_ERROR_KEY), undefined);
+  assert.equal(JSON.stringify(ticket).includes('test-token'), false);
+});
+
+test('importTask() upserts an existing ticket and preserves its local workflow', async () => {
+  const { store, sync } = createSetup({ clock: clockFrom(T2) });
+  const created = await store.applyAction(
+    IMPORT_CODE,
+    'create',
+    { title: '本地手工工单' },
+    { actionId: 'import-existing-create' },
+  );
+  assert.equal(created.ok, true);
+  const advanced = await store.applyAction(
+    IMPORT_CODE,
+    'start_analysis',
+    {},
+    { actionId: 'import-existing-advance' },
+  );
+  assert.equal(advanced.ok, true);
+  const before = store.get(IMPORT_CODE);
+  assert.equal(before.source, 'manual');
+  assert.equal(before.workflow, 'analyzing');
+
+  const result = await sync.importTask(CWD, IMPORT_CODE);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.created, 0);
+  assert.equal(result.updated, 1);
+  const after = store.get(IMPORT_CODE);
+  assert.equal(after.source, 'platform');
+  assert.equal(after.workflow, 'analyzing');
+  assert.deepEqual(after.timeline, before.timeline);
+  assert.equal(after.createdAt, before.createdAt);
+  assert.equal(after.title, '工单列表筛选后分页显示为空');
+  assert.equal(after.updatedAt, T2);
+  assert.equal(after.platform.syncedAt, Date.parse(T2));
+  assert.equal(store.list().length, 1);
+});
+
+test('importTask() uses the task-code project in the url when it is outside the sync filter', async () => {
+  const { store, sync } = createSetup();
+
+  const result = await sync.importTask(CWD, 'HTSMART-12');
+
+  assert.equal(result.ok, true);
+  assert.equal(result.ticket.source, 'platform');
+  assert.equal(
+    result.ticket.url,
+    `${BASE_URL}/HT_TEAM/project/HTSMART/issues?issueCode=HTSMART-12`,
+  );
+  assert.equal(store.get('HTSMART-12').source, 'platform');
+});
+
+test('importTask() trims the code and tolerates a detail record without taskCode', async () => {
+  const { store, sync, fake } = createSetup({
+    platform: {
+      getTask: () => ({ ok: true, data: { id: 9001, taskName: '无编号详情' } }),
+    },
+  });
+
+  const result = await sync.importTask(CWD, '  ABC-77  ');
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(fake.calls.task, ['ABC-77']);
+  assert.equal(result.ticket.code, 'ABC-77');
+  assert.equal(result.ticket.source, 'platform');
+  assert.equal(result.ticket.platform.taskId, '9001');
+  assert.equal(store.get('ABC-77').title, '无编号详情');
+});
+
+test('importTask() rejects blank, overlong and unsafe codes before calling the platform', async () => {
+  const { store, sync, factoryCalls } = createSetup();
+
+  for (const code of ['', '   ', 'x'.repeat(129), 'BAD CODE', 'BAD/CODE', 'BAD\nCODE', 42, null, undefined]) {
+    const result = await sync.importTask(CWD, code);
+    assert.equal(result.ok, false, String(code));
+    assert.equal(result.code, 'invalid-code', String(code));
+  }
+
+  assert.equal(factoryCalls.length, 0);
+  assert.equal(store.list().length, 0);
+});
+
+test('importTask() without a token fails with no-platform-token and touches nothing', async () => {
+  const { store, sync, factoryCalls } = createSetup({ token: null });
+
+  const result = await sync.importTask(CWD, IMPORT_CODE);
+
+  assert.deepEqual(result, {
+    ok: false,
+    code: 'no-platform-token',
+    message: '未配置平台 token，请先在设置中保存 token',
+  });
+  assert.equal(factoryCalls.length, 0);
+  assert.equal(store.list().length, 0);
+  assert.equal(store.getMeta(LAST_SYNC_AT_KEY), undefined);
+  assert.equal(store.getMeta(LAST_SYNC_ERROR_KEY), undefined);
+});
+
+test('importTask() maps an invalid platform configuration to invalid-platform-config', async () => {
+  const { store, sync } = createSetup({
+    platformClientFor: () => {
+      throw new Error('平台地址不合法');
+    },
+  });
+
+  const result = await sync.importTask(CWD, IMPORT_CODE);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'invalid-platform-config');
+  assert.equal(store.list().length, 0);
+  assert.equal(store.getMeta(LAST_SYNC_ERROR_KEY), undefined);
+});
+
+test('importTask() maps an upstream 401 to platform-unauthorized', async () => {
+  const { store, sync } = createSetup({
+    platform: {
+      getTask: () => ({
+        ok: false,
+        code: 'platform-unauthorized',
+        status: 401,
+        message: '平台鉴权失败，请重新配置 token',
+      }),
+    },
+  });
+
+  const result = await sync.importTask(CWD, IMPORT_CODE);
+
+  assert.deepEqual(result, {
+    ok: false,
+    code: 'platform-unauthorized',
+    message: '平台鉴权失败，请重新配置 token',
+  });
+  assert.equal(store.list().length, 0);
+});
+
+test('importTask() maps an unknown task code to platform-not-found', async () => {
+  const { store, sync } = createSetup();
+
+  const result = await sync.importTask(CWD, 'UNKNOWN-999');
+
+  assert.deepEqual(result, {
+    ok: false,
+    code: 'platform-not-found',
+    message: '平台没有该工单',
+  });
+  assert.equal(store.list().length, 0);
+});
+
+test('importTask() maps a malformed detail response to platform-bad-response', async () => {
+  const failures = createSetup({
+    platform: {
+      getTask: () => ({ ok: false, code: 'platform-bad-response', message: '平台响应结构异常' }),
+    },
+  });
+  const failed = await failures.sync.importTask(CWD, IMPORT_CODE);
+  assert.equal(failed.ok, false);
+  assert.equal(failed.code, 'platform-bad-response');
+  assert.equal(failures.store.list().length, 0);
+
+  // An `ok` result whose data is not a detail object is equally unusable.
+  const notAnObject = createSetup({
+    platform: { getTask: () => ({ ok: true, data: null }) },
+  });
+  const malformed = await notAnObject.sync.importTask(CWD, IMPORT_CODE);
+  assert.equal(malformed.ok, false);
+  assert.equal(malformed.code, 'platform-bad-response');
+  assert.equal(notAnObject.store.list().length, 0);
 });
 
 // ---------------------------------------------------------------------------
