@@ -502,7 +502,10 @@ function answerFallbackHealth(res, health) {
 function unavailableHandler(method, health) {
   return wrap(async (req, res) => {
     if (!guard(req, res, method)) return;
-    if (!guardJsonContentType(req, res)) return;
+    // The media-type guard is a POST-body guard: a browser GET (notably the
+    // snapshot poll) legitimately carries no Content-Type and must still reach
+    // the documented retryable 503 instead of a misleading 415.
+    if (method === 'POST' && !guardJsonContentType(req, res)) return;
     if (!guardOrigin(req, res)) return;
     sendJsonSafe(res, 503, {
       ok: false,

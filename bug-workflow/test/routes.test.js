@@ -1276,3 +1276,47 @@ test('registerUnavailableRoutes() keeps health 500/503 and other routes 503 unti
   dispose();
   assert.equal(webServer.routes.size, 0);
 });
+
+test('fallback snapshot GET without a Content-Type answers 503 while POST keeps the JSON guard', async () => {
+  const webServer = createFakeWebServer();
+  const health = { status: 'opening', stage: 'open-domain' };
+  const dispose = registerUnavailableRoutes({ webServer }, health);
+
+  // A normal browser GET has no Content-Type: it must get the documented
+  // retryable fallback, not the POST-only media-type 415.
+  const snapshot = await callRegistered(webServer, API_PATHS.snapshot, {
+    method: 'GET',
+    url: snapshotUrl(),
+    contentType: null,
+  });
+  assert.equal(snapshot.res.statusCode, 503);
+  assert.equal(snapshot.res.headers['content-type'], 'application/json; charset=utf-8');
+  assert.deepEqual(snapshot.json, {
+    ok: false,
+    code: 'storage-unavailable',
+    message: '存储服务尚未就绪，请稍后重试',
+    stage: 'open-domain',
+  });
+
+  // The media-type guard still protects the POST fallbacks (text/plain is the
+  // no-preflight cross-site bypass), and these routes stay 503 for JSON.
+  const textPlain = await callRegistered(webServer, API_PATHS.action, {
+    method: 'POST',
+    url: API_PATHS.action,
+    contentType: 'text/plain',
+    body: actionBody(),
+  });
+  assert.equal(textPlain.res.statusCode, 415);
+  assert.equal(textPlain.json.code, 'unsupported-media-type');
+
+  const json = await callRegistered(webServer, API_PATHS.action, {
+    method: 'POST',
+    url: API_PATHS.action,
+    body: actionBody(),
+  });
+  assert.equal(json.res.statusCode, 503);
+  assert.equal(json.json.code, 'storage-unavailable');
+
+  dispose();
+  assert.equal(webServer.routes.size, 0);
+});
