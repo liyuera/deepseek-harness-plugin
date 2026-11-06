@@ -50,11 +50,14 @@ canApply(ticket, action) -> { ok: true } | { ok: false, code, message }
 apply(ticket, action, payload, at) -> Ticket   // 不合法迁移 throw StateError；返回新对象（不 mutate 入参）
 // actions: 'create' | 'start_analysis' | 'analysis_done' | 'approve_plan' | 'reject_plan'
 //        | 'fix_done' | 'mark_test_passed' | 'submit_mr' | 'mr_created'
-//        | 'review_requests_changes' | 'review_fix_done' | 'review_pass' | 'mr_merged' | 'dismiss' | 'retry'
+//        | 'review_requests_changes' | 'review_fix_done' | 'review_pass' | 'mr_merged' | 'dismiss' | 'retry' | 'block'
+// block 可从任意非终态进入 blocked，并记录 blockedFrom/blockedReason；retry 回到 blockedFrom。
+// 「review 轮次耗尽」由宿主映射：canApply 返回 code 'review-rounds-exhausted' 时，宿主调用 block 动作（reason='review-rounds-exhausted'）。
 
 // Ticket（持久化形状，字段可增不可改语义）
 { code, title, type, status, version, priority, assignee, url,
-  workflow, plan: null | { summary, rootCause, approach, changedFiles: [], risks: [], testPlan, generatedAt, approvedAt, rejectedReason },
+  workflow, blockedFrom: null, blockedReason: null,
+  plan: null | { summary, rootCause, approach, changedFiles: [], risks: [], testPlan, generatedAt, approvedAt, rejectedReason },
   branch: null | { name, target },
   mr: null | { iid, url, sourceBranch, targetBranch, state, verdict, blockingIssues: [], nonBlockingIssues: [], rounds },
   fixes: [], timeline: [ { at, kind, actor, message } ],
@@ -93,18 +96,19 @@ apply(ticket, action, payload, at) -> Ticket   // 不合法迁移 throw StateErr
 1. `initialTicket()` 得到 `workflow:'inbox'` 且 timeline 一条 `created`。
 2. 合法链：`start_analysis → analysis_done → approve_plan → fix_done → mark_test_passed → submit_mr → mr_created → review_requests_changes → review_fix_done → review_pass → mr_merged → dismiss`，最终 `workflow:'done'`。
 3. 非法迁移：`inbox` 直接 `mr_merged`、`plan_review` 上 `fix_done`、`done` 上任何动作都返回 `ok:false`。
-4. `reject_plan` 进 `blocked`，`retry` 回 `plan_review` 且保留 rejectedReason；`review_requests_changes` 轮次 `mr.rounds` 自增，第 4 次请求返回 `ok:false`（上限 3 轮）。
+4. `reject_plan` 进 `blocked`（`blockedFrom:'plan_review'`），`retry` 回 `plan_review` 且保留 rejectedReason；`review_requests_changes` 轮次 `mr.rounds` 自增，第 4 次请求返回 `ok:false, code:'review-rounds-exhausted'`（上限 3 轮）。
 5. `apply()` 不修改入参（deepEqual 原对象）且返回新 timeline 追加一条事件。
+6. `block` 动作：从 `fixing` / `mr_open` 进 `blocked` 并记录 `blockedFrom`/`blockedReason`；`retry` 回到 `blockedFrom`（`mr_open` 场景保留 `mr` 上下文）；`done` 上 `block` 被拒绝。
 
-Run: `node --test bug-workflow/test/` → 预期 FAIL（模块不存在）。
+Run: `node --test bug-workflow/test/*.test.js` → 预期 FAIL（模块不存在）。
 
 - [ ] **Step 2: 实现 protocol.js 与 state-machine.js**
 
-按「接口与数据契约」实现；`apply()` 用 switch/表驱动，非法迁移抛 `StateError({ code:'invalid-transition', message })`；`canApply()` 不抛。轮次计算：`review_requests_changes` 时 `mr.rounds = (mr.rounds ?? 0) + 1`，>3 返回 `{ ok:false, code:'review-rounds-exhausted' }`。
+按「接口与数据契约」实现；`apply()` 用 switch/表驱动，非法迁移抛 `StateError({ code:'invalid-transition', message })`；`canApply()` 不抛。轮次计算：`review_requests_changes` 时 `mr.rounds = (mr.rounds ?? 0) + 1`，>3 返回 `{ ok:false, code:'review-rounds-exhausted' }`。`block` 动作从任意非终态进入 `blocked` 并记录 `blockedFrom`/`blockedReason`（`reject_plan` 等价于 `blockedFrom:'plan_review'`）；`retry` 优先回到 `blockedFrom` 并清除这两个字段；`blockedFrom` 为空时按旧规则（plan ? plan_review : inbox）。
 
 - [ ] **Step 3: 跑测试**
 
-Run: `node --test bug-workflow/test/` → 全部 PASS。
+Run: `node --test bug-workflow/test/*.test.js` → 全部 PASS。
 
 - [ ] **Step 4: 提交**
 
@@ -141,7 +145,7 @@ git commit -m "feat(bug-workflow): 工单状态机与协议常量"
 2. `applyAction()` 调状态机后持久化；同 `actionId` 二次调用返回首次结果（幂等）。
 3. `getSettings` 无记录返回默认设置；`putSettings` 后读回一致。
 4. `list()` 顺序稳定（按 `createdAt`）。
-Run: `node --test bug-workflow/test/` → FAIL。
+Run: `node --test bug-workflow/test/*.test.js` → FAIL。
 
 - [ ] **Step 3: 实现 domain.js + store.js**
 
@@ -150,7 +154,7 @@ Run: `node --test bug-workflow/test/` → FAIL。
 
 - [ ] **Step 4: 跑测试 + 语法检查**
 
-`node --test bug-workflow/test/` 全过；`node --check` 新文件。
+`node --test bug-workflow/test/*.test.js` 全过；`node --check` 新文件。
 
 - [ ] **Step 5: 提交**
 
@@ -180,12 +184,12 @@ git commit -m "feat(bug-workflow): storageDomain 持久化与工单仓库"
 3. `POST settings` 校验字段类型，返回保存后的 settings。
 4. `GET health` 返回 `{ ok:true, domainOpenedAt }`。
 5. `Host` 非 loopback 时返回 403。
-Run: `node --test bug-workflow/test/` → FAIL。
+Run: `node --test bug-workflow/test/*.test.js` → FAIL。
 
 - [ ] **Step 2: 实现 workspace.js + routes.js**
 
 `workspace.resolve(sessionId)`：`ctx.sessions.get(sessionId)?.header.cwd`（取不到时返回 `{ path: null, configured:false }`）；bindings 以 cwd 为 key 存 `settings` 表。
-`routes.js`：按契约实现 `createHandlers` + `registerRoutes(ctx, { store })`；JSON 读写带大小上限与 try/catch；动作成功后返回新 ticket。
+`routes.js`：按契约实现 `createHandlers` + `registerRoutes(ctx, { store })`；JSON 读写带大小上限与 try/catch；动作成功后返回新 ticket。动作被状态机拒绝时返回 409 + `{code,message}`；当 `canApply` 返回 `review-rounds-exhausted` 时，handler 先执行 `block` 动作（`reason:'review-rounds-exhausted'`）再返回 409，保证 spec §12 的「超轮次 → blocked」由宿主兑现。
 
 - [ ] **Step 3: 接线 index.js**
 
@@ -306,7 +310,7 @@ git commit -m "feat(bug-workflow): 看板设置视图与工作区绑定"
 
 - [ ] **Step 3: 清理与提交**
 
-确认 `.tmp` 不提交、无 spike 路由残留；`node --test bug-workflow/test/` 全过。
+确认 `.tmp` 不提交、无 spike 路由残留；`node --test bug-workflow/test/*.test.js` 全过。
 
 ```bash
 git add bug-workflow/README.md docs/superpowers/spikes/2026-11-07-p1-findings.md
@@ -317,7 +321,7 @@ git commit -m "docs(bug-workflow): P1 骨架 README 与验收记录"
 
 ## P1 退出标准
 
-- `node --test bug-workflow/test/` 全绿。
+- `node --test bug-workflow/test/*.test.js` 全绿。
 - live：`/bug-workflow/api/health` 200；一张工单能从 `inbox` 走到 `done`，host 半热重载后数据保留。
 - 右栏 tab 打开显示看板；列表/详情/设置可用（视觉项记录证据，用户最终验收时目视）。
 - 无 Critical/Important 审查问题；未完成项显式记录。
