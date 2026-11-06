@@ -1,26 +1,42 @@
 /**
  * Host half of `@liyuera/dsh-bug-workflow`.
  *
- * Task 2 wiring: prove the host can import the storage-domain package through
- * `peerDependencies`, open domain `bug_workflow`, and serve a minimal probe.
+ * Wiring:
  *
- *   GET /bug-workflow/api/health -> { ok, domainOpenedAt, tickets }
+ *   apply()
+ *     -> mount fallback /bug-workflow/api/* routes (health reports the stage)
+ *     -> ctx.inject(['storageDomain','sessions'])
+ *          -> openDomain() -> createStore(domain, schemas) -> registerRoutes()
+ *          -> swap the fallback routes for the real handlers
+ *          -> close the domain from the fiber disposer
  *
- * Task 3 turns this into the full `/bug-workflow/api/*` route set; it extends
- * the store/domain wiring started here instead of replacing it.
+ *   GET  /bug-workflow/api/health    -> { ok, domainOpenedAt, tickets }
+ *   GET  /bug-workflow/api/snapshot  -> { ok, workspace, settings, tickets, serverTime }
+ *   POST /bug-workflow/api/action    -> { ok, ticket } | { ok:false, code, message, ticket? }
+ *   POST /bug-workflow/api/settings  -> { ok, settings }
  *
  * Failure policy: `webServer` is the only hard dependency, so the plugin still
- * loads in a profile without storage. The domain is opened inside
- * `ctx.inject(['storageDomain'], ...)`; if the service never becomes available,
- * `/health` answers HTTP 500 with `{ ok: false, stage: 'storage-service' }`.
- * An open failure is cached (domain.js) instead of retried per request.
+ * loads in a profile without storage. The fallback routes stay mounted until the
+ * real handlers are ready: `/health` answers HTTP 500 with
+ * `{ ok:false, stage:'storage-service' }` when the inject never ran, 503 while
+ * opening, and 500 with the failing stage after an open/create-store/register
+ * error; the data routes answer 503. An open failure is cached by domain.js
+ * instead of retried per request, and the per-fiber cache key is the inject
+ * child context (never the facility singleton — see Task 2 concern #1).
+ *
+ * The web server rejects duplicate exact paths, so routes are never registered
+ * twice: the fallback is disposed immediately before the real set is mounted.
+ * Both sets are removed by the `apply` fiber disposer.
  */
 import { closeDomain, openDomain, settingsSchema, ticketSchema } from './src/host/domain.js';
+import {
+  registerRoutes,
+  registerUnavailableRoutes,
+} from './src/host/routes.js';
 import { createStore } from './src/host/store.js';
+import { resolveWorkspace } from './src/host/workspace.js';
 
 export const inject = ['webServer'];
-
-const HEALTH_ROUTE = '/bug-workflow/api/health';
 
 /**
  * Write-boundary validators handed to the store. These are the domain's real
@@ -31,47 +47,119 @@ const HEALTH_ROUTE = '/bug-workflow/api/health';
 const validateTicket = (ticket) => ticketSchema.parse(ticket);
 const validateSettings = (settings) => settingsSchema.parse(settings);
 
+const clock = () => new Date().toISOString();
+
 export function apply(ctx) {
-  // Shared state observed by the health route. `status` is one of
+  // Shared state observed by the fallback health route. `status` is one of
   // waiting-for-service | opening | open | failed.
   const health = {
     status: 'waiting-for-service',
     stage: 'storage-service',
-    error: undefined,
-    openedAt: undefined,
-    store: undefined,
+    error: 'ctx.storageDomain / ctx.sessions service unavailable',
   };
 
   let openPending;
+  let disposeApi;
+  let disposed = false;
 
-  ctx.inject(['storageDomain'], (storageCtx) => {
+  /**
+   * Replace the mounted route set. The old set is disposed first because the
+   * web server forbids duplicate `(kind, path)` registrations. Returns false
+   * when the fiber is already disposed, in which case the caller must not
+   * register anything.
+   */
+  const mountApi = (register) => {
+    if (disposed) return false;
+    const previous = disposeApi;
+    disposeApi = undefined;
+    previous?.();
+    disposeApi = register();
+    return true;
+  };
+
+  // Health (and inert 503 data routes) exist from the first moment the plugin
+  // loads, so a board poll never gets a 404 while storage is still opening.
+  mountApi(() => registerUnavailableRoutes(ctx, health));
+
+  ctx.effect(
+    () => () => {
+      disposed = true;
+      const dispose = disposeApi;
+      disposeApi = undefined;
+      dispose?.();
+    },
+    'bug-workflow: api routes',
+  );
+
+  ctx.inject(['storageDomain', 'sessions'], (storageCtx) => {
     health.status = 'opening';
     health.stage = 'open-domain';
+    health.error = undefined;
 
     openPending = (async () => {
       let handle;
+      let stage = 'open-domain';
       try {
         handle = await openDomain(storageCtx);
-        health.openedAt = handle.openedAt;
 
-        health.stage = 'create-store';
-        health.store = createStore(handle.domain, undefined, {
+        stage = 'create-store';
+        health.stage = stage;
+        const store = createStore(handle.domain, undefined, {
           validateTicket,
           validateSettings,
         });
 
+        // Workspace settings are keyed by the live session header cwd. The
+        // settings store is passed for the future "has saved settings" check;
+        // P1 `configured` only means the session resolved to a directory.
+        const workspace = {
+          resolve: (sessionId) => resolveWorkspace(
+            { sessions: storageCtx.sessions, settingsStore: store },
+            sessionId,
+          ),
+        };
+
+        stage = 'register-routes';
+        health.stage = stage;
+        const mounted = mountApi(() => registerRoutes(ctx, {
+          store,
+          workspace,
+          clock,
+          domainOpenedAt: handle.openedAt,
+        }));
+
+        if (!mounted) {
+          // The fiber was disposed while the domain was opening; no request can
+          // reach these handlers any more, so release the domain immediately
+          // instead of leaving a handle behind.
+          await closeDomain(handle);
+          return handle;
+        }
+
         health.status = 'open';
         health.stage = undefined;
+        health.error = undefined;
         return handle;
       } catch (error) {
-        // Release a domain that opened but could not be attached to a store;
-        // otherwise the facility would report `already-open` on every reload.
+        // Release a domain that opened but could not be attached to a store (or
+        // to routes); otherwise the facility would report `already-open` on
+        // every reload.
         if (handle !== undefined) await closeDomain(handle).catch(() => {});
         health.status = 'failed';
-        // Keep the pre-set stage for errors that do not tag themselves
-        // (e.g. the TypeError createStore throws for a bad domain).
-        health.stage = typeof error?.stage === 'string' ? error.stage : health.stage;
+        health.stage = typeof error?.stage === 'string' ? error.stage : stage;
         health.error = errorMessage(error);
+
+        // A failed route swap has already disposed the fallback. Restore it so
+        // health still reports the failure instead of disappearing; if the
+        // fallback survived, leave it alone.
+        if (disposeApi === undefined && !disposed) {
+          try {
+            mountApi(() => registerUnavailableRoutes(ctx, health));
+          } catch {
+            // The web server itself is tearing down; nothing left to serve.
+          }
+        }
+
         logFailure(storageCtx, error);
         throw error;
       }
@@ -91,102 +179,12 @@ export function apply(ctx) {
       'bug-workflow: bug_workflow domain lifetime',
     );
   });
-
-  ctx.effect(
-    () =>
-      ctx.webServer.register({
-        kind: 'exact',
-        path: HEALTH_ROUTE,
-        handler: (req, res) => handleHealth(health, req, res),
-      }),
-    'bug-workflow: health route',
-  );
-}
-
-/**
- * Minimal live probe for the storage-domain wiring. Task 3 replaces the body
- * with the full snapshot/action/settings handlers.
- */
-function handleHealth(health, req, res) {
-  if (req.method !== 'GET') {
-    sendJsonSafe(res, 405, {
-      ok: false,
-      code: 'method-not-allowed',
-      message: 'health 仅支持 GET',
-    });
-    return;
-  }
-
-  if (health.status === 'open') {
-    try {
-      const tickets = health.store.list().length;
-      sendJsonSafe(res, 200, {
-        ok: true,
-        domainOpenedAt: health.openedAt,
-        tickets,
-      });
-    } catch (error) {
-      sendJsonSafe(res, 500, {
-        ok: false,
-        stage: 'list-tickets',
-        error: errorMessage(error),
-      });
-    }
-    return;
-  }
-
-  if (health.status === 'failed') {
-    sendJsonSafe(res, 500, {
-      ok: false,
-      stage: health.stage,
-      error: health.error ?? 'storage domain 打开失败',
-    });
-    return;
-  }
-
-  // `waiting-for-service` means `ctx.inject(['storageDomain'], ...)` never ran:
-  // the profile has no storage service, so this is a permanent 500, not a
-  // transient "still starting" answer.
-  if (health.status === 'waiting-for-service') {
-    sendJsonSafe(res, 500, {
-      ok: false,
-      stage: 'storage-service',
-      error: 'ctx.storageDomain service unavailable',
-    });
-    return;
-  }
-
-  sendJsonSafe(res, 503, {
-    ok: false,
-    stage: 'open-domain',
-    error: 'storage domain 仍在打开',
-  });
-}
-
-/** A response writer that also survives a client that already disconnected. */
-function sendJsonSafe(res, status, payload) {
-  try {
-    sendJson(res, status, payload);
-  } catch {
-    // Nothing is left to report to; the handler still must not throw.
-  }
-}
-
-function sendJson(res, status, payload) {
-  if (res.writableEnded || res.headersSent) return;
-  const body = JSON.stringify(payload);
-  res.writeHead(status, {
-    'content-type': 'application/json; charset=utf-8',
-    'cache-control': 'no-store',
-    'content-length': Buffer.byteLength(body),
-  });
-  res.end(body);
 }
 
 /** Diagnostics only; a failing logger must not mask the original error. */
 function logFailure(context, error) {
   try {
-    context.logger?.error?.('bug-workflow: storage domain 打开失败', error);
+    context.logger?.error?.('bug-workflow: 存储域装配失败', error);
   } catch {
     // Ignore logger failures.
   }
