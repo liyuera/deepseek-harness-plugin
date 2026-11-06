@@ -3,12 +3,17 @@
  *
  * Routes (all exact, all JSON, all same-origin/loopback only):
  *
- *   GET  /bug-workflow/api/health    -> { ok, domainOpenedAt, tickets }
- *   GET  /bug-workflow/api/snapshot  -> { ok, workspace, settings, tickets, serverTime }
- *   POST /bug-workflow/api/action    -> { ok, ticket } | { ok:false, code, message, ticket? }
- *   POST /bug-workflow/api/settings  -> { ok, settings }
+ *   GET  /bug-workflow/api/health          -> { ok, domainOpenedAt, tickets }
+ *   GET  /bug-workflow/api/snapshot        -> { ok, workspace, settings, platform, dicts, tickets, serverTime }
+ *   POST /bug-workflow/api/action          -> { ok, ticket } | { ok:false, code, message, ticket? }
+ *                                              action:'create' + payload.code imports that
+ *                                              platform task by code (see `importTask`)
+ *   POST /bug-workflow/api/settings        -> { ok, settings }
+ *   POST /bug-workflow/api/platform-token  -> { ok, tokenPresent } (token is only written, never read back)
+ *   POST /bug-workflow/api/sync            -> { ok, synced, created, updated, total, filtered, lastSyncAt }
+ *                                              | { ok:false, code, message }
  *
- * `createHandlers({ store, workspace, clock })` is pure over its dependencies so
+ * `createHandlers({ store, workspace, clock, tokenStore })` is pure over its dependencies so
  * the tests can drive real `IncomingMessage`-shaped fake requests. `index.js`
  * calls `registerRoutes()` once the storage domain is open, and keeps
  * `registerUnavailableRoutes()` mounted while the domain is still opening or
@@ -53,6 +58,8 @@ export const API_PATHS = Object.freeze({
   snapshot: '/bug-workflow/api/snapshot',
   action: '/bug-workflow/api/action',
   settings: '/bug-workflow/api/settings',
+  platformToken: '/bug-workflow/api/platform-token',
+  sync: '/bug-workflow/api/sync',
 });
 
 /** Request-body cap for POST routes (64 KiB). */
@@ -64,6 +71,9 @@ export const BODY_TIMEOUT_MS = 10_000;
 /** Client-visible error messages never exceed this many characters. */
 const MAX_ERROR_MESSAGE_CHARS = 300;
 
+/** 503 message for an absent/failed credential service (never mentions a token). */
+const CREDENTIALS_UNAVAILABLE_MESSAGE = '凭据服务不可用，暂时无法保存平台 token';
+
 /** A rejected action name is echoed back truncated to this many characters. */
 const MAX_ACTION_NAME_CHARS = 64;
 
@@ -73,6 +83,8 @@ const ROUTE_METHODS = Object.freeze({
   snapshot: 'GET',
   action: 'POST',
   settings: 'POST',
+  platformToken: 'POST',
+  sync: 'POST',
 });
 
 /** Store failure code -> HTTP status. Unknown codes are protocol bugs -> 500. */
@@ -86,6 +98,42 @@ const STORE_ERROR_STATUS = Object.freeze({
   'duplicate-code': 409,
   'not-found': 404,
   'invalid-record': 500,
+});
+
+/**
+ * Sync failure code -> HTTP status. Upstream 401 is the only error the user can
+ * fix by re-entering the token; every other upstream/network failure is a 502
+ * (bad gateway) and unexpected service failures are 500.
+ */
+const SYNC_ERROR_STATUS = Object.freeze({
+  'no-platform-token': 400,
+  'invalid-platform-config': 400,
+  'unknown-workspace': 400,
+  'platform-unauthorized': 401,
+  'platform-network': 502,
+  'platform-http': 502,
+  'platform-not-found': 502,
+  'platform-bad-response': 502,
+  'invalid-request': 502,
+  internal: 500,
+});
+
+/**
+ * Import failure code -> HTTP status. A missing/unknown token or an invalid
+ * code/config is a 400; an upstream 401 asks for a new token; an unknown task is
+ * a 404; every other upstream/network failure is a 502.
+ */
+const IMPORT_ERROR_STATUS = Object.freeze({
+  'invalid-code': 400,
+  'no-platform-token': 400,
+  'invalid-platform-config': 400,
+  'platform-unauthorized': 401,
+  'platform-not-found': 404,
+  'platform-network': 502,
+  'platform-http': 502,
+  'platform-bad-response': 502,
+  'invalid-request': 502,
+  internal: 500,
 });
 
 /** Explicit allow-list of loopback Host header values (with optional port). */
@@ -103,16 +151,25 @@ const LOOPBACK_REMOTE_ADDRESSES = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1
  * @param {object} deps
  * @param {object} deps.store `createStore()` result (or an equivalent double)
  * @param {{resolve: (sessionId: string) => {path: string|null, configured: boolean}}} deps.workspace
+ * @param {object|null} [deps.tokenStore] `createTokenStore()` result; when null
+ *   the snapshot reports `tokenPresent:false` and the token route answers 503
+ * @param {object|null} [deps.sync] `createSyncService()` result; when null the
+ *   sync route answers 503 and the snapshot falls back to token presence only
+ * @param {((cwd: string|null, code: string) => Promise<object>)|null} [deps.importTask]
+ *   `createSyncService().importTask`; when null an import request answers 503
  * @param {() => string} [deps.clock] ISO 8601 server time for snapshots
  * @param {number|null} [deps.domainOpenedAt] domain open timestamp for health
  * @param {number} [deps.bodyTimeoutMs] POST body read deadline (default 10 s)
  * @param {((entry: {event: string, error: unknown}) => void)|null} [deps.log]
  *   optional host logger; receives full errors that are hidden from responses
- * @returns {{health: Function, snapshot: Function, action: Function, settings: Function}}
+ * @returns {{health: Function, snapshot: Function, action: Function, settings: Function, platformToken: Function, sync: Function}}
  */
 export function createHandlers({
   store,
   workspace,
+  tokenStore = null,
+  sync = null,
+  importTask = null,
   clock = defaultClock,
   domainOpenedAt = null,
   bodyTimeoutMs = BODY_TIMEOUT_MS,
@@ -122,6 +179,26 @@ export function createHandlers({
   if (workspace === null || typeof workspace !== 'object' || typeof workspace.resolve !== 'function') {
     throw new TypeError('createHandlers() requires a workspace with resolve(sessionId)');
   }
+  if (tokenStore !== null && tokenStore !== undefined) {
+    for (const method of ['get', 'set', 'clear', 'present']) {
+      if (typeof tokenStore[method] !== 'function') {
+        throw new TypeError(`createHandlers() tokenStore.${method} must be a function`);
+      }
+    }
+  }
+  const tokenStoreSafe = tokenStore === undefined ? null : tokenStore;
+  if (sync !== null && sync !== undefined) {
+    for (const method of ['run', 'status']) {
+      if (typeof sync[method] !== 'function') {
+        throw new TypeError(`createHandlers() sync.${method} must be a function`);
+      }
+    }
+  }
+  const syncService = sync === undefined ? null : sync;
+  if (importTask !== null && importTask !== undefined && typeof importTask !== 'function') {
+    throw new TypeError('createHandlers() importTask must be a function');
+  }
+  const importTaskFn = importTask === undefined ? null : importTask;
   if (typeof clock !== 'function') {
     throw new TypeError('createHandlers() requires clock to be a function');
   }
@@ -171,6 +248,10 @@ export function createHandlers({
         ok: true,
         workspace: resolved,
         settings: store.getSettings(resolved.path),
+        // Task 4: platform status + dictionaries. Both readers degrade to
+        // safe defaults so a failing sync/meta read cannot take down the board.
+        platform: await readPlatformStatus(syncService, tokenStoreSafe),
+        dicts: readDicts(store),
         tickets: snapshot.tickets,
         serverTime: clock(),
       });
@@ -224,6 +305,35 @@ export function createHandlers({
         return;
       }
 
+      // P2 「从平台导入」 uses the existing create action with `payload.code`.
+      // It must be handled before `store.applyAction('create')`, otherwise the
+      // host would create a local manual ticket titled with the code instead of
+      // importing the platform detail.
+      const importCode = normalizeImportPayloadCode(payload.value);
+      if (action === 'create' && importCode !== null) {
+        if (importTaskFn === null) {
+          sendError(res, 503, 'storage-unavailable', '平台导入服务不可用，请稍后重试');
+          return;
+        }
+
+        const resolved = normalizeWorkspace(workspace.resolve(sessionId));
+        const result = await importTaskFn(resolved.path, importCode);
+        if (result?.ok === true) {
+          sendJsonSafe(res, 200, { ok: true, ticket: result.ticket });
+          return;
+        }
+
+        const failureCode = typeof result?.code === 'string' ? result.code : 'internal';
+        const status = IMPORT_ERROR_STATUS[failureCode] ?? 500;
+        sendError(
+          res,
+          status,
+          failureCode,
+          clipMessage(typeof result?.message === 'string' ? result.message : '平台工单导入失败'),
+        );
+        return;
+      }
+
       // P1 actions are profile-global and do not require a bound workspace; the
       // sessionId is part of the client contract and is validated above only.
       const result = await store.applyAction(code, action, payload.value, { actionId });
@@ -272,11 +382,138 @@ export function createHandlers({
         throw error;
       }
     }),
+
+    /**
+     * Run the platform → ticket-store sync for the caller's workspace. The
+     * workspace cwd (not the session id) keys both the settings record and the
+     * per-cwd single-flight in the sync service. Every failure is a structured
+     * code; the mapping is in `SYNC_ERROR_STATUS` (no token/config 400,
+     * upstream 401, network/upstream 502, unexpected 500).
+     */
+    sync: safe(async (req, res) => {
+      if (!guard(req, res, ROUTE_METHODS.sync)) return;
+      if (!guardJsonContentType(req, res)) return;
+      if (!guardOrigin(req, res)) return;
+
+      const body = await readJsonBody(req, bodyTimeoutMs);
+      if (!body.ok) {
+        sendError(res, body.status, body.code, body.message);
+        if (body.destroyRequest === true) destroyRequest(req);
+        return;
+      }
+      const input = body.value;
+
+      const sessionId = normalizeSessionId(input.sessionId);
+      if (sessionId === undefined) {
+        sendError(res, 400, 'missing-session', '缺少有效的 sessionId');
+        return;
+      }
+
+      if (syncService === null) {
+        sendError(res, 503, 'sync-unavailable', '平台同步服务不可用，请稍后重试');
+        return;
+      }
+
+      const resolved = normalizeWorkspace(workspace.resolve(sessionId));
+      if (resolved.path === null) {
+        // The platform base URL/project code live in workspace settings; an
+        // unbound session would silently sync against the default real platform.
+        sendError(res, 400, 'unknown-workspace', '无法确定工作区路径，无法同步平台工单');
+        return;
+      }
+
+      const result = await syncService.run(resolved.path);
+      if (result?.ok === true) {
+        sendJsonSafe(res, 200, {
+          ok: true,
+          synced: numberOrZero(result.synced),
+          created: numberOrZero(result.created),
+          updated: numberOrZero(result.updated),
+          total: numberOrZero(result.total),
+          filtered: numberOrZero(result.filtered),
+          lastSyncAt: typeof result.lastSyncAt === 'string' ? result.lastSyncAt : null,
+        });
+        return;
+      }
+
+      const code = typeof result?.code === 'string' ? result.code : 'internal';
+      const status = SYNC_ERROR_STATUS[code] ?? 500;
+      sendError(
+        res,
+        status,
+        code,
+        clipMessage(typeof result?.message === 'string' ? result.message : '平台同步失败'),
+      );
+    }),
+
+    /**
+     * Write or clear the platform token. The body is `{sessionId, token}`:
+     * a string stores it, `null` clears it. Nothing from the credential store
+     * is ever echoed: the response carries only `{ok, tokenPresent}`.
+     *
+     * The token is profile-global (it is not workspace-scoped), so an unbound
+     * session may still configure it; only a missing/blank sessionId is
+     * rejected, matching the action route's validation. The board still gates
+     * the UI on a bound workspace.
+     */
+    platformToken: safe(async (req, res) => {
+      if (!guard(req, res, ROUTE_METHODS.platformToken)) return;
+      if (!guardJsonContentType(req, res)) return;
+      if (!guardOrigin(req, res)) return;
+
+      const body = await readJsonBody(req, bodyTimeoutMs);
+      if (!body.ok) {
+        sendError(res, body.status, body.code, body.message);
+        if (body.destroyRequest === true) destroyRequest(req);
+        return;
+      }
+      const input = body.value;
+
+      const sessionId = normalizeSessionId(input.sessionId);
+      if (sessionId === undefined) {
+        sendError(res, 400, 'missing-session', '缺少有效的 sessionId');
+        return;
+      }
+
+      if (tokenStoreSafe === null) {
+        sendError(res, 503, 'credentials-unavailable', CREDENTIALS_UNAVAILABLE_MESSAGE);
+        return;
+      }
+
+      const clear = input.token === null;
+      if (!clear && typeof input.token !== 'string') {
+        sendError(res, 400, 'invalid-token', 'token 必须是非空字符串，或传 null 清除');
+        return;
+      }
+
+      try {
+        if (clear) {
+          await tokenStoreSafe.clear();
+          sendJsonSafe(res, 200, { ok: true, tokenPresent: false });
+          return;
+        }
+        await tokenStoreSafe.set(input.token);
+        // Deliberately optimistic: a successful write means the token is now
+        // present; reading it back is not needed (and must not leave the store).
+        sendJsonSafe(res, 200, { ok: true, tokenPresent: true });
+      } catch (error) {
+        const code = typeof error?.code === 'string' ? error.code : undefined;
+        if (code === 'invalid-token') {
+          sendError(res, 400, 'invalid-token', clipMessage(errorMessage(error)));
+          return;
+        }
+        if (code === 'credentials-unavailable') {
+          sendError(res, 503, 'credentials-unavailable', CREDENTIALS_UNAVAILABLE_MESSAGE);
+          return;
+        }
+        throw error;
+      }
+    }),
   };
 }
 
 /**
- * Register the four real routes on `ctx.webServer` and return a disposer.
+ * Register the six real routes on `ctx.webServer` and return a disposer.
  *
  * The caller must have opened the domain and built the store already. Register
  * this only after disposing `registerUnavailableRoutes()`: duplicate exact paths
@@ -284,7 +521,7 @@ export function createHandlers({
  *
  * @param {object} ctx Cordis context carrying `webServer`
  * @param {object} deps same deps as {@link createHandlers}
- * @returns {() => void} idempotent disposer removing all four routes
+ * @returns {() => void} idempotent disposer removing all six routes
  */
 export function registerRoutes(ctx, deps) {
   const webServer = getWebServer(ctx);
@@ -299,12 +536,12 @@ export function registerRoutes(ctx, deps) {
  *
  * Health answers the Task 2 contract: 500 `{stage:'storage-service'}` when the
  * inject never ran, 503 while opening, 500 `{stage,error}` after a failure.
- * The three data routes answer 503 so a client polling the board sees a
+ * The four data routes answer 503 so a client polling the board sees a
  * retryable "storage unavailable" state instead of a missing route.
  *
  * @param {object} ctx Cordis context carrying `webServer`
  * @param {{status?: string, stage?: string, error?: string}} [health] shared health state
- * @returns {() => void} idempotent disposer removing all four routes
+ * @returns {() => void} idempotent disposer removing all six routes
  */
 export function registerUnavailableRoutes(ctx, health = {}) {
   const webServer = getWebServer(ctx);
@@ -321,6 +558,8 @@ export function registerUnavailableRoutes(ctx, health = {}) {
     snapshot: unavailableHandler(ROUTE_METHODS.snapshot, health),
     action: unavailableHandler(ROUTE_METHODS.action, health),
     settings: unavailableHandler(ROUTE_METHODS.settings, health),
+    platformToken: unavailableHandler(ROUTE_METHODS.platformToken, health),
+    sync: unavailableHandler(ROUTE_METHODS.sync, health),
   };
   return registerHandlers(webServer, handlers);
 }
@@ -444,6 +683,88 @@ function checkOrigin(req) {
 
 function sendError(res, status, code, message) {
   sendJsonSafe(res, status, { ok: false, code, message });
+}
+
+/**
+ * Snapshot flag only: ask the token store whether a credential exists. A
+ * missing or failing credentials service must not take the whole board down,
+ * so any failure reads as `false`.
+ */
+async function readTokenPresent(tokenStore) {
+  if (tokenStore === null || tokenStore === undefined) return false;
+  try {
+    return (await tokenStore.present()) === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Snapshot `platform` object. The sync service is the source of truth for both
+ * token presence and the last-sync meta; without it (or if its status read
+ * throws) the snapshot degrades to token presence + null timestamps so the
+ * board keeps rendering.
+ */
+async function readPlatformStatus(syncService, tokenStore) {
+  if (syncService !== null && syncService !== undefined) {
+    try {
+      const status = await syncService.status();
+      if (isPlainObject(status)) {
+        return {
+          tokenPresent: status.tokenPresent === true,
+          lastSyncAt: typeof status.lastSyncAt === 'string' ? status.lastSyncAt : null,
+          lastSyncError: typeof status.lastSyncError === 'string' ? status.lastSyncError : null,
+        };
+      }
+    } catch {
+      // Fall through to the token-only default.
+    }
+  }
+  return {
+    tokenPresent: await readTokenPresent(tokenStore),
+    lastSyncAt: null,
+    lastSyncError: null,
+  };
+}
+
+/**
+ * Snapshot `dicts` object. Always all three groups as arrays (the client never
+ * special-cases a missing dictionary); a store without `getDicts()` (fake store
+ * in tests, older host) or a corrupted meta record reads as empty.
+ */
+function readDicts(store) {
+  const empty = emptyDicts();
+  if (typeof store.getDicts !== 'function') return empty;
+
+  let dicts;
+  try {
+    dicts = store.getDicts();
+  } catch {
+    return empty;
+  }
+
+  const out = emptyDicts();
+  for (const group of ['status', 'type', 'priority']) {
+    const entries = isPlainObject(dicts) ? dicts[group] : undefined;
+    if (!Array.isArray(entries)) continue;
+    out[group] = entries
+      .filter((entry) => isPlainObject(entry) && typeof entry.key === 'string')
+      .map((entry) => ({
+        key: entry.key,
+        value: typeof entry.value === 'string' ? entry.value : '',
+        color: typeof entry.color === 'string' ? entry.color : '',
+      }));
+  }
+  return out;
+}
+
+function emptyDicts() {
+  return { status: [], type: [], priority: [] };
+}
+
+/** Coerce a sync stat to a non-negative integer; anything else counts as 0. */
+function numberOrZero(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0;
 }
 
 /** A response writer that also survives a client that already disconnected. */
@@ -770,6 +1091,21 @@ function normalizePayload(value) {
     return { ok: false, code: 'invalid-payload', message: 'payload 必须是普通对象' };
   }
   return { ok: true, value };
+}
+
+/**
+ * `payload.code` of a create request, when it is a non-empty string. This is
+ * the 「从平台导入」 trigger; every other create (the demo ticket, which sends
+ * only title/type/version) keeps the P1 local-create path. The actual code
+ * validation (length/charset) belongs to `importTask`, so a bad code answers
+ * 400 `invalid-code` instead of silently creating a manual ticket.
+ */
+function normalizeImportPayloadCode(payload) {
+  if (!isPlainObject(payload)) return null;
+  const value = payload.code;
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed === '' ? null : trimmed;
 }
 
 function normalizeWorkspace(resolved) {

@@ -30,8 +30,12 @@ function cloneJson(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
 }
 
-/** Minimal in-memory `Domain` double; mirrors the KvTable surface exactly. */
-function createFakeDomain() {
+/**
+ * Minimal in-memory `Domain` double; mirrors the KvTable surface exactly.
+ * `beforePut(table, key, value)` is an optional test hook awaited at the start
+ * of a `put`, used to pause one write deterministically (write-queue tests).
+ */
+function createFakeDomain({ beforePut } = {}) {
   const tables = new Map();
 
   return {
@@ -47,6 +51,7 @@ function createFakeDomain() {
       return {
         get: (key) => cloneJson(records.get(key)),
         put: async (key, value) => {
+          if (typeof beforePut === 'function') await beforePut(name, key, value);
           records.set(key, cloneJson(value));
         },
         delete: async (key) => records.delete(key),
@@ -74,6 +79,25 @@ function createFakeDomain() {
 function clockFrom(...times) {
   let index = 0;
   return () => times[Math.min(index++, times.length - 1)];
+}
+
+/** A promise plus its settle functions; used to pause a fake write deterministically. */
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+/**
+ * Let every already-scheduled microtask (and one macrotask) run. Not a sleep:
+ * it is the deterministic way to prove a queued write has NOT executed yet.
+ */
+function flushEventLoop() {
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
 const T1 = '2026-11-07T00:00:01.000Z';
@@ -130,7 +154,13 @@ function strictTicket(ticket) {
 /** Domain-schema double for settings; same contract as `strictTicket`. */
 function strictSettings(settings) {
   for (const [field, value] of Object.entries(settings)) {
-    if (typeof value !== 'string') throw new Error(`settings.${field} 必须是字符串`);
+    // Domain v2 adds one boolean setting; every other declared field is a string.
+    const expected = DEFAULT_SETTINGS[field] === true || DEFAULT_SETTINGS[field] === false
+      ? 'boolean'
+      : 'string';
+    if (typeof value !== expected) {
+      throw new Error(`settings.${field} 必须是${expected === 'boolean' ? '布尔值' : '字符串'}`);
+    }
   }
   return cloneJson(settings);
 }
@@ -162,9 +192,14 @@ test('create() persists an inbox ticket and snapshot() reports it', async () => 
   assert.equal(created.ticket.createdAt, T1);
   assert.equal(created.ticket.updatedAt, T1);
   assert.equal(created.ticket.timeline.length, 1);
+  // Domain v2 write-side defaults: manual tickets are explicit, never implied.
+  assert.equal(created.ticket.source, 'manual');
+  assert.equal(created.ticket.platform, null);
 
   const persisted = domain.table('tickets').get('BUG-1');
   assert.deepEqual(persisted, created.ticket);
+  assert.equal(persisted.source, 'manual');
+  assert.equal(persisted.platform, null);
 
   assert.deepEqual(store.get('BUG-1'), created.ticket);
   const snapshot = store.snapshot();
@@ -477,6 +512,183 @@ test('the actionId cache is capped at MAX_ACTION_RESULTS, evicting the oldest', 
 });
 
 // ---------------------------------------------------------------------------
+// write serialization (P2 whole-branch review)
+// ---------------------------------------------------------------------------
+
+/** A mapped platform record accepted by `upsertPlatformRecords()`. */
+function platformRecord(code, overrides = {}) {
+  const url = `https://platform.example.com/issues/${code}`;
+  return {
+    code,
+    title: '平台标题',
+    type: '缺陷',
+    status: '进行中',
+    version: 'V1.2.0',
+    priority: '高',
+    assignee: '李昱',
+    url,
+    source: 'platform',
+    platform: {
+      taskId: `id-${code}`,
+      taskCode: code,
+      typeKey: '001_BUG',
+      typeName: '缺陷',
+      statusKey: '002_DOING',
+      statusName: '进行中',
+      priorityKey: '001_HIGH',
+      priorityName: '高',
+      versionKey: '501',
+      versionName: 'V1.2.0',
+      projectId: '1001',
+      projectName: '示例项目',
+      assigneeId: '10086',
+      assigneeName: '李昱',
+      description: '',
+      url,
+      syncedAt: Date.parse(T2),
+    },
+    ...overrides,
+  };
+}
+
+test('a paused platform upsert cannot overwrite a locally started action', async () => {
+  const entered = deferred();
+  const release = deferred();
+  let pauseArmed = false;
+  const domain = createFakeDomain({
+    beforePut: async (table, key) => {
+      if (!pauseArmed || table !== 'tickets' || key !== 'SYNC-RACE-1') return;
+      pauseArmed = false;
+      entered.resolve();
+      await release.promise;
+    },
+  });
+  const store = createStrictStore(domain, clockFrom(T1, T2, T3));
+  await store.create({ code: 'SYNC-RACE-1', title: '本地标题' });
+
+  const record = platformRecord('SYNC-RACE-1');
+  pauseArmed = true;
+  const syncPromise = store.upsertPlatformRecords([record], T2);
+  await entered.promise;
+
+  // The upsert is parked inside tickets.put(). A local action must queue behind
+  // it; before write serialization it ran here and was then overwritten by the
+  // stale clone the upsert had already built.
+  const actionPromise = store.applyAction('SYNC-RACE-1', 'start_analysis', {}, { actionId: 'race-action' });
+  await flushEventLoop();
+  assert.equal(
+    domain.table('tickets').get('SYNC-RACE-1').workflow,
+    'inbox',
+    'the action must not run inside the paused upsert',
+  );
+  assert.equal(domain.table('tickets').get('SYNC-RACE-1').timeline.length, 1);
+
+  release.resolve();
+  const [synced, applied] = await Promise.all([syncPromise, actionPromise]);
+
+  assert.deepEqual(synced, { created: 0, updated: 1 });
+  assert.equal(applied.ok, true);
+
+  const finalTicket = domain.table('tickets').get('SYNC-RACE-1');
+  // Both effects survive: the platform fields from the upsert AND the local
+  // workflow/timeline from the action (the reproduced bug lost the action).
+  assert.equal(finalTicket.title, '平台标题');
+  assert.equal(finalTicket.status, '进行中');
+  assert.equal(finalTicket.source, 'platform');
+  assert.deepEqual(finalTicket.platform, record.platform);
+  assert.equal(finalTicket.workflow, 'analyzing');
+  assert.deepEqual(finalTicket.timeline.map((event) => event.kind), ['created', 'start_analysis']);
+});
+
+test('two concurrent applyAction calls are serialized in call order', async () => {
+  const domain = createFakeDomain();
+  const store = createStrictStore(domain, clockFrom(T1, T2, T3));
+  await store.create({ code: 'RACE-2' });
+
+  const started = store.applyAction('RACE-2', 'start_analysis', {});
+  const analysed = store.applyAction('RACE-2', 'analysis_done', { plan: { summary: '方案' } });
+  const [first, second] = await Promise.all([started, analysed]);
+
+  assert.equal(first.ok, true);
+  assert.equal(second.ok, true);
+  // The second action is only legal from `analyzing`; without the queue both
+  // calls read `inbox` and `analysis_done` fails as an invalid transition.
+  const ticket = domain.table('tickets').get('RACE-2');
+  assert.equal(ticket.workflow, 'plan_review');
+  assert.equal(ticket.plan.summary, '方案');
+  assert.deepEqual(ticket.timeline.map((event) => event.kind), [
+    'created',
+    'start_analysis',
+    'analysis_done',
+  ]);
+  // Deterministic order: the first enqueued call owns the first transition.
+  assert.equal(first.ticket.workflow, 'analyzing');
+  assert.equal(second.ticket.workflow, 'plan_review');
+});
+
+test('concurrent actionId retries replay the first result only once', async () => {
+  const domain = createFakeDomain();
+  let validations = 0;
+  const store = createStore(domain, () => T1, {
+    validateTicket: (ticket) => {
+      validations += 1;
+      return strictTicket(ticket);
+    },
+  });
+  await seedTicket(domain, initialTicket({ code: 'RACE-3' }, T1));
+  validations = 0;
+
+  const [first, second] = await Promise.all([
+    store.applyAction('RACE-3', 'start_analysis', {}, { actionId: 'race-id' }),
+    store.applyAction('RACE-3', 'start_analysis', {}, { actionId: 'race-id' }),
+  ]);
+
+  assert.equal(first.ok, true);
+  assert.deepEqual(second, first, 'the retry replays the first result verbatim');
+  // A second state-machine run would validate and write again; the ledger
+  // replay inside the same critical section must short-circuit it.
+  assert.equal(validations, 1);
+  const ticket = domain.table('tickets').get('RACE-3');
+  assert.equal(ticket.workflow, 'analyzing');
+  assert.equal(ticket.timeline.length, 2);
+  assert.equal(domain.table('meta').size, 1);
+  assert.deepEqual(domain.table('meta').get('action:race-id').value.result, first);
+});
+
+test('a rejected write does not wedge the queue and keeps its own error', async () => {
+  const domain = createFakeDomain();
+  const store = createStrictStore(domain, () => T1);
+
+  const rejected = store.upsertPlatformRecords(null);
+  const created = store.create({ code: 'AFTER-REJECT' });
+
+  await assert.rejects(rejected, (error) => error.name === 'StoreError' && error.code === 'invalid-input');
+  const createdResult = await created;
+  assert.equal(createdResult.ok, true);
+  assert.equal(store.get('AFTER-REJECT').workflow, 'inbox');
+
+  // The tail is still usable after the rejection (and after a second failure).
+  await assert.rejects(store.setMeta('', 'x'), (error) => error.code === 'invalid-input');
+  assert.equal((await store.create({ code: 'AFTER-REJECT-2' })).ok, true);
+});
+
+test('concurrent partial putSettings calls merge instead of dropping a field', async () => {
+  const domain = createFakeDomain();
+  const store = createStrictStore(domain, () => T1);
+
+  const [first, second] = await Promise.all([
+    store.putSettings('/workspace/race', { branchUser: 'aa' }),
+    store.putSettings('/workspace/race', { testCommand: 'npm test' }),
+  ]);
+
+  assert.equal(first.branchUser, 'aa');
+  assert.equal(second.branchUser, 'aa');
+  const stored = domain.table('settings').get('/workspace/race');
+  assert.equal(stored.branchUser, 'aa');
+  assert.equal(stored.testCommand, 'npm test');
+});
+
+// ---------------------------------------------------------------------------
 // settings
 // ---------------------------------------------------------------------------
 
@@ -487,6 +699,9 @@ test('getSettings() returns defaults until putSettings() writes a workspace reco
   const defaults = store.getSettings('/workspace/a');
   assert.deepEqual(defaults, DEFAULT_SETTINGS);
   assert.notEqual(defaults, DEFAULT_SETTINGS, 'callers must not receive the shared default object');
+  // Domain v2 settings defaults.
+  assert.equal(defaults.platformBaseUrl, 'https://ecard.htwisdom.cn');
+  assert.equal(defaults.writebackStatus, false);
 
   const saved = await store.putSettings('/workspace/a', {
     gitlabProjectPath: 'group/project',
@@ -495,6 +710,8 @@ test('getSettings() returns defaults until putSettings() writes a workspace reco
   assert.equal(saved.gitlabProjectPath, 'group/project');
   assert.equal(saved.branchUser, 'zs');
   assert.equal(saved.commitType, 'fix');
+  assert.equal(saved.platformBaseUrl, 'https://ecard.htwisdom.cn');
+  assert.equal(saved.writebackStatus, false);
   assert.deepEqual(store.getSettings('/workspace/a'), saved);
 
   assert.deepEqual(domain.table('settings').get('/workspace/a'), saved);
@@ -504,6 +721,11 @@ test('getSettings() returns defaults until putSettings() writes a workspace reco
   assert.equal(merged.gitlabProjectPath, 'group/project', 'partial updates keep saved fields');
   assert.equal(merged.testCommand, 'npm test');
   assert.deepEqual(store.getSettings('/workspace/a'), merged);
+
+  const toggled = await store.putSettings('/workspace/a', { writebackStatus: true });
+  assert.equal(toggled.writebackStatus, true, 'the boolean platform setting is writable');
+  assert.equal(toggled.testCommand, 'npm test');
+  assert.deepEqual(store.getSettings('/workspace/a'), toggled);
 });
 
 test('getSettings() falls back to defaults when the workspace is unknown or empty', () => {
@@ -536,6 +758,10 @@ test('putSettings() reports unknown-workspace and invalid-settings as structured
   await assert.rejects(store.putSettings('/workspace/a', null), expectCode('invalid-settings'));
   await assert.rejects(
     store.putSettings('/workspace/a', { branchUser: 42 }),
+    expectCode('invalid-settings'),
+  );
+  await assert.rejects(
+    store.putSettings('/workspace/a', { writebackStatus: 'no' }),
     expectCode('invalid-settings'),
   );
   await assert.rejects(

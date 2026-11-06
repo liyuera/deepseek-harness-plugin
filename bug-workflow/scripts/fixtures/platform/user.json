@@ -1,0 +1,35 @@
+{
+  "user": {
+    "id": 10086,
+    "code": "liyu",
+    "account": "liyu",
+    "name": "李昱",
+    "avatar": null,
+    "level": 1,
+    "mainDeptId": 6132
+  },
+  "roles": ["team-admin", "team-member"],
+  "depts": [
+    {
+      "deptId": 6132,
+      "deptCode": "D6132",
+      "deptName": "研发中心",
+      "fullName": "星瞰河山/研发中心",
+      "regionCode": "330100",
+      "regionLevel": 3,
+      "regionName": "杭州市",
+      "deptCategory": "001"
+    }
+  ],
+  "appInfos": [],
+  "detail": {
+    "user_id": "10086",
+    "account": "liyu",
+    "tenant_id": "1",
+    "client_id": "ht-team",
+    "oauth_id": "oauth-10086",
+    "type": "employee",
+    "Menu-Classify": "team",
+    "Current-Dept": "6132"
+  }
+}
