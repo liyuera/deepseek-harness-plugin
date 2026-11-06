@@ -16,7 +16,8 @@
     "locale/*.json",
     "icon.svg",
     "src",
-    "test"
+    "test",
+    "scripts"
   ],
   "peerDependencies": {
     "@deepseek-ai/dsh-storage-domain": "*",
