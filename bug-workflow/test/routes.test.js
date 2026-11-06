@@ -175,8 +175,17 @@ function createFakeStore(options = {}) {
         throw storeError('invalid-settings', 'settings 必须是普通对象');
       }
       for (const field of Object.keys(DEFAULT_SETTINGS)) {
-        if (input[field] !== undefined && typeof input[field] !== 'string') {
-          throw storeError('invalid-settings', `settings.${field} 必须是字符串`);
+        if (input[field] === undefined) continue;
+        // Domain v2 adds the boolean `writebackStatus`; every other declared
+        // field is a string. Mirrors the store's declared-type derivation.
+        const expected = DEFAULT_SETTINGS[field] === true || DEFAULT_SETTINGS[field] === false
+          ? 'boolean'
+          : 'string';
+        if (typeof input[field] !== expected) {
+          throw storeError(
+            'invalid-settings',
+            `settings.${field} 必须是${expected === 'boolean' ? '布尔值' : '字符串'}`,
+          );
         }
       }
       const next = { ...DEFAULT_SETTINGS, ...(settingsByCwd.get(cwd) ?? {}), ...input };
