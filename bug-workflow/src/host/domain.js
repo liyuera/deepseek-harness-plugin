@@ -183,16 +183,11 @@ export function openDomain(ctx) {
       domainFailure('storage-service', 'ctx.storageDomain service unavailable'),
     );
   }
-  if (ctx === null || typeof ctx !== 'object') {
-    return Promise.reject(
-      domainFailure('storage-service', 'openDomain(ctx) requires the storage child context'),
-    );
-  }
 
   const cached = openStates.get(ctx);
   if (cached !== undefined && cached.pending !== undefined) return cached.pending;
 
-  const state = { pending: undefined, openedAt: undefined, closed: false };
+  const state = { pending: undefined };
   openStates.set(ctx, state);
 
   // `pending` stays assigned on failure, so the rejection is cached and every
@@ -214,9 +209,9 @@ export function openDomain(ctx) {
       );
     }
 
-    state.openedAt = Date.now();
+    const openedAt = Date.now();
     domainContexts.set(domain, ctx);
-    return { domain, openedAt: state.openedAt };
+    return { domain, openedAt };
   })();
 
   return state.pending;
@@ -236,9 +231,6 @@ export async function closeDomain(handle) {
   closedDomains.add(domain);
 
   const context = domainContexts.get(domain);
-  const state = context === undefined ? undefined : openStates.get(context);
-  if (state?.closed === true) return;
-  if (state !== undefined) state.closed = true;
 
   try {
     if (typeof domain.close === 'function') await domain.close();

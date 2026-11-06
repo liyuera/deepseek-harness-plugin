@@ -11,16 +11,25 @@
  *
  * Failure policy: `webServer` is the only hard dependency, so the plugin still
  * loads in a profile without storage. The domain is opened inside
- * `ctx.inject(['storageDomain'], ...)`; if the service is missing or the open
- * fails, `/health` answers HTTP 5xx with `{ ok: false, stage, error }` and the
- * failure is cached (domain.js) instead of being retried per request.
+ * `ctx.inject(['storageDomain'], ...)`; if the service never becomes available,
+ * `/health` answers HTTP 500 with `{ ok: false, stage: 'storage-service' }`.
+ * An open failure is cached (domain.js) instead of retried per request.
  */
-import { closeDomain, openDomain } from './src/host/domain.js';
+import { closeDomain, openDomain, settingsSchema, ticketSchema } from './src/host/domain.js';
 import { createStore } from './src/host/store.js';
 
 export const inject = ['webServer'];
 
 const HEALTH_ROUTE = '/bug-workflow/api/health';
+
+/**
+ * Write-boundary validators handed to the store. These are the domain's real
+ * zod schemas (the same `parse` the storage layer runs on open), so the store
+ * cannot persist a state-machine output that would fail loud on the next
+ * reload and make the domain/board unopenable.
+ */
+const validateTicket = (ticket) => ticketSchema.parse(ticket);
+const validateSettings = (settings) => settingsSchema.parse(settings);
 
 export function apply(ctx) {
   // Shared state observed by the health route. `status` is one of
@@ -30,7 +39,6 @@ export function apply(ctx) {
     stage: 'storage-service',
     error: undefined,
     openedAt: undefined,
-    domain: undefined,
     store: undefined,
   };
 
@@ -41,20 +49,28 @@ export function apply(ctx) {
     health.stage = 'open-domain';
 
     openPending = (async () => {
+      let handle;
       try {
-        const handle = await openDomain(storageCtx);
+        handle = await openDomain(storageCtx);
         health.openedAt = handle.openedAt;
-        health.domain = handle.domain;
 
         health.stage = 'create-store';
-        health.store = createStore(handle.domain);
+        health.store = createStore(handle.domain, undefined, {
+          validateTicket,
+          validateSettings,
+        });
 
         health.status = 'open';
         health.stage = undefined;
         return handle;
       } catch (error) {
+        // Release a domain that opened but could not be attached to a store;
+        // otherwise the facility would report `already-open` on every reload.
+        if (handle !== undefined) await closeDomain(handle).catch(() => {});
         health.status = 'failed';
-        health.stage = typeof error?.stage === 'string' ? error.stage : 'open-domain';
+        // Keep the pre-set stage for errors that do not tag themselves
+        // (e.g. the TypeError createStore throws for a bad domain).
+        health.stage = typeof error?.stage === 'string' ? error.stage : health.stage;
         health.error = errorMessage(error);
         logFailure(storageCtx, error);
         throw error;
@@ -119,13 +135,31 @@ function handleHealth(health, req, res) {
     return;
   }
 
-  const opening = health.status !== 'failed';
-  sendJsonSafe(res, health.status === 'failed' ? 500 : 503, {
+  if (health.status === 'failed') {
+    sendJsonSafe(res, 500, {
+      ok: false,
+      stage: health.stage,
+      error: health.error ?? 'storage domain 打开失败',
+    });
+    return;
+  }
+
+  // `waiting-for-service` means `ctx.inject(['storageDomain'], ...)` never ran:
+  // the profile has no storage service, so this is a permanent 500, not a
+  // transient "still starting" answer.
+  if (health.status === 'waiting-for-service') {
+    sendJsonSafe(res, 500, {
+      ok: false,
+      stage: 'storage-service',
+      error: 'ctx.storageDomain service unavailable',
+    });
+    return;
+  }
+
+  sendJsonSafe(res, 503, {
     ok: false,
-    stage: health.stage,
-    error: health.error ?? (opening
-      ? 'storage domain 仍在打开'
-      : 'ctx.storageDomain service unavailable'),
+    stage: 'open-domain',
+    error: 'storage domain 仍在打开',
   });
 }
 
