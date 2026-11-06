@@ -12,15 +12,27 @@
  * the final `hello.txt`). The fixture is created by
  * `bug-workflow/scripts/make-temp-repo.mjs`.
  *
- * The route is a spike harness, not the product endpoint: it exists to capture
- * the live contract (services, event shape, parent acquisition, reload behavior)
- * in `docs/superpowers/spikes/2026-11-06-p0-findings.md`.
+ * P0 spike E: prove that a domain opened through the storage service survives a
+ * host-half reload. `apply` opens the `bug_workflow_spike` domain once the
+ * `storageDomain` service exists and this half registers
+ *
+ *   GET /bug-workflow/spike/state?action=write|read[&value=<string>]
+ *
+ * `write` stores `{ id: 'spike', at: Date.now(), value? }` and returns the
+ * record; `read` returns the stored record or `{ empty: true }`. Every failure
+ * is answered as `{ ok: false, error }` with HTTP 500 and never thrown. The
+ * domain handle is closed by this plugin's `ctx.effect` disposer.
+ *
+ * Both routes are spike harnesses, not product endpoints: they exist to capture
+ * the live contract (services, event shape, parent acquisition, storage
+ * persistence, reload behavior) in
+ * `docs/superpowers/spikes/2026-11-06-p0-findings.md`.
  */
 import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import { dirname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
@@ -35,6 +47,52 @@ const START_TIMEOUT_MS = 120_000;
 const RESULT_TIMEOUT_MS = 240_000;
 const DISPOSE_TIMEOUT_MS = 10_000;
 const RESULT_TEXT_LIMIT = 16_000;
+
+// Spike E: the storage-domain facility rejects names outside UNIT_NAME_RE
+// (`/^[a-z][a-z0-9_]*$/`), so the spike name uses underscores, not hyphens.
+const SPIKE_STATE_ROUTE = '/bug-workflow/spike/state';
+const SPIKE_DOMAIN_NAME = 'bug_workflow_spike';
+const SPIKE_DOMAIN_VERSION = 1;
+const SPIKE_TABLE = 'state';
+const SPIKE_RECORD_KEY = 'spike';
+const DOMAIN_PACKAGE = '@deepseek-ai/dsh-storage-domain';
+// A reloaded fiber can briefly race its predecessor's async `domain.close()`;
+// the facility keeps the name reserved (`already-open`) until teardown ends.
+const OPEN_ATTEMPTS = 20;
+const OPEN_RETRY_MS = 100;
+
+/**
+ * Record schema for the spike table.
+ *
+ * The domain contract asks for a zod schema (`table().parse` runs on every
+ * stored record at open). This bundle is linked without its own `node_modules`
+ * and has no build step, so it validates the exact record shape it writes with
+ * a minimal `parse`-shaped object; the findings record the real zod contract.
+ */
+const SPIKE_RECORD_SCHEMA = {
+  parse(value) {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error('spike record must be a JSON object');
+    }
+    if (value.id !== SPIKE_RECORD_KEY) {
+      throw new Error(`spike record.id must be '${SPIKE_RECORD_KEY}'`);
+    }
+    if (!Number.isFinite(value.at)) {
+      throw new Error('spike record.at must be a finite number');
+    }
+    if (value.value !== undefined && typeof value.value !== 'string') {
+      throw new Error('spike record.value must be a string when present');
+    }
+    return value;
+  },
+};
+
+/** Equivalent spec used when the host package cannot be imported — see `loadDomainHelpers`. */
+const SPIKE_DOMAIN_SPEC = {
+  name: SPIKE_DOMAIN_NAME,
+  version: SPIKE_DOMAIN_VERSION,
+  tables: { [SPIKE_TABLE]: { valueSchema: SPIKE_RECORD_SCHEMA } },
+};
 
 /** Last Agent announced by `agent/created`; only a fallback — see `resolveParent`. */
 let lastCreatedAgent;
@@ -62,6 +120,59 @@ export function apply(ctx) {
         handler: (req, res) => handleSpikeSubagent(ctx, req, res),
       }),
     'bug-workflow: spike D subagent route',
+  );
+
+  // Spike E state. `pending` stays undefined until `storageDomain` is mounted;
+  // `ctx.inject` starts the open exactly when the service becomes available,
+  // without making it a hard dependency of the existing spike D route.
+  const spikeState = {
+    status: 'waiting-for-service',
+    specSource: undefined,
+    domainName: SPIKE_DOMAIN_NAME,
+    table: SPIKE_TABLE,
+    openError: undefined,
+    openedAt: undefined,
+    pending: undefined,
+  };
+
+  ctx.inject(['storageDomain'], (storageCtx) => {
+    spikeState.status = 'opening';
+    const pending = openSpikeDomain(storageCtx.storageDomain, spikeState);
+    spikeState.pending = pending;
+    pending.then(
+      () => {
+        spikeState.status = 'open';
+        spikeState.openedAt = Date.now();
+      },
+      (error) => {
+        spikeState.status = 'failed';
+        spikeState.openError = errorMessage(error);
+      },
+    );
+    // No request may have observed the open yet; keep its rejection handled.
+    pending.catch(() => {});
+
+    // The caller owns the handle: close it when this fiber is disposed (plugin
+    // unload/reload). The disposer awaits the open so a late success is closed
+    // too; `close()` is idempotent, so the facility's own closeAll fallback is
+    // harmless. Both the route and this effect disappear with the same fiber.
+    storageCtx.effect(
+      () => async () => {
+        const domain = await pending.catch(() => undefined);
+        if (domain !== undefined) await domain.close().catch(() => {});
+      },
+      'bug-workflow: spike E domain lifetime',
+    );
+  });
+
+  ctx.effect(
+    () =>
+      ctx.webServer.register({
+        kind: 'exact',
+        path: SPIKE_STATE_ROUTE,
+        handler: (req, res) => handleSpikeState(spikeState, req, res),
+      }),
+    'bug-workflow: spike E storage route',
   );
 }
 
@@ -178,6 +289,213 @@ async function handleSpikeSubagent(ctx, req, res) {
       elapsedMs: Date.now() - startedAt,
     });
   }
+}
+
+/**
+ * Handle one spike E storage read/write. Every failure becomes
+ * `{ ok: false, error, stage }` with HTTP 500 — nothing escapes the handler.
+ * @param spikeState - per-apply open state (see `apply`).
+ * @param req - inbound HTTP request.
+ * @param res - response writer.
+ */
+async function handleSpikeState(spikeState, req, res) {
+  const startedAt = Date.now();
+  let stage = 'validate';
+
+  try {
+    if (req.method !== 'GET') {
+      sendJsonSafe(res, 500, {
+        ok: false,
+        error: 'method not allowed; use GET',
+        stage,
+        route: SPIKE_STATE_ROUTE,
+      });
+      return;
+    }
+
+    const url = new URL(req.url ?? SPIKE_STATE_ROUTE, 'http://127.0.0.1');
+    const action = url.searchParams.get('action');
+    if (action !== 'write' && action !== 'read') {
+      sendJsonSafe(res, 500, {
+        ok: false,
+        error: `action must be 'write' or 'read', got ${JSON.stringify(action)}`,
+        stage,
+        route: SPIKE_STATE_ROUTE,
+      });
+      return;
+    }
+
+    stage = 'await-domain';
+    if (spikeState.pending === undefined) {
+      sendJsonSafe(res, 500, {
+        ok: false,
+        error: 'ctx.storageDomain service unavailable',
+        stage: 'storage-service',
+        domain: SPIKE_DOMAIN_NAME,
+        status: spikeState.status,
+      });
+      return;
+    }
+
+    let domain;
+    try {
+      domain = await spikeState.pending;
+    } catch (error) {
+      sendJsonSafe(res, 500, {
+        ok: false,
+        error: `storage domain open failed: ${errorMessage(error)}`,
+        stage: 'open-domain',
+        code: typeof error?.code === 'string' ? error.code : undefined,
+        domain: spikeState.domainName,
+        specSource: spikeState.specSource,
+      });
+      return;
+    }
+
+    const table = domain.table(SPIKE_TABLE);
+    const base = {
+      ok: true,
+      action,
+      domain: domain.name,
+      domainOpenedAt: spikeState.openedAt,
+      domainOpenedAtIso: spikeState.openedAt === undefined ? undefined : new Date(spikeState.openedAt).toISOString(),
+      table: SPIKE_TABLE,
+      key: SPIKE_RECORD_KEY,
+      specSource: spikeState.specSource,
+    };
+
+    if (action === 'write') {
+      stage = 'write';
+      const record = { id: SPIKE_RECORD_KEY, at: Date.now() };
+      const value = url.searchParams.get('value');
+      if (value !== null) record.value = value;
+      await table.put(SPIKE_RECORD_KEY, record);
+      sendJsonSafe(res, 200, {
+        ...base,
+        record,
+        atIso: new Date(record.at).toISOString(),
+        elapsedMs: Date.now() - startedAt,
+      });
+      return;
+    }
+
+    stage = 'read';
+    const record = table.get(SPIKE_RECORD_KEY);
+    const payload = {
+      ...base,
+      record: record ?? null,
+      empty: record === undefined,
+      elapsedMs: Date.now() - startedAt,
+    };
+    if (record !== undefined) payload.atIso = new Date(record.at).toISOString();
+    sendJsonSafe(res, 200, payload);
+  } catch (error) {
+    sendJsonSafe(res, 500, {
+      ok: false,
+      error: errorMessage(error),
+      stage,
+      code: typeof error?.code === 'string' ? error.code : undefined,
+      domain: spikeState.domainName,
+      specSource: spikeState.specSource,
+      elapsedMs: Date.now() - startedAt,
+    });
+  }
+}
+
+/**
+ * Load the domain declaration helpers from the copy the running host mounted.
+ *
+ * This bundle is a linked directory without its own `node_modules`, so a bare
+ * `@deepseek-ai/dsh-storage-domain` import is not resolvable from its real path
+ * on this installation. Prefer the exact package the desktop host loaded from
+ * `app.asar` (Electron's `process.resourcesPath`), then try the bare specifier
+ * for installed/bundled layouts, and fall back to the equivalent inline spec so
+ * the spike route still answers instead of failing to load the plugin.
+ * @returns `{ module, source }` or `undefined` when no copy could be imported.
+ */
+async function loadDomainHelpers() {
+  const candidates = [];
+  const resources = typeof process.resourcesPath === 'string' ? process.resourcesPath : undefined;
+  if (resources !== undefined) {
+    candidates.push({
+      source: 'app.asar dsh/node_modules/@deepseek-ai/dsh-storage-domain',
+      specifier: pathToFileURL(
+        join(
+          resources,
+          'app.asar',
+          'dsh',
+          'node_modules',
+          '@deepseek-ai',
+          'dsh-storage-domain',
+          'lib',
+          'index.js',
+        ),
+      ).href,
+    });
+  }
+  candidates.push({ source: `bare ${DOMAIN_PACKAGE}`, specifier: DOMAIN_PACKAGE });
+
+  for (const candidate of candidates) {
+    try {
+      const module = await import(candidate.specifier);
+      if (typeof module.defineDomain === 'function' && typeof module.domainTable === 'function') {
+        return { module, source: candidate.source };
+      }
+    } catch {
+      // Try the next resolution route.
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Declare and open the spike domain. `defineDomain`/`domainTable` come from the
+ * host package when importable; the inline spec is shape-identical otherwise.
+ * @param facility - mounted `ctx.storageDomain` facility.
+ * @param spikeState - receives the resolved spec source for the route response.
+ */
+async function openSpikeDomain(facility, spikeState) {
+  const helpers = await loadDomainHelpers();
+  spikeState.specSource = helpers === undefined ? 'inline spec (defineDomain unavailable)' : helpers.source;
+  const spec =
+    helpers === undefined
+      ? SPIKE_DOMAIN_SPEC
+      : helpers.module.defineDomain({
+          name: SPIKE_DOMAIN_NAME,
+          version: SPIKE_DOMAIN_VERSION,
+          tables: { [SPIKE_TABLE]: helpers.module.domainTable(SPIKE_RECORD_SCHEMA) },
+        });
+  return openWithRetry(facility, spec);
+}
+
+/**
+ * Open the domain, retrying the short `already-open` window where a reloaded
+ * fiber races its predecessor's asynchronous close.
+ * @param facility - mounted `ctx.storageDomain` facility.
+ * @param spec - domain declaration.
+ */
+async function openWithRetry(facility, spec) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await facility.open(spec);
+    } catch (error) {
+      if (error?.code !== 'already-open' || attempt >= OPEN_ATTEMPTS) throw error;
+      await delay(OPEN_RETRY_MS);
+    }
+  }
+}
+
+/** A response writer that also survives a client that already disconnected. */
+function sendJsonSafe(res, status, payload) {
+  try {
+    sendJson(res, status, payload);
+  } catch {
+    // Nothing is left to report to; the handler still must not throw.
+  }
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /** Fail fast with an actionable message when the spike fixture was never built. */
