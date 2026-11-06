@@ -24,6 +24,11 @@
  *     The host binds settings to the session's workspace cwd, so when the
  *     snapshot reports `workspace.configured === false` the panel still opens
  *     read-only with the save button disabled and an explicit hint.
+ *   - the same panel carries a 「平台连接」 section: the platform base URL plus a
+ *     write-only token field. The token is POSTed to
+ *     `/bug-workflow/api/platform-token` (`{sessionId, token}`) and cleared with
+ *     `{token:null}`; the status dot follows `snapshot.platform.tokenPresent`,
+ *     and the value is never rendered back (the input is cleared on success).
  *   - `PanelErrorBoundary` keeps a render failure from blanking the whole slot.
  *
  * The client never re-implements the state machine: action buttons are derived
@@ -47,6 +52,7 @@ window.__ModuleLoader__.load({
       snapshot: '/bug-workflow/api/snapshot',
       action: '/bug-workflow/api/action',
       settings: '/bug-workflow/api/settings',
+      platformToken: '/bug-workflow/api/platform-token',
     });
 
     /** Poll cadence in milliseconds (P1 contract: every 3 s). */
@@ -298,8 +304,14 @@ window.__ModuleLoader__.load({
     // Workspace settings (the host stores them per workspace cwd)
     // ---------------------------------------------------------------------
 
-    /** Settings contract defaults, mirrored from `src/host/store.js`. */
+    /**
+     * Settings contract defaults. The host store owns the nine P1 fields;
+     * `platformBaseUrl` is carried in the same payload and joins the host
+     * schema with the P2 sync task, so the panel already validates and submits
+     * it today.
+     */
     const SETTINGS_DEFAULTS = Object.freeze({
+      platformBaseUrl: 'https://ecard.htwisdom.cn',
       platformProjectCode: '',
       gitlabProjectPath: '',
       branchUser: 'ly',
@@ -315,7 +327,8 @@ window.__ModuleLoader__.load({
     const SETTINGS_KEYS = Object.freeze(Object.keys(SETTINGS_DEFAULTS));
 
     /**
-     * The nine settings fields, Chinese label + one-line help. `required` marks
+     * The nine GitLab/tooling settings fields, Chinese label + one-line help.
+     * `required` marks
      * the fields the board refuses to submit empty (the host would still accept
      * them, but P2 uses them for branch/commit generation).
      */
@@ -378,6 +391,18 @@ window.__ModuleLoader__.load({
       },
     ]);
 
+    /**
+     * The platform base URL row. Rendered inside the 「平台连接」 section rather
+     * than among the GitLab rows, but still part of the settings payload.
+     */
+    const PLATFORM_BASE_URL_FIELD = Object.freeze({
+      key: 'platformBaseUrl',
+      label: '平台地址',
+      hint: '平台根地址，必须是 http(s) URL，且不能内嵌账号密码',
+      placeholder: 'https://ecard.htwisdom.cn',
+      required: true,
+    });
+
     /** `group/project`, two non-empty segments without whitespace. */
     const GITLAB_PROJECT_PATH_RE = /^[^/\s]+\/[^/\s]+$/;
 
@@ -385,6 +410,11 @@ window.__ModuleLoader__.load({
     const SETTINGS_UNBOUND_HINT = '当前会话未绑定工作区，设置无法保存：请先在会话工作区打开「Bug 看板」后再保存。';
     const SETTINGS_LOADING_HINT = '正在读取工作区信息，读取完成前无法保存设置。';
     const SETTINGS_NO_SESSION_HINT = '缺少会话上下文，无法保存设置。';
+
+    const PLATFORM_SECTION_HINT = '用于从平台同步「我的工单」。token 只写入宿主凭据服务，看板与接口都不会回显。';
+    const PLATFORM_TOKEN_HINT = '从浏览器 localStorage 的 `access-token` 复制';
+    const PLATFORM_TOKEN_PRESENT = 'token 已配置';
+    const PLATFORM_TOKEN_ABSENT = 'token 未配置';
 
     // ---------------------------------------------------------------------
     // Theme tokens (all colors come from --dsw-alias-*; fallbacks are neutral)
@@ -627,12 +657,18 @@ window.__ModuleLoader__.load({
     function normalizeSnapshot(payload) {
       const value = payload && typeof payload === 'object' ? payload : {};
       const workspace = value.workspace && typeof value.workspace === 'object' ? value.workspace : {};
+      const platform = value.platform && typeof value.platform === 'object' ? value.platform : {};
       return {
         workspace: {
           path: typeof workspace.path === 'string' ? workspace.path : null,
           configured: workspace.configured === true,
         },
         settings: value.settings && typeof value.settings === 'object' ? value.settings : {},
+        platform: {
+          tokenPresent: platform.tokenPresent === true,
+          lastSyncAt: typeof platform.lastSyncAt === 'string' ? platform.lastSyncAt : null,
+          lastSyncError: typeof platform.lastSyncError === 'string' ? platform.lastSyncError : null,
+        },
         tickets: Array.isArray(value.tickets)
           ? value.tickets.filter((ticket) => ticket && typeof ticket === 'object' && typeof ticket.code === 'string')
           : [],
@@ -641,7 +677,7 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Normalize a settings record to the nine contract fields. Values are kept
+     * Normalize a settings record to the contract fields. Values are kept
      * verbatim (trimming happens only on save); a missing field takes its
      * documented default, an empty string stays empty so required-field
      * validation can report it.
@@ -685,11 +721,14 @@ window.__ModuleLoader__.load({
     /**
      * Field errors for a settings draft. Empty `gitlabProjectPath` means "not
      * configured" and is valid; `branchUser` and `commitType` must not be empty;
-     * command/preview fields may be empty.
+     * command/preview fields may be empty. `platformBaseUrl` must be an
+     * http(s) URL without embedded credentials.
      */
     function validateSettings(draft) {
       const value = draft !== null && typeof draft === 'object' ? draft : {};
       const errors = {};
+      const platformBaseUrlError = validatePlatformBaseUrl(value.platformBaseUrl);
+      if (platformBaseUrlError !== null) errors.platformBaseUrl = platformBaseUrlError;
       const projectPath = typeof value.gitlabProjectPath === 'string'
         ? value.gitlabProjectPath.trim()
         : '';
@@ -703,6 +742,29 @@ window.__ModuleLoader__.load({
         errors.commitType = '提交信息前缀不能为空';
       }
       return errors;
+    }
+
+    /**
+     * `platformBaseUrl` rule shared by the panel and the save path. Returns the
+     * error text, or `null` when valid. Localhost http URLs are allowed (the
+     * P2 mock platform runs there); embedded credentials are never allowed.
+     */
+    function validatePlatformBaseUrl(value) {
+      const text = typeof value === 'string' ? value.trim() : '';
+      if (text === '') return '平台地址不能为空';
+      let url;
+      try {
+        url = new URL(text);
+      } catch {
+        return '平台地址必须是合法的 http(s) URL';
+      }
+      if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+        return '平台地址只支持 http(s)';
+      }
+      if (url.username !== '' || url.password !== '') {
+        return '平台地址不能内嵌账号密码';
+      }
+      return null;
     }
 
     function errorCodeText(error) {
@@ -1259,6 +1321,155 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 「平台连接」 section: platform base URL + write-only token control.
+     *
+     * The token input is `type=password`, starts empty on every open, and is
+     * cleared by the board after a successful save; the status dot follows the
+     * polled `snapshot.platform.tokenPresent`, never a client copy of the value.
+     * Save/clear are disabled while the session has no bound workspace (the
+     * host token route is profile-global, but the panel keeps the same gate as
+     * every other write) and while another request is in flight.
+     */
+    function PlatformConnectionSection({
+      draft,
+      errors,
+      disabled,
+      canSave,
+      tokenDraft,
+      tokenBusy,
+      tokenPresent,
+      baseUrlInputRef,
+      onFieldChange,
+      onTokenChange,
+      onSaveToken,
+      onClearToken,
+    }) {
+      const tokenLocked = disabled === true || tokenBusy === true || canSave !== true;
+      const saveTokenDisabled = tokenLocked || tokenDraft.trim() === '';
+      const clearTokenDisabled = tokenLocked || tokenPresent !== true;
+      const gateHint = canSave === true ? PLATFORM_TOKEN_HINT : SETTINGS_UNBOUND_HINT;
+      const dotColor = tokenPresent === true ? C.success : C.textTertiary;
+      const statusText = tokenPresent === true ? PLATFORM_TOKEN_PRESENT : PLATFORM_TOKEN_ABSENT;
+
+      return h('section', {
+        'data-bug-platform-connection': 'section',
+        style: {
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 8,
+          paddingBottom: 10,
+          borderBottom: `0.5px solid ${C.border}`,
+          minWidth: 0,
+        },
+      },
+        h('div', {
+          style: { display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap', minWidth: 0 },
+        },
+          h('h3', {
+            style: {
+              margin: 0,
+              fontSize: 12.5,
+              fontWeight: 600,
+              lineHeight: '18px',
+              color: C.text,
+            },
+          }, '平台连接'),
+          h('span', {
+            style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary, minWidth: 0 },
+          }, 'token 仅保存在宿主凭据服务')),
+        h('div', {
+          style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary, wordBreak: 'break-word' },
+        }, PLATFORM_SECTION_HINT),
+        h(SettingsField, {
+          field: PLATFORM_BASE_URL_FIELD,
+          value: draft.platformBaseUrl,
+          error: errors.platformBaseUrl,
+          disabled: disabled === true,
+          inputRef: baseUrlInputRef,
+          onChange: onFieldChange,
+        }),
+        h('div', {
+          style: { display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 },
+        },
+          h('div', {
+            style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', minWidth: 0 },
+          },
+            h('span', {
+              'aria-hidden': 'true',
+              style: {
+                width: 7,
+                height: 7,
+                borderRadius: '50%',
+                background: dotColor,
+                flex: '0 0 auto',
+              },
+            }),
+            h('span', {
+              role: 'status',
+              style: {
+                fontSize: 11,
+                lineHeight: '16px',
+                color: tokenPresent === true ? C.success : C.textTertiary,
+              },
+            }, statusText),
+            tokenBusy === true
+              ? h('span', {
+                style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary },
+              }, '处理中…')
+              : null),
+          h('input', {
+            type: 'password',
+            value: tokenDraft,
+            onChange: (event) => onTokenChange(event.target.value),
+            placeholder: '粘贴平台 access-token',
+            disabled: tokenLocked,
+            'aria-label': '平台 token',
+            autoComplete: 'new-password',
+            spellCheck: false,
+            style: {
+              font: 'inherit',
+              fontSize: 12,
+              lineHeight: '18px',
+              padding: '4px 8px',
+              borderRadius: 6,
+              border: `0.5px solid ${C.borderStrong}`,
+              background: 'transparent',
+              color: C.text,
+              width: '100%',
+              minWidth: 0,
+              boxSizing: 'border-box',
+              opacity: tokenLocked ? 0.55 : 1,
+            },
+          }),
+          h('div', {
+            style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary, wordBreak: 'break-word' },
+          }, gateHint),
+          h('div', {
+            style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', minWidth: 0 },
+          },
+            h('button', {
+              type: 'button',
+              onClick: onSaveToken,
+              disabled: saveTokenDisabled,
+              'aria-busy': tokenBusy === true || undefined,
+              title: canSave !== true
+                ? SETTINGS_UNBOUND_HINT
+                : (tokenDraft.trim() === '' ? '请先粘贴 token' : '保存 token'),
+              style: primaryButtonStyle(saveTokenDisabled),
+            }, tokenBusy === true ? '保存中…' : '保存 token'),
+            h('button', {
+              type: 'button',
+              onClick: onClearToken,
+              disabled: clearTokenDisabled,
+              title: tokenPresent === true ? '清除已保存的 token' : '当前没有已保存的 token',
+              style: smallButtonStyle(clearTokenDisabled),
+            }, '清除'),
+            h('span', {
+              style: { marginLeft: 'auto', fontSize: 11, lineHeight: '16px', color: C.textTertiary },
+            }, '不会回显 token'))));
+    }
+
+    /**
      * In-panel settings overlay (same board view, not a new tab).
      *
      * Opens read-only when the session has no bound workspace: the hint names
@@ -1275,7 +1486,13 @@ window.__ModuleLoader__.load({
       sessionMissing,
       workspaceKnown,
       workspacePath,
+      tokenDraft,
+      tokenBusy,
+      tokenPresent,
       onChange,
+      onTokenChange,
+      onSaveToken,
+      onClearToken,
       onSave,
       onCancel,
     }) {
@@ -1430,15 +1647,29 @@ window.__ModuleLoader__.load({
             gap: 10,
             boxSizing: 'border-box',
           },
-        }, SETTINGS_FIELDS.map((field, index) => h(SettingsField, {
-          key: field.key,
-          field,
-          value: draft[field.key],
-          error: errors[field.key],
-          disabled: saving === true,
-          inputRef: index === 0 ? firstInputRef : undefined,
-          onChange,
-        }))),
+        },
+          h(PlatformConnectionSection, {
+            draft,
+            errors,
+            disabled: saving === true,
+            canSave,
+            tokenDraft,
+            tokenBusy,
+            tokenPresent,
+            baseUrlInputRef: firstInputRef,
+            onFieldChange: onChange,
+            onTokenChange,
+            onSaveToken,
+            onClearToken,
+          }),
+          SETTINGS_FIELDS.map((field) => h(SettingsField, {
+            key: field.key,
+            field,
+            value: draft[field.key],
+            error: errors[field.key],
+            disabled: saving === true,
+            onChange,
+          }))),
         h('div', {
           style: {
             flex: '0 0 auto',
@@ -2142,10 +2373,13 @@ window.__ModuleLoader__.load({
       const [settingsDraft, setSettingsDraft] = React.useState(() => normalizeSettings(null));
       const [settingsErrors, setSettingsErrors] = React.useState({});
       const [settingsSaving, setSettingsSaving] = React.useState(false);
+      const [tokenDraft, setTokenDraft] = React.useState('');
+      const [tokenBusy, setTokenBusy] = React.useState(false);
       const busyRef = React.useRef(false);
       const mutationControllerRef = React.useRef(null);
       const settingsButtonRef = React.useRef(null);
       const settingsSavingRef = React.useRef(false);
+      const tokenBusyRef = React.useRef(false);
       const settingsTouchedRef = React.useRef(false);
       const settingsDraftRef = React.useRef(settingsDraft);
       settingsDraftRef.current = settingsDraft;
@@ -2153,6 +2387,7 @@ window.__ModuleLoader__.load({
       const snapshot = polling.data;
       const tickets = snapshot === null ? [] : snapshot.tickets;
       const configured = snapshot !== null && snapshot.workspace.configured === true;
+      const tokenPresent = snapshot !== null && snapshot.platform.tokenPresent === true;
       const canWrite = sessionId !== null && configured;
       const settingsBaseline = React.useMemo(() => settingsFromSnapshot(snapshot), [snapshot]);
       const settingsDirty = settingsOpen === true && !settingsEqual(settingsDraft, settingsBaseline);
@@ -2227,21 +2462,24 @@ window.__ModuleLoader__.load({
       }, []);
 
       const closeSettings = React.useCallback(() => {
-        if (settingsSavingRef.current) return;
+        if (settingsSavingRef.current || tokenBusyRef.current) return;
         settingsTouchedRef.current = false;
         setSettingsOpen(false);
         setSettingsErrors({});
+        // A token typed but not saved must not outlive the panel.
+        setTokenDraft('');
         focusSettingsButton();
       }, [focusSettingsButton]);
 
       const openSettings = React.useCallback(() => {
-        if (busyRef.current || settingsSavingRef.current) return;
+        if (busyRef.current || settingsSavingRef.current || tokenBusyRef.current) return;
         const initial = settingsFromSnapshot(snapshot);
         settingsDraftRef.current = initial;
         settingsTouchedRef.current = false;
         setPendingRequest(null);
         setSettingsDraft(initial);
         setSettingsErrors({});
+        setTokenDraft('');
         setSettingsOpen(true);
       }, [snapshot]);
 
@@ -2311,6 +2549,90 @@ window.__ModuleLoader__.load({
           setSettingsSaving(false);
         }
       }, [configured, focusSettingsButton, polling, postMutation, sessionId]);
+
+      /**
+       * Save the platform token. The value never enters this component's
+       * rendered output: the input is cleared on success and the status dot
+       * follows the refreshed snapshot. The request is a plain JSON POST with
+       * `Content-Type: application/json` (the host rejects anything else).
+       */
+      const savePlatformToken = React.useCallback(async () => {
+        if (tokenBusyRef.current || settingsSavingRef.current || busyRef.current) return;
+        if (sessionId === null || configured !== true) return;
+
+        const token = tokenDraft.trim();
+        if (token === '') {
+          setActionError({
+            code: 'invalid-token',
+            message: '请输入平台 token',
+            status: null,
+            stage: null,
+          });
+          return;
+        }
+
+        setActionError(null);
+        setFlash(null);
+        tokenBusyRef.current = true;
+        busyRef.current = true;
+        setTokenBusy(true);
+
+        try {
+          const result = await postMutation(API.platformToken, { sessionId, token });
+          if (result.aborted === true) return;
+
+          if (!result.ok) {
+            setActionError(toErrorView(result));
+            return;
+          }
+
+          setTokenDraft('');
+          setFlash('token 已保存');
+          try {
+            await polling.refresh();
+          } catch {
+            // The polling banner (or the next poll) reports a failed refresh.
+          }
+        } finally {
+          tokenBusyRef.current = false;
+          busyRef.current = false;
+          setTokenBusy(false);
+        }
+      }, [configured, polling, postMutation, sessionId, tokenDraft]);
+
+      /** Clear the stored platform token (`{token:null}`, never an empty string). */
+      const clearPlatformToken = React.useCallback(async () => {
+        if (tokenBusyRef.current || settingsSavingRef.current || busyRef.current) return;
+        if (sessionId === null || configured !== true) return;
+
+        setActionError(null);
+        setFlash(null);
+        tokenBusyRef.current = true;
+        busyRef.current = true;
+        setTokenBusy(true);
+
+        try {
+          const result = await postMutation(API.platformToken, { sessionId, token: null });
+          if (result.aborted === true) return;
+
+          if (!result.ok) {
+            setActionError(toErrorView(result));
+            return;
+          }
+
+          setTokenDraft('');
+          setFlash('token 已清除');
+          try {
+            await polling.refresh();
+          } catch {
+            // The polling banner (or the next poll) reports a failed refresh.
+          }
+        } finally {
+          tokenBusyRef.current = false;
+          busyRef.current = false;
+          setTokenBusy(false);
+        }
+      }, [configured, polling, postMutation, sessionId]);
 
       const executeAction = React.useCallback(async (descriptor, ticket, reason) => {
         if (!descriptor || !ticket || busyRef.current || typeof ticket.code !== 'string') return;
@@ -2709,7 +3031,13 @@ window.__ModuleLoader__.load({
               sessionMissing: sessionId === null,
               workspaceKnown: snapshot !== null,
               workspacePath: snapshot === null ? null : snapshot.workspace.path,
+              tokenDraft,
+              tokenBusy,
+              tokenPresent,
               onChange: updateSettingsField,
+              onTokenChange: setTokenDraft,
+              onSaveToken: savePlatformToken,
+              onClearToken: clearPlatformToken,
               onSave: saveSettings,
               onCancel: closeSettings,
             })

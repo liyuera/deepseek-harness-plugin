@@ -3,12 +3,13 @@
  *
  * Routes (all exact, all JSON, all same-origin/loopback only):
  *
- *   GET  /bug-workflow/api/health    -> { ok, domainOpenedAt, tickets }
- *   GET  /bug-workflow/api/snapshot  -> { ok, workspace, settings, tickets, serverTime }
- *   POST /bug-workflow/api/action    -> { ok, ticket } | { ok:false, code, message, ticket? }
- *   POST /bug-workflow/api/settings  -> { ok, settings }
+ *   GET  /bug-workflow/api/health          -> { ok, domainOpenedAt, tickets }
+ *   GET  /bug-workflow/api/snapshot        -> { ok, workspace, settings, platform, tickets, serverTime }
+ *   POST /bug-workflow/api/action          -> { ok, ticket } | { ok:false, code, message, ticket? }
+ *   POST /bug-workflow/api/settings        -> { ok, settings }
+ *   POST /bug-workflow/api/platform-token  -> { ok, tokenPresent } (token is only written, never read back)
  *
- * `createHandlers({ store, workspace, clock })` is pure over its dependencies so
+ * `createHandlers({ store, workspace, clock, tokenStore })` is pure over its dependencies so
  * the tests can drive real `IncomingMessage`-shaped fake requests. `index.js`
  * calls `registerRoutes()` once the storage domain is open, and keeps
  * `registerUnavailableRoutes()` mounted while the domain is still opening or
@@ -53,6 +54,7 @@ export const API_PATHS = Object.freeze({
   snapshot: '/bug-workflow/api/snapshot',
   action: '/bug-workflow/api/action',
   settings: '/bug-workflow/api/settings',
+  platformToken: '/bug-workflow/api/platform-token',
 });
 
 /** Request-body cap for POST routes (64 KiB). */
@@ -64,6 +66,9 @@ export const BODY_TIMEOUT_MS = 10_000;
 /** Client-visible error messages never exceed this many characters. */
 const MAX_ERROR_MESSAGE_CHARS = 300;
 
+/** 503 message for an absent/failed credential service (never mentions a token). */
+const CREDENTIALS_UNAVAILABLE_MESSAGE = '凭据服务不可用，暂时无法保存平台 token';
+
 /** A rejected action name is echoed back truncated to this many characters. */
 const MAX_ACTION_NAME_CHARS = 64;
 
@@ -73,6 +78,7 @@ const ROUTE_METHODS = Object.freeze({
   snapshot: 'GET',
   action: 'POST',
   settings: 'POST',
+  platformToken: 'POST',
 });
 
 /** Store failure code -> HTTP status. Unknown codes are protocol bugs -> 500. */
@@ -103,16 +109,19 @@ const LOOPBACK_REMOTE_ADDRESSES = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1
  * @param {object} deps
  * @param {object} deps.store `createStore()` result (or an equivalent double)
  * @param {{resolve: (sessionId: string) => {path: string|null, configured: boolean}}} deps.workspace
+ * @param {object|null} [deps.tokenStore] `createTokenStore()` result; when null
+ *   the snapshot reports `tokenPresent:false` and the token route answers 503
  * @param {() => string} [deps.clock] ISO 8601 server time for snapshots
  * @param {number|null} [deps.domainOpenedAt] domain open timestamp for health
  * @param {number} [deps.bodyTimeoutMs] POST body read deadline (default 10 s)
  * @param {((entry: {event: string, error: unknown}) => void)|null} [deps.log]
  *   optional host logger; receives full errors that are hidden from responses
- * @returns {{health: Function, snapshot: Function, action: Function, settings: Function}}
+ * @returns {{health: Function, snapshot: Function, action: Function, settings: Function, platformToken: Function}}
  */
 export function createHandlers({
   store,
   workspace,
+  tokenStore = null,
   clock = defaultClock,
   domainOpenedAt = null,
   bodyTimeoutMs = BODY_TIMEOUT_MS,
@@ -122,6 +131,14 @@ export function createHandlers({
   if (workspace === null || typeof workspace !== 'object' || typeof workspace.resolve !== 'function') {
     throw new TypeError('createHandlers() requires a workspace with resolve(sessionId)');
   }
+  if (tokenStore !== null && tokenStore !== undefined) {
+    for (const method of ['get', 'set', 'clear', 'present']) {
+      if (typeof tokenStore[method] !== 'function') {
+        throw new TypeError(`createHandlers() tokenStore.${method} must be a function`);
+      }
+    }
+  }
+  const tokenStoreSafe = tokenStore === undefined ? null : tokenStore;
   if (typeof clock !== 'function') {
     throw new TypeError('createHandlers() requires clock to be a function');
   }
@@ -171,6 +188,13 @@ export function createHandlers({
         ok: true,
         workspace: resolved,
         settings: store.getSettings(resolved.path),
+        platform: {
+          tokenPresent: await readTokenPresent(tokenStoreSafe),
+          // Task 4 owns the sync engine; keep the final snapshot shape from
+          // day one so the client never has to special-case an absent object.
+          lastSyncAt: null,
+          lastSyncError: null,
+        },
         tickets: snapshot.tickets,
         serverTime: clock(),
       });
@@ -272,11 +296,75 @@ export function createHandlers({
         throw error;
       }
     }),
+
+    /**
+     * Write or clear the platform token. The body is `{sessionId, token}`:
+     * a string stores it, `null` clears it. Nothing from the credential store
+     * is ever echoed: the response carries only `{ok, tokenPresent}`.
+     *
+     * The token is profile-global (it is not workspace-scoped), so an unbound
+     * session may still configure it; only a missing/blank sessionId is
+     * rejected, matching the action route's validation. The board still gates
+     * the UI on a bound workspace.
+     */
+    platformToken: safe(async (req, res) => {
+      if (!guard(req, res, ROUTE_METHODS.platformToken)) return;
+      if (!guardJsonContentType(req, res)) return;
+      if (!guardOrigin(req, res)) return;
+
+      const body = await readJsonBody(req, bodyTimeoutMs);
+      if (!body.ok) {
+        sendError(res, body.status, body.code, body.message);
+        if (body.destroyRequest === true) destroyRequest(req);
+        return;
+      }
+      const input = body.value;
+
+      const sessionId = normalizeSessionId(input.sessionId);
+      if (sessionId === undefined) {
+        sendError(res, 400, 'missing-session', '缺少有效的 sessionId');
+        return;
+      }
+
+      if (tokenStoreSafe === null) {
+        sendError(res, 503, 'credentials-unavailable', CREDENTIALS_UNAVAILABLE_MESSAGE);
+        return;
+      }
+
+      const clear = input.token === null;
+      if (!clear && typeof input.token !== 'string') {
+        sendError(res, 400, 'invalid-token', 'token 必须是非空字符串，或传 null 清除');
+        return;
+      }
+
+      try {
+        if (clear) {
+          await tokenStoreSafe.clear();
+          sendJsonSafe(res, 200, { ok: true, tokenPresent: false });
+          return;
+        }
+        await tokenStoreSafe.set(input.token);
+        // Deliberately optimistic: a successful write means the token is now
+        // present; reading it back is not needed (and must not leave the store).
+        sendJsonSafe(res, 200, { ok: true, tokenPresent: true });
+      } catch (error) {
+        const code = typeof error?.code === 'string' ? error.code : undefined;
+        if (code === 'invalid-token') {
+          sendError(res, 400, 'invalid-token', clipMessage(errorMessage(error)));
+          return;
+        }
+        if (code === 'credentials-unavailable') {
+          sendError(res, 503, 'credentials-unavailable', CREDENTIALS_UNAVAILABLE_MESSAGE);
+          return;
+        }
+        throw error;
+      }
+    }),
   };
 }
 
 /**
- * Register the four real routes on `ctx.webServer` and return a disposer.
+ * Register the five real routes on `ctx.webServer` and return a disposer.
  *
  * The caller must have opened the domain and built the store already. Register
  * this only after disposing `registerUnavailableRoutes()`: duplicate exact paths
@@ -284,7 +372,7 @@ export function createHandlers({
  *
  * @param {object} ctx Cordis context carrying `webServer`
  * @param {object} deps same deps as {@link createHandlers}
- * @returns {() => void} idempotent disposer removing all four routes
+ * @returns {() => void} idempotent disposer removing all five routes
  */
 export function registerRoutes(ctx, deps) {
   const webServer = getWebServer(ctx);
@@ -299,12 +387,12 @@ export function registerRoutes(ctx, deps) {
  *
  * Health answers the Task 2 contract: 500 `{stage:'storage-service'}` when the
  * inject never ran, 503 while opening, 500 `{stage,error}` after a failure.
- * The three data routes answer 503 so a client polling the board sees a
+ * The four data routes answer 503 so a client polling the board sees a
  * retryable "storage unavailable" state instead of a missing route.
  *
  * @param {object} ctx Cordis context carrying `webServer`
  * @param {{status?: string, stage?: string, error?: string}} [health] shared health state
- * @returns {() => void} idempotent disposer removing all four routes
+ * @returns {() => void} idempotent disposer removing all five routes
  */
 export function registerUnavailableRoutes(ctx, health = {}) {
   const webServer = getWebServer(ctx);
@@ -321,6 +409,7 @@ export function registerUnavailableRoutes(ctx, health = {}) {
     snapshot: unavailableHandler(ROUTE_METHODS.snapshot, health),
     action: unavailableHandler(ROUTE_METHODS.action, health),
     settings: unavailableHandler(ROUTE_METHODS.settings, health),
+    platformToken: unavailableHandler(ROUTE_METHODS.platformToken, health),
   };
   return registerHandlers(webServer, handlers);
 }
@@ -444,6 +533,20 @@ function checkOrigin(req) {
 
 function sendError(res, status, code, message) {
   sendJsonSafe(res, status, { ok: false, code, message });
+}
+
+/**
+ * Snapshot flag only: ask the token store whether a credential exists. A
+ * missing or failing credentials service must not take the whole board down,
+ * so any failure reads as `false`.
+ */
+async function readTokenPresent(tokenStore) {
+  if (tokenStore === null || tokenStore === undefined) return false;
+  try {
+    return (await tokenStore.present()) === true;
+  } catch {
+    return false;
+  }
 }
 
 /** A response writer that also survives a client that already disconnected. */

@@ -11,14 +11,20 @@
  *          -> close the domain from the fiber disposer
  *
  *   GET  /bug-workflow/api/health    -> { ok, domainOpenedAt, tickets }
- *   GET  /bug-workflow/api/snapshot  -> { ok, workspace, settings, tickets, serverTime }
+ *   GET  /bug-workflow/api/snapshot  -> { ok, workspace, settings, platform, tickets, serverTime }
  *   POST /bug-workflow/api/action    -> { ok, ticket } | { ok:false, code, message, ticket? }
  *   POST /bug-workflow/api/settings  -> { ok, settings }
+ *   POST /bug-workflow/api/platform-token -> { ok, tokenPresent }
  *
  * Failure policy: `webServer` is the only hard dependency, so the plugin still
- * loads in a profile without storage. The fallback routes stay mounted until the
- * real handlers are ready: `/health` answers HTTP 500 with
- * `{ ok:false, stage:'storage-service' }` when the inject never ran, 503 while
+ * loads in a profile without storage. The `credentials` service is read
+ * optionally (`ctx.get('credentials')`) instead of injected: if it were a hard
+ * injection, an absent credentials service would hold back the storage routes
+ * too, leaving the board with no snapshot at all. Without credentials the
+ * plugin still loads, the snapshot reports `platform.tokenPresent:false`, and
+ * the token route answers 503 `credentials-unavailable`. The fallback routes
+ * stay mounted until the real handlers are ready: `/health` answers HTTP 500
+ * with `{ ok:false, stage:'storage-service' }` when the inject never ran, 503 while
  * opening, and 500 with the failing stage after an open/create-store/register
  * error; the data routes answer 503. An open failure is cached by domain.js
  * instead of retried per request, and the per-fiber cache key is the inject
@@ -29,6 +35,7 @@
  * Both sets are removed by the `apply` fiber disposer.
  */
 import { closeDomain, openDomain, settingsSchema, ticketSchema } from './src/host/domain.js';
+import { createTokenStore } from './src/host/credentials.js';
 import {
   registerRoutes,
   registerUnavailableRoutes,
@@ -119,11 +126,17 @@ export function apply(ctx) {
           ),
         };
 
+        // `credentials` is read optionally rather than injected: hardening the
+        // storage routes must not depend on a service the board can live
+        // without. Absent credentials -> tokenPresent:false + 503 on writes.
+        const tokenStore = createTokenStore(readCredentials(storageCtx));
+
         stage = 'register-routes';
         health.stage = stage;
         const mounted = mountApi(() => registerRoutes(ctx, {
           store,
           workspace,
+          tokenStore,
           clock,
           domainOpenedAt: handle.openedAt,
           // Full request errors stay in the host log; only clipped summaries
@@ -182,6 +195,20 @@ export function apply(ctx) {
       'bug-workflow: bug_workflow domain lifetime',
     );
   });
+}
+
+/**
+ * Optional service read: `credentials` is not a hard dependency of the board.
+ * `ctx.get()` is the seam's documented optional access; a context without the
+ * service returns undefined, which the token store reports as unavailable.
+ */
+function readCredentials(context) {
+  try {
+    if (typeof context?.get === 'function') return context.get('credentials');
+    return context?.credentials;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Diagnostics only; a failing logger must not mask the original error. */
