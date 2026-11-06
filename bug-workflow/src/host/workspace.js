@@ -12,9 +12,8 @@
  * workspace directory?", which is what the P1 client uses to decide whether it
  * can show/edit workspace settings. It does NOT mean the user saved custom
  * settings: `store.getSettings(cwd)` returns defaults for an unsaved cwd, so
- * P1 cannot distinguish defaults from an explicitly saved default record. The
- * `settingsStore` input is accepted for the future version that can make that
- * distinction; it is intentionally unused today.
+ * P1 cannot distinguish defaults from an explicitly saved default record. Task
+ * 5 adds an explicit `hasSettings` check for that distinction.
  */
 
 /**
@@ -27,7 +26,6 @@
  *
  * @param {object} deps
  * @param {object} deps.sessions `ctx.sessions` (only `get(id)` is used)
- * @param {object} [deps.settingsStore] reserved; see the module comment
  * @param {string} sessionId session id supplied by the client slot/qerystring
  * @returns {{path: string|null, configured: boolean}}
  */

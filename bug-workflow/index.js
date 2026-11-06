@@ -109,12 +109,12 @@ export function apply(ctx) {
           validateSettings,
         });
 
-        // Workspace settings are keyed by the live session header cwd. The
-        // settings store is passed for the future "has saved settings" check;
-        // P1 `configured` only means the session resolved to a directory.
+        // Workspace settings are keyed by the live session header cwd. P1
+        // `configured` only means the session resolved to a directory; Task 5
+        // adds the explicit "has saved settings" check.
         const workspace = {
           resolve: (sessionId) => resolveWorkspace(
-            { sessions: storageCtx.sessions, settingsStore: store },
+            { sessions: storageCtx.sessions },
             sessionId,
           ),
         };
@@ -126,6 +126,9 @@ export function apply(ctx) {
           workspace,
           clock,
           domainOpenedAt: handle.openedAt,
+          // Full request errors stay in the host log; only clipped summaries
+          // reach an HTTP response.
+          log: (entry) => logRequestFailure(storageCtx, entry),
         }));
 
         if (!mounted) {
@@ -185,6 +188,15 @@ export function apply(ctx) {
 function logFailure(context, error) {
   try {
     context.logger?.error?.('bug-workflow: 存储域装配失败', error);
+  } catch {
+    // Ignore logger failures.
+  }
+}
+
+/** Diagnostics only: request errors are clipped before leaving the host. */
+function logRequestFailure(context, entry) {
+  try {
+    context.logger?.warn?.(`bug-workflow: 请求处理失败 (${entry?.event ?? 'internal'})`, entry?.error);
   } catch {
     // Ignore logger failures.
   }

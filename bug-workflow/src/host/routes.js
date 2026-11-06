@@ -17,6 +17,17 @@
  * server forbids duplicate exact paths, so a fallback must be disposed before
  * the real routes are mounted.
  *
+ * Request admission (defense in depth — the Host header alone is spoofable):
+ *   - transport: `socket.remoteAddress` must be loopback, AND `Host` must be a
+ *     textual loopback allow-list value (no DNS resolution: rebinding-proof);
+ *   - POST bodies: `Content-Type: application/json` (parameters allowed), else
+ *     415 before one byte of the body is read. A cross-origin JSON `fetch`
+ *     forces a CORS preflight this server never answers;
+ *   - browser `Origin`, when present, must equal the request's own loopback
+ *     host:port (http or https); a missing Origin stays allowed for local
+ *     non-browser clients. Malformed/foreign origins are 403;
+ *   - body: 64 KiB cap (413) and a 10 s read deadline (408, request destroyed).
+ *
  * Error mapping (see the P1 plan's "宿主路由契约"):
  *   store invalid-input/invalid-payload/unknown-workspace/invalid-settings -> 400
  *   store action-id-reused/invalid-transition/duplicate-code             -> 409
@@ -28,6 +39,10 @@
  * Failures are closed over: every handler is wrapped, and no handler lets an
  * exception escape into the HTTP server. The plugin loads without storage; the
  * fallback handlers are the contract for that state.
+ *
+ * Client-visible error messages are clipped to a short bounded string; the full
+ * error goes only to the optional `log` dependency (host logger), never into an
+ * HTTP response.
  */
 
 import { ACTIONS } from './protocol.js';
@@ -42,6 +57,15 @@ export const API_PATHS = Object.freeze({
 
 /** Request-body cap for POST routes (64 KiB). */
 export const MAX_BODY_BYTES = 64 * 1024;
+
+/** Maximum time to receive a complete POST body before 408 (10 s). */
+export const BODY_TIMEOUT_MS = 10_000;
+
+/** Client-visible error messages never exceed this many characters. */
+const MAX_ERROR_MESSAGE_CHARS = 300;
+
+/** A rejected action name is echoed back truncated to this many characters. */
+const MAX_ACTION_NAME_CHARS = 64;
 
 /** HTTP method accepted by each route. */
 const ROUTE_METHODS = Object.freeze({
@@ -68,6 +92,12 @@ const STORE_ERROR_STATUS = Object.freeze({
 const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1']);
 
 /**
+ * Loopback socket addresses. `::ffff:127.0.0.1` is the IPv4-mapped form Node
+ * reports for an IPv4 client on a dual-stack listener; it is still loopback.
+ */
+const LOOPBACK_REMOTE_ADDRESSES = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
+
+/**
  * Build the four route handlers over an already-open store.
  *
  * @param {object} deps
@@ -75,6 +105,9 @@ const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1']);
  * @param {{resolve: (sessionId: string) => {path: string|null, configured: boolean}}} deps.workspace
  * @param {() => string} [deps.clock] ISO 8601 server time for snapshots
  * @param {number|null} [deps.domainOpenedAt] domain open timestamp for health
+ * @param {number} [deps.bodyTimeoutMs] POST body read deadline (default 10 s)
+ * @param {((entry: {event: string, error: unknown}) => void)|null} [deps.log]
+ *   optional host logger; receives full errors that are hidden from responses
  * @returns {{health: Function, snapshot: Function, action: Function, settings: Function}}
  */
 export function createHandlers({
@@ -82,6 +115,8 @@ export function createHandlers({
   workspace,
   clock = defaultClock,
   domainOpenedAt = null,
+  bodyTimeoutMs = BODY_TIMEOUT_MS,
+  log = null,
 } = {}) {
   assertStore(store);
   if (workspace === null || typeof workspace !== 'object' || typeof workspace.resolve !== 'function') {
@@ -90,19 +125,29 @@ export function createHandlers({
   if (typeof clock !== 'function') {
     throw new TypeError('createHandlers() requires clock to be a function');
   }
+  if (!Number.isFinite(bodyTimeoutMs) || bodyTimeoutMs <= 0) {
+    throw new TypeError('createHandlers() requires bodyTimeoutMs to be a positive number');
+  }
+  if (log !== null && typeof log !== 'function') {
+    throw new TypeError('createHandlers() requires log to be a function');
+  }
+
+  const safe = (handler) => wrap(handler, log);
 
   return {
-    health: wrap(async (req, res) => {
+    health: safe(async (req, res) => {
       if (!guard(req, res, ROUTE_METHODS.health)) return;
+      if (!guardOrigin(req, res)) return;
 
       let tickets;
       try {
         tickets = store.list().length;
       } catch (error) {
+        notifyLog(log, 'health-list', error);
         sendJsonSafe(res, 500, {
           ok: false,
           stage: 'list-tickets',
-          error: errorMessage(error),
+          error: clipMessage(errorMessage(error)),
         });
         return;
       }
@@ -110,8 +155,9 @@ export function createHandlers({
       sendJsonSafe(res, 200, { ok: true, domainOpenedAt, tickets });
     }),
 
-    snapshot: wrap(async (req, res) => {
+    snapshot: safe(async (req, res) => {
       if (!guard(req, res, ROUTE_METHODS.snapshot)) return;
+      if (!guardOrigin(req, res)) return;
 
       const sessionId = normalizeSessionId(readQueryParam(req, 'sessionId'));
       if (sessionId === undefined) {
@@ -130,12 +176,15 @@ export function createHandlers({
       });
     }),
 
-    action: wrap(async (req, res) => {
+    action: safe(async (req, res) => {
       if (!guard(req, res, ROUTE_METHODS.action)) return;
+      if (!guardJsonContentType(req, res)) return;
+      if (!guardOrigin(req, res)) return;
 
-      const body = await readJsonBody(req);
+      const body = await readJsonBody(req, bodyTimeoutMs);
       if (!body.ok) {
         sendError(res, body.status, body.code, body.message);
+        if (body.destroyRequest === true) destroyRequest(req);
         return;
       }
       const input = body.value;
@@ -160,7 +209,12 @@ export function createHandlers({
 
       const action = input.action;
       if (typeof action !== 'string' || !ACTIONS.includes(action)) {
-        sendError(res, 400, 'unknown-action', `未知动作：${String(action)}`);
+        sendError(
+          res,
+          400,
+          'unknown-action',
+          `未知动作：${clipMessage(String(action), MAX_ACTION_NAME_CHARS)}`,
+        );
         return;
       }
 
@@ -178,15 +232,18 @@ export function createHandlers({
         return;
       }
 
-      await sendActionFailure(res, store, { code, action, actionId, result });
+      await sendActionFailure(res, store, { code, action, actionId, result, log });
     }),
 
-    settings: wrap(async (req, res) => {
+    settings: safe(async (req, res) => {
       if (!guard(req, res, ROUTE_METHODS.settings)) return;
+      if (!guardJsonContentType(req, res)) return;
+      if (!guardOrigin(req, res)) return;
 
-      const body = await readJsonBody(req);
+      const body = await readJsonBody(req, bodyTimeoutMs);
       if (!body.ok) {
         sendError(res, body.status, body.code, body.message);
+        if (body.destroyRequest === true) destroyRequest(req);
         return;
       }
       const input = body.value;
@@ -209,7 +266,7 @@ export function createHandlers({
       } catch (error) {
         const code = typeof error?.code === 'string' ? error.code : undefined;
         if (code !== undefined && STORE_ERROR_STATUS[code] !== undefined) {
-          sendError(res, STORE_ERROR_STATUS[code], code, errorMessage(error));
+          sendError(res, STORE_ERROR_STATUS[code], code, clipMessage(errorMessage(error)));
           return;
         }
         throw error;
@@ -258,6 +315,7 @@ export function registerUnavailableRoutes(ctx, health = {}) {
   const handlers = {
     health: wrap(async (req, res) => {
       if (!guard(req, res, ROUTE_METHODS.health)) return;
+      if (!guardOrigin(req, res)) return;
       answerFallbackHealth(res, health);
     }),
     snapshot: unavailableHandler(ROUTE_METHODS.snapshot, health),
@@ -274,24 +332,42 @@ export function registerUnavailableRoutes(ctx, health = {}) {
 /**
  * Wrap a handler so no exception escapes into the HTTP server. If the failure
  * happens before any response was written, answer a JSON 500; a partially sent
- * response is left untouched.
+ * response is left untouched. The full error is handed to `log` (when present)
+ * and only a clipped summary is sent to the client.
  */
-function wrap(handler) {
+function wrap(handler, log = null) {
   return async function safeHandler(req, res) {
     try {
       await handler(req, res);
     } catch (error) {
+      notifyLog(log, 'internal', error);
       sendJsonSafe(res, 500, {
         ok: false,
         code: 'internal',
-        message: errorMessage(error),
+        message: clipMessage(errorMessage(error)),
       });
     }
   };
 }
 
-/** Common preflight: loopback Host first, then the route's HTTP method. */
+/**
+ * Transport/host/method preflight, in that order:
+ *   1. `socket.remoteAddress` must be loopback (a spoofable Host is not enough);
+ *   2. `Host` must be a loopback allow-list value;
+ *   3. the route's method must match.
+ * POST media-type and Origin checks follow separately so a cross-site
+ * `text/plain` POST is rejected as 415 before its Origin is even considered.
+ */
 function guard(req, res, method) {
+  if (!isLoopbackRemote(req)) {
+    sendJsonSafe(res, 403, {
+      ok: false,
+      code: 'forbidden-remote',
+      message: '只接受本机回环地址的连接',
+    });
+    return false;
+  }
+
   if (!isLoopbackHost(req?.headers?.host)) {
     sendJsonSafe(res, 403, {
       ok: false,
@@ -310,6 +386,60 @@ function guard(req, res, method) {
     return false;
   }
   return true;
+}
+
+/**
+ * POST bodies must be announced as JSON before a single byte is consumed.
+ * A cross-origin browser cannot send this media type without a CORS preflight,
+ * which this server never answers; `text/plain` is the classic no-preflight
+ * bypass and is rejected here.
+ */
+function guardJsonContentType(req, res) {
+  if (isJsonContentType(req?.headers?.['content-type'])) return true;
+  sendJsonSafe(res, 415, {
+    ok: false,
+    code: 'unsupported-media-type',
+    message: 'POST 请求必须使用 application/json 内容类型',
+  });
+  return false;
+}
+
+/**
+ * Browser cross-origin requests always carry `Origin`. It must match the
+ * request's own origin (same host:port as the Host header; http or https,
+ * since the local scheme depends on the deployment). A missing Origin is a
+ * non-browser local client (curl, scripts) and stays allowed.
+ */
+function guardOrigin(req, res) {
+  const reason = checkOrigin(req);
+  if (reason === null) return true;
+  sendJsonSafe(res, 403, {
+    ok: false,
+    code: 'forbidden-origin',
+    message: reason,
+  });
+  return false;
+}
+
+function checkOrigin(req) {
+  const raw = req?.headers?.origin;
+  if (raw === undefined) return null;
+  if (typeof raw !== 'string' || raw.trim() === '') return 'Origin 头不合法';
+
+  const host = normalizeHostHeader(req?.headers?.host);
+  if (host === undefined) return 'Origin 与请求 Host 不一致';
+
+  let origin;
+  try {
+    origin = new URL(raw);
+  } catch {
+    return 'Origin 头不合法';
+  }
+  if (origin.protocol !== 'http:' && origin.protocol !== 'https:') return 'Origin 头不合法';
+  // `URL.host` normalizes IPv6 brackets and drops default ports; the validated
+  // Host header uses the same textual form.
+  if (origin.host.toLowerCase() !== host) return '拒绝跨站请求：Origin 与请求 Host 不一致';
+  return null;
 }
 
 function sendError(res, status, code, message) {
@@ -344,7 +474,9 @@ function answerFallbackHealth(res, health) {
     sendJsonSafe(res, 500, {
       ok: false,
       stage: typeof status.stage === 'string' ? status.stage : 'open-domain',
-      error: typeof status.error === 'string' ? status.error : 'storage domain 打开失败',
+      error: clipMessage(
+        typeof status.error === 'string' ? status.error : 'storage domain 打开失败',
+      ),
     });
     return;
   }
@@ -359,15 +491,19 @@ function answerFallbackHealth(res, health) {
   sendJsonSafe(res, 500, {
     ok: false,
     stage: typeof status.stage === 'string' ? status.stage : 'storage-service',
-    error: typeof status.error === 'string'
-      ? status.error
-      : 'ctx.storageDomain / ctx.sessions service unavailable',
+    error: clipMessage(
+      typeof status.error === 'string'
+        ? status.error
+        : 'ctx.storageDomain / ctx.sessions service unavailable',
+    ),
   });
 }
 
 function unavailableHandler(method, health) {
   return wrap(async (req, res) => {
     if (!guard(req, res, method)) return;
+    if (!guardJsonContentType(req, res)) return;
+    if (!guardOrigin(req, res)) return;
     sendJsonSafe(res, 503, {
       ok: false,
       code: 'storage-unavailable',
@@ -381,9 +517,11 @@ function unavailableHandler(method, health) {
 // Action result mapping
 // ---------------------------------------------------------------------------
 
-async function sendActionFailure(res, store, { code, action, actionId, result }) {
+async function sendActionFailure(res, store, { code, action, actionId, result, log = null }) {
   const errorCode = typeof result?.code === 'string' ? result.code : undefined;
-  const message = typeof result?.message === 'string' ? result.message : '动作执行失败';
+  const message = clipMessage(
+    typeof result?.message === 'string' ? result.message : '动作执行失败',
+  );
 
   if (errorCode === 'review-rounds-exhausted') {
     // Spec §12: exhausted review rounds must end in `blocked`, not just an
@@ -426,10 +564,11 @@ async function sendActionFailure(res, store, { code, action, actionId, result })
 
   // The store promises structured results; anything else is a server bug and
   // must not look like a client error.
+  notifyLog(log, 'store-result', result);
   sendJsonSafe(res, 500, {
     ok: false,
     code: 'internal',
-    message: errorCode === undefined ? message : `${message} (${errorCode})`,
+    message: clipMessage(errorCode === undefined ? message : `${message} (${errorCode})`),
   });
 }
 
@@ -463,39 +602,50 @@ function safeGet(store, code) {
 // Request parsing
 // ---------------------------------------------------------------------------
 
+/** Sentinel that wins the body-read race when the deadline expires. */
+const BODY_TIMEOUT = Symbol('bug-workflow.body-timeout');
+
 /**
- * Read and parse one JSON object body, enforcing the 64 KiB cap.
- * @returns {Promise<{ok:true, value: object} | {ok:false, status:number, code:string, message:string}>}
+ * Read and parse one JSON object body, enforcing the 64 KiB cap and a read
+ * deadline (default 10 s). On a deadline miss the caller answers 408 and then
+ * destroys the stalled request (`destroyRequest` in the returned object).
+ *
+ * @param {object} req IncomingMessage-shaped request
+ * @param {number} [timeoutMs] body read deadline
+ * @returns {Promise<{ok:true, value: object} | {ok:false, status:number, code:string, message:string, destroyRequest?: boolean}>}
  */
-async function readJsonBody(req) {
+async function readJsonBody(req, timeoutMs = BODY_TIMEOUT_MS) {
   const declared = Number(req?.headers?.['content-length']);
   if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
     drain(req);
     return tooLarge();
   }
 
-  const chunks = [];
-  let total = 0;
+  let timer;
+  const deadline = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(BODY_TIMEOUT), timeoutMs);
+  });
+
+  let outcome;
   try {
-    for await (const chunk of req) {
-      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-      total += buffer.length;
-      if (total > MAX_BODY_BYTES) {
-        drain(req);
-        return tooLarge();
-      }
-      chunks.push(buffer);
-    }
-  } catch {
-    return {
-      ok: false,
-      status: 400,
-      code: 'invalid-json',
-      message: '读取请求体失败',
-    };
+    outcome = await Promise.race([readRawBody(req), deadline]);
+  } finally {
+    clearTimeout(timer);
   }
 
-  if (total === 0) {
+  if (outcome === BODY_TIMEOUT) {
+    return {
+      ok: false,
+      status: 408,
+      code: 'body-timeout',
+      message: '请求体读取超时',
+      // Answer 408 first (the handler does), then drop the stalled stream.
+      destroyRequest: true,
+    };
+  }
+  if (!outcome.ok) return outcome;
+
+  if (outcome.total === 0) {
     return {
       ok: false,
       status: 400,
@@ -506,7 +656,7 @@ async function readJsonBody(req) {
 
   let value;
   try {
-    value = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    value = JSON.parse(outcome.buffer.toString('utf8'));
   } catch {
     return {
       ok: false,
@@ -526,6 +676,40 @@ async function readJsonBody(req) {
   }
 
   return { ok: true, value };
+}
+
+/** Accumulate the raw body without ever throwing; the cap is checked live. */
+async function readRawBody(req) {
+  const chunks = [];
+  let total = 0;
+  try {
+    for await (const chunk of req) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      total += buffer.length;
+      if (total > MAX_BODY_BYTES) {
+        drain(req);
+        return tooLarge();
+      }
+      chunks.push(buffer);
+    }
+    return { ok: true, total, buffer: Buffer.concat(chunks) };
+  } catch {
+    return {
+      ok: false,
+      status: 400,
+      code: 'invalid-json',
+      message: '读取请求体失败',
+    };
+  }
+}
+
+/** Destroy a request whose body outlived the read deadline; never throws. */
+function destroyRequest(req) {
+  try {
+    req?.destroy?.();
+  } catch {
+    // The socket may already be gone; the 408 was written first.
+  }
 }
 
 function tooLarge() {
@@ -620,12 +804,51 @@ function isLoopbackHost(header) {
   return LOOPBACK_HOSTNAMES.has(hostname);
 }
 
+/** True when `socket.remoteAddress` is exactly a loopback address. */
+function isLoopbackRemote(req) {
+  const address = req?.socket?.remoteAddress;
+  if (typeof address !== 'string') return false;
+  return LOOPBACK_REMOTE_ADDRESSES.has(address.trim().toLowerCase());
+}
+
+/** True for `application/json`, ignoring parameters such as `; charset=utf-8`. */
+function isJsonContentType(header) {
+  if (typeof header !== 'string') return false;
+  const semicolon = header.indexOf(';');
+  const mediaType = (semicolon === -1 ? header : header.slice(0, semicolon)).trim().toLowerCase();
+  return mediaType === 'application/json';
+}
+
+/** Lower-cased, trimmed Host header text (already validated by isLoopbackHost). */
+function normalizeHostHeader(header) {
+  if (typeof header !== 'string') return undefined;
+  const host = header.trim().toLowerCase();
+  return host === '' ? undefined : host;
+}
+
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** Bound a client-visible message; zod reports/OS errors can be huge. */
+function clipMessage(value, max = MAX_ERROR_MESSAGE_CHARS) {
+  const text = typeof value === 'string' ? value : String(value);
+  if (text.length <= max) return text;
+  return `${text.slice(0, Math.max(0, max - 1))}…`;
+}
+
+/** Best-effort host logger; a broken logger must not change the response. */
+function notifyLog(log, event, error) {
+  if (typeof log !== 'function') return;
+  try {
+    log({ event, error });
+  } catch {
+    // Logging is diagnostic only.
+  }
 }
 
 // ---------------------------------------------------------------------------
