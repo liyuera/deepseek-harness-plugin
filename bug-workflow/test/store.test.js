@@ -251,7 +251,7 @@ test('returned tickets do not alias the stored record', async () => {
 
 test('applyAction() persists the next ticket and advances updatedAt', async () => {
   const domain = createFakeDomain();
-  const store = createStore(domain, clockFrom(T1, T2, T3));
+  const store = createStrictStore(domain, clockFrom(T1, T2, T3));
   await store.create({ code: 'BUG-5' });
 
   const started = await store.applyAction('BUG-5', 'start_analysis', {});
