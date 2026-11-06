@@ -14,9 +14,19 @@
  *   GET  /bug-workflow/api/snapshot  -> { ok, workspace, settings, platform, dicts, tickets, serverTime }
  *   POST /bug-workflow/api/action    -> { ok, ticket } | { ok:false, code, message, ticket? }
  *                                       (create + payload.code = 按编号从平台导入)
+ *   POST /bug-workflow/api/analyze   -> { ok, workflow:'analyzing', running }
+ *                                       (P3 real analysis; see below)
  *   POST /bug-workflow/api/settings  -> { ok, settings }
  *   POST /bug-workflow/api/platform-token -> { ok, tokenPresent }
  *   POST /bug-workflow/api/sync      -> { ok, synced, created, updated, total, filtered, lastSyncAt }
+ *
+ * Analysis wiring (P3 Task 2): one `createAgentRunner()` per fiber resolves the
+ * optional `subagents`/`agents` services through `ctx.get`, and
+ * `createAnalysisService()` orchestrates the ticket transitions/errors over the
+ * opened store. The runner is built even when those services are absent: it
+ * reports `available() === false`, so `/analyze` answers 503 `analysis-unavailable`
+ * instead of failing the whole plugin. The service is disposed (running jobs
+ * aborted) before the storage domain closes.
  *
  * Sync wiring (P2 Task 4): `createSyncService()` reads the token from
  * `ctx.credentials`, maps platform tasks into the v2 ticket store, and persists
@@ -44,6 +54,8 @@
  * Both sets are removed by the `apply` fiber disposer.
  */
 import { closeDomain, openDomain, settingsSchema, ticketSchema } from './src/host/domain.js';
+import { createAgentRunner } from './src/host/agent-access.js';
+import { createAnalysisService } from './src/host/analysis-service.js';
 import { createTokenStore } from './src/host/credentials.js';
 import { createPlatformClient } from './src/host/platform.js';
 import {
@@ -82,6 +94,16 @@ export function apply(ctx) {
   let openPending;
   let disposeApi;
   let disposed = false;
+  // Created after the store is ready; read by the domain-lifetime disposer so
+  // running analyses are aborted before the storage domain closes.
+  let analysisService;
+
+  // One runner per fiber. Resolving the optional delegation services lazily via
+  // `ctx.get` keeps the plugin loadable in profiles without subagents/agents:
+  // the runner then reports `available() === false` and `/analyze` answers 503.
+  const runner = createAgentRunner({
+    services: { get: (name) => readService(ctx, name) },
+  });
 
   /**
    * Replace the mounted route set. The old set is disposed first because the
@@ -160,6 +182,18 @@ export function apply(ctx) {
           clock,
         });
 
+        // P3 analysis orchestration. A construction failure must not take the
+        // board down: the routes stay mounted, `/analyze` answers 503, and the
+        // snapshot reports an empty analysis block.
+        let analysis = null;
+        try {
+          analysisService = createAnalysisService({ store, runner, clock });
+          analysis = { service: analysisService, runner };
+        } catch (error) {
+          analysisService = undefined;
+          logWarning(storageCtx, 'bug-workflow: 分析服务初始化失败', error);
+        }
+
         // Automatic sync is registered BEFORE the real routes are mounted: if
         // the optional timer service misbehaves, the catch path still owns the
         // fallback route set (never real handlers over a closed domain).
@@ -178,6 +212,7 @@ export function apply(ctx) {
           importTask: typeof sync.importTask === 'function'
             ? (cwd, code) => sync.importTask(cwd, code)
             : null,
+          analysis,
           clock,
           domainOpenedAt: handle.openedAt,
           // Full request errors stay in the host log; only clipped summaries
@@ -189,6 +224,7 @@ export function apply(ctx) {
           // The fiber was disposed while the domain was opening; no request can
           // reach these handlers any more, so release the domain immediately
           // instead of leaving a handle behind.
+          analysisService?.dispose();
           await closeDomain(handle);
           return handle;
         }
@@ -200,7 +236,12 @@ export function apply(ctx) {
       } catch (error) {
         // Release a domain that opened but could not be attached to a store (or
         // to routes); otherwise the facility would report `already-open` on
-        // every reload.
+        // every reload. Abort any analysis job first; it may still write.
+        try {
+          analysisService?.dispose();
+        } catch {
+          // Teardown must continue regardless.
+        }
         if (handle !== undefined) await closeDomain(handle).catch(() => {});
         health.status = 'failed';
         health.stage = typeof error?.stage === 'string' ? error.stage : stage;
@@ -230,6 +271,13 @@ export function apply(ctx) {
     // a late successful open; `closeDomain` is idempotent.
     storageCtx.effect(
       () => async () => {
+        // Abort running analyses first: their background jobs may still write
+        // through the store, and the domain must not close under a live job.
+        try {
+          analysisService?.dispose();
+        } catch {
+          // Disposal is best-effort; the domain teardown still has to run.
+        }
         const handle = await openPending.catch(() => undefined);
         if (handle !== undefined) await closeDomain(handle).catch(() => {});
       },
@@ -252,10 +300,33 @@ function readCredentials(context) {
   }
 }
 
+/**
+ * Optional Cordis service lookup (`ctx.get(name)`). A missing or throwing
+ * registry yields undefined instead of rejecting: optional services only
+ * degrade a feature, they never take the plugin down.
+ */
+function readService(context, name) {
+  try {
+    if (typeof context?.get === 'function') return context.get(name);
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Diagnostics only; a failing logger must not mask the original error. */
 function logFailure(context, error) {
   try {
     context.logger?.error?.('bug-workflow: 存储域装配失败', error);
+  } catch {
+    // Ignore logger failures.
+  }
+}
+
+/** Diagnostics only: non-fatal wiring degradation (never thrown). */
+function logWarning(context, message, error) {
+  try {
+    context.logger?.warn?.(message, error);
   } catch {
     // Ignore logger failures.
   }

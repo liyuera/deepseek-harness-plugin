@@ -8,12 +8,15 @@
  *   POST /bug-workflow/api/action          -> { ok, ticket } | { ok:false, code, message, ticket? }
  *                                              action:'create' + payload.code imports that
  *                                              platform task by code (see `importTask`)
+ *   POST /bug-workflow/api/analyze         -> { ok, workflow:'analyzing', running }
+ *                                              | { ok:false, code, message } (P3 real analysis)
  *   POST /bug-workflow/api/settings        -> { ok, settings }
  *   POST /bug-workflow/api/platform-token  -> { ok, tokenPresent } (token is only written, never read back)
  *   POST /bug-workflow/api/sync            -> { ok, synced, created, updated, total, filtered, lastSyncAt }
  *                                              | { ok:false, code, message }
  *
- * `createHandlers({ store, workspace, clock, tokenStore })` is pure over its dependencies so
+ * `createHandlers({ store, workspace, clock, tokenStore, analysis })` is pure over its
+ * dependencies so
  * the tests can drive real `IncomingMessage`-shaped fake requests. `index.js`
  * calls `registerRoutes()` once the storage domain is open, and keeps
  * `registerUnavailableRoutes()` mounted while the domain is still opening or
@@ -41,6 +44,13 @@
  *   review-rounds-exhausted -> run `block` (actor system) first, then 409 with
  *   the blocked ticket (spec §12: exhausted rounds become a blocked ticket).
  *
+ * P3 `/analyze` mapping: `ticket-not-found` 404, `invalid-state` 409,
+ * `no-live-agent`/`analysis-unavailable` 503 (no wired analysis service or no
+ * live session Agent), `unknown-workspace`/`invalid-code` 400, anything else 500.
+ * The snapshot always carries `analysis:{running, errors}` (empty when the
+ * analysis service is not wired) so the client never special-cases a missing
+ * key.
+ *
  * Failures are closed over: every handler is wrapped, and no handler lets an
  * exception escape into the HTTP server. The plugin loads without storage; the
  * fallback handlers are the contract for that state.
@@ -57,6 +67,7 @@ export const API_PATHS = Object.freeze({
   health: '/bug-workflow/api/health',
   snapshot: '/bug-workflow/api/snapshot',
   action: '/bug-workflow/api/action',
+  analyze: '/bug-workflow/api/analyze',
   settings: '/bug-workflow/api/settings',
   platformToken: '/bug-workflow/api/platform-token',
   sync: '/bug-workflow/api/sync',
@@ -82,6 +93,7 @@ const ROUTE_METHODS = Object.freeze({
   health: 'GET',
   snapshot: 'GET',
   action: 'POST',
+  analyze: 'POST',
   settings: 'POST',
   platformToken: 'POST',
   sync: 'POST',
@@ -136,6 +148,28 @@ const IMPORT_ERROR_STATUS = Object.freeze({
   internal: 500,
 });
 
+/**
+ * `POST /analyze` failure code -> HTTP status (P3 plan). A missing ticket is
+ * 404, a state-machine refusal is 409, and "no live agent"/"service not wired"
+ * is a retryable 503. Unknown codes are programming errors -> 500.
+ */
+const ANALYSIS_ERROR_STATUS = Object.freeze({
+  'ticket-not-found': 404,
+  'not-found': 404,
+  'invalid-state': 409,
+  'invalid-transition': 409,
+  'unknown-workspace': 400,
+  'invalid-code': 400,
+  'invalid-input': 400,
+  'invalid-payload': 400,
+  'no-live-agent': 503,
+  'analysis-unavailable': 503,
+  internal: 500,
+});
+
+/** 503 message for a host built without the analysis service (older wiring). */
+const ANALYSIS_UNAVAILABLE_MESSAGE = '分析服务不可用，请稍后重试';
+
 /** Explicit allow-list of loopback Host header values (with optional port). */
 const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1']);
 
@@ -146,7 +180,7 @@ const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1']);
 const LOOPBACK_REMOTE_ADDRESSES = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
 
 /**
- * Build the four route handlers over an already-open store.
+ * Build the seven route handlers over an already-open store.
  *
  * @param {object} deps
  * @param {object} deps.store `createStore()` result (or an equivalent double)
@@ -157,6 +191,10 @@ const LOOPBACK_REMOTE_ADDRESSES = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1
  *   sync route answers 503 and the snapshot falls back to token presence only
  * @param {((cwd: string|null, code: string) => Promise<object>)|null} [deps.importTask]
  *   `createSyncService().importTask`; when null an import request answers 503
+ * @param {{service: object, runner?: object}|null} [deps.analysis]
+ *   `createAnalysisService()` result (+ optional runner) for `POST /analyze` and
+ *   the snapshot `analysis` block; when null `/analyze` answers 503
+ *   `analysis-unavailable` and the snapshot reports empty analysis state
  * @param {() => string} [deps.clock] ISO 8601 server time for snapshots
  * @param {number|null} [deps.domainOpenedAt] domain open timestamp for health
  * @param {number} [deps.bodyTimeoutMs] POST body read deadline (default 10 s)
@@ -170,6 +208,7 @@ export function createHandlers({
   tokenStore = null,
   sync = null,
   importTask = null,
+  analysis = null,
   clock = defaultClock,
   domainOpenedAt = null,
   bodyTimeoutMs = BODY_TIMEOUT_MS,
@@ -199,6 +238,16 @@ export function createHandlers({
     throw new TypeError('createHandlers() importTask must be a function');
   }
   const importTaskFn = importTask === undefined ? null : importTask;
+  if (analysis !== null && analysis !== undefined) {
+    if (typeof analysis !== 'object'
+      || typeof analysis.service?.start !== 'function'
+      || typeof analysis.service?.status !== 'function') {
+      throw new TypeError(
+        'createHandlers() analysis.service must expose start(sessionId, cwd, code) and status()',
+      );
+    }
+  }
+  const analysisDeps = analysis === undefined ? null : analysis;
   if (typeof clock !== 'function') {
     throw new TypeError('createHandlers() requires clock to be a function');
   }
@@ -252,6 +301,9 @@ export function createHandlers({
         // safe defaults so a failing sync/meta read cannot take down the board.
         platform: await readPlatformStatus(syncService, tokenStoreSafe),
         dicts: readDicts(store),
+        // P3: analysis progress + static per-ticket errors. Absent wiring
+        // reports empty state instead of an undefined key.
+        analysis: readAnalysisStatus(analysisDeps),
         tickets: snapshot.tickets,
         serverTime: clock(),
       });
@@ -343,6 +395,78 @@ export function createHandlers({
       }
 
       await sendActionFailure(res, store, { code, action, actionId, result, log });
+    }),
+
+    /**
+     * Start the real (P3) analysis for one ticket: `{sessionId, code}`.
+     *
+     * The service persists `start_analysis`, then runs the read-only subagent in
+     * the background; this route answers as soon as the ticket is `analyzing`.
+     * A duplicate click for an already-running ticket is a 200 with
+     * `running:true` rather than a second subagent. No-live-agent and an
+     * unwired analysis service are retryable 503s.
+     */
+    analyze: safe(async (req, res) => {
+      if (!guard(req, res, ROUTE_METHODS.analyze)) return;
+      if (!guardJsonContentType(req, res)) return;
+      if (!guardOrigin(req, res)) return;
+
+      const body = await readJsonBody(req, bodyTimeoutMs);
+      if (!body.ok) {
+        sendError(res, body.status, body.code, body.message);
+        if (body.destroyRequest === true) destroyRequest(req);
+        return;
+      }
+      const input = body.value;
+
+      const sessionId = normalizeSessionId(input.sessionId);
+      if (sessionId === undefined) {
+        sendError(res, 400, 'missing-session', '缺少有效的 sessionId');
+        return;
+      }
+
+      const code = normalizeCode(input.code);
+      if (code === undefined) {
+        sendError(res, 400, 'invalid-code', '缺少有效的工单编号 code');
+        return;
+      }
+
+      if (analysisDeps === null) {
+        sendError(res, 503, 'analysis-unavailable', ANALYSIS_UNAVAILABLE_MESSAGE);
+        return;
+      }
+
+      // The child agent must read a real workspace; an unbound session would
+      // otherwise analyze the wrong directory (or none at all).
+      const resolved = normalizeWorkspace(workspace.resolve(sessionId));
+      if (resolved.path === null) {
+        sendError(res, 400, 'unknown-workspace', '无法确定工作区路径，无法开始分析');
+        return;
+      }
+
+      const result = await analysisDeps.service.start(sessionId, resolved.path, code);
+      if (result?.ok === true) {
+        sendJsonSafe(res, 200, {
+          ok: true,
+          workflow: 'analyzing',
+          running: result.running === true,
+        });
+        return;
+      }
+
+      const failureCode = typeof result?.code === 'string' ? result.code : 'internal';
+      const status = ANALYSIS_ERROR_STATUS[failureCode];
+      if (status === undefined) {
+        notifyLog(log, 'analysis-result', result);
+        sendError(res, 500, 'internal', '分析启动失败');
+        return;
+      }
+      sendError(
+        res,
+        status,
+        failureCode,
+        clipMessage(typeof result?.message === 'string' ? result.message : '分析启动失败'),
+      );
     }),
 
     settings: safe(async (req, res) => {
@@ -513,7 +637,7 @@ export function createHandlers({
 }
 
 /**
- * Register the six real routes on `ctx.webServer` and return a disposer.
+ * Register the seven real routes on `ctx.webServer` and return a disposer.
  *
  * The caller must have opened the domain and built the store already. Register
  * this only after disposing `registerUnavailableRoutes()`: duplicate exact paths
@@ -521,7 +645,7 @@ export function createHandlers({
  *
  * @param {object} ctx Cordis context carrying `webServer`
  * @param {object} deps same deps as {@link createHandlers}
- * @returns {() => void} idempotent disposer removing all six routes
+ * @returns {() => void} idempotent disposer removing all seven routes
  */
 export function registerRoutes(ctx, deps) {
   const webServer = getWebServer(ctx);
@@ -536,12 +660,12 @@ export function registerRoutes(ctx, deps) {
  *
  * Health answers the Task 2 contract: 500 `{stage:'storage-service'}` when the
  * inject never ran, 503 while opening, 500 `{stage,error}` after a failure.
- * The four data routes answer 503 so a client polling the board sees a
+ * The data routes answer 503 so a client polling the board sees a
  * retryable "storage unavailable" state instead of a missing route.
  *
  * @param {object} ctx Cordis context carrying `webServer`
  * @param {{status?: string, stage?: string, error?: string}} [health] shared health state
- * @returns {() => void} idempotent disposer removing all six routes
+ * @returns {() => void} idempotent disposer removing all seven routes
  */
 export function registerUnavailableRoutes(ctx, health = {}) {
   const webServer = getWebServer(ctx);
@@ -557,6 +681,7 @@ export function registerUnavailableRoutes(ctx, health = {}) {
     }),
     snapshot: unavailableHandler(ROUTE_METHODS.snapshot, health),
     action: unavailableHandler(ROUTE_METHODS.action, health),
+    analyze: unavailableHandler(ROUTE_METHODS.analyze, health),
     settings: unavailableHandler(ROUTE_METHODS.settings, health),
     platformToken: unavailableHandler(ROUTE_METHODS.platformToken, health),
     sync: unavailableHandler(ROUTE_METHODS.sync, health),
@@ -760,6 +885,37 @@ function readDicts(store) {
 
 function emptyDicts() {
   return { status: [], type: [], priority: [] };
+}
+
+/**
+ * Snapshot `analysis` object. The analysis service is optional (older wiring, a
+ * profile without subagent services, or a failed service construction), so a
+ * missing/failing `status()` degrades to empty state and the board keeps
+ * rendering. Only static strings persisted by the service are exposed.
+ */
+function readAnalysisStatus(analysis) {
+  const empty = { running: [], errors: {} };
+  if (analysis === null || analysis === undefined) return empty;
+  if (typeof analysis.service?.status !== 'function') return empty;
+
+  let status;
+  try {
+    status = analysis.service.status();
+  } catch {
+    return empty;
+  }
+  if (!isPlainObject(status)) return empty;
+
+  const running = Array.isArray(status.running)
+    ? status.running.filter((code) => typeof code === 'string' && code !== '')
+    : [];
+  const errors = {};
+  if (isPlainObject(status.errors)) {
+    for (const [code, message] of Object.entries(status.errors)) {
+      if (typeof message === 'string' && message !== '') errors[code] = message;
+    }
+  }
+  return { running, errors };
 }
 
 /** Coerce a sync stat to a non-negative integer; anything else counts as 0. */

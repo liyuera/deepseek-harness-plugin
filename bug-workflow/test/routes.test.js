@@ -377,6 +377,14 @@ function actionBody(overrides = {}) {
   });
 }
 
+function analyzeBody(overrides = {}) {
+  return JSON.stringify({
+    sessionId: SESSION_ID,
+    code: 'BUG-1',
+    ...overrides,
+  });
+}
+
 function settingsBody(overrides = {}) {
   return JSON.stringify({
     sessionId: SESSION_ID,
@@ -453,6 +461,32 @@ function createFakeImportTask({ result } = {}) {
   return { importTask, calls };
 }
 
+/**
+ * Fake analysis service (P3). The route consumes `start()`'s structured result
+ * and `status()`'s snapshot block; `calls` records both so wiring/arguments can
+ * be asserted without loading the agent runner.
+ */
+function createFakeAnalysis({ start, status } = {}) {
+  const calls = { start: [], status: 0 };
+  return {
+    calls,
+    service: {
+      async start(sessionId, cwd, code) {
+        calls.start.push({ sessionId, cwd, code });
+        if (typeof start === 'function') return start(sessionId, cwd, code);
+        return { ok: true, running: true, workflow: 'analyzing' };
+      },
+      status() {
+        calls.status += 1;
+        if (typeof status === 'function') return status();
+        if (status !== undefined) return clone(status);
+        return { running: [], errors: {} };
+      },
+    },
+    runner: {},
+  };
+}
+
 /** Fake credentials service used by the token-store integration. */
 function createFakeCredentials(initial = {}) {
   const values = new Map(Object.entries(initial));
@@ -493,6 +527,7 @@ function handlersWith({
   tokenStore = createTokenStore(createFakeCredentials()),
   sync,
   importTask,
+  analysis,
   clock = () => SERVER_TIME,
   domainOpenedAt = OPENED_AT,
 } = {}) {
@@ -504,18 +539,23 @@ function handlersWith({
   const importTaskFn = importTask === undefined
     ? createFakeImportTask().importTask
     : importTask;
+  // `analysis: undefined` wires a working fake; `analysis: null` exercises the
+  // "analysis service not wired" 503 path / empty snapshot block.
+  const analysisDeps = analysis === undefined ? createFakeAnalysis() : analysis;
   return {
     store,
     workspace,
     tokenStore,
     sync: syncService,
     importTask: importTaskFn,
+    analysis: analysisDeps,
     handlers: createHandlers({
       store,
       workspace,
       tokenStore,
       sync: syncService,
       importTask: importTaskFn,
+      analysis: analysisDeps,
       clock,
       domainOpenedAt,
     }),
@@ -620,6 +660,7 @@ test('GET /snapshot composes workspace, settings, tickets and serverTime', async
     settings: DEFAULT_SETTINGS,
     platform: { tokenPresent: false, lastSyncAt: null, lastSyncError: null },
     dicts: { status: [], type: [], priority: [] },
+    analysis: { running: [], errors: {} },
     tickets: [ticket],
     serverTime: SERVER_TIME,
   });
@@ -711,6 +752,59 @@ test('GET /snapshot degrades to empty dicts and token-only status when readers f
   assert.deepEqual(json.dicts, { status: [], type: [], priority: [] });
   // The fallback reads presence, never the value.
   assert.deepEqual(credentials.calls.resolve, []);
+});
+
+test('GET /snapshot reports the analysis running set and persisted errors', async () => {
+  const analysis = createFakeAnalysis({
+    status: {
+      running: ['BUG-2'],
+      errors: { 'BUG-1': '分析超时，请重试' },
+    },
+  });
+  const { handlers } = handlersWith({ analysis });
+  const { res, json } = await call(handlers.snapshot, { url: snapshotUrl() });
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(json.analysis, {
+    running: ['BUG-2'],
+    errors: { 'BUG-1': '分析超时，请重试' },
+  });
+  assert.equal(analysis.calls.status, 1);
+});
+
+test('GET /snapshot degrades analysis to empty when unwired or failing', async () => {
+  const unwired = await call(handlersWith({ analysis: null }).handlers.snapshot, {
+    url: snapshotUrl(),
+  });
+  assert.equal(unwired.res.statusCode, 200);
+  assert.deepEqual(unwired.json.analysis, { running: [], errors: {} });
+
+  const failing = createFakeAnalysis({
+    status: () => {
+      throw new Error('analysis status unavailable');
+    },
+  });
+  const { res, json } = await call(handlersWith({ analysis: failing }).handlers.snapshot, {
+    url: snapshotUrl(),
+  });
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(json.analysis, { running: [], errors: {} });
+});
+
+test('GET /snapshot sanitizes malformed analysis status fields', async () => {
+  const analysis = createFakeAnalysis({
+    status: {
+      running: ['BUG-2', '', 42],
+      errors: { 'BUG-1': '分析失败', 'BUG-3': null },
+    },
+  });
+  const { json } = await call(handlersWith({ analysis }).handlers.snapshot, {
+    url: snapshotUrl(),
+  });
+  assert.deepEqual(json.analysis, {
+    running: ['BUG-2'],
+    errors: { 'BUG-1': '分析失败' },
+  });
 });
 
 test('GET /snapshot returns an unbound workspace for an unknown live session', async () => {
@@ -1210,6 +1304,130 @@ test('POST /action only routes create + payload.code to importTask', async () =>
 });
 
 // ---------------------------------------------------------------------------
+// Analyze (P3 real analysis)
+// ---------------------------------------------------------------------------
+
+test('POST /analyze starts the analysis for the resolved workspace', async () => {
+  const analysis = createFakeAnalysis();
+  const { handlers } = handlersWith({ analysis });
+  const { res, json } = await call(handlers.analyze, {
+    method: 'POST',
+    url: API_PATHS.analyze,
+    body: analyzeBody({ code: '  BUG-1  ' }),
+  });
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(json, { ok: true, workflow: 'analyzing', running: true });
+  assert.deepEqual(analysis.calls.start, [
+    { sessionId: SESSION_ID, cwd: WORKSPACE, code: 'BUG-1' },
+  ]);
+});
+
+test('POST /analyze reports a duplicate running analysis without a second start', async () => {
+  const analysis = createFakeAnalysis({
+    start: () => ({ ok: true, running: true, workflow: 'analyzing' }),
+  });
+  const { handlers } = handlersWith({ analysis });
+  const { res, json } = await call(handlers.analyze, {
+    method: 'POST',
+    url: API_PATHS.analyze,
+    body: analyzeBody(),
+  });
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(json.running, true);
+});
+
+test('POST /analyze validates session, code and workspace before starting', async () => {
+  const analysis = createFakeAnalysis();
+  const { handlers } = handlersWith({ analysis });
+
+  const missingSession = await call(handlers.analyze, {
+    method: 'POST',
+    url: API_PATHS.analyze,
+    body: analyzeBody({ sessionId: '   ' }),
+  });
+  assert.equal(missingSession.res.statusCode, 400);
+  assert.equal(missingSession.json.code, 'missing-session');
+
+  for (const code of ['', '   ', undefined]) {
+    const missingCode = await call(handlers.analyze, {
+      method: 'POST',
+      url: API_PATHS.analyze,
+      body: analyzeBody({ code }),
+    });
+    assert.equal(missingCode.res.statusCode, 400, String(code));
+    assert.equal(missingCode.json.code, 'invalid-code', String(code));
+  }
+
+  const unbound = await call(handlers.analyze, {
+    method: 'POST',
+    url: API_PATHS.analyze,
+    body: analyzeBody({ sessionId: UNBOUND_SESSION_ID }),
+  });
+  assert.equal(unbound.res.statusCode, 400);
+  assert.equal(unbound.json.code, 'unknown-workspace');
+  assert.equal(analysis.calls.start.length, 0);
+});
+
+test('POST /analyze maps analysis failures to 404/409/503/500', async () => {
+  const cases = [
+    ['ticket-not-found', 404],
+    ['invalid-state', 409],
+    ['analysis-unavailable', 503],
+    ['no-live-agent', 503],
+    ['invalid-transition', 409],
+    ['internal', 500],
+  ];
+  for (const [code, status] of cases) {
+    const analysis = createFakeAnalysis({
+      start: () => ({ ok: false, code, message: `失败 ${code}` }),
+    });
+    const { handlers } = handlersWith({ analysis });
+    const { res, json } = await call(handlers.analyze, {
+      method: 'POST',
+      url: API_PATHS.analyze,
+      body: analyzeBody(),
+    });
+    assert.equal(res.statusCode, status, code);
+    assert.equal(json.ok, false, code);
+    assert.equal(json.code, code, code);
+    assert.equal(json.message, `失败 ${code}`, code);
+  }
+});
+
+test('POST /analyze answers 503 analysis-unavailable when the service is not wired', async () => {
+  const { handlers } = handlersWith({ analysis: null });
+  const { res, json } = await call(handlers.analyze, {
+    method: 'POST',
+    url: API_PATHS.analyze,
+    body: analyzeBody(),
+  });
+
+  assert.equal(res.statusCode, 503);
+  assert.equal(json.ok, false);
+  assert.equal(json.code, 'analysis-unavailable');
+});
+
+test('POST /analyze maps an unexpected service failure to 500 internal', async () => {
+  const failing = createFakeAnalysis({
+    start: () => {
+      throw new Error('analysis blew up');
+    },
+  });
+  const { handlers } = handlersWith({ analysis: failing });
+  const { res, json } = await call(handlers.analyze, {
+    method: 'POST',
+    url: API_PATHS.analyze,
+    body: analyzeBody(),
+  });
+
+  assert.equal(res.statusCode, 500);
+  assert.equal(json.code, 'internal');
+  assert.match(json.message, /analysis blew up/);
+});
+
+// ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
 
@@ -1598,6 +1816,7 @@ test('every route rejects a non-loopback Host with 403', async () => {
     ['health', 'GET', API_PATHS.health, undefined],
     ['snapshot', 'GET', snapshotUrl(), undefined],
     ['action', 'POST', API_PATHS.action, actionBody()],
+    ['analyze', 'POST', API_PATHS.analyze, analyzeBody()],
     ['settings', 'POST', API_PATHS.settings, settingsBody()],
     ['platformToken', 'POST', API_PATHS.platformToken, platformTokenBody()],
     ['sync', 'POST', API_PATHS.sync, syncBody()],
@@ -1648,6 +1867,7 @@ test('every route rejects the wrong HTTP method with 405 and an Allow header', a
     ['health', 'POST', API_PATHS.health, 'GET'],
     ['snapshot', 'POST', API_PATHS.snapshot, 'GET'],
     ['action', 'GET', API_PATHS.action, 'POST'],
+    ['analyze', 'GET', API_PATHS.analyze, 'POST'],
     ['settings', 'GET', API_PATHS.settings, 'POST'],
     ['platformToken', 'GET', API_PATHS.platformToken, 'POST'],
     ['sync', 'GET', API_PATHS.sync, 'POST'],
@@ -1666,6 +1886,7 @@ test('every route rejects the wrong HTTP method with 405 and an Allow header', a
 
 const POST_ROUTES = [
   ['action', API_PATHS.action, () => actionBody()],
+  ['analyze', API_PATHS.analyze, () => analyzeBody()],
   ['settings', API_PATHS.settings, () => settingsBody()],
   ['platformToken', API_PATHS.platformToken, () => platformTokenBody()],
   ['sync', API_PATHS.sync, () => syncBody()],
@@ -1781,6 +2002,7 @@ test('every route rejects a non-loopback remote address with 403', async () => {
     ['health', 'GET', API_PATHS.health, undefined],
     ['snapshot', 'GET', snapshotUrl(), undefined],
     ['action', 'POST', API_PATHS.action, () => actionBody()],
+    ['analyze', 'POST', API_PATHS.analyze, () => analyzeBody()],
     ['settings', 'POST', API_PATHS.settings, () => settingsBody()],
     ['platformToken', 'POST', API_PATHS.platformToken, () => platformTokenBody()],
     ['sync', 'POST', API_PATHS.sync, () => syncBody()],
@@ -1854,7 +2076,7 @@ async function callRegistered(webServer, path, options) {
   return call(handler, options);
 }
 
-test('registerRoutes() mounts all six exact routes and returns a disposer', async () => {
+test('registerRoutes() mounts all seven exact routes and returns a disposer', async () => {
   const webServer = createFakeWebServer();
   const { store, workspace } = handlersWith();
   const dispose = registerRoutes(
@@ -1919,6 +2141,13 @@ test('registerUnavailableRoutes() keeps health 500/503 and other routes 503 unti
   });
   assert.equal(sync.res.statusCode, 503);
   assert.equal(sync.json.code, 'storage-unavailable');
+
+  const analyze = await callRegistered(webServer, API_PATHS.analyze, {
+    method: 'POST',
+    body: analyzeBody(),
+  });
+  assert.equal(analyze.res.statusCode, 503);
+  assert.equal(analyze.json.code, 'storage-unavailable');
 
   dispose();
   assert.equal(webServer.routes.size, 0);
