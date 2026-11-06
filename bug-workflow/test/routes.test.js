@@ -65,7 +65,7 @@ function createSessions(entries = { [SESSION_ID]: { header: { cwd: WORKSPACE } }
  */
 function createWorkspace(sessions = createSessions()) {
   return {
-    resolve: (sessionId) => resolveWorkspace({ sessions, settingsStore: {} }, sessionId),
+    resolve: (sessionId) => resolveWorkspace({ sessions }, sessionId),
   };
 }
 
@@ -263,9 +263,12 @@ function makeRequest({
   method = 'GET',
   url = API_PATHS.health,
   host = '127.0.0.1:49254',
+  remoteAddress = '127.0.0.1',
   body,
   headers = {},
   contentLength = true,
+  contentType,
+  origin,
 } = {}) {
   const payload = body === undefined
     ? undefined
@@ -276,9 +279,41 @@ function makeRequest({
   req.method = method;
   req.url = url;
   req.headers = { ...(host === null ? {} : { host }), ...headers };
+
+  // POST routes now require a JSON media type. Tests that are not about the
+  // media type get the realistic browser default; `contentType: null` omits
+  // the header entirely (the 415 path).
+  if (req.headers['content-type'] === undefined) {
+    const inferred = contentType === undefined && method === 'POST'
+      ? 'application/json'
+      : contentType;
+    if (inferred !== null && inferred !== undefined) {
+      req.headers['content-type'] = inferred;
+    }
+  }
+  if (origin !== undefined) req.headers.origin = origin;
+
+  // `remoteAddress: null` simulates a request whose socket tells us nothing.
+  if (remoteAddress !== null) req.socket = { remoteAddress };
+
   if (payload !== undefined && contentLength && req.headers['content-length'] === undefined) {
     req.headers['content-length'] = String(payload.length);
   }
+  return req;
+}
+
+/** A request whose body never ends, to exercise the body-read deadline. */
+function makeHangingRequest({
+  method = 'POST',
+  url = API_PATHS.action,
+  host = '127.0.0.1:49254',
+  remoteAddress = '127.0.0.1',
+} = {}) {
+  const req = new Readable({ read() {} });
+  req.method = method;
+  req.url = url;
+  req.headers = { host, 'content-type': 'application/json' };
+  req.socket = { remoteAddress };
   return req;
 }
 
@@ -349,7 +384,7 @@ function handlersWith({
 // ---------------------------------------------------------------------------
 
 test('resolveWorkspace() returns the live session cwd as a configured workspace', () => {
-  const resolved = resolveWorkspace({ sessions: createSessions(), settingsStore: {} }, SESSION_ID);
+  const resolved = resolveWorkspace({ sessions: createSessions() }, SESSION_ID);
   assert.deepEqual(resolved, { path: WORKSPACE, configured: true });
 });
 
@@ -778,6 +813,48 @@ test('POST /action never throws when the store throws', async () => {
   assert.match(json.message, /disk on fire/);
 });
 
+test('error responses clip unknown-action, internal and invalid-payload detail', async () => {
+  const longName = 'x'.repeat(200);
+  const { handlers } = handlersWith();
+  const unknown = await call(handlers.action, {
+    method: 'POST',
+    url: API_PATHS.action,
+    body: actionBody({ action: longName }),
+  });
+  assert.equal(unknown.res.statusCode, 400);
+  assert.equal(unknown.json.code, 'unknown-action');
+  assert.ok(unknown.json.message.length <= 300);
+  assert.ok(unknown.json.message.includes('x'.repeat(63)));
+  assert.equal(unknown.json.message.includes('x'.repeat(64)), false);
+
+  const longError = 'E'.repeat(4000);
+  const internal = await call(
+    handlersWith({
+      store: createFakeStore({
+        applyAction: async () => {
+          throw new Error(longError);
+        },
+      }),
+    }).handlers.action,
+    { method: 'POST', url: API_PATHS.action, body: actionBody() },
+  );
+  assert.equal(internal.res.statusCode, 500);
+  assert.equal(internal.json.code, 'internal');
+  assert.ok(internal.json.message.length <= 300);
+
+  const invalidPayload = await call(
+    handlersWith({
+      store: createFakeStore({
+        applyAction: async () => ({ ok: false, code: 'invalid-payload', message: longError }),
+      }),
+    }).handlers.action,
+    { method: 'POST', url: API_PATHS.action, body: actionBody() },
+  );
+  assert.equal(invalidPayload.res.statusCode, 400);
+  assert.equal(invalidPayload.json.code, 'invalid-payload');
+  assert.ok(invalidPayload.json.message.length <= 300);
+});
+
 // ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
@@ -819,6 +896,33 @@ test('POST /settings rejects a non-object settings field with 400', async () => 
   });
   assert.equal(res.statusCode, 400);
   assert.equal(json.code, 'invalid-settings');
+});
+
+test('POST /settings rejects a body over 64 KiB with 413', async () => {
+  const { handlers } = handlersWith();
+  const oversized = JSON.stringify({
+    sessionId: SESSION_ID,
+    settings: { padding: 'x'.repeat(MAX_BODY_BYTES) },
+  });
+  assert.ok(Buffer.byteLength(oversized) > MAX_BODY_BYTES);
+
+  const declared = await call(handlers.settings, {
+    method: 'POST',
+    url: API_PATHS.settings,
+    body: oversized,
+  });
+  assert.equal(declared.res.statusCode, 413);
+  assert.equal(declared.json.code, 'payload-too-large');
+
+  // Chunked requests carry no content-length: the cap must still apply.
+  const chunked = await call(handlers.settings, {
+    method: 'POST',
+    url: API_PATHS.settings,
+    body: oversized,
+    contentLength: false,
+  });
+  assert.equal(chunked.res.statusCode, 413);
+  assert.equal(chunked.json.code, 'payload-too-large');
 });
 
 test('POST /settings maps store invalid-settings to 400', async () => {
@@ -911,19 +1015,187 @@ test('a missing Host header is rejected with 403', async () => {
   assert.equal(json.code, 'forbidden-host');
 });
 
-test('every route rejects the wrong HTTP method with 405', async () => {
+test('every route rejects the wrong HTTP method with 405 and an Allow header', async () => {
   const { handlers } = handlersWith();
   const cases = [
-    ['health', 'POST', API_PATHS.health],
-    ['snapshot', 'POST', API_PATHS.snapshot],
-    ['action', 'GET', API_PATHS.action],
-    ['settings', 'GET', API_PATHS.settings],
+    ['health', 'POST', API_PATHS.health, 'GET'],
+    ['snapshot', 'POST', API_PATHS.snapshot, 'GET'],
+    ['action', 'GET', API_PATHS.action, 'POST'],
+    ['settings', 'GET', API_PATHS.settings, 'POST'],
   ];
-  for (const [name, method, url] of cases) {
+  for (const [name, method, url, allow] of cases) {
     const { res, json } = await call(handlers[name], { method, url });
     assert.equal(res.statusCode, 405, name);
     assert.equal(json.code, 'method-not-allowed', name);
+    assert.equal(res.headers.allow, allow, name);
   }
+});
+
+// ---------------------------------------------------------------------------
+// Origin / media-type / remote-address guards (Task 3 review findings)
+// ---------------------------------------------------------------------------
+
+const POST_ROUTES = [
+  ['action', API_PATHS.action, () => actionBody()],
+  ['settings', API_PATHS.settings, () => settingsBody()],
+];
+
+test('POST routes reject non-JSON media types with 415 before reading the body', async () => {
+  for (const [name, url, body] of POST_ROUTES) {
+    for (const contentType of ['text/plain', 'application/x-www-form-urlencoded', null]) {
+      const { store, handlers } = handlersWith();
+      const { res, json } = await call(handlers[name], {
+        method: 'POST',
+        url,
+        body: body(),
+        contentType,
+        // The media-type gate must win over the Origin gate: this is the exact
+        // cross-site `no-cors` shape (text/plain + a foreign Origin).
+        origin: 'https://evil.example',
+      });
+      const label = `${name} ${contentType}`;
+      assert.equal(res.statusCode, 415, label);
+      assert.equal(json.ok, false, label);
+      assert.equal(json.code, 'unsupported-media-type', label);
+      assert.match(json.message, /application\/json/, label);
+      assert.equal(store.calls.applyAction.length, 0, label);
+      assert.equal(store.calls.putSettings.length, 0, label);
+    }
+  }
+});
+
+test('POST routes accept application/json with media-type parameters', async () => {
+  const { handlers } = handlersWith();
+  const { res, json } = await call(handlers.action, {
+    method: 'POST',
+    url: API_PATHS.action,
+    body: actionBody(),
+    contentType: 'application/json; charset=utf-8',
+  });
+  assert.equal(res.statusCode, 200);
+  assert.equal(json.ok, true);
+});
+
+test('POST routes reject a foreign Origin with 403', async () => {
+  for (const [name, url, body] of POST_ROUTES) {
+    for (const origin of [
+      'https://evil.example',
+      'http://127.0.0.1:9999',
+      'http://localhost:49254',
+      'null',
+      'not a url',
+    ]) {
+      const { store, handlers } = handlersWith();
+      const { res, json } = await call(handlers[name], {
+        method: 'POST',
+        url,
+        body: body(),
+        origin,
+      });
+      const label = `${name} ${origin}`;
+      assert.equal(res.statusCode, 403, label);
+      assert.equal(json.code, 'forbidden-origin', label);
+      assert.equal(store.calls.applyAction.length, 0, label);
+      assert.equal(store.calls.putSettings.length, 0, label);
+    }
+  }
+});
+
+test('POST routes accept a same-origin Origin from a loopback socket', async () => {
+  for (const [name, url, body] of POST_ROUTES) {
+    const { handlers } = handlersWith();
+    const { res } = await call(handlers[name], {
+      method: 'POST',
+      url,
+      body: body(),
+      origin: 'http://127.0.0.1:49254',
+      remoteAddress: '::ffff:127.0.0.1',
+    });
+    assert.equal(res.statusCode, 200, name);
+  }
+
+  // Only the host:port has to match the Host header; both schemes are local.
+  const { handlers } = handlersWith();
+  const https = await call(handlers.action, {
+    method: 'POST',
+    url: API_PATHS.action,
+    body: actionBody(),
+    origin: 'https://127.0.0.1:49254',
+  });
+  assert.equal(https.res.statusCode, 200);
+
+  const ipv6 = await call(handlers.health, {
+    host: '[::1]:49254',
+    origin: 'http://[::1]:49254',
+    remoteAddress: '::1',
+  });
+  assert.equal(ipv6.res.statusCode, 200);
+});
+
+test('a missing Origin (non-browser local client) is allowed', async () => {
+  const { handlers } = handlersWith();
+  const health = await call(handlers.health, {});
+  assert.equal(health.res.statusCode, 200);
+
+  const action = await call(handlers.action, {
+    method: 'POST',
+    url: API_PATHS.action,
+    body: actionBody(),
+  });
+  assert.equal(action.res.statusCode, 200);
+});
+
+test('every route rejects a non-loopback remote address with 403', async () => {
+  const cases = [
+    ['health', 'GET', API_PATHS.health, undefined],
+    ['snapshot', 'GET', snapshotUrl(), undefined],
+    ['action', 'POST', API_PATHS.action, () => actionBody()],
+    ['settings', 'POST', API_PATHS.settings, () => settingsBody()],
+  ];
+  for (const [name, method, url, body] of cases) {
+    for (const remoteAddress of ['10.0.0.7', '::2', '::ffff:10.0.0.7', '127.0.0.2', null]) {
+      const { handlers } = handlersWith();
+      const { res, json } = await call(handlers[name], {
+        method,
+        url,
+        body: body?.(),
+        remoteAddress,
+      });
+      const label = `${name} ${remoteAddress}`;
+      assert.equal(res.statusCode, 403, label);
+      assert.equal(json.code, 'forbidden-remote', label);
+    }
+  }
+});
+
+test('loopback remote address variants are accepted', async () => {
+  for (const remoteAddress of ['127.0.0.1', '::1', '::ffff:127.0.0.1']) {
+    const { handlers } = handlersWith();
+    const { res } = await call(handlers.health, { remoteAddress });
+    assert.equal(res.statusCode, 200, remoteAddress);
+  }
+});
+
+test('POST routes answer 408 and destroy a body that misses the read deadline', async () => {
+  const { store, workspace } = handlersWith();
+  const handlers = createHandlers({
+    store,
+    workspace,
+    clock: () => SERVER_TIME,
+    domainOpenedAt: OPENED_AT,
+    bodyTimeoutMs: 25,
+  });
+
+  for (const [name, url] of POST_ROUTES) {
+    const req = makeHangingRequest({ url });
+    const res = makeResponse();
+    await handlers[name](req, res);
+    assert.equal(res.statusCode, 408, name);
+    assert.equal(JSON.parse(res.body).code, 'body-timeout', name);
+    assert.equal(req.destroyed, true, name);
+  }
+  assert.equal(store.calls.applyAction.length, 0);
+  assert.equal(store.calls.putSettings.length, 0);
 });
 
 // ---------------------------------------------------------------------------
