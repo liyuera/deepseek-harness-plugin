@@ -13,6 +13,7 @@
  *   GET  /bug-workflow/api/health    -> { ok, domainOpenedAt, tickets }
  *   GET  /bug-workflow/api/snapshot  -> { ok, workspace, settings, platform, dicts, tickets, serverTime }
  *   POST /bug-workflow/api/action    -> { ok, ticket } | { ok:false, code, message, ticket? }
+ *                                       (create + payload.code = 按编号从平台导入)
  *   POST /bug-workflow/api/settings  -> { ok, settings }
  *   POST /bug-workflow/api/platform-token -> { ok, tokenPresent }
  *   POST /bug-workflow/api/sync      -> { ok, synced, created, updated, total, filtered, lastSyncAt }
@@ -171,6 +172,12 @@ export function apply(ctx) {
           workspace,
           tokenStore,
           sync,
+          // By-code import shares the sync service's token/settings/platform
+          // client wiring. Guarding the method keeps an older/sync-less build
+          // on the route's 503 storage-unavailable path instead of throwing.
+          importTask: typeof sync.importTask === 'function'
+            ? (cwd, code) => sync.importTask(cwd, code)
+            : null,
           clock,
           domainOpenedAt: handle.openedAt,
           // Full request errors stay in the host log; only clipped summaries

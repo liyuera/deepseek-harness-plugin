@@ -6,6 +6,8 @@
  *   GET  /bug-workflow/api/health          -> { ok, domainOpenedAt, tickets }
  *   GET  /bug-workflow/api/snapshot        -> { ok, workspace, settings, platform, dicts, tickets, serverTime }
  *   POST /bug-workflow/api/action          -> { ok, ticket } | { ok:false, code, message, ticket? }
+ *                                              action:'create' + payload.code imports that
+ *                                              platform task by code (see `importTask`)
  *   POST /bug-workflow/api/settings        -> { ok, settings }
  *   POST /bug-workflow/api/platform-token  -> { ok, tokenPresent } (token is only written, never read back)
  *   POST /bug-workflow/api/sync            -> { ok, synced, created, updated, total, filtered, lastSyncAt }
@@ -116,6 +118,24 @@ const SYNC_ERROR_STATUS = Object.freeze({
   internal: 500,
 });
 
+/**
+ * Import failure code -> HTTP status. A missing/unknown token or an invalid
+ * code/config is a 400; an upstream 401 asks for a new token; an unknown task is
+ * a 404; every other upstream/network failure is a 502.
+ */
+const IMPORT_ERROR_STATUS = Object.freeze({
+  'invalid-code': 400,
+  'no-platform-token': 400,
+  'invalid-platform-config': 400,
+  'platform-unauthorized': 401,
+  'platform-not-found': 404,
+  'platform-network': 502,
+  'platform-http': 502,
+  'platform-bad-response': 502,
+  'invalid-request': 502,
+  internal: 500,
+});
+
 /** Explicit allow-list of loopback Host header values (with optional port). */
 const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1']);
 
@@ -135,6 +155,8 @@ const LOOPBACK_REMOTE_ADDRESSES = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1
  *   the snapshot reports `tokenPresent:false` and the token route answers 503
  * @param {object|null} [deps.sync] `createSyncService()` result; when null the
  *   sync route answers 503 and the snapshot falls back to token presence only
+ * @param {((cwd: string|null, code: string) => Promise<object>)|null} [deps.importTask]
+ *   `createSyncService().importTask`; when null an import request answers 503
  * @param {() => string} [deps.clock] ISO 8601 server time for snapshots
  * @param {number|null} [deps.domainOpenedAt] domain open timestamp for health
  * @param {number} [deps.bodyTimeoutMs] POST body read deadline (default 10 s)
@@ -147,6 +169,7 @@ export function createHandlers({
   workspace,
   tokenStore = null,
   sync = null,
+  importTask = null,
   clock = defaultClock,
   domainOpenedAt = null,
   bodyTimeoutMs = BODY_TIMEOUT_MS,
@@ -172,6 +195,10 @@ export function createHandlers({
     }
   }
   const syncService = sync === undefined ? null : sync;
+  if (importTask !== null && importTask !== undefined && typeof importTask !== 'function') {
+    throw new TypeError('createHandlers() importTask must be a function');
+  }
+  const importTaskFn = importTask === undefined ? null : importTask;
   if (typeof clock !== 'function') {
     throw new TypeError('createHandlers() requires clock to be a function');
   }
@@ -275,6 +302,35 @@ export function createHandlers({
       const payload = normalizePayload(input.payload);
       if (!payload.ok) {
         sendError(res, 400, payload.code, payload.message);
+        return;
+      }
+
+      // P2 「从平台导入」 uses the existing create action with `payload.code`.
+      // It must be handled before `store.applyAction('create')`, otherwise the
+      // host would create a local manual ticket titled with the code instead of
+      // importing the platform detail.
+      const importCode = normalizeImportPayloadCode(payload.value);
+      if (action === 'create' && importCode !== null) {
+        if (importTaskFn === null) {
+          sendError(res, 503, 'storage-unavailable', '平台导入服务不可用，请稍后重试');
+          return;
+        }
+
+        const resolved = normalizeWorkspace(workspace.resolve(sessionId));
+        const result = await importTaskFn(resolved.path, importCode);
+        if (result?.ok === true) {
+          sendJsonSafe(res, 200, { ok: true, ticket: result.ticket });
+          return;
+        }
+
+        const failureCode = typeof result?.code === 'string' ? result.code : 'internal';
+        const status = IMPORT_ERROR_STATUS[failureCode] ?? 500;
+        sendError(
+          res,
+          status,
+          failureCode,
+          clipMessage(typeof result?.message === 'string' ? result.message : '平台工单导入失败'),
+        );
         return;
       }
 
@@ -1035,6 +1091,21 @@ function normalizePayload(value) {
     return { ok: false, code: 'invalid-payload', message: 'payload 必须是普通对象' };
   }
   return { ok: true, value };
+}
+
+/**
+ * `payload.code` of a create request, when it is a non-empty string. This is
+ * the 「从平台导入」 trigger; every other create (the demo ticket, which sends
+ * only title/type/version) keeps the P1 local-create path. The actual code
+ * validation (length/charset) belongs to `importTask`, so a bad code answers
+ * 400 `invalid-code` instead of silently creating a manual ticket.
+ */
+function normalizeImportPayloadCode(payload) {
+  if (!isPlainObject(payload)) return null;
+  const value = payload.code;
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed === '' ? null : trimmed;
 }
 
 function normalizeWorkspace(resolved) {

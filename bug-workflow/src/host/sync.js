@@ -37,6 +37,14 @@
  * Single-flight: concurrent `run(cwd)` calls for the same cwd coalesce to one
  * promise (the periodic interval and a manual sync cannot double-write).
  *
+ * `importTask(cwd, code)` is the P2 「从平台导入」 path: it validates the code,
+ * fetches one detail record (`platformClient.getTask`), maps it with the same
+ * mapper `run()` uses, and upserts it through `store.upsertPlatformRecords()`.
+ * It deliberately does not write `lastSyncAt`/`lastSyncError` (it is not a
+ * sync) and preserves the local workflow of an existing ticket. Failure codes:
+ * `invalid-code`/`no-platform-token`/`invalid-platform-config`/upstream codes,
+ * all with static, token-free messages.
+ *
  * This module must stay dependency-free (relative imports only, no packages)
  * so `node --test` can import it under plain Node.
  */
@@ -56,6 +64,12 @@ export const LAST_SYNC_AT_KEY = 'platform.lastSyncAt';
 /** Meta key holding the last sync failure message (string) or null. */
 export const LAST_SYNC_ERROR_KEY = 'platform.lastSyncError';
 
+/** Longest accepted task code for a by-code import (defensive bound). */
+export const IMPORT_CODE_MAX_LENGTH = 128;
+
+/** Accepted task-code characters: project prefix + number, e.g. `ABC-12`. */
+const IMPORT_CODE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
 /** Query sort passed to `listMyTasks`; matches the P0 list contract. */
 const SYNC_SORT = 'createdTime';
 
@@ -70,6 +84,23 @@ const MESSAGES = Object.freeze({
   'platform-bad-response': '平台响应结构异常',
   'invalid-request': '平台请求参数不合法',
   internal: '平台同步失败，请稍后重试',
+});
+
+/**
+ * Import-specific messages. A 404 here means the platform has no ticket with
+ * the requested code (not a missing route), and `invalid-code` is the client's
+ * input problem rather than a sync failure.
+ */
+const IMPORT_MESSAGES = Object.freeze({
+  'no-platform-token': MESSAGES['no-platform-token'],
+  'invalid-platform-config': MESSAGES['invalid-platform-config'],
+  'invalid-code': '工单编号不合法：仅支持字母、数字、点、下划线和短横线，最长 128 字符',
+  'platform-unauthorized': MESSAGES['platform-unauthorized'],
+  'platform-not-found': '平台没有该工单',
+  'platform-network': MESSAGES['platform-network'],
+  'platform-http': MESSAGES['platform-http'],
+  'platform-bad-response': MESSAGES['platform-bad-response'],
+  internal: '平台工单导入失败，请稍后重试',
 });
 
 /** Platform-client failure codes copied through to the route layer. */
@@ -87,13 +118,17 @@ const UPSTREAM_CODES = new Set([
  *
  * @param {object} deps
  * @param {object} deps.store `createStore()` result; needs
- *   `upsertPlatformRecords`, `setDicts`, `getMeta` and `setMeta`
+ *   `upsertPlatformRecords`, `getDicts`, `setDicts`, `getMeta`, `setMeta` and `get`
  * @param {{get: () => Promise<string|null>, present: () => Promise<boolean>}} deps.tokenStore
  * @param {(cwd: string|null) => object} deps.getSettings workspace settings for a cwd
  * @param {(settings: object, token: string) => object} deps.platformClientFor
  *   builds the platform client; may throw for invalid configuration
  * @param {() => string} deps.clock returns an ISO 8601 timestamp
- * @returns {{run: (cwd: string|null) => Promise<object>, status: () => Promise<object>}}
+ * @returns {{
+ *   run: (cwd: string|null) => Promise<object>,
+ *   importTask: (cwd: string|null, code: string) => Promise<object>,
+ *   status: () => Promise<object>,
+ * }}
  */
 export function createSyncService(deps = {}) {
   if (deps === null || typeof deps !== 'object') {
@@ -104,7 +139,7 @@ export function createSyncService(deps = {}) {
   if (store === null || typeof store !== 'object') {
     throw new TypeError('createSyncService() requires a store');
   }
-  for (const method of ['upsertPlatformRecords', 'getDicts', 'setDicts', 'getMeta', 'setMeta']) {
+  for (const method of ['upsertPlatformRecords', 'getDicts', 'setDicts', 'getMeta', 'setMeta', 'get']) {
     if (typeof store[method] !== 'function') {
       throw new TypeError(`createSyncService() store.${method} must be a function`);
     }
@@ -189,6 +224,112 @@ export function createSyncService(deps = {}) {
     return { tokenPresent, lastSyncAt, lastSyncError };
   }
 
+  /**
+   * Import one platform ticket by code (P2 「从平台导入」).
+   *
+   * The code is validated before any platform call, then resolved through
+   * `getTask(code)` and mapped with the very same `mapRecordToPlatformTicket()`
+   * used by `run()`. The single record is upserted through
+   * `store.upsertPlatformRecords([record], now)`, so an existing ticket keeps
+   * its local workflow/timeline and a new one starts at `inbox` with
+   * `source:'platform'`.
+   *
+   * Unlike `run()`, an import is not a sync: it never writes
+   * `meta['platform.lastSyncAt']` or `meta['platform.lastSyncError']`, so a
+   * failed import cannot masquerade as a failed sync in the header.
+   *
+   * @param {string|null} cwd workspace path (null = defaults settings)
+   * @param {string} code platform task code entered by the user
+   * @returns {Promise<
+   *   {ok:true, ticket:object, created:number, updated:number} |
+   *   {ok:false, code:string, message:string}>}
+   */
+  async function importTask(cwd, code) {
+    const taskCode = normalizeImportCode(code);
+    if (taskCode === undefined) return importFailure('invalid-code');
+
+    let token;
+    try {
+      token = await tokenStore.get();
+    } catch {
+      token = null;
+    }
+    if (typeof token !== 'string' || token.trim() === '') {
+      return importFailure('no-platform-token');
+    }
+
+    let settings;
+    try {
+      settings = await getSettings(cwd);
+    } catch {
+      return importFailure('internal');
+    }
+    const safeSettings = isPlainObject(settings) ? settings : {};
+
+    let client;
+    try {
+      client = platformClientFor(safeSettings, token.trim());
+    } catch {
+      // `createPlatformClient` throws PlatformError for an invalid baseUrl.
+      return importFailure('invalid-platform-config');
+    }
+    if (!isUsableClient(client, ['getTask'])) {
+      return importFailure('invalid-platform-config');
+    }
+
+    let detail;
+    try {
+      detail = await client.getTask(taskCode);
+    } catch {
+      return importFailure('internal');
+    }
+    if (!detail?.ok) return importFailure(importUpstreamCode(detail));
+    if (!isPlainObject(detail.data)) return importFailure('platform-bad-response');
+
+    let now;
+    try {
+      now = readNow(clock);
+    } catch {
+      return importFailure('internal');
+    }
+
+    // The detail endpoint is the full record (it also carries `id`); a detail
+    // shape may omit taskCode, in which case the requested code identifies it.
+    const record = {
+      ...detail.data,
+      taskCode: textValue(detail.data.taskCode) ?? taskCode,
+    };
+    const mapped = mapRecordToPlatformTicket(record, {
+      baseUrl: pickBaseUrl(client, safeSettings),
+      projectCode: textValue(safeSettings.platformProjectCode) ?? '',
+      now,
+    });
+    if (mapped === null) return importFailure('platform-bad-response');
+
+    let counts;
+    try {
+      counts = await store.upsertPlatformRecords([mapped], now);
+    } catch {
+      // Covers schema rejection and storage failures: run() does the same and
+      // reports a static failure instead of leaking the internal error.
+      return importFailure('internal');
+    }
+
+    let ticket;
+    try {
+      ticket = store.get(mapped.code);
+    } catch {
+      return importFailure('internal');
+    }
+
+    return {
+      ok: true,
+      ticket,
+      created: countOf(counts?.created),
+      updated: countOf(counts?.updated),
+    };
+  }
+
   // -------------------------------------------------------------------------
   // Run pipeline
   // -------------------------------------------------------------------------
@@ -262,14 +403,11 @@ export function createSyncService(deps = {}) {
     }
 
     const now = readNow(clock);
-    const syncedAt = Date.parse(now);
     const baseUrl = pickBaseUrl(client, settings);
-    const mapped = kept.map(({ code, record }) => mapPlatformRecord(record, {
-      code,
-      settings,
-      baseUrl,
-      syncedAt,
-    }));
+    const mapped = kept
+      .map(({ record }) => mapRecordToPlatformTicket(record, { baseUrl, projectCode, now }))
+      // Kept records always carry a code, so this only guards a future change.
+      .filter((ticket) => ticket !== null);
 
     let counts;
     try {
@@ -361,7 +499,7 @@ export function createSyncService(deps = {}) {
     return { ok: false, code, message: MESSAGES[code] ?? MESSAGES.internal };
   }
 
-  return { run, status };
+  return { run, importTask, status };
 }
 
 // ---------------------------------------------------------------------------
@@ -369,13 +507,24 @@ export function createSyncService(deps = {}) {
 // ---------------------------------------------------------------------------
 
 /**
- * Map one platform list record to the v2 Ticket fields understood by
+ * Map one platform record to the v2 Ticket fields understood by
  * `store.upsertPlatformRecords()`. Top-level fields hold the display names the
  * board renders; `platform` keeps the raw keys next to them, because the
  * platform status is deliberately separate from the local workflow.
+ *
+ * Shared by `run()` (list records) and `importTask()` (detail records): the
+ * detail shape also carries `id`, may leave `description` null and may omit
+ * list-only fields such as `refProjectName`, all of which map the same way.
+ *
+ * @param {object} record platform list or detail record
+ * @param {{baseUrl: string, projectCode: string, now: string}} options
+ *   `now` is an ISO 8601 timestamp; `syncedAt` is stored as epoch milliseconds
+ * @returns {object|null} mapped record, or null when the record has no code
  */
-function mapPlatformRecord(record, { code, settings, baseUrl, syncedAt }) {
-  const url = buildPlatformUrl(baseUrl, projectSegment(settings, code), code);
+function mapRecordToPlatformTicket(record, { baseUrl, projectCode, now } = {}) {
+  const code = textValue(record?.taskCode);
+  if (code === undefined) return null;
+  const url = buildPlatformUrl(baseUrl, projectSegment(projectCode, code), code);
   return {
     code,
     title: textValue(record.taskName) ?? code,
@@ -403,7 +552,7 @@ function mapPlatformRecord(record, { code, settings, baseUrl, syncedAt }) {
       assigneeName: textValue(record.refHandlePersonName) ?? null,
       description: typeof record.description === 'string' ? record.description : '',
       url,
-      syncedAt,
+      syncedAt: Date.parse(now),
     },
   };
 }
@@ -446,16 +595,17 @@ function buildPlatformUrl(baseUrl, projectCode, code) {
 }
 
 /**
- * URL project segment: the configured project code wins (the sync is filtered
- * to it), then the task-code prefix (the same convention), then the numeric
- * project id as a last resort.
+ * URL project segment. The configured project code wins for codes that belong
+ * to it (the sync is filtered to that prefix). A by-code import may target a
+ * ticket from another project, where the task-code prefix is the correct
+ * segment; an unprefixed code falls back to the configured project, then ''.
  */
-function projectSegment(settings, code) {
-  const configured = textValue(settings.platformProjectCode);
-  if (configured !== undefined) return configured;
+function projectSegment(projectCode, code) {
+  const configured = textValue(projectCode);
+  if (configured !== undefined && code.startsWith(`${configured}-`)) return configured;
   const dash = code.indexOf('-');
   if (dash > 0) return code.slice(0, dash);
-  return '';
+  return configured ?? '';
 }
 
 /** Prefer the normalized client base URL (has the trailing slash stripped). */
@@ -464,9 +614,9 @@ function pickBaseUrl(client, settings) {
   return textValue(settings.platformBaseUrl) ?? '';
 }
 
-function isUsableClient(client) {
+function isUsableClient(client, methods = ['getUser', 'listMyTasks', 'getDicts']) {
   if (client === null || typeof client !== 'object') return false;
-  for (const method of ['getUser', 'listMyTasks', 'getDicts']) {
+  for (const method of methods) {
     if (typeof client[method] !== 'function') return false;
   }
   return true;
@@ -496,6 +646,46 @@ function countValue(value) {
   if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return Math.floor(value);
   if (typeof value === 'string' && /^\d+$/.test(value.trim())) return Number(value.trim());
   return undefined;
+}
+
+/**
+ * Trim and validate a user-entered platform code. Only the documented shape
+ * (`PROJECT-123`) is sent upstream; anything else is a 400-class input error
+ * rather than an upstream request.
+ */
+function normalizeImportCode(value) {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (trimmed === '' || trimmed.length > IMPORT_CODE_MAX_LENGTH) return undefined;
+  if (!IMPORT_CODE_PATTERN.test(trimmed)) return undefined;
+  return trimmed;
+}
+
+/** Static import failure; never writes the sync error banner. */
+function importFailure(code) {
+  return {
+    ok: false,
+    code,
+    message: IMPORT_MESSAGES[code] ?? IMPORT_MESSAGES.internal,
+  };
+}
+
+/**
+ * Map a platform-client failure to the import error vocabulary. `invalid-request`
+ * can only mean the code itself was rejected, so it becomes `invalid-code`
+ * (400 at the route) instead of an upstream 502.
+ */
+function importUpstreamCode(result) {
+  const code = typeof result?.code === 'string' ? result.code : 'platform-http';
+  if (code === 'invalid-request') return 'invalid-code';
+  return UPSTREAM_CODES.has(code) ? code : 'platform-http';
+}
+
+/** Non-negative integer count from the store upsert result. */
+function countOf(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+    ? Math.floor(value)
+    : 0;
 }
 
 function isPlainObject(value) {

@@ -39,7 +39,11 @@
  *     (label = `value`, stable key = `key`, optional colour dot) and fall back
  *     to the values observed on tickets. Rows carry a 平台/手动 source badge.
  *   - the manual add box is 「从平台导入」: it sends the existing `create`
- *     action with `{code}` and selects the imported ticket after the refresh.
+ *     action with `{code}`, requires the returned ticket to carry
+ *     `source:'platform'` before claiming success (a local/manual ticket gets a
+ *     warning banner instead), and selects the imported ticket after the
+ *     refresh; if that refresh does not contain it the pending selection is
+ *     dropped.
  *   - `PanelErrorBoundary` keeps a render failure from blanking the whole slot.
  *
  * The client never re-implements the state machine: action buttons are derived
@@ -2310,7 +2314,7 @@ window.__ModuleLoader__.load({
         type: 'button',
         onClick: () => onSelect(ticket.code),
         'aria-current': selected ? 'true' : undefined,
-        'aria-label': `工单 ${ticket.code} ${title}，${workflowLabel(ticket.workflow)}`,
+        'aria-label': `工单 ${ticket.code} ${title}，来源${sourceLabel(ticket)}，${workflowLabel(ticket.workflow)}`,
         style: {
           display: 'flex',
           flexDirection: 'column',
@@ -2830,11 +2834,17 @@ window.__ModuleLoader__.load({
         // A just-imported ticket is selected as soon as the refreshed snapshot
         // contains it (selecting before the refresh would be cleared by this
         // same effect, because the old ticket list does not have the code yet).
+        // The first snapshot that arrives after the import is authoritative: if
+        // it does not contain the code, drop the pending selection so a later
+        // unrelated snapshot can never auto-open a stale code by surprise.
         const pending = pendingSelectRef.current;
-        if (pending !== null && tickets.some((ticket) => ticket.code === pending)) {
+        if (pending !== null) {
+          if (tickets.some((ticket) => ticket.code === pending)) {
+            pendingSelectRef.current = null;
+            setSelectedCode(pending);
+            return;
+          }
           pendingSelectRef.current = null;
-          setSelectedCode(pending);
-          return;
         }
         if (selectedCode === null || snapshot === null) return;
         if (!tickets.some((ticket) => ticket.code === selectedCode)) setSelectedCode(null);
@@ -3281,11 +3291,27 @@ window.__ModuleLoader__.load({
           if (result.aborted === true) return;
 
           if (result.ok) {
-            const created = result.data && typeof result.data === 'object' ? result.data.ticket : null;
-            const createdCode = created && typeof created.code === 'string' ? created.code : code;
-            setManualCode('');
-            pendingSelectRef.current = createdCode;
-            setFlash(`工单 ${createdCode} 已从平台导入`);
+            const imported = result.data && typeof result.data === 'object' ? result.data.ticket : null;
+            const importedCode = imported && typeof imported.code === 'string' ? imported.code : code;
+            if (imported !== null && imported.source === 'platform') {
+              setManualCode('');
+              pendingSelectRef.current = importedCode;
+              setFlash(`工单 ${importedCode} 已从平台导入`);
+            } else {
+              // A successful host response that is not a platform ticket means
+              // the host did not run the by-code import path (older host or a
+              // misconfigured build). Never claim 「已从平台导入」 for it and do
+              // not auto-select a manual ticket: warn and keep the input so the
+              // user can retry after fixing the setup.
+              pendingSelectRef.current = null;
+              setActionError({
+                code: 'import-not-platform',
+                title: '导入警告',
+                message: `宿主返回的工单不是平台工单（来源：${imported === null ? '未知' : sourceLabel(imported)}），未完成平台导入；请检查平台 token 与宿主版本。`,
+                status: null,
+                stage: null,
+              });
+            }
           } else {
             setActionError(importErrorView(result));
           }
@@ -3360,7 +3386,7 @@ window.__ModuleLoader__.load({
 
       const bannerError = actionError ?? (polling.error === null ? null : polling.error);
       const bannerTitle = actionError === null
-        ? '同步失败'
+        ? '刷新失败'
         : (typeof actionError.title === 'string' && actionError.title !== '' ? actionError.title : '操作失败');
       const showBanner = bannerError !== null && (snapshot !== null || actionError !== null);
       const filtersActive = filters.status.length > 0 || filters.type.length > 0;
