@@ -19,8 +19,11 @@
  *      pass note with no item and no explicit zero-issue statement yields `unknown`.
  *      A pass note may legitimately have zero items when the template states so
  *      (`历史未收敛: 0 条` / `剩余问题: 0 条`), e.g. an `AI Code Review 人工复核结果`.
- *   7. Only the note's own unquoted lines count for the conclusion and the zero-issue
- *      declaration. A human reply that quotes a passing note stays `unknown`.
+ *   7. Only the note's own top-level lines count: blockquote lines, fenced code blocks
+ *      (``` / ~~~) and indented code blocks (4 spaces / tab at line start) are removed
+ *      before the verdict, the zero-issue declaration and the issue sections are read.
+ *      A human reply that quotes or pastes a passing note stays `unknown`; there is no
+ *      inline-verdict fallback.
  *
  * The module also works as a self-test entry point:
  *   node bug-workflow/scripts/review-parser.mjs
@@ -37,7 +40,6 @@ const HEADING_RE = /^[ \t]*#{1,6}[ \t]+\S/;
 const ITEM_START_RE = /^[ \t]*(?:\d+[.、)]|[-*+])[ \t]+(?:\*\*)?文件(?:\*\*)?[ \t]*[:：][ \t]*(.*)$/;
 const FIELD_RE = /^[ \t]*(?:[-*+][ \t]+)?(?:\*\*)?(FID|复验次数|级别|类型|门禁分类|提交人|位置|源码|状态|人工复核结果|问题|建议)(?:\*\*)?[ \t]*[:：][ \t]*(.*)$/;
 const VERDICT_RE = /^[ \t]*(?:\*\*)?结论(?:\*\*)?[ \t]*[:：][ \t]*(.*)$/m;
-const INLINE_VERDICT_RE = /结论[ \t]*[:：][ \t]*(?:\*\*)?[ \t]*(可直接合并|需要修改)/;
 // A zero-issue declaration is a summary line of its own. Anchor it to the whole line so a
 // passing note quoted inside a human reply can never be read as the latest conclusion.
 const ZERO_ISSUE_RE =
@@ -105,35 +107,63 @@ function visibleBody(body) {
   return body.slice(0, cut).replace(/<!--\s*AI_REVIEW_[\s\S]*?-->/g, '');
 }
 
+const BLOCKQUOTE_RE = /^[ \t]*>/;
+const FENCE_OPEN_RE = /^[ \t]*(`{3,}|~{3,})/;
+const FENCE_CLOSE_RE = /^[ \t]*(`{3,}|~{3,})[ \t]*$/;
+// 4 columns of leading whitespace: four spaces, or any earlier tab (a tab reaches the
+// next 4-column stop, so ` \t` / `  \t` / `   \t` are indented code too).
+const INDENTED_CODE_RE = /^(?: {4}|[ \t]*\t)/;
+
 /**
- * The note's own lines, i.e. everything a human did not quote from another note.
- * A human reply quoting a passing AI note must not be mistaken for a review.
+ * The note's own top-level lines, i.e. everything a human did not quote from another
+ * note. Quoted or pasted content is removed before any rule runs:
+ *   - blockquote lines (`>` chains), including their content;
+ *   - fenced code blocks (` ``` ` / `~~~`), including their content;
+ *   - indented code blocks (4 spaces / tab at line start).
+ * Verdict detection, zero-issue detection and section parsing all read this text only, so
+ * a human reply quoting or pasting a previous AI note can never authorize a verdict.
  */
-function topLevelText(visible) {
-  return visible
-    .split('\n')
-    .filter((line) => !/^[ \t]*>/.test(line))
-    .join('\n');
+function ownLines(visible) {
+  const own = [];
+  let fence = null;
+  for (const line of visible.split('\n')) {
+    if (fence) {
+      const close = line.match(FENCE_CLOSE_RE);
+      if (close && close[1][0] === fence[0] && close[1].length >= fence.length) {
+        fence = null;
+      }
+      continue;
+    }
+    // Drop the whole quoted line, not just the marker: the quoted content is someone
+    // else's conclusion.
+    if (BLOCKQUOTE_RE.test(line)) continue;
+    // Check fences before indented code: an indented fence is still an attempt to quote,
+    // and leaving it open would make the sanitizer fail open.
+    const open = line.match(FENCE_OPEN_RE);
+    if (open) {
+      fence = open[1];
+      continue;
+    }
+    if (INDENTED_CODE_RE.test(line)) continue;
+    own.push(line);
+  }
+  return own.join('\n');
 }
 
-function extractVerdict(topLevel) {
-  const lineMatch = topLevel.match(VERDICT_RE);
-  if (lineMatch) {
-    const value = lineMatch[1].replace(/\*\*/g, '').trim();
-    if (value.startsWith('可直接合并')) return 'pass';
-    if (value.startsWith('需要修改')) return 'changes';
-    return 'unknown';
-  }
-  const inlineMatch = topLevel.match(INLINE_VERDICT_RE);
-  if (inlineMatch) return inlineMatch[1] === '可直接合并' ? 'pass' : 'changes';
+function extractVerdict(own) {
+  const lineMatch = own.match(VERDICT_RE);
+  if (!lineMatch) return 'unknown';
+  const value = lineMatch[1].replace(/\*\*/g, '').trim();
+  if (value.startsWith('可直接合并')) return 'pass';
+  if (value.startsWith('需要修改')) return 'changes';
   return 'unknown';
 }
 
-/** Split lines into the two issue sections; any other heading closes the current one. */
-function extractIssueSections(visible) {
+/** Split own lines into the two issue sections; any other heading closes the current one. */
+function extractIssueSections(own) {
   const sections = { need: [], history: [] };
   let current = null;
-  for (const line of visible.split('\n')) {
+  for (const line of own.split('\n')) {
     const sectionMatch = line.match(SECTION_RE);
     if (sectionMatch) {
       current = sectionMatch[1] === '需要关注的问题' ? sections.need : sections.history;
@@ -231,8 +261,8 @@ function isNonBlocking(issue) {
  * A clean review template says how many issues remain even when it has no item list.
  * Only trust an explicit `0`; an empty/broken body stays `unknown`.
  */
-function hasExplicitZeroIssues(topLevel) {
-  return ZERO_ISSUE_RE.test(topLevel);
+function hasExplicitZeroIssues(own) {
+  return ZERO_ISSUE_RE.test(own);
 }
 
 /**
@@ -244,15 +274,17 @@ export function parseReview(body) {
   if (typeof body !== 'string' || !body.length) return unknownResult();
 
   const visible = visibleBody(body);
-  if (!visible.includes(AI_MARKER) || !/结论[ \t]*[:：]/.test(visible)) return unknownResult();
 
-  // A human reply quoting a passing note is not a review: the conclusion and the
-  // zero-issue declaration only count on the note's own (unquoted) lines.
-  const topLevel = topLevelText(visible);
-  const verdict = extractVerdict(topLevel);
+  // A human reply quoting or pasting a note is not a review: marker, conclusion,
+  // zero-issue declaration and issue sections only count on the note's own top-level
+  // lines (see ownLines).
+  const own = ownLines(visible);
+  if (!own.includes(AI_MARKER) || !/结论[ \t]*[:：]/.test(own)) return unknownResult();
+
+  const verdict = extractVerdict(own);
   if (verdict === 'unknown') return unknownResult();
 
-  const sections = extractIssueSections(visible);
+  const sections = extractIssueSections(own);
   const need = parseSection(sections.need);
   const history = parseSection(sections.history);
   if (need.malformed || history.malformed) return unknownResult();
@@ -274,7 +306,7 @@ export function parseReview(body) {
   // A `需要修改` verdict without items cannot tell P1 what to fix: never guess.
   if (verdict === 'changes' && items.length === 0) return unknownResult();
   // A pass with no items is only valid when the template explicitly reports zero.
-  if (verdict === 'pass' && items.length === 0 && !hasExplicitZeroIssues(topLevel)) {
+  if (verdict === 'pass' && items.length === 0 && !hasExplicitZeroIssues(own)) {
     return unknownResult();
   }
 
@@ -394,6 +426,43 @@ function runSelfTest() {
         '> ## AI Code Review\n> 结论: **可直接合并**\n> 历史未收敛: `0` 条\n\n' +
         '收到，已确认。\n',
       expected: { verdict: 'unknown' },
+    },
+    {
+      label: 'fenced pass note -> unknown',
+      body:
+        '以下为上一轮 AI Review 原文引用：\n\n' +
+        '```markdown\n## AI Code Review\n\n结论: **可直接合并**\n\n历史未收敛: `0` 条\n```\n',
+      expected: { verdict: 'unknown' },
+    },
+    {
+      label: 'fenced changes note -> unknown',
+      body:
+        '引用 AI Review 原文：\n\n' +
+        '~~~markdown\n## AI Code Review\n\n结论: **需要修改**\n\n' +
+        '### 需要关注的问题\n1. **文件**: `src/quoted.ts`\n   - 级别: 高\n   - 门禁分类: 逻辑错误\n   - 问题: quoted blocking problem\n~~~\n',
+      expected: { verdict: 'unknown' },
+    },
+    {
+      label: 'indented-code quoted note -> unknown',
+      body:
+        '收到，原 note 如下：\n\n' +
+        '    ## AI Code Review\n\n    结论: **可直接合并**\n\n    历史未收敛: `0` 条\n',
+      expected: { verdict: 'unknown' },
+    },
+    {
+      label: 'inline "之前的结论" does not authorize pass -> unknown',
+      body:
+        '## AI Code Review\n\n补充说明：之前的结论: 可直接合并。\n\n' +
+        '历史未收敛: 0 条\n',
+      expected: { verdict: 'unknown' },
+    },
+    {
+      label: 'fenced section is not parsed as own issues -> pass',
+      body:
+        '## AI Code Review\n\n结论: **可直接合并**\n\n历史未收敛: `0` 条\n\n' +
+        '```markdown\n### 需要关注的问题\n1. **文件**: `src/quoted.ts`\n   - 级别: 高\n' +
+        '   - 门禁分类: 逻辑错误\n   - 问题: quoted blocking problem\n```\n',
+      expected: { verdict: 'pass', blocking: 0, nonBlocking: 0 },
     },
     {
       label: 'pass with non-field-shaped section content -> unknown',
