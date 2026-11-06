@@ -38,6 +38,18 @@
  *     reports `已同步：新增 X / 更新 Y`, and is disabled with a reason when the
  *     session lacks a workspace or the platform token. `snapshot.platform` also
  *     carries the last sync time and the host's static last error.
+ *   - P3 real analysis: `start_analysis` (and the board-only 「重新分析」 button)
+ *     POSTs `/bug-workflow/api/analyze` (`{sessionId, code}`) instead of the
+ *     legacy `/action` route. A 200 is treated only as "the request was
+ *     accepted" — progress comes from the polled `snapshot.analysis.running`
+ *     set, because an orphaned `analyzing` ticket with no live agent can still
+ *     answer 200 and block moments later. The detail view therefore shows the
+ *     「AI 分析中…」 elapsed timer only while the code is in that set, and an
+ *     interrupted notice plus 「重新分析」 when it is not (the host restarts
+ *     orphaned and blocked-from-analyzing tickets through the same route).
+ *     `snapshot.analysis.errors[code]` / `blockedReason` are rendered as static
+ *     copy only for analysis-related blocks (never on tickets that already moved
+ *     on, where a stale persisted error may survive).
  *   - status/type filters prefer the platform dictionaries in `snapshot.dicts`
  *     (label = `value`, stable key = `key`, optional colour dot) and fall back
  *     to the values observed on tickets. Rows carry a 平台/手动 source badge.
@@ -69,6 +81,7 @@ window.__ModuleLoader__.load({
     const API = Object.freeze({
       snapshot: '/bug-workflow/api/snapshot',
       action: '/bug-workflow/api/action',
+      analyze: '/bug-workflow/api/analyze',
       settings: '/bug-workflow/api/settings',
       platformToken: '/bug-workflow/api/platform-token',
       sync: '/bug-workflow/api/sync',
@@ -318,6 +331,72 @@ window.__ModuleLoader__.load({
       return `Review 修复轮次已耗尽（${Math.min(rounds, maxRounds)}/${maxRounds}），请人工处理`;
     };
     // </client-action-availability>
+
+    // ---------------------------------------------------------------------
+    // P3 real analysis (POST /api/analyze + snapshot.analysis feedback)
+    // ---------------------------------------------------------------------
+
+    /**
+     * Static copy for the analysis failure reasons persisted by the host
+     * (`blockedReason` on a blocked ticket, e.g. `analysis-failed`). Never
+     * render the raw code: the host keeps messages static on purpose, and the
+     * board is the only place a Chinese hint can be attached to the reason.
+     */
+    const ANALYSIS_REASON_LABELS = Object.freeze({
+      'analysis-failed': '分析失败，可重新分析',
+      'analysis-timeout': '分析超时，可重新分析',
+      'no-live-agent': '当前没有可用的会话 Agent',
+      'analysis-bad-output': 'AI 输出格式不正确，可重新分析',
+    });
+
+    /** Live progress copy (elapsed time is appended from the local timer). */
+    const ANALYSIS_RUNNING_HINT = 'AI 分析中…（最长约 10 分钟，可继续做其他操作）';
+
+    /** Shown when the ticket is `analyzing` but the host reports no running job. */
+    const ANALYSIS_INTERRUPTED_HINT = '上次分析已中断，可重新分析';
+
+    /**
+     * Board-only action descriptor for restarting an analysis. It is NOT part
+     * of `ACTION_BY_STATE` (that literal is the state-machine contract and is
+     * cross-checked by `test/client-action-map.test.js`); the board adds it
+     * contextually for an interrupted `analyzing` ticket and for a ticket
+     * blocked by an analysis failure. `executeAction` routes it to
+     * `POST /api/analyze`, which the host uses to restart orphans and to
+     * retry blocked-from-analyzing tickets (no separate `/action retry`).
+     */
+    const ANALYSIS_RETRY_DESCRIPTOR = Object.freeze({
+      action: 'start_analysis',
+      label: '重新分析',
+      confirm: '确认重新开始 AI 分析？（分析最长约 10 分钟，可继续做其他操作）',
+      tone: 'primary',
+    });
+
+    /**
+     * `POST /api/analyze` failure code -> actionable Chinese hint. The host
+     * messages are already static; the hint tells the user what to do next.
+     * Statuses are the fallback for a host that returns a code we do not know.
+     */
+    const ANALYSIS_ERROR_HINTS = Object.freeze({
+      'ticket-not-found': '工单不存在',
+      'not-found': '工单不存在',
+      'invalid-state': '当前状态不能分析，请刷新',
+      'invalid-transition': '当前状态不能分析，请刷新',
+      'analysis-unavailable': '当前没有可用的会话 Agent（请在有活动会话的窗口中操作）',
+      'no-live-agent': '当前没有可用的会话 Agent（请在有活动会话的窗口中操作）',
+      'unknown-workspace': '工单编号/工作区无效',
+      'invalid-code': '工单编号/工作区无效',
+      'invalid-input': '工单编号/工作区无效',
+      'invalid-payload': '工单编号/工作区无效',
+      'missing-session': '缺少会话上下文，无法分析',
+    });
+
+    /** Product-status fallback for `POST /api/analyze` (400/404/409/503). */
+    const ANALYSIS_STATUS_HINTS = Object.freeze({
+      400: '工单编号/工作区无效',
+      404: '工单不存在',
+      409: '当前状态不能分析，请刷新',
+      503: '当前没有可用的会话 Agent（请在有活动会话的窗口中操作）',
+    });
 
     // ---------------------------------------------------------------------
     // Workspace settings (the host stores them per workspace cwd)
@@ -606,6 +685,22 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /**
+     * Local analysis elapsed time. The host does not persist a start timestamp
+     * for a running job (snapshot only carries the running codes), so the board
+     * counts from the first poll that reports the code as running. Rendered as
+     * `0 分 07 秒` style text; clamped so a clock jump cannot show negatives.
+     */
+    function formatElapsed(seconds) {
+      const total = typeof seconds === 'number' && Number.isFinite(seconds) && seconds > 0
+        ? Math.floor(seconds)
+        : 0;
+      const minutes = Math.floor(total / 60);
+      const rest = total % 60;
+      if (minutes < 60) return `${minutes} 分 ${String(rest).padStart(2, '0')} 秒`;
+      return `${Math.floor(minutes / 60)} 小时 ${String(minutes % 60).padStart(2, '0')} 分`;
+    }
+
     function baseName(path) {
       if (typeof path !== 'string' || path.trim() === '') return '';
       const parts = path.split(/[\\/]+/).filter(Boolean);
@@ -712,6 +807,67 @@ window.__ModuleLoader__.load({
       return ticketSource(ticket) === 'platform' ? 'info' : 'neutral';
     }
 
+    /** Snapshot `analysis.running` lookup; a missing block means "not running". */
+    function analysisRunningFor(snapshot, code) {
+      if (typeof code !== 'string' || code === '') return false;
+      if (snapshot === null || typeof snapshot !== 'object') return false;
+      const analysis = snapshot.analysis;
+      if (analysis === null || typeof analysis !== 'object' || !Array.isArray(analysis.running)) return false;
+      return analysis.running.includes(code);
+    }
+
+    /**
+     * The persisted static analysis error for one code, or `null`.
+     *
+     * Staleness rule (Task 2 handoff): `analysis.error:<code>` is only cleared
+     * by a later successful analysis start, so a ticket that already moved on
+     * (plan_review/fixing/...) may still carry an old error. Callers must only
+     * render it for the two live conditions in `AnalysisNotice` — an
+     * analysis-related blocked ticket, or `analyzing` with no running job.
+     */
+    function analysisErrorFor(snapshot, code) {
+      if (typeof code !== 'string' || code === '') return null;
+      if (snapshot === null || typeof snapshot !== 'object') return null;
+      const analysis = snapshot.analysis;
+      if (analysis === null || typeof analysis !== 'object') return null;
+      const errors = analysis.errors;
+      if (errors === null || typeof errors !== 'object' || Array.isArray(errors)) return null;
+      const message = errors[code];
+      return typeof message === 'string' && message !== '' ? message : null;
+    }
+
+    /**
+     * True when a `blocked` ticket was blocked by the analysis flow: either the
+     * documented `analysis-*`/`no-live-agent` reason, or a block taken directly
+     * from `analyzing` (the service only blocks from there on analysis failure).
+     */
+    function isAnalysisBlock(ticket) {
+      if (ticket === null || typeof ticket !== 'object' || ticket.workflow !== 'blocked') return false;
+      if (ticket.blockedFrom === 'analyzing') return true;
+      return typeof ticket.blockedReason === 'string'
+        && ANALYSIS_REASON_LABELS[ticket.blockedReason] !== undefined;
+    }
+
+    /** Static failure copy for a blocked analysis (never the raw reason code). */
+    function analysisFailureText(ticket, serverError) {
+      const reason = ticket !== null && typeof ticket === 'object' && typeof ticket.blockedReason === 'string'
+        ? ticket.blockedReason
+        : '';
+      const mapped = ANALYSIS_REASON_LABELS[reason];
+      if (mapped !== undefined) return mapped;
+      if (typeof serverError === 'string' && serverError !== '') return clip(serverError, 300);
+      return '分析失败，可重新分析';
+    }
+
+    /** Blocked-reason display text: mapped analysis copy, raw code otherwise. */
+    function blockedReasonText(ticket) {
+      const reason = ticket !== null && typeof ticket === 'object' && typeof ticket.blockedReason === 'string'
+        ? ticket.blockedReason
+        : '';
+      if (reason === '') return '未记录';
+      return ANALYSIS_REASON_LABELS[reason] ?? clip(reason, 300);
+    }
+
     function safeHttpUrl(value) {
       if (typeof value !== 'string') return null;
       const trimmed = value.trim();
@@ -812,6 +968,26 @@ window.__ModuleLoader__.load({
       return entries;
     }
 
+    /**
+     * Snapshot `analysis` block: `{running: string[], errors: {[code]: string}}`.
+     * The host always sends it (empty when the analysis service is not wired),
+     * but normalize defensively so a partial/older response cannot crash the
+     * board or leak non-string entries into rendered output.
+     */
+    function normalizeAnalysis(raw) {
+      const value = raw !== null && typeof raw === 'object' ? raw : {};
+      const running = Array.isArray(value.running)
+        ? value.running.filter((code) => typeof code === 'string' && code !== '')
+        : [];
+      const errors = {};
+      if (value.errors !== null && typeof value.errors === 'object' && !Array.isArray(value.errors)) {
+        for (const [code, message] of Object.entries(value.errors)) {
+          if (typeof message === 'string' && message !== '') errors[code] = message;
+        }
+      }
+      return { running, errors };
+    }
+
     function normalizeSnapshot(payload) {
       const value = payload && typeof payload === 'object' ? payload : {};
       const workspace = value.workspace && typeof value.workspace === 'object' ? value.workspace : {};
@@ -828,6 +1004,9 @@ window.__ModuleLoader__.load({
           lastSyncAt: typeof platform.lastSyncAt === 'string' ? platform.lastSyncAt : null,
           lastSyncError: typeof platform.lastSyncError === 'string' ? platform.lastSyncError : null,
         },
+        // P3 analysis progress/errors (empty shape when the host has no
+        // analysis service, e.g. a profile without subagent services).
+        analysis: normalizeAnalysis(value.analysis),
         // Task 4 guarantees all three groups; normalize anyway so a partial
         // host response can never make the filter crash.
         dicts: {
@@ -994,6 +1173,25 @@ window.__ModuleLoader__.load({
         return { ...view, title: '导入失败', message: '平台没有该工单' };
       }
       return { ...view, title: '导入失败' };
+    }
+
+    /**
+     * `POST /api/analyze` failure copy: 404 missing ticket, 409 stale state
+     * (refresh), 503 no live session agent / service not wired, 400 invalid
+     * code or unbound workspace. The hint replaces the host message so the
+     * banner always tells the user what to do; the server code/status stay in
+     * the banner for diagnosis.
+     */
+    function analyzeErrorView(result) {
+      const view = toErrorView(result);
+      const hint = ANALYSIS_ERROR_HINTS[view.code]
+        ?? (view.status === null ? null : ANALYSIS_STATUS_HINTS[view.status])
+        ?? null;
+      return {
+        ...view,
+        title: '分析启动失败',
+        message: hint === null ? view.message : hint,
+      };
     }
 
     /** Human-readable reason the header sync button is disabled, or null. */
@@ -1223,6 +1421,31 @@ window.__ModuleLoader__.load({
       }, []);
 
       return { ...state, refresh, dismissError };
+    }
+
+    /**
+     * Local elapsed-seconds counter for a running analysis. Starts at 0 when
+     * `active` first becomes true (or when `resetKey` changes, e.g. a different
+     * ticket/analysis), ticks once a second, and resets/stops when `active`
+     * turns false or the component unmounts. The host snapshot has no
+     * per-ticket start timestamp, so this is deliberately an approximation
+     * ("since the board first saw it running"), never persisted.
+     */
+    function useElapsedSeconds(active, resetKey) {
+      const [seconds, setSeconds] = React.useState(0);
+      React.useEffect(() => {
+        if (active !== true) {
+          setSeconds(0);
+          return undefined;
+        }
+        const startedAt = Date.now();
+        setSeconds(0);
+        const timer = setInterval(() => {
+          setSeconds(Math.max(0, Math.floor((Date.now() - startedAt) / 1000)));
+        }, 1000);
+        return () => clearInterval(timer);
+      }, [active, resetKey]);
+      return seconds;
     }
 
     // ---------------------------------------------------------------------
@@ -2483,19 +2706,61 @@ window.__ModuleLoader__.load({
           }, '在平台打开'));
     }
 
-    function PlanCard({ plan, workflow, footer }) {
+    /**
+     * Plan card (P3 real analysis output). Renders the six contract fields
+     * (`summary`, `rootCause`, `approach`, `changedFiles`, `risks`,
+     * `testPlan`) — files/risks as lists, test plan as a paragraph — and keeps
+     * the plan-review action bar (通过/驳回) in the footer. An empty card
+     * explains why there is no plan yet: running analysis, interrupted
+     * analysis, or any other state.
+     */
+    function PlanCard({ plan, workflow, analysisRunning, footer }) {
       const value = plan !== null && typeof plan === 'object' ? plan : null;
       const body = [];
       if (value === null) {
         body.push(h('p', { key: 'plan-empty', style: emptyTextStyle },
-          workflow === 'analyzing' ? '分析进行中，完成后会生成方案。' : '暂无方案。'));
+          workflow === 'analyzing'
+            ? (analysisRunning === true
+              ? 'AI 分析中，完成后会生成方案。'
+              : '分析未在运行，可点击「重新分析」生成方案。')
+            : '暂无方案。'));
       } else {
+        if (workflow === 'plan_review') {
+          body.push(h('p', {
+            key: 'plan-review-hint',
+            style: { ...emptyTextStyle, color: C.textSecondary },
+          }, '请审核以下方案：通过后进入修复，驳回则转人工处理。'));
+        }
         body.push(h(TextField, { key: 'plan-summary', label: '摘要', value: value.summary }));
         body.push(h(TextField, { key: 'plan-root-cause', label: '根因', value: value.rootCause }));
-        body.push(h(TextField, { key: 'plan-approach', label: '方案', value: value.approach }));
-        body.push(h(ListField, { key: 'plan-files', label: '改动文件', values: value.changedFiles }));
-        body.push(h(ListField, { key: 'plan-risks', label: '风险', values: value.risks }));
-        body.push(h(TextField, { key: 'plan-test-plan', label: '测试建议', value: value.testPlan }));
+        body.push(h(TextField, { key: 'plan-approach', label: '修复方案', value: value.approach }));
+        const files = Array.isArray(value.changedFiles)
+          ? value.changedFiles.filter((file) => file !== null && file !== undefined && textOf(file) !== '')
+          : [];
+        body.push(h(ListField, {
+          key: 'plan-files',
+          label: files.length === 0 ? '改动文件' : `改动文件（${files.length}）`,
+          values: files,
+        }));
+        const risks = Array.isArray(value.risks)
+          ? value.risks.filter((risk) => risk !== null && risk !== undefined && textOf(risk) !== '')
+          : [];
+        body.push(h(ListField, {
+          key: 'plan-risks',
+          label: risks.length === 0 ? '风险' : `风险（${risks.length}）`,
+          values: risks,
+        }));
+        const testPlan = typeof value.testPlan === 'string' && value.testPlan.trim() !== ''
+          ? value.testPlan
+          : '—';
+        body.push(h('div', {
+          key: 'plan-test-plan',
+          style: { display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 },
+        },
+          h('div', { style: fieldLabelStyle }, '测试建议'),
+          h('p', {
+            style: { margin: 0, ...fieldValueStyle, whiteSpace: 'pre-wrap' },
+          }, testPlan)));
         if (typeof value.approvedAt === 'string') {
           body.push(h('div', { key: 'plan-approved', style: { fontSize: 11, lineHeight: '16px', color: C.success } },
             `已通过 ${formatTime(value.approvedAt)}`));
@@ -2705,15 +2970,149 @@ window.__ModuleLoader__.load({
       },
         h('div', { style: { fontSize: 12, fontWeight: 600, color: C.error, lineHeight: '18px' } }, '工单已阻塞，需要人工处理'),
         h('div', { style: { ...fieldValueStyle, fontSize: 12 } },
-          `原因：${typeof ticket.blockedReason === 'string' && ticket.blockedReason !== '' ? clip(ticket.blockedReason, 300) : '未记录'}`),
+          `原因：${blockedReasonText(ticket)}`),
         from === null
           ? null
           : h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textSecondary } }, `阻塞前状态：${from}`),
-        h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary } }, '处理完成后可点击「重试」回到阻塞前状态。'));
+        h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary } },
+          isAnalysisBlock(ticket)
+            ? '这是 AI 分析失败导致的阻塞：点击「重新分析」会解除阻塞并重新开始分析。'
+            : '处理完成后可点击「重试」回到阻塞前状态。'));
+    }
+
+    /**
+     * P3 analysis status/failure panel for the detail view.
+     *
+     * Three mutually exclusive renderings, all driven by the polled snapshot:
+     *   - `analyzing` + `analysis.running` has the code: live progress copy plus
+     *     a local elapsed timer (the demo `analysis_done` button is hidden by
+     *     the caller while this is true, so the fake completion cannot be
+     *     clicked mid-run);
+     *   - `analyzing` without a running job: an interrupted analysis (crash,
+     *     host reload, or a start whose background job already settled) with a
+     *     「重新分析」 button that re-POSTs `/api/analyze` (the host restarts the
+     *     orphan; no `/action retry` first);
+     *   - an analysis-related `blocked` ticket: the static failure reason from
+     *     `blockedReason`/`snapshot.analysis.errors[code]` plus the same
+     *     「重新分析」 button (the host retries blocked-from-analyzing tickets).
+     *
+     * The persisted error is deliberately NOT rendered for any other workflow:
+     * a stale `analysis.error:<code>` may survive on a ticket that already moved
+     * to plan_review/fixing. The host remains the authority for both actions.
+     */
+    function AnalysisNotice({ ticket, snapshot, busyAction, locked, onAction }) {
+      const isAnalyzing = ticket.workflow === 'analyzing';
+      const running = isAnalyzing && analysisRunningFor(snapshot, ticket.code);
+      const elapsed = useElapsedSeconds(running, ticket.code);
+      const block = isAnalysisBlock(ticket);
+      if (!isAnalyzing && !block) return null;
+
+      const busy = busyAction === ANALYSIS_RETRY_DESCRIPTOR.action;
+      const retryDisabled = busy || locked === true;
+      const retry = h('button', {
+        key: 'analysis-retry',
+        type: 'button',
+        disabled: retryDisabled,
+        'aria-busy': busy || undefined,
+        title: locked === true ? UNBOUND_WORKSPACE_HINT : ANALYSIS_RETRY_DESCRIPTOR.confirm,
+        onClick: () => {
+          if (retryDisabled) return;
+          if (typeof onAction === 'function') onAction(ANALYSIS_RETRY_DESCRIPTOR);
+        },
+        style: primaryButtonStyle(retryDisabled),
+      }, busy ? '处理中…' : ANALYSIS_RETRY_DESCRIPTOR.label);
+
+      if (isAnalyzing && running) {
+        return h('div', {
+          role: 'status',
+          'aria-live': 'polite',
+          'data-bug-analysis': 'running',
+          style: {
+            border: `0.5px solid ${TONES.info.border}`,
+            background: TONES.info.background,
+            borderRadius: 8,
+            padding: '8px 10px',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 3,
+            minWidth: 0,
+          },
+        },
+          h('div', { style: { fontSize: 12, fontWeight: 600, color: TONES.info.color, lineHeight: '18px' } },
+            ANALYSIS_RUNNING_HINT),
+          h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textSecondary } },
+            `已运行 ${formatElapsed(elapsed)}`),
+          h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary } },
+            '分析在后台进行，可继续做其他操作；完成后工单会进入「方案待审」。'));
+      }
+
+      if (isAnalyzing) {
+        const serverError = analysisErrorFor(snapshot, ticket.code);
+        return h('div', {
+          role: 'status',
+          'data-bug-analysis': 'interrupted',
+          style: {
+            border: `0.5px solid ${TONES.warn.border}`,
+            background: TONES.warn.background,
+            borderRadius: 8,
+            padding: '8px 10px',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 4,
+            minWidth: 0,
+          },
+        },
+          h('div', { style: { fontSize: 12, fontWeight: 600, color: TONES.warn.color, lineHeight: '18px' } },
+            ANALYSIS_INTERRUPTED_HINT),
+          serverError === null
+            ? null
+            : h('div', {
+              style: { fontSize: 11, lineHeight: '16px', color: C.textSecondary, wordBreak: 'break-word' },
+            }, `宿主记录：${clip(serverError, 300)}`),
+          h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary } },
+            '重新分析会从当前状态继续（不会先回到待入列）。'),
+          h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' } }, retry));
+      }
+
+      const serverError = analysisErrorFor(snapshot, ticket.code);
+      return h('div', {
+        role: 'alert',
+        'data-bug-analysis': 'blocked',
+        style: {
+          border: `0.5px solid ${TONES.danger.border}`,
+          background: TONES.danger.background,
+          borderRadius: 8,
+          padding: '8px 10px',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 4,
+          minWidth: 0,
+        },
+      },
+        h('div', { style: { fontSize: 12, fontWeight: 600, color: C.error, lineHeight: '18px' } }, 'AI 分析未完成'),
+        h('div', { style: { ...fieldValueStyle, fontSize: 12 } }, analysisFailureText(ticket, serverError)),
+        serverError === null
+          ? null
+          : h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textSecondary, wordBreak: 'break-word' } },
+            `宿主记录：${clip(serverError, 300)}`),
+        h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center', paddingTop: 2 } },
+          retry,
+          h('span', { style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary } },
+            '重新分析会自动解除该阻塞并重新开始，最长约 10 分钟。')));
     }
 
     function TicketDetail({ ticket, snapshot, busyAction, locked, onAction, onBack }) {
-      const actions = ACTION_BY_STATE[ticket.workflow] ?? [];
+      // UI-only filters (the action-map literal and its contract test stay
+      // untouched): the demo 「分析完成」 button is hidden while a real analysis
+      // is running, and the generic 「重试」 is replaced by the analysis
+      // restart button for a ticket blocked by the analysis flow.
+      const analysisRunning = ticket.workflow === 'analyzing' && analysisRunningFor(snapshot, ticket.code);
+      const analysisBlock = isAnalysisBlock(ticket);
+      const actions = (ACTION_BY_STATE[ticket.workflow] ?? []).filter((descriptor) => {
+        if (analysisRunning && descriptor.action === 'analysis_done') return false;
+        if (analysisBlock && descriptor.action === 'retry') return false;
+        return true;
+      });
       const planReview = ticket.workflow === 'plan_review';
       const actionBar = h(ActionBar, {
         actions,
@@ -2743,11 +3142,17 @@ window.__ModuleLoader__.load({
               style: { fontSize: 14, fontWeight: 600, lineHeight: '20px', color: C.text, wordBreak: 'break-word' },
             }, typeof ticket.title === 'string' && ticket.title.trim() !== '' ? ticket.title : '（无标题）')),
           h(Badge, { label: workflowLabel(ticket.workflow), tone: workflowTone(ticket.workflow) })),
+        h(AnalysisNotice, { ticket, snapshot, busyAction, locked, onAction }),
         h(BlockedNotice, { ticket }),
         planReview ? null : actionBar,
         h(FieldsBlock, { ticket, snapshot }),
         h(PlatformCard, { ticket }),
-        h(PlanCard, { plan: ticket.plan, workflow: ticket.workflow, footer: planReview ? actionBar : null }),
+        h(PlanCard, {
+          plan: ticket.plan,
+          workflow: ticket.workflow,
+          analysisRunning,
+          footer: planReview ? actionBar : null,
+        }),
         h(FixCard, { fixes: ticket.fixes }),
         h(TestCard, { fixes: ticket.fixes, workflow: ticket.workflow }),
         h(MrCard, { ticket }),
@@ -3216,10 +3621,19 @@ window.__ModuleLoader__.load({
         if (!descriptor || !ticket || busyRef.current || typeof ticket.code !== 'string') return;
         if (sessionId === null || configured !== true) return;
 
-        let payload = descriptor.payload === undefined || descriptor.payload === null ? {} : descriptor.payload;
-        if (descriptor.input === 'reason') {
-          const trimmed = typeof reason === 'string' ? reason.trim() : '';
-          payload = { ...payload, reason: trimmed === '' ? '未填写驳回原因' : trimmed };
+        // P3: `start_analysis` (from `inbox`) and the board-only 「重新分析」
+        // descriptor both go to the real analysis route. The host handles the
+        // inbox start, the orphaned-`analyzing` restart and the
+        // blocked-from-analyzing auto-retry, so the client never sends a
+        // separate `/action retry` first.
+        const isAnalyze = descriptor.action === 'start_analysis';
+        let payload = {};
+        if (!isAnalyze) {
+          payload = descriptor.payload === undefined || descriptor.payload === null ? {} : descriptor.payload;
+          if (descriptor.input === 'reason') {
+            const trimmed = typeof reason === 'string' ? reason.trim() : '';
+            payload = { ...payload, reason: trimmed === '' ? '未填写驳回原因' : trimmed };
+          }
         }
 
         busyRef.current = true;
@@ -3229,27 +3643,38 @@ window.__ModuleLoader__.load({
         setFlash(null);
 
         try {
-          const result = await postMutation(API.action, {
-            sessionId,
-            actionId: createActionId(),
-            code: ticket.code,
-            action: descriptor.action,
-            payload,
-          });
+          const result = isAnalyze
+            ? await postMutation(API.analyze, { sessionId, code: ticket.code })
+            : await postMutation(API.action, {
+              sessionId,
+              actionId: createActionId(),
+              code: ticket.code,
+              action: descriptor.action,
+              payload,
+            });
           if (result.aborted === true) return;
 
           if (result.ok) {
-            const next = result.data && typeof result.data === 'object' ? result.data.ticket : null;
-            const nextWorkflow = next && typeof next.workflow === 'string' ? next.workflow : null;
-            setFlash(nextWorkflow === null
-              ? `工单 ${ticket.code} 操作成功`
-              : `工单 ${ticket.code} 已更新：${workflowLabel(nextWorkflow)}`);
+            if (isAnalyze) {
+              // A 200 only means the host accepted the start. An orphaned
+              // `analyzing` ticket without a live agent also answers 200 and
+              // blocks moments later, so progress is never claimed here: the
+              // refreshed snapshot's `analysis.running` is the only signal.
+              setFlash(`工单 ${ticket.code} 分析请求已受理，正在刷新…`);
+            } else {
+              const next = result.data && typeof result.data === 'object' ? result.data.ticket : null;
+              const nextWorkflow = next && typeof next.workflow === 'string' ? next.workflow : null;
+              setFlash(nextWorkflow === null
+                ? `工单 ${ticket.code} 操作成功`
+                : `工单 ${ticket.code} 已更新：${workflowLabel(nextWorkflow)}`);
+            }
           } else {
-            setActionError(toErrorView(result));
+            setActionError(isAnalyze ? analyzeErrorView(result) : toErrorView(result));
           }
 
           // Refresh after success and after a rejected action: a 409 may have
-          // changed the ticket server-side (e.g. review rounds -> blocked).
+          // changed the ticket server-side (e.g. review rounds -> blocked), and
+          // the analysis progress/errors only exist in the snapshot.
           try {
             await polling.refresh();
           } catch {
