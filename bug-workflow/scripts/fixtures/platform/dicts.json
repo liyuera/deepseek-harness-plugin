@@ -1,0 +1,138 @@
+{
+  "teamTaskStatus": [
+    {
+      "id": 1,
+      "parentId": 0,
+      "parentName": null,
+      "code": "teamTaskStatus",
+      "dictKey": "001_CREATE",
+      "dictValue": "待处理",
+      "sort": 1,
+      "color": "#1890ff",
+      "remark": "",
+      "hasChildren": false,
+      "children": []
+    },
+    {
+      "id": 2,
+      "parentId": 0,
+      "parentName": null,
+      "code": "teamTaskStatus",
+      "dictKey": "002_DOING",
+      "dictValue": "进行中",
+      "sort": 2,
+      "color": "#faad14",
+      "remark": "",
+      "hasChildren": false,
+      "children": []
+    },
+    {
+      "id": 3,
+      "parentId": 0,
+      "parentName": null,
+      "code": "teamTaskStatus",
+      "dictKey": "003_CHECK",
+      "dictValue": "待验证",
+      "sort": 3,
+      "color": "#722ed1",
+      "remark": "",
+      "hasChildren": false,
+      "children": []
+    },
+    {
+      "id": 4,
+      "parentId": 0,
+      "parentName": null,
+      "code": "teamTaskStatus",
+      "dictKey": "004_DONE",
+      "dictValue": "已完成",
+      "sort": 4,
+      "color": "#52c41a",
+      "remark": "",
+      "hasChildren": false,
+      "children": []
+    }
+  ],
+  "teamTaskType": [
+    {
+      "id": 11,
+      "parentId": 0,
+      "parentName": null,
+      "code": "teamTaskType",
+      "dictKey": "001_BUG",
+      "dictValue": "缺陷",
+      "sort": 1,
+      "color": "#f5222d",
+      "remark": "",
+      "hasChildren": false,
+      "children": []
+    },
+    {
+      "id": 12,
+      "parentId": 0,
+      "parentName": null,
+      "code": "teamTaskType",
+      "dictKey": "002_REQUIREMENT",
+      "dictValue": "需求",
+      "sort": 2,
+      "color": "#1677ff",
+      "remark": "",
+      "hasChildren": false,
+      "children": []
+    },
+    {
+      "id": 13,
+      "parentId": 0,
+      "parentName": null,
+      "code": "teamTaskType",
+      "dictKey": "003_TASK",
+      "dictValue": "任务",
+      "sort": 3,
+      "color": "#13c2c2",
+      "remark": "",
+      "hasChildren": false,
+      "children": []
+    }
+  ],
+  "teamTaskPriority": [
+    {
+      "id": 21,
+      "parentId": 0,
+      "parentName": null,
+      "code": "teamTaskPriority",
+      "dictKey": "001_HIGH",
+      "dictValue": "高",
+      "sort": 1,
+      "color": "#f5222d",
+      "remark": "",
+      "hasChildren": false,
+      "children": []
+    },
+    {
+      "id": 22,
+      "parentId": 0,
+      "parentName": null,
+      "code": "teamTaskPriority",
+      "dictKey": "002_MEDIUM",
+      "dictValue": "中",
+      "sort": 2,
+      "color": "#faad14",
+      "remark": "",
+      "hasChildren": false,
+      "children": []
+    },
+    {
+      "id": 23,
+      "parentId": 0,
+      "parentName": null,
+      "code": "teamTaskPriority",
+      "dictKey": "003_LOW",
+      "dictValue": "低",
+      "sort": 3,
+      "color": "#52c41a",
+      "remark": "",
+      "hasChildren": false,
+      "children": []
+    }
+  ]
+}
