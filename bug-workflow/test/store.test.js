@@ -22,6 +22,14 @@ import { initialTicket } from '../src/host/state-machine.js';
 // Fixtures
 // ---------------------------------------------------------------------------
 
+/**
+ * JSON round-trip so the fake backend behaves like the real single-file JSON
+ * storage: reads and writes never share object identity with the caller.
+ */
+function cloneJson(value) {
+  return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+}
+
 /** Minimal in-memory `Domain` double; mirrors the KvTable surface exactly. */
 function createFakeDomain() {
   const tables = new Map();
@@ -37,20 +45,24 @@ function createFakeDomain() {
         tables.set(name, records);
       }
       return {
-        get: (key) => records.get(key),
+        get: (key) => cloneJson(records.get(key)),
         put: async (key, value) => {
-          records.set(key, value);
+          records.set(key, cloneJson(value));
         },
         delete: async (key) => records.delete(key),
-        entries: () => records.entries(),
+        entries: () => {
+          const pairs = [];
+          for (const [key, value] of records) pairs.push([key, cloneJson(value)]);
+          return pairs[Symbol.iterator]();
+        },
         keys: () => records.keys(),
         get size() {
           return records.size;
         },
         update: async (key, fn) => {
-          const next = fn(records.get(key));
-          records.set(key, next);
-          return next;
+          const next = fn(cloneJson(records.get(key)));
+          records.set(key, cloneJson(next));
+          return cloneJson(next);
         },
       };
     },
@@ -92,6 +104,45 @@ function mrOpenTicket(code, at, rounds) {
       rounds,
     },
   };
+}
+
+/**
+ * Domain-schema double for the store's injected write-boundary validator.
+ * Mirrors the checks the host zod schemas perform on the review's examples.
+ * A validator returns the normalized record or throws.
+ */
+function strictTicket(ticket) {
+  if (ticket.plan !== null && typeof ticket.plan.summary !== 'string') {
+    throw new Error('plan.summary 必须是字符串');
+  }
+  if (ticket.plan !== null && !Array.isArray(ticket.plan.changedFiles)) {
+    throw new Error('plan.changedFiles 必须是数组');
+  }
+  if (ticket.blockedReason !== null && typeof ticket.blockedReason !== 'string') {
+    throw new Error('blockedReason 必须是字符串');
+  }
+  if (ticket.mr !== null && !Number.isInteger(ticket.mr.rounds)) {
+    throw new Error('mr.rounds 必须是整数');
+  }
+  return cloneJson(ticket);
+}
+
+/** Domain-schema double for settings; same contract as `strictTicket`. */
+function strictSettings(settings) {
+  for (const [field, value] of Object.entries(settings)) {
+    if (typeof value !== 'string') throw new Error(`settings.${field} 必须是字符串`);
+  }
+  return cloneJson(settings);
+}
+
+const STRICT_VALIDATORS = Object.freeze({
+  validateTicket: strictTicket,
+  validateSettings: strictSettings,
+});
+
+/** Store wired like `index.js` wires it in the host: real validators at the boundary. */
+function createStrictStore(domain, clock = () => T1) {
+  return createStore(domain, clock, STRICT_VALIDATORS);
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +212,37 @@ test('create() rejects missing/duplicate codes and invalid field types', async (
   assert.equal(badType.ok, false);
   assert.equal(badType.code, 'invalid-input');
   assert.equal(domain.table('tickets').get('BUG-4'), undefined);
+});
+
+test('create() refuses a schema-invalid ticket before writing', async () => {
+  const domain = createFakeDomain();
+  const store = createStore(domain, () => T1, {
+    validateTicket: (ticket) => {
+      if (ticket.status === 'X') throw new Error('status 非法');
+      return ticket;
+    },
+  });
+
+  const created = await store.create({ code: 'BUG-SCHEMA', status: 'X' });
+
+  assert.equal(created.ok, false);
+  assert.equal(created.code, 'invalid-payload');
+  assert.match(created.message, /status/);
+  assert.equal(domain.table('tickets').size, 0, 'invalid ticket must not be written');
+  assert.deepEqual(store.snapshot(), { tickets: [], total: 0, invalid: 0 });
+});
+
+test('returned tickets do not alias the stored record', async () => {
+  const domain = createFakeDomain();
+  const store = createStrictStore(domain, () => T1);
+
+  const created = await store.create({ code: 'BUG-CLONE', title: '原值' });
+  created.ticket.title = '被调用方改坏';
+  store.get('BUG-CLONE').title = '再改一次';
+  store.list()[0].title = '列表改坏';
+
+  assert.equal(domain.table('tickets').get('BUG-CLONE').title, '原值');
+  assert.equal(store.get('BUG-CLONE').title, '原值');
 });
 
 // ---------------------------------------------------------------------------
@@ -236,6 +318,50 @@ test('applyAction() reports missing tickets and unknown actions as failures', as
   assert.equal(unknown.code, 'invalid-action');
 });
 
+test('applyAction() refuses a schema-invalid plan and leaves the stored ticket untouched', async () => {
+  const domain = createFakeDomain();
+  const store = createStrictStore(domain, clockFrom(T1, T2, T3));
+  await store.create({ code: 'BUG-PLAN' });
+  await store.applyAction('BUG-PLAN', 'start_analysis', {});
+  const before = domain.table('tickets').get('BUG-PLAN');
+
+  const rejected = await store.applyAction(
+    'BUG-PLAN',
+    'analysis_done',
+    { plan: { summary: 42, changedFiles: 'src/a.js' } },
+    { actionId: 'bad-plan' },
+  );
+
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.code, 'invalid-payload');
+  assert.match(rejected.message, /plan\.summary/);
+  assert.deepEqual(domain.table('tickets').get('BUG-PLAN'), before);
+  assert.equal(domain.table('tickets').get('BUG-PLAN').workflow, 'analyzing');
+  assert.equal(domain.table('meta').size, 0, 'failed validation must not persist the actionId');
+});
+
+test('applyAction() refuses schema-invalid block and MR payloads without writing', async () => {
+  const domain = createFakeDomain();
+  const store = createStrictStore(domain, () => T1);
+  await store.create({ code: 'BUG-BLOCK' });
+
+  const blocked = await store.applyAction('BUG-BLOCK', 'block', { reason: 123 });
+
+  assert.equal(blocked.ok, false);
+  assert.equal(blocked.code, 'invalid-payload');
+  assert.match(blocked.message, /blockedReason/);
+  assert.equal(domain.table('tickets').get('BUG-BLOCK').workflow, 'inbox');
+
+  await seedTicket(domain, { ...initialTicket({ code: 'BUG-MR' }, T1), workflow: 'submitting' });
+  const mr = await store.applyAction('BUG-MR', 'mr_created', { mr: { iid: '1', rounds: '2' } });
+
+  assert.equal(mr.ok, false);
+  assert.equal(mr.code, 'invalid-payload');
+  assert.match(mr.message, /mr\.rounds/);
+  assert.equal(domain.table('tickets').get('BUG-MR').workflow, 'submitting');
+  assert.equal(domain.table('tickets').get('BUG-MR').mr, null);
+});
+
 test('applyAction(create) creates the ticket named by the route code', async () => {
   const domain = createFakeDomain();
   const store = createStore(domain, () => T1);
@@ -295,6 +421,36 @@ test('the same actionId for create is idempotent too', async () => {
   assert.equal(domain.table('tickets').size, 1);
 });
 
+test('an actionId reused for another ticket or action is rejected', async () => {
+  const domain = createFakeDomain();
+  const store = createStore(domain, clockFrom(T1, T2, T3));
+  await store.create({ code: 'BUG-ID-1' });
+  await store.create({ code: 'BUG-ID-2' });
+
+  const first = await store.applyAction('BUG-ID-1', 'start_analysis', {}, { actionId: 'shared-1' });
+  assert.equal(first.ok, true);
+
+  const otherTicket = await store.applyAction('BUG-ID-2', 'start_analysis', {}, { actionId: 'shared-1' });
+  assert.equal(otherTicket.ok, false);
+  assert.equal(otherTicket.code, 'action-id-reused');
+  assert.match(otherTicket.message, /BUG-ID-1/);
+  assert.equal(domain.table('tickets').get('BUG-ID-2').workflow, 'inbox');
+
+  const otherAction = await store.applyAction(
+    'BUG-ID-1',
+    'analysis_done',
+    { plan: { summary: '方案' } },
+    { actionId: 'shared-1' },
+  );
+  assert.equal(otherAction.ok, false);
+  assert.equal(otherAction.code, 'action-id-reused');
+  assert.equal(domain.table('tickets').get('BUG-ID-1').workflow, 'analyzing');
+
+  // The original request still replays the original result.
+  const replay = await store.applyAction('BUG-ID-1', 'start_analysis', {}, { actionId: 'shared-1' });
+  assert.deepEqual(replay, first);
+});
+
 test('the actionId cache is capped at MAX_ACTION_RESULTS, evicting the oldest', async () => {
   const domain = createFakeDomain();
   const meta = domain.table('meta');
@@ -326,7 +482,7 @@ test('the actionId cache is capped at MAX_ACTION_RESULTS, evicting the oldest', 
 
 test('getSettings() returns defaults until putSettings() writes a workspace record', async () => {
   const domain = createFakeDomain();
-  const store = createStore(domain, () => T1);
+  const store = createStrictStore(domain, () => T1);
 
   const defaults = store.getSettings('/workspace/a');
   assert.deepEqual(defaults, DEFAULT_SETTINGS);
@@ -350,17 +506,42 @@ test('getSettings() returns defaults until putSettings() writes a workspace reco
   assert.deepEqual(store.getSettings('/workspace/a'), merged);
 });
 
-test('settings reject invalid input and missing workspace keys', async () => {
+test('getSettings() falls back to defaults when the workspace is unknown or empty', () => {
   const domain = createFakeDomain();
   const store = createStore(domain, () => T1);
 
+  for (const cwd of [null, undefined, '', '   ', 42]) {
+    assert.deepEqual(store.getSettings(cwd), DEFAULT_SETTINGS);
+  }
+  assert.equal(domain.table('settings').size, 0);
+});
+
+test('putSettings() reports unknown-workspace and invalid-settings as structured errors', async () => {
+  const domain = createFakeDomain();
+  const store = createStore(domain, () => T1, {
+    validateSettings: (settings) => {
+      if (settings.gitlabReviewer.length > 10) throw new Error('gitlabReviewer 过长');
+      return settings;
+    },
+  });
+
+  const expectCode = (code) => (error) => {
+    assert.equal(error.name, 'StoreError');
+    assert.equal(error.code, code);
+    return true;
+  };
+
+  await assert.rejects(store.putSettings(null, { testCommand: 'npm test' }), expectCode('unknown-workspace'));
+  await assert.rejects(store.putSettings('', { testCommand: 'npm test' }), expectCode('unknown-workspace'));
+  await assert.rejects(store.putSettings('/workspace/a', null), expectCode('invalid-settings'));
   await assert.rejects(
-    () => store.putSettings('/workspace/a', { branchUser: 42 }),
-    TypeError,
+    store.putSettings('/workspace/a', { branchUser: 42 }),
+    expectCode('invalid-settings'),
   );
-  await assert.rejects(() => store.putSettings('/workspace/a', null), TypeError);
-  assert.throws(() => store.getSettings(''), TypeError);
-  assert.throws(() => store.getSettings(undefined), TypeError);
+  await assert.rejects(
+    store.putSettings('/workspace/a', { gitlabReviewer: 'x'.repeat(11) }),
+    expectCode('invalid-settings'),
+  );
   assert.equal(domain.table('settings').size, 0);
 });
 
@@ -384,6 +565,19 @@ test('list() orders tickets by createdAt and breaks ties by code', async () => {
     store.list().map((ticket) => ticket.code),
     ['BUG-B', 'BUG-D', 'BUG-C', 'BUG-A'],
   );
+});
+
+test('list() orders createdAt by instant, not by the offset text', async () => {
+  const domain = createFakeDomain();
+  const store = createStore(domain, () => T1);
+
+  // `08:00+08:00` is 00:00Z — earlier than `02:00Z`, but sorts later as text.
+  const early = { ...initialTicket({ code: 'BUG-EARLY' }, T1), createdAt: '2026-11-07T08:00:00+08:00' };
+  const late = { ...initialTicket({ code: 'BUG-LATE' }, T1), createdAt: '2026-11-07T02:00:00Z' };
+  await seedTicket(domain, late);
+  await seedTicket(domain, early);
+
+  assert.deepEqual(store.list().map((ticket) => ticket.code), ['BUG-EARLY', 'BUG-LATE']);
 });
 
 // ---------------------------------------------------------------------------

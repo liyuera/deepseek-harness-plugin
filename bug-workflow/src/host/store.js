@@ -19,13 +19,20 @@
  * This module is pure logic + domain adapter and must stay importable with no
  * runtime dependencies: the unit tests run under plain Node, where zod/the
  * storage-domain package are not resolvable. Record schemas for on-open
- * validation live in `domain.js`.
+ * validation live in `domain.js`; the host passes their `parse` functions in as
+ * `validateTicket`/`validateSettings` so every write is checked against the
+ * exact schema the domain uses on open. Without that check a state-machine
+ * output with a wrong-typed payload field could be persisted and fail loud on
+ * the next reload, making the domain (and the board) unopenable.
  *
  * Error contract: `create()`/`applyAction()` return
- * `{ ok: false, code, message }` for expected failures (invalid input, duplicate
- * code, unknown ticket, illegal transition, corrupted record). StateError from
- * the state machine is mapped this way; anything else is a programming or
- * storage failure and is rethrown.
+ * `{ ok: false, code, message }` for expected failures (invalid input, invalid
+ * payload, duplicate code, unknown ticket, illegal transition, corrupted
+ * record). StateError from the state machine is mapped this way; anything else
+ * is a programming or storage failure and is rethrown. `putSettings()` throws a
+ * `StoreError` with `code: 'unknown-workspace'` when the caller has no
+ * workspace path and `code: 'invalid-settings'` when the record fails the
+ * domain settings schema; Task 3 maps those to HTTP responses.
  */
 
 import {
@@ -34,6 +41,19 @@ import {
   apply,
   initialTicket,
 } from './state-machine.js';
+
+/**
+ * Structured error thrown by store APIs that cannot return a result object
+ * (currently only `putSettings()`). `code` is stable; callers should branch on
+ * it rather than on the message.
+ */
+export class StoreError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = 'StoreError';
+    this.code = code;
+  }
+}
 
 /** Table names of the `bug_workflow` domain; shared with `domain.js`. */
 export const TICKETS_TABLE = 'tickets';
@@ -78,14 +98,30 @@ const CREATE_FIELDS = Object.freeze([
  *
  * @param domain opened `Domain` handle of `bug_workflow`
  * @param clock returns an ISO 8601 timestamp; injected by tests
+ * @param options optional write-boundary validators from `domain.js`:
+ *   `validateTicket(ticket)` / `validateSettings(settings)` return the record
+ *   to persist (or throw on a schema violation). The host passes the domain's
+ *   real zod `parse` functions; tests pass equivalent doubles. Omitting them
+ *   keeps the legacy behaviour and is only meant for fake domains.
  * @returns TicketStore
  */
-export function createStore(domain, clock = defaultClock) {
+export function createStore(domain, clock = defaultClock, options = {}) {
   if (domain === null || typeof domain !== 'object' || typeof domain.table !== 'function') {
     throw new TypeError('createStore(domain) requires an opened storage domain');
   }
   if (typeof clock !== 'function') {
     throw new TypeError('createStore(domain, clock) requires clock to be a function');
+  }
+  if (options === null || typeof options !== 'object') {
+    throw new TypeError('createStore(domain, clock, options) requires options to be an object');
+  }
+
+  const { validateTicket, validateSettings } = options;
+  if (validateTicket !== undefined && typeof validateTicket !== 'function') {
+    throw new TypeError('createStore() options.validateTicket must be a function');
+  }
+  if (validateSettings !== undefined && typeof validateSettings !== 'function') {
+    throw new TypeError('createStore() options.validateSettings must be a function');
   }
 
   const tickets = domain.table(TICKETS_TABLE);
@@ -119,6 +155,36 @@ export function createStore(domain, clock = defaultClock) {
     }
     found.sort(compareTickets);
     return { tickets: found.map(cloneTicket), invalid };
+  }
+
+  /**
+   * Check the exact object about to be persisted. `isStoredTicket` is the
+   * dependency-free structural pre-check; the host-supplied domain schema parse
+   * is the authority and returns the normalized record. Never call this after
+   * a write: a rejected ticket must leave the stored state and ledger intact.
+   */
+  function checkTicket(ticket) {
+    if (!isPlainObject(ticket) || !isStoredTicket(ticket, ticket.code)) {
+      return failure('invalid-payload', '工单数据不符合持久化结构');
+    }
+    if (validateTicket === undefined) return { ok: true, ticket };
+    try {
+      const parsed = validateTicket(ticket);
+      return { ok: true, ticket: isPlainObject(parsed) ? parsed : ticket };
+    } catch (error) {
+      return failure('invalid-payload', `工单数据未通过校验：${errorMessage(error)}`);
+    }
+  }
+
+  /** Validate the merged settings record with the domain schema before put. */
+  function checkSettings(settings) {
+    if (validateSettings === undefined) return settings;
+    try {
+      const parsed = validateSettings(settings);
+      return isPlainObject(parsed) ? parsed : settings;
+    } catch (error) {
+      throw new StoreError('invalid-settings', `settings 未通过校验：${errorMessage(error)}`);
+    }
   }
 
   function list() {
@@ -164,8 +230,11 @@ export function createStore(domain, clock = defaultClock) {
       ticket.title = code;
     }
 
-    await tickets.put(code, ticket);
-    return { ok: true, ticket: cloneTicket(ticket) };
+    const checked = checkTicket(ticket);
+    if (!checked.ok) return checked;
+
+    await tickets.put(code, checked.ticket);
+    return { ok: true, ticket: cloneTicket(checked.ticket) };
   }
 
   async function applyAction(rawCode, action, payload = {}, options = {}) {
@@ -178,8 +247,18 @@ export function createStore(domain, clock = defaultClock) {
       if (actionId === undefined) {
         return failure('invalid-input', 'actionId 必须是非空字符串');
       }
-      const cached = readActionResult(metaTable, actionId);
-      if (cached !== undefined) return cached;
+      const cached = readActionResult(metaTable, actionId, code, action);
+      if (cached !== undefined) {
+        // A retry must replay the same ticket+action; reusing an id for another
+        // request is a client bug and must not leak the first ticket's result.
+        if (cached.reused === true) {
+          return failure(
+            'action-id-reused',
+            `actionId ${actionId} 已用于工单 ${String(cached.code)} 的动作 ${String(cached.action)}`,
+          );
+        }
+        return cached.result;
+      }
     }
 
     if (action === 'create') {
@@ -206,8 +285,11 @@ export function createStore(domain, clock = defaultClock) {
       throw error;
     }
 
-    await tickets.put(code, next);
-    const result = { ok: true, ticket: cloneTicket(next) };
+    const checked = checkTicket(next);
+    if (!checked.ok) return checked;
+
+    await tickets.put(code, checked.ticket);
+    const result = { ok: true, ticket: cloneTicket(checked.ticket) };
     if (actionId !== undefined) {
       await rememberActionResult(actionId, code, action, result);
     }
@@ -229,26 +311,35 @@ export function createStore(domain, clock = defaultClock) {
   }
 
   function getSettings(rawCwd) {
-    const cwd = normalizeCwd(rawCwd, 'getSettings');
+    const cwd = normalizeCwd(rawCwd);
+    // A session without a working directory still needs a readable board.
+    if (cwd === undefined) return { ...DEFAULT_SETTINGS };
     return mergeSettings(settingsTable.get(cwd));
   }
 
   async function putSettings(rawCwd, input) {
-    const cwd = normalizeCwd(rawCwd, 'putSettings');
-    if (!isPlainObject(input)) throw new TypeError('settings 必须是普通对象');
+    const cwd = normalizeCwd(rawCwd);
+    if (cwd === undefined) {
+      // Task 3 maps this to its "workspace not resolved" HTTP response.
+      throw new StoreError('unknown-workspace', '无法确定工作区路径，settings 未保存');
+    }
+    if (!isPlainObject(input)) {
+      throw new StoreError('invalid-settings', 'settings 必须是普通对象');
+    }
 
     const next = mergeSettings(settingsTable.get(cwd));
     for (const field of Object.keys(DEFAULT_SETTINGS)) {
       const value = input[field];
       if (value === undefined) continue;
       if (typeof value !== 'string') {
-        throw new TypeError(`settings.${field} 必须是字符串`);
+        throw new StoreError('invalid-settings', `settings.${field} 必须是字符串`);
       }
       next[field] = value;
     }
 
-    await settingsTable.put(cwd, next);
-    return { ...next };
+    const validated = checkSettings(next);
+    await settingsTable.put(cwd, validated);
+    return structuredClone(validated);
   }
 
   return { list, get, snapshot, create, applyAction, getSettings, putSettings };
@@ -307,9 +398,23 @@ function isStoredTicket(value, key) {
 }
 
 function compareTickets(a, b) {
-  const byCreatedAt = a.createdAt.localeCompare(b.createdAt);
+  const byCreatedAt = compareTimestamps(a.createdAt, b.createdAt);
   if (byCreatedAt !== 0) return byCreatedAt;
   return a.code.localeCompare(b.code);
+}
+
+/**
+ * Compare two stored timestamps as instants, not as text: an injected clock may
+ * emit different UTC offsets, and `08:00+08:00` is earlier than `02:00Z` even
+ * though its text sorts later. Unparseable values fall back to a stable string
+ * comparison so corrupt records still have a deterministic order.
+ */
+function compareTimestamps(a, b) {
+  const left = typeof a === 'string' ? Date.parse(a) : Number.NaN;
+  const right = typeof b === 'string' ? Date.parse(b) : Number.NaN;
+  if (Number.isFinite(left) && Number.isFinite(right) && left !== right) return left - right;
+  if (a === b) return 0;
+  return a < b ? -1 : 1;
 }
 
 /** Rebuild the ledger order from the persisted meta table (oldest first). */
@@ -326,15 +431,22 @@ function readActionOrder(metaTable) {
   return entries.map((entry) => entry.actionId);
 }
 
-/** Replay a persisted successful result; corrupted ledger entries count as a miss. */
-function readActionResult(metaTable, actionId) {
+/**
+ * Replay a persisted successful result, but only for the same ticket+action.
+ * Corrupted ledger entries count as a miss; a valid entry for another request
+ * is reported as reused so the caller can answer `action-id-reused`.
+ */
+function readActionResult(metaTable, actionId, code, action) {
   const record = metaTable.get(ACTION_KEY_PREFIX + actionId);
   if (!isPlainObject(record) || !isPlainObject(record.value)) return undefined;
-  const result = record.value.result;
+  const { code: storedCode, action: storedAction, result } = record.value;
   if (!isPlainObject(result) || result.ok !== true || !isPlainObject(result.ticket)) {
     return undefined;
   }
-  return structuredClone(result);
+  if (storedCode !== code || storedAction !== action) {
+    return { reused: true, code: storedCode, action: storedAction };
+  }
+  return { reused: false, result: structuredClone(result) };
 }
 
 /** Fill every declared settings field from `raw`, falling back to the defaults. */
@@ -361,10 +473,12 @@ function normalizeActionId(actionId) {
   return trimmed === '' ? undefined : trimmed;
 }
 
-function normalizeCwd(cwd, operation) {
-  if (typeof cwd !== 'string' || cwd.trim() === '') {
-    throw new TypeError(`${operation}(cwd) 需要一个非空的工作区路径`);
-  }
+/**
+ * Resolve the workspace settings key. `undefined` means "no workspace": reads
+ * fall back to defaults, writes reject with `unknown-workspace`.
+ */
+function normalizeCwd(cwd) {
+  if (typeof cwd !== 'string' || cwd.trim() === '') return undefined;
   return cwd;
 }
 
