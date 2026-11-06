@@ -29,6 +29,9 @@
  *     `/bug-workflow/api/platform-token` (`{sessionId, token}`) and cleared with
  *     `{token:null}`; the status dot follows `snapshot.platform.tokenPresent`,
  *     and the value is never rendered back (the input is cleared on success).
+ *     Saving the token also persists a dirty settings draft first (and aborts
+ *     the token save if that validation/POST fails), so a user who edited the
+ *     platform base URL cannot end up with a token bound to the old URL.
  *     `writebackStatus` is a boolean switch the panel only persists today (P5
  *     will use it).
  *   - the header 「同步」 button POSTs `/bug-workflow/api/sync` (`{sessionId}`),
@@ -3011,6 +3014,13 @@ window.__ModuleLoader__.load({
        * rendered output: the input is cleared on success and the status dot
        * follows the refreshed snapshot. The request is a plain JSON POST with
        * `Content-Type: application/json` (the host rejects anything else).
+       *
+       * A dirty settings draft is persisted FIRST. Closing the panel discards
+       * an unsaved draft, while sync/import would keep using the old platform
+       * base URL/token pairing — so saving a token must not silently drop the
+       * base-URL edit. Validation failure keeps the panel open and saves no
+       * token; a settings POST failure does the same. A clean draft skips the
+       * settings request entirely (token-only save keeps its old behaviour).
        */
       const savePlatformToken = React.useCallback(async () => {
         if (tokenBusyRef.current || settingsSavingRef.current || busyRef.current) return;
@@ -3027,34 +3037,102 @@ window.__ModuleLoader__.load({
           return;
         }
 
+        const draftDirty = settingsOpen === true
+          && !settingsEqual(settingsDraftRef.current, settingsBaseline);
+        let settingsToSave = null;
+        if (draftDirty) {
+          settingsToSave = settingsPayload(settingsDraftRef.current);
+          const errors = validateSettings(settingsToSave);
+          if (Object.keys(errors).length > 0) {
+            // Inline field errors are the panel's validation surface; the token
+            // stays unsaved so the user fixes the settings first.
+            setSettingsErrors(errors);
+            return;
+          }
+        }
+
+        setSettingsErrors({});
         setActionError(null);
         setFlash(null);
+        settingsSavingRef.current = true;
         tokenBusyRef.current = true;
         busyRef.current = true;
+        setSettingsSaving(draftDirty);
         setTokenBusy(true);
 
         try {
+          if (settingsToSave !== null) {
+            const savedResult = await postMutation(API.settings, {
+              sessionId,
+              settings: settingsToSave,
+            });
+            if (savedResult.aborted === true) return;
+
+            if (!savedResult.ok) {
+              // The token must never be bound to a base URL the user only
+              // thought was saved: keep the panel open, save nothing.
+              setActionError(toErrorView(savedResult));
+              return;
+            }
+
+            const saved = normalizeSettings(
+              savedResult.data !== null && typeof savedResult.data === 'object'
+                ? savedResult.data.settings
+                : settingsToSave,
+            );
+            settingsDraftRef.current = saved;
+            setSettingsDraft(saved);
+            settingsTouchedRef.current = false;
+            setSettingsErrors({});
+          }
+
           const result = await postMutation(API.platformToken, { sessionId, token });
           if (result.aborted === true) return;
 
           if (!result.ok) {
             setActionError(toErrorView(result));
+            if (settingsToSave !== null) {
+              // The settings half already landed; refresh so the panel's dirty
+              // baseline matches what is actually stored.
+              try {
+                await polling.refresh();
+              } catch {
+                // The next poll re-syncs the baseline.
+              }
+            }
             return;
           }
 
           setTokenDraft('');
-          setFlash('token 已保存');
+          if (settingsToSave !== null) {
+            // Mirror a normal settings save: close the overlay so the combined
+            // success flash (rendered behind it) is actually visible.
+            setSettingsOpen(false);
+            focusSettingsButton();
+          }
+          setFlash(settingsToSave === null ? 'token 已保存' : '设置与 token 已保存');
           try {
             await polling.refresh();
           } catch {
             // The polling banner (or the next poll) reports a failed refresh.
           }
         } finally {
+          settingsSavingRef.current = false;
           tokenBusyRef.current = false;
           busyRef.current = false;
+          setSettingsSaving(false);
           setTokenBusy(false);
         }
-      }, [configured, polling, postMutation, sessionId, tokenDraft]);
+      }, [
+        configured,
+        focusSettingsButton,
+        polling,
+        postMutation,
+        sessionId,
+        settingsBaseline,
+        settingsOpen,
+        tokenDraft,
+      ]);
 
       /** Clear the stored platform token (`{token:null}`, never an empty string). */
       const clearPlatformToken = React.useCallback(async () => {
