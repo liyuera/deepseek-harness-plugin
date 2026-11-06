@@ -11,7 +11,7 @@
  *          -> close the domain from the fiber disposer
  *
  *   GET  /bug-workflow/api/health    -> { ok, domainOpenedAt, tickets }
- *   GET  /bug-workflow/api/snapshot  -> { ok, workspace, settings, platform, dicts, tickets, serverTime }
+ *   GET  /bug-workflow/api/snapshot  -> { ok, workspace, settings, platform, dicts, analysis, tickets, serverTime }
  *   POST /bug-workflow/api/action    -> { ok, ticket } | { ok:false, code, message, ticket? }
  *                                       (create + payload.code = 按编号从平台导入)
  *   POST /bug-workflow/api/analyze   -> { ok, workflow:'analyzing', running }
@@ -25,8 +25,9 @@
  * `createAnalysisService()` orchestrates the ticket transitions/errors over the
  * opened store. The runner is built even when those services are absent: it
  * reports `available() === false`, so `/analyze` answers 503 `analysis-unavailable`
- * instead of failing the whole plugin. The service is disposed (running jobs
- * aborted) before the storage domain closes.
+ * instead of failing the whole plugin. The service is disposed and drained
+ * (aborted jobs' terminal writes awaited, bounded) before the storage domain
+ * closes; a stuck runner cannot hang unload.
  *
  * Sync wiring (P2 Task 4): `createSyncService()` reads the token from
  * `ctx.credentials`, maps platform tasks into the v2 ticket store, and persists
@@ -187,6 +188,9 @@ export function apply(ctx) {
         // snapshot reports an empty analysis block.
         let analysis = null;
         try {
+          // The 10-minute analysis budget is a code-level default in
+          // analysis-service.js; P3 exposes no host setting for it. Pass
+          // `{ timeoutMs }` here to change it.
           analysisService = createAnalysisService({ store, runner, clock });
           analysis = { service: analysisService, runner };
         } catch (error) {
@@ -223,8 +227,9 @@ export function apply(ctx) {
         if (!mounted) {
           // The fiber was disposed while the domain was opening; no request can
           // reach these handlers any more, so release the domain immediately
-          // instead of leaving a handle behind.
-          analysisService?.dispose();
+          // instead of leaving a handle behind. Drain any analysis job before
+          // closing the domain so its terminal write cannot be lost.
+          await analysisService?.dispose();
           await closeDomain(handle);
           return handle;
         }
@@ -236,9 +241,10 @@ export function apply(ctx) {
       } catch (error) {
         // Release a domain that opened but could not be attached to a store (or
         // to routes); otherwise the facility would report `already-open` on
-        // every reload. Abort any analysis job first; it may still write.
+        // every reload. Abort and drain any analysis job first; it may still
+        // write through the store.
         try {
-          analysisService?.dispose();
+          await analysisService?.dispose();
         } catch {
           // Teardown must continue regardless.
         }
@@ -271,10 +277,11 @@ export function apply(ctx) {
     // a late successful open; `closeDomain` is idempotent.
     storageCtx.effect(
       () => async () => {
-        // Abort running analyses first: their background jobs may still write
-        // through the store, and the domain must not close under a live job.
+        // Abort and drain running analyses first: their background jobs may
+        // still write through the store, and the domain must not close under a
+        // live job. The drain is bounded, so a stuck runner cannot hang unload.
         try {
-          analysisService?.dispose();
+          await analysisService?.dispose();
         } catch {
           // Disposal is best-effort; the domain teardown still has to run.
         }

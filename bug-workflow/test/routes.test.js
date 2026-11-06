@@ -24,6 +24,7 @@ import {
   registerRoutes,
   registerUnavailableRoutes,
 } from '../src/host/routes.js';
+import { createAnalysisService } from '../src/host/analysis-service.js';
 import { PLATFORM_TOKEN_REF, createTokenStore } from '../src/host/credentials.js';
 import { DEFAULT_SETTINGS, createStore } from '../src/host/store.js';
 import { MAX_REVIEW_ROUNDS, initialTicket } from '../src/host/state-machine.js';
@@ -360,6 +361,25 @@ async function call(handler, options) {
   const res = makeResponse();
   await handler(makeRequest(options), res);
   return { res, json: res.body === '' ? undefined : JSON.parse(res.body) };
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+/** Tick macrotasks until the real analysis service has no running job. */
+async function waitForServiceIdle(service, limit = 200) {
+  for (let index = 0; index < limit; index += 1) {
+    if (service.status().running.length === 0) return;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  throw new Error('analysis job did not settle');
 }
 
 function snapshotUrl(sessionId = SESSION_ID) {
@@ -1323,19 +1343,44 @@ test('POST /analyze starts the analysis for the resolved workspace', async () =>
   ]);
 });
 
-test('POST /analyze reports a duplicate running analysis without a second start', async () => {
-  const analysis = createFakeAnalysis({
-    start: () => ({ ok: true, running: true, workflow: 'analyzing' }),
-  });
-  const { handlers } = handlersWith({ analysis });
-  const { res, json } = await call(handlers.analyze, {
-    method: 'POST',
-    url: API_PATHS.analyze,
-    body: analyzeBody(),
-  });
+test('POST /analyze reports a duplicate running analysis without a second runner call', async () => {
+  // Real store + real analysis service so the duplicate guard is exercised
+  // end-to-end: two concurrent route requests, one background runner call.
+  const domain = createFakeDomain();
+  await domain.table('tickets').put('BUG-DUP', inboxTicket('BUG-DUP'));
+  const store = createStore(domain);
+  const pending = deferred();
+  const runner = {
+    calls: [],
+    available: () => true,
+    runAnalysis(input) {
+      this.calls.push(input);
+      return pending.promise;
+    },
+  };
+  const service = createAnalysisService({ store, runner, clock: () => SERVER_TIME });
+  const { handlers } = handlersWith({ store, analysis: { service, runner } });
 
-  assert.equal(res.statusCode, 200);
-  assert.equal(json.running, true);
+  const body = analyzeBody({ code: 'BUG-DUP' });
+  const first = call(handlers.analyze, { method: 'POST', url: API_PATHS.analyze, body });
+  const second = call(handlers.analyze, { method: 'POST', url: API_PATHS.analyze, body });
+  const [firstResult, secondResult] = await Promise.all([first, second]);
+
+  assert.equal(firstResult.res.statusCode, 200);
+  assert.equal(secondResult.res.statusCode, 200);
+  assert.equal(secondResult.json.running, true);
+  // The service reserves before awaiting; the duplicate must not start a
+  // second subagent nor write a second `start_analysis` transition.
+  assert.equal(runner.calls.length, 1);
+  assert.equal(
+    store.get('BUG-DUP').timeline.filter((entry) => entry.kind === 'start_analysis').length,
+    1,
+  );
+
+  pending.resolve({ ok: true, plan: { summary: '双请求' }, childId: 'child-1', elapsedMs: 2 });
+  await waitForServiceIdle(service);
+  assert.equal(store.get('BUG-DUP').workflow, 'plan_review');
+  assert.equal(runner.calls.length, 1);
 });
 
 test('POST /analyze validates session, code and workspace before starting', async () => {

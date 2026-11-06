@@ -200,7 +200,7 @@ const LOOPBACK_REMOTE_ADDRESSES = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1
  * @param {number} [deps.bodyTimeoutMs] POST body read deadline (default 10 s)
  * @param {((entry: {event: string, error: unknown}) => void)|null} [deps.log]
  *   optional host logger; receives full errors that are hidden from responses
- * @returns {{health: Function, snapshot: Function, action: Function, settings: Function, platformToken: Function, sync: Function}}
+ * @returns {{health: Function, snapshot: Function, action: Function, analyze: Function, settings: Function, platformToken: Function, sync: Function}}
  */
 export function createHandlers({
   store,
@@ -403,8 +403,11 @@ export function createHandlers({
      * The service persists `start_analysis`, then runs the read-only subagent in
      * the background; this route answers as soon as the ticket is `analyzing`.
      * A duplicate click for an already-running ticket is a 200 with
-     * `running:true` rather than a second subagent. No-live-agent and an
-     * unwired analysis service are retryable 503s.
+     * `running:true` rather than a second subagent. The service also restarts a
+     * ticket that is already `analyzing` (crash orphan) or blocked from
+     * `analyzing` (failure retry), so the client can always call this route
+     * directly. No-live-agent and an unwired analysis service are retryable
+     * 503s.
      */
     analyze: safe(async (req, res) => {
       if (!guard(req, res, ROUTE_METHODS.analyze)) return;

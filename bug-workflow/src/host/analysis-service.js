@@ -13,21 +13,33 @@
  *   - One analysis per ticket: `start()` returns `running:true` for a duplicate
  *     click instead of launching a second subagent; different tickets run in
  *     parallel.
+ *   - Service-level restart: a failure blocks from `analyzing`, and the
+ *     `start_analysis` action only accepts `inbox`. So `start()` also restarts
+ *     (a) a ticket that is already `analyzing` but has no in-memory job (crash,
+ *     unload, previous host) without another state write, and (b) a ticket
+ *     blocked with `blockedFrom:'analyzing'` by applying `retry` back to
+ *     `analyzing`. Both paths clear the persisted analysis error and launch a
+ *     new job; the state machine is never bypassed or modified.
  *   - `start_analysis` is applied through the store (state machine + write
  *     queue) before the background job is launched, so an invalid state never
  *     starts a subagent and never writes a partial ticket.
  *   - The background job never rejects: runner failures are mapped to a static
  *     block reason + static message, stored in `meta['analysis.error:<code>']`.
  *     A failure after the ticket left `analyzing` only records the error; it
- *     never blocks a ticket that has already moved on.
+ *     never blocks a ticket that has already moved on (`block` is legal from
+ *     many workflows, so the failure path additionally requires `analyzing`).
  *   - Before `analysis_done` the persisted ticket is re-read and checked with
  *     `canApply()`. A stale result (the ticket was blocked/approved/dismissed
  *     while the child was running) is discarded with a static meta error; the
  *     state machine remains the only writer of the workflow.
  *   - Error messages are static Chinese strings: runner messages, internal
  *     details and stacks never reach `meta` or the snapshot.
- *   - `dispose()` aborts every running job (the runner's caller signal) and
- *     clears the in-memory running set; it is idempotent.
+ *   - `dispose()` aborts every running job and drains them: it returns a
+ *     promise that settles when the aborted jobs' terminal writes have been
+ *     attempted (bounded, so a stuck runner cannot hang unload). Idempotent.
+ *     The host must await it before closing the storage domain.
+ *   - `start()` re-checks `disposed` after every await and never launches a job
+ *     once teardown began.
  *
  * `meta` stays the same domain v2 table as the action ledger: the error keys
  * are `analysis.error:<code>` and `null` clears one. No Ticket/domain schema
@@ -66,6 +78,14 @@ const RUNNER_CODE_TO_REASON = Object.freeze({
 const DEFAULT_TIMEOUT_MS = DEFAULT_ANALYSIS_TIMEOUT_MS;
 
 /**
+ * Upper bound on `dispose()` draining aborted jobs. The host awaits the drain
+ * before closing the storage domain, so a runner that ignores its abort signal
+ * must not be able to hang plugin unload. Normal aborts settle in microseconds;
+ * the bound only matters for a stuck runner.
+ */
+const DEFAULT_DRAIN_TIMEOUT_MS = 3_000;
+
+/**
  * Create the analysis service.
  *
  * @param {object} deps
@@ -73,10 +93,11 @@ const DEFAULT_TIMEOUT_MS = DEFAULT_ANALYSIS_TIMEOUT_MS;
  * @param {object} deps.runner `createAgentRunner()` result (`available/runAnalysis`)
  * @param {(() => string) | {now: () => string}} [deps.clock] action-id clock
  * @param {number} [deps.timeoutMs] analysis budget forwarded to the runner
+ * @param {number} [deps.drainTimeoutMs] bound on `dispose()` draining jobs
  * @returns {{
  *   start: (sessionId: string, cwd: string, code: string) => Promise<object>,
  *   status: () => {running: string[], errors: Record<string, string>},
- *   dispose: () => void,
+ *   dispose: () => Promise<void>,
  * }}
  */
 export function createAnalysisService({
@@ -84,20 +105,25 @@ export function createAnalysisService({
   runner,
   clock = defaultClock,
   timeoutMs = DEFAULT_TIMEOUT_MS,
+  drainTimeoutMs = DEFAULT_DRAIN_TIMEOUT_MS,
 } = {}) {
   assertStore(store);
   assertRunner(runner);
   const readNow = normalizeClock(clock);
   const analysisTimeoutMs = positiveNumber(timeoutMs) ?? DEFAULT_TIMEOUT_MS;
+  const disposeTimeoutMs = positiveNumber(drainTimeoutMs) ?? DEFAULT_DRAIN_TIMEOUT_MS;
 
   /** code -> { controller, startedAt } for analyses currently running. */
   const running = new Map();
+  /** Promises of background jobs that have not settled yet (dispose drain). */
+  const jobs = new Set();
   /** Codes known to carry an analysis error (meta is still the source of truth). */
   const errorCodes = new Set();
   /** Action ids already used by this service instance (clock can be coarse). */
   const usedActionIds = new Set();
   let duplicateActionIdSuffix = 0;
   let disposed = false;
+  let disposePromise;
 
   /**
    * Start one analysis. Returns after `start_analysis` is persisted; the
@@ -125,10 +151,22 @@ export function createAnalysisService({
     }
 
     // Duplicate click / concurrent request for the same ticket: never launch a
-    // second subagent. The entry is reserved BEFORE `applyAction` awaits, so
-    // two same-tick requests cannot both pass this check.
+    // second subagent. Every branch below reserves the entry BEFORE its first
+    // await, so two same-tick requests cannot both pass this check.
     if (running.has(key)) {
       return { ok: true, running: true, workflow: 'analyzing' };
+    }
+
+    // Service-level restart (P3 Task 2 review findings). A failure blocks the
+    // ticket from `analyzing`, and `start_analysis` only accepts `inbox`, so
+    // without these branches a failed (or crash-orphaned) analysis could never
+    // be started again — the plan's "retry → re-analyze" flow would 409
+    // forever. The state machine itself is untouched.
+    if (ticket.workflow === 'analyzing') {
+      return restartAnalyzing({ key, sessionId, cwd, ticket });
+    }
+    if (ticket.workflow === 'blocked' && ticket.blockedFrom === 'analyzing') {
+      return restartBlocked({ key, sessionId, cwd });
     }
 
     const check = canApply(ticket, 'start_analysis');
@@ -144,12 +182,7 @@ export function createAnalysisService({
 
     // Surface (and later clear) an error persisted by a previous host load.
     readPersistedError(key);
-
-    const entry = {
-      controller: new AbortController(),
-      startedAt: readNow(),
-    };
-    running.set(key, entry);
+    const entry = reserve(key);
 
     let applied;
     try {
@@ -157,7 +190,7 @@ export function createAnalysisService({
         key,
         'start_analysis',
         { actor: 'user' },
-        { actionId: nextActionId(key) },
+        { actionId: nextActionId('analyze', key) },
       );
     } catch {
       clearRunning(key, entry);
@@ -179,16 +212,83 @@ export function createAnalysisService({
       return failure('invalid-state', '工单状态已变化，请刷新后重试');
     }
 
-    await clearError(key);
-    launchJob({
-      entry,
-      key,
-      sessionId,
-      cwd,
-      ticket: applied.ticket,
-    });
+    if (disposed) return disposedStart(key, entry);
 
+    await clearError(key);
+    // Re-check AFTER every await: dispose() may have aborted the reserved
+    // entry while the write above was in flight. No job may launch then.
+    if (disposed) return disposedStart(key, entry);
+
+    launchJob({ entry, key, sessionId, cwd, ticket: applied.ticket });
     return { ok: true, running: true, workflow: 'analyzing' };
+  }
+
+  /**
+   * Restart a ticket persisted as `analyzing` that has no in-memory job (host
+   * crash/unload, or a job that vanished with a previous fiber). No state
+   * write happens: the workflow is already where analysis expects it. Only the
+   * stale error is cleared and a new background job is launched.
+   */
+  async function restartAnalyzing({ key, sessionId, cwd, ticket }) {
+    const entry = reserve(key);
+    await clearError(key);
+    if (disposed) return disposedStart(key, entry);
+
+    launchJob({ entry, key, sessionId, cwd, ticket });
+    return { ok: true, running: true, workflow: 'analyzing' };
+  }
+
+  /**
+   * Restart a ticket blocked by a failed analysis: `retry` returns it to the
+   * recorded `blockedFrom` (`analyzing`), then a new job is launched. The live
+   * agent is checked before any write so a 503 never leaves a half-restarted
+   * ticket; a retry that does not end in `analyzing` is treated as lost race.
+   */
+  async function restartBlocked({ key, sessionId, cwd }) {
+    if (!runnerAvailable()) {
+      return failure('analysis-unavailable', ANALYSIS_REASON_MESSAGES['no-live-agent']);
+    }
+
+    const entry = reserve(key);
+
+    let applied;
+    try {
+      applied = await store.applyAction(
+        key,
+        'retry',
+        { actor: 'user' },
+        { actionId: nextActionId('analyze-retry', key) },
+      );
+    } catch {
+      clearRunning(key, entry);
+      return failure('internal', '分析启动失败，请重试');
+    }
+
+    if (applied?.ok !== true || applied.ticket?.workflow !== 'analyzing') {
+      clearRunning(key, entry);
+      return failure('invalid-state', '工单状态已变化，请刷新后重试');
+    }
+
+    if (disposed) return disposedStart(key, entry);
+
+    await clearError(key);
+    if (disposed) return disposedStart(key, entry);
+
+    launchJob({ entry, key, sessionId, cwd, ticket: applied.ticket });
+    return { ok: true, running: true, workflow: 'analyzing' };
+  }
+
+  /** Reserve the running entry before the first await of a start branch. */
+  function reserve(key) {
+    const entry = { controller: new AbortController(), startedAt: readNow() };
+    running.set(key, entry);
+    return entry;
+  }
+
+  /** A start that raced teardown: drop the reservation, never launch, 503. */
+  function disposedStart(key, entry) {
+    clearRunning(key, entry);
+    return failure('analysis-unavailable', '分析服务不可用，请稍后重试');
   }
 
   /**
@@ -222,28 +322,47 @@ export function createAnalysisService({
     return { running: [...running.keys()], errors };
   }
 
-  /** Abort every running job and drop the in-memory running set (idempotent). */
+  /**
+   * Abort every running job and drain it: the returned promise settles once
+   * the aborted jobs have attempted their terminal writes (block + meta), or
+   * after `drainTimeoutMs` when a runner ignores its abort signal. The host
+   * awaits this before closing the storage domain, so a terminal write cannot
+   * silently land on a closed domain. Idempotent: repeated calls return the
+   * same in-flight drain promise.
+   *
+   * @returns {Promise<void>}
+   */
   function dispose() {
-    if (disposed) return;
+    if (disposePromise !== undefined) return disposePromise;
     disposed = true;
-    for (const entry of running.values()) {
+    const entries = [...running.values()];
+    running.clear();
+    for (const entry of entries) {
       try {
         entry.controller.abort();
       } catch {
         // A hostile signal implementation must not break teardown.
       }
     }
-    running.clear();
+    // Snapshot the jobs AFTER aborting: abort only schedules the runner's
+    // settlement on the microtask queue, so no new job can be added.
+    disposePromise = drainJobs([...jobs], disposeTimeoutMs);
+    return disposePromise;
   }
 
   /**
-   * Fire-and-forget background job. `run()` never throws (catch-all) and its
-   * completion always releases the running entry.
+   * Fire-and-forget background job. `run()` never throws (catch-all), its
+   * completion always releases the running entry, and the promise stays in
+   * `jobs` until the terminal write settles so `dispose()` can drain it.
    */
   function launchJob({ entry, key, sessionId, cwd, ticket }) {
     const job = run({ entry, key, sessionId, cwd, ticket });
+    jobs.add(job);
     void job
-      .finally(() => clearRunning(key, entry))
+      .finally(() => {
+        jobs.delete(job);
+        clearRunning(key, entry);
+      })
       .catch(() => {
         // `run()` contains every failure; this catch is belt-and-braces so a
         // misbehaving `finally` cannot become an unhandled rejection.
@@ -293,13 +412,22 @@ export function createAnalysisService({
     await rememberError(key, STALE_ANALYSIS_MESSAGE);
   }
 
-  /** Block the ticket (only when still legal) and persist the static reason. */
+  /**
+   * Block the ticket and persist the static reason. `block` is legal from many
+   * workflows (plan_review, fixing, ...), so a late failure is gated on the
+   * ticket still being in `analyzing`: a ticket that already advanced must not
+   * regress. In that case only the static error meta is recorded.
+   */
   async function applyAnalysisFailure(key, runnerCode) {
     const reason = RUNNER_CODE_TO_REASON[runnerCode] ?? 'analysis-failed';
     const message = ANALYSIS_REASON_MESSAGES[reason] ?? ANALYSIS_REASON_MESSAGES['analysis-failed'];
 
     const current = readTicket(key);
-    if (current !== undefined && canApply(current, 'block').ok) {
+    if (
+      current !== undefined
+      && current.workflow === 'analyzing'
+      && canApply(current, 'block').ok
+    ) {
       try {
         await store.applyAction(key, 'block', { reason, actor: 'system' });
       } catch {
@@ -369,13 +497,14 @@ export function createAnalysisService({
   }
 
   /**
-   * Action ids stay `analyze-<code>-<clock>` as specified. A coarse injected
-   * clock (same millisecond) would otherwise replay the store's cached result
-   * of a previous start instead of running the state machine again, so a
-   * collision within this instance gets a numeric suffix.
+   * Action ids stay `analyze-<code>-<clock>` (and
+   * `analyze-retry-<code>-<clock>` for a restart) as specified. A coarse
+   * injected clock (same millisecond) would otherwise replay the store's
+   * cached result of a previous action instead of running the state machine
+   * again, so a collision within this instance gets a numeric suffix.
    */
-  function nextActionId(key) {
-    const base = `analyze-${key}-${readNow()}`;
+  function nextActionId(prefix, key) {
+    const base = `${prefix}-${key}-${readNow()}`;
     let actionId = base;
     while (usedActionIds.has(actionId)) {
       duplicateActionIdSuffix += 1;
@@ -453,4 +582,29 @@ function failure(code, message) {
 
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * Wait for every job to settle, but never longer than `timeoutMs`. Used by
+ * `dispose()` so a stuck runner cannot hang plugin unload: the timer is kept
+ * referenced so the bounded promise always settles (an unref'd timer could let
+ * an idle process drain the loop before it fires).
+ *
+ * @param {Promise<unknown>[]} pending job promises (already started)
+ * @param {number} timeoutMs drain bound
+ * @returns {Promise<void>}
+ */
+function drainJobs(pending, timeoutMs) {
+  if (pending.length === 0) return Promise.resolve();
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    Promise.allSettled(pending).then(finish, finish);
+  });
 }

@@ -100,7 +100,7 @@ function createFakeRunner({ available = true, run } = {}) {
   return {
     calls,
     available() {
-      return available;
+      return typeof available === 'function' ? available() : available;
     },
     runAnalysis(input) {
       calls.push(input);
@@ -125,11 +125,20 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
+/** Real-timer delay used to make terminal writes land after dispose() starts. */
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
  * Build a real store over a fake domain plus the analysis service.
  * `store` uses a constant clock: the persisted timestamps are not under test.
  */
-function setup({ runner = createFakeRunner(), timeoutMs = 5_000 } = {}) {
+function setup({
+  runner = createFakeRunner(),
+  timeoutMs = 5_000,
+  drainTimeoutMs,
+} = {}) {
   const domain = createFakeDomain();
   const store = createStore(domain, () => T1);
   const service = createAnalysisService({
@@ -137,6 +146,7 @@ function setup({ runner = createFakeRunner(), timeoutMs = 5_000 } = {}) {
     runner,
     clock: createServiceClock(),
     timeoutMs,
+    ...(drainTimeoutMs === undefined ? {} : { drainTimeoutMs }),
   });
   return { domain, store, service, runner };
 }
@@ -155,6 +165,20 @@ async function seedTicket(domain, code, patch = {}) {
   };
   await domain.table('tickets').put(code, ticket);
   return ticket;
+}
+
+/** Ticket left blocked by a failed analysis (the state a host reload sees). */
+async function seedBlockedFromAnalysis(domain, code, reason = 'analysis-failed') {
+  return seedTicket(domain, code, {
+    workflow: 'blocked',
+    blockedFrom: 'analyzing',
+    blockedReason: reason,
+    timeline: [
+      { at: T1, kind: 'created', actor: 'system', message: '工单已创建' },
+      { at: T1, kind: 'start_analysis', actor: 'user', message: '开始分析工单' },
+      { at: T1, kind: 'blocked', actor: 'system', message: '工单已阻塞' },
+    ],
+  });
 }
 
 /** Tick macrotasks until the service has no running analysis (bounded). */
@@ -375,6 +399,162 @@ test('start() propagates a structured store failure instead of throwing', async 
 });
 
 // ---------------------------------------------------------------------------
+// Restart semantics (P3 Task 2 review findings)
+//
+// A failure blocks the ticket from `analyzing`; `start_analysis` only accepts
+// `inbox`, so without service-level restart a blocked ticket could never be
+// analyzed again. The service retries the ticket back to `analyzing` itself.
+// ---------------------------------------------------------------------------
+
+test('a blocked analysis restarts through retry, clears the stale error and launches one job', async () => {
+  const pending = deferred();
+  const attempts = [];
+  const runner = createFakeRunner({
+    run: () => {
+      attempts.push('run');
+      if (attempts.length === 1) {
+        return Promise.resolve({ ok: false, code: 'analysis-timeout', message: 'timeout' });
+      }
+      return pending.promise;
+    },
+  });
+  const { store, service } = setup({ runner });
+  await createTicket(store);
+
+  await service.start(SESSION_ID, CWD, 'BUG-1');
+  await waitForIdle(service);
+  const failed = store.get('BUG-1');
+  assert.equal(failed.workflow, 'blocked');
+  assert.equal(failed.blockedFrom, 'analyzing');
+  assert.equal(store.getMeta(ANALYSIS_ERROR_META_PREFIX + 'BUG-1'), '分析超时，请重试');
+
+  const callsBefore = runner.calls.length;
+  const restarted = await service.start(SESSION_ID, CWD, 'BUG-1');
+  assert.deepEqual(restarted, { ok: true, running: true, workflow: 'analyzing' });
+  assert.equal(runner.calls.length, callsBefore + 1);
+
+  const ticket = store.get('BUG-1');
+  assert.equal(ticket.workflow, 'analyzing');
+  assert.equal(ticket.blockedFrom, null);
+  assert.equal(ticket.blockedReason, null);
+  assert.equal(ticket.timeline.at(-1).kind, 'retry');
+  assert.equal(ticket.timeline.at(-1).actor, 'user');
+  // The restart must not smuggle in a second `start_analysis` transition.
+  assert.equal(
+    ticket.timeline.filter((entry) => entry.kind === 'start_analysis').length,
+    1,
+  );
+  // The stale error is cleared when the restart is accepted, not only after
+  // the new runner eventually settles.
+  assert.equal(store.getMeta(ANALYSIS_ERROR_META_PREFIX + 'BUG-1'), null);
+  assert.deepEqual(service.status().errors, {});
+
+  pending.resolve({ ok: true, plan: makePlan(), childId: 'child-2', elapsedMs: 5 });
+  await waitForIdle(service);
+  assert.equal(store.get('BUG-1').workflow, 'plan_review');
+});
+
+test('an orphaned analyzing ticket restarts without another start_analysis transition', async () => {
+  const pending = deferred();
+  const runner = createFakeRunner({ run: () => pending.promise });
+  const { domain, store, service } = setup({ runner });
+  // Shape left behind when the host unloaded mid-analysis: `analyzing` with no
+  // in-memory running job and a persisted failure error.
+  await seedTicket(domain, 'BUG-1', {
+    workflow: 'analyzing',
+    timeline: [
+      { at: T1, kind: 'created', actor: 'system', message: '工单已创建' },
+      { at: T1, kind: 'start_analysis', actor: 'user', message: '开始分析工单' },
+    ],
+  });
+  await store.setMeta(ANALYSIS_ERROR_META_PREFIX + 'BUG-1', '分析子代理执行失败，请重试');
+  assert.equal(service.status().errors['BUG-1'], '分析子代理执行失败，请重试');
+
+  const result = await service.start(SESSION_ID, CWD, 'BUG-1');
+  assert.deepEqual(result, { ok: true, running: true, workflow: 'analyzing' });
+  assert.equal(runner.calls.length, 1);
+
+  const ticket = store.get('BUG-1');
+  assert.equal(ticket.workflow, 'analyzing');
+  assert.equal(
+    ticket.timeline.filter((entry) => entry.kind === 'start_analysis').length,
+    1,
+  );
+  assert.equal(store.getMeta(ANALYSIS_ERROR_META_PREFIX + 'BUG-1'), null);
+  assert.deepEqual(service.status().errors, {});
+
+  pending.resolve({ ok: true, plan: makePlan(), childId: 'child-3', elapsedMs: 4 });
+  await waitForIdle(service);
+  assert.equal(store.get('BUG-1').workflow, 'plan_review');
+});
+
+test('a ticket blocked for a non-analysis reason is not restarted', async () => {
+  const { domain, store, runner, service } = setup();
+  await seedTicket(domain, 'BUG-1', {
+    workflow: 'blocked',
+    blockedFrom: 'plan_review',
+    blockedReason: 'plan-rejected',
+  });
+
+  const result = await service.start(SESSION_ID, CWD, 'BUG-1');
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'invalid-state');
+  assert.equal(runner.calls.length, 0);
+
+  const ticket = store.get('BUG-1');
+  assert.equal(ticket.workflow, 'blocked');
+  assert.equal(ticket.blockedFrom, 'plan_review');
+  assert.equal(ticket.blockedReason, 'plan-rejected');
+  assert.equal(ticket.timeline.some((entry) => entry.kind === 'retry'), false);
+  assert.deepEqual(service.status().running, []);
+});
+
+test('two concurrent restarts of a blocked analysis launch exactly one runner', async () => {
+  const pending = deferred();
+  const runner = createFakeRunner({ run: () => pending.promise });
+  const { domain, store, service } = setup({ runner });
+  await seedBlockedFromAnalysis(domain, 'BUG-1');
+
+  const first = service.start(SESSION_ID, CWD, 'BUG-1');
+  const duplicate = await service.start(SESSION_ID, CWD, 'BUG-1');
+  assert.deepEqual(duplicate, { ok: true, running: true, workflow: 'analyzing' });
+
+  const restarted = await first;
+  assert.deepEqual(restarted, { ok: true, running: true, workflow: 'analyzing' });
+  assert.equal(runner.calls.length, 1);
+  assert.equal(
+    store.get('BUG-1').timeline.filter((entry) => entry.kind === 'retry').length,
+    1,
+  );
+
+  pending.resolve({ ok: true, plan: makePlan(), childId: 'child-4', elapsedMs: 6 });
+  await waitForIdle(service);
+  assert.equal(store.get('BUG-1').workflow, 'plan_review');
+});
+
+test('restarting a blocked analysis with no live agent leaves the ticket blocked', async () => {
+  let available = true;
+  const runner = createFakeRunner({ available: () => available });
+  const { domain, store, service } = setup({ runner });
+  await seedBlockedFromAnalysis(domain, 'BUG-1');
+  await store.setMeta(ANALYSIS_ERROR_META_PREFIX + 'BUG-1', '分析子代理执行失败，请重试');
+  available = false;
+
+  const result = await service.start(SESSION_ID, CWD, 'BUG-1');
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'analysis-unavailable');
+  assert.equal(result.message, '当前没有可用的会话 Agent');
+
+  // Availability is checked before any write: no retry transition, no runner.
+  assert.equal(runner.calls.length, 0);
+  assert.ok(store.get('BUG-1').timeline.every((entry) => entry.kind !== 'retry'));
+  assert.equal(store.get('BUG-1').workflow, 'blocked');
+  assert.equal(store.get('BUG-1').blockedFrom, 'analyzing');
+  assert.equal(store.getMeta(ANALYSIS_ERROR_META_PREFIX + 'BUG-1'), '分析子代理执行失败，请重试');
+  assert.deepEqual(service.status().running, []);
+});
+
+// ---------------------------------------------------------------------------
 // Stale result
 // ---------------------------------------------------------------------------
 
@@ -403,6 +583,39 @@ test('a completed analysis is discarded when the ticket is no longer analyzing',
   assert.equal(ticket.timeline.some((entry) => entry.kind === 'analysis_done'), false);
   assert.equal(store.getMeta(ANALYSIS_ERROR_META_PREFIX + 'BUG-1'), STALE_MESSAGE);
   assert.deepEqual(service.status().errors, { 'BUG-1': STALE_MESSAGE });
+});
+
+test('a late failure never blocks a ticket that already advanced past analyzing', async () => {
+  const pending = deferred();
+  const runner = createFakeRunner({ run: () => pending.promise });
+  const { store, service } = setup({ runner });
+  await createTicket(store);
+
+  await service.start(SESSION_ID, CWD, 'BUG-1');
+  // Manual/system completion while the child is still running: the ticket is
+  // already in plan_review when the job later reports a failure.
+  const done = await store.applyAction(
+    'BUG-1',
+    'analysis_done',
+    { plan: makePlan(), actor: 'agent' },
+    { actionId: 'manual-analysis-done' },
+  );
+  assert.equal(done.ok, true);
+  assert.equal(done.ticket.workflow, 'plan_review');
+
+  pending.resolve({ ok: false, code: 'analysis-failed', message: 'late boom' });
+  await waitForIdle(service);
+
+  const ticket = store.get('BUG-1');
+  assert.equal(ticket.workflow, 'plan_review');
+  assert.equal(ticket.blockedFrom, null);
+  assert.equal(ticket.blockedReason, null);
+  assert.equal(ticket.timeline.some((entry) => entry.kind === 'blocked'), false);
+  // The static reason is still recorded for the user, but no state write.
+  assert.equal(
+    store.getMeta(ANALYSIS_ERROR_META_PREFIX + 'BUG-1'),
+    '分析子代理执行失败，请重试',
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -454,11 +667,11 @@ test('dispose() aborts running work, clears running and is idempotent', async ()
   assert.deepEqual(service.status().running, ['BUG-1']);
   assert.equal(signal.aborted, false);
 
-  service.dispose();
+  const drained = service.dispose();
   assert.equal(signal.aborted, true);
   assert.deepEqual(service.status().running, []);
-  // Idempotent: a second teardown must not throw or re-abort.
-  service.dispose();
+  // Idempotent: a second teardown returns the same in-flight drain.
+  assert.equal(service.dispose(), drained);
   assert.deepEqual(service.status().running, []);
 
   // A disposed service refuses new work with the 503-mapped code.
@@ -466,8 +679,117 @@ test('dispose() aborts running work, clears running and is idempotent', async ()
   assert.equal(after.ok, false);
   assert.equal(after.code, 'analysis-unavailable');
 
-  // Let the aborted job settle: the failure is still handled exactly once.
-  await waitForIdle(service);
+  // The drain settles only after the aborted job's terminal write is persisted.
+  await drained;
   assert.equal(store.get('BUG-1').workflow, 'blocked');
   assert.equal(store.get('BUG-1').blockedReason, 'analysis-failed');
+  assert.equal(
+    store.getMeta(ANALYSIS_ERROR_META_PREFIX + 'BUG-1'),
+    '分析子代理执行失败，请重试',
+  );
+});
+
+test('dispose() drains an aborted job before resolving, even with slow store writes', async () => {
+  const runner = createFakeRunner({
+    run: ({ signal }) => new Promise((resolve) => {
+      signal.addEventListener('abort', () => {
+        resolve({ ok: false, code: 'analysis-failed', message: 'aborted' });
+      }, { once: true });
+    }),
+  });
+  const { store, service } = setup({ runner });
+  await createTicket(store);
+  await service.start(SESSION_ID, CWD, 'BUG-1');
+
+  // Simulate the teardown race: the abort-triggered block + meta writes are
+  // still in flight when the domain would otherwise be closed. A dispose()
+  // that merely fired abort() would resolve before these writes land.
+  const originalApply = store.applyAction.bind(store);
+  const originalSetMeta = store.setMeta.bind(store);
+  store.applyAction = async (...args) => {
+    await delay(10);
+    return originalApply(...args);
+  };
+  store.setMeta = async (...args) => {
+    await delay(10);
+    return originalSetMeta(...args);
+  };
+
+  const drained = service.dispose();
+  assert.equal(typeof drained?.then, 'function');
+  assert.deepEqual(service.status().running, []);
+  assert.equal(store.get('BUG-1').workflow, 'analyzing');
+
+  await drained;
+  const ticket = store.get('BUG-1');
+  assert.equal(ticket.workflow, 'blocked');
+  assert.equal(ticket.blockedFrom, 'analyzing');
+  assert.equal(ticket.blockedReason, 'analysis-failed');
+  assert.equal(
+    store.getMeta(ANALYSIS_ERROR_META_PREFIX + 'BUG-1'),
+    '分析子代理执行失败，请重试',
+  );
+});
+
+test('dispose() still settles when a closing store refuses the terminal write', async () => {
+  const runner = createFakeRunner({
+    run: ({ signal }) => new Promise((resolve) => {
+      signal.addEventListener('abort', () => {
+        resolve({ ok: false, code: 'analysis-failed', message: 'aborted' });
+      }, { once: true });
+    }),
+  });
+  const { store, service } = setup({ runner });
+  await createTicket(store);
+  await service.start(SESSION_ID, CWD, 'BUG-1');
+
+  // A store that is already closing rejects every write; the drain must still
+  // settle (the ticket is simply left for the next host load to reconcile).
+  store.applyAction = async () => {
+    throw new Error('domain closed');
+  };
+  store.setMeta = async () => {
+    throw new Error('domain closed');
+  };
+
+  await service.dispose();
+  assert.deepEqual(service.status().running, []);
+  assert.equal(store.get('BUG-1').workflow, 'analyzing');
+});
+
+test('dispose() is bounded when a runner ignores the abort signal', async () => {
+  const runner = createFakeRunner({ run: () => new Promise(() => {}) });
+  const { store, service } = setup({ runner, drainTimeoutMs: 25 });
+  await createTicket(store);
+  await service.start(SESSION_ID, CWD, 'BUG-1');
+
+  const startedAt = Date.now();
+  await service.dispose();
+  const elapsed = Date.now() - startedAt;
+  assert.ok(elapsed >= 10, `drain returned too early: ${elapsed}ms`);
+  assert.ok(elapsed < 1_000, `drain was not bounded: ${elapsed}ms`);
+  assert.deepEqual(service.status().running, []);
+});
+
+test('dispose() during start() prevents the background job from launching', async () => {
+  const pending = deferred();
+  const runner = createFakeRunner();
+  const { store, service } = setup({ runner });
+  await createTicket(store);
+  // Hold `start_analysis` in flight, then tear down while start() awaits it.
+  store.applyAction = () => pending.promise;
+
+  const started = service.start(SESSION_ID, CWD, 'BUG-1');
+  assert.deepEqual(service.status().running, ['BUG-1']);
+  const drained = service.dispose();
+  pending.resolve({ ok: true, ticket: { ...store.get('BUG-1'), workflow: 'analyzing' } });
+
+  const result = await started;
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'analysis-unavailable');
+  assert.equal(runner.calls.length, 0);
+  assert.deepEqual(service.status().running, []);
+  await drained;
+  // The held write was never followed by a launch, so the ticket stays inbox.
+  assert.equal(store.get('BUG-1').workflow, 'inbox');
 });
