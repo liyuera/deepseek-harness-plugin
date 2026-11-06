@@ -1,10 +1,10 @@
 # @liyuera/dsh-bug-workflow
 
-DeepSeek Harness（DSH）的 Bug 工作流看板，**P2 平台接入版本 0.0.1**。右栏打开「Bug 看板」tab，即可把一张工单从 `inbox` 一路驱动到 `done`：状态机、storageDomain 持久化、工作区设置、同源 HTTP 路由与安全守卫都是真实实现；P2 起工单可来自星瞰河山一体化平台（token 凭据、我的工单同步、按编号导入、字典筛选）。分析/修复子代理、GitLab MR 与 review 循环、状态写回留给 P3–P5。
+DeepSeek Harness（DSH）的 Bug 工作流看板，**P3 真分析版本 0.0.1**。右栏打开「Bug 看板」tab，即可把一张工单从 `inbox` 一路驱动到 `done`：状态机、storageDomain 持久化、工作区设置、同源 HTTP 路由与安全守卫都是真实实现；P2 起工单可来自星瞰河山一体化平台（token 凭据、我的工单同步、按编号导入、字典筛选）；P3 起「开始分析」由**真实只读分析子代理**读取工作区代码并产出结构化修复方案，审核通过后进入 `fixing`。修复子代理、GitLab MR 与 review 循环、状态写回留给 P4–P5。
 
-> 当前为 `private` 包，尚未发布 npm。P2 验收记录见 [`docs/superpowers/spikes/2026-11-07-p2-findings.md`](../docs/superpowers/spikes/2026-11-07-p2-findings.md)，P1 见 [`docs/superpowers/spikes/2026-11-07-p1-findings.md`](../docs/superpowers/spikes/2026-11-07-p1-findings.md)。
+> 当前为 `private` 包，尚未发布 npm。P3 验收记录见 [`docs/superpowers/spikes/2026-11-07-p3-findings.md`](../docs/superpowers/spikes/2026-11-07-p3-findings.md)，P2 见 [`docs/superpowers/spikes/2026-11-07-p2-findings.md`](../docs/superpowers/spikes/2026-11-07-p2-findings.md)，P1 见 [`docs/superpowers/spikes/2026-11-07-p1-findings.md`](../docs/superpowers/spikes/2026-11-07-p1-findings.md)。
 >
-> P2 的 live 证据全部来自**本地 mock 平台**。真实平台联调、状态写回与 GUI 目视验收**尚未执行**，是用户的最终验收项（见「平台接入」）。
+> P2 的 live 证据全部来自**本地 mock 平台**。P3 的分析是**真子代理**（真实模型、真实工作区读取，单次约 7 分钟量级），但本机验收工作区是插件仓库本身、不是工单所属业务仓库。真实平台联调、状态写回、真实业务仓库分析与 GUI 目视验收**尚未执行**，是用户的最终验收项（见「平台接入」「P3 真分析」）。
 
 ## 安装
 
@@ -56,9 +56,40 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 | 自动同步 | 有 token 时每 10 分钟对最近 live 会话的工作区执行一次同步；单飞是**按 cwd 的**——自动同步选中最近 live 会话的 cwd，手动同步用的是当前会话的 cwd，**同一工作区内**才会合并，不同工作区各自独立、可以并发；**本项未在 live 观察到 tick** |
 | 测试 | 197 个用例（credentials / domain v2 / platform 客户端 / sync / routes / client 映射；含 store 写串行化竞态用例） |
 
-> **动作映射的维护约束（每期必读）**：按钮只来自 `bug-workflow/client.js` 的 `ACTION_BY_STATE` 字面量（按 `workflow` 的静态列表）；宿主 `canApply` 是转移的权威，但两者是**两份独立数据**。`test/client-action-map.test.js` 只做单向校验（map → host：每个映射动作在该状态必须被 `canApply` 接受），**不校验 host → map**，所以新增宿主动作不会自动出现按钮。每加/改一个动作，必须同步更新该映射并运行 `node --test bug-workflow/test/*.test.js`。已知一处偏差：宿主支持 `block`（任意非终态可执行），但看板没有「阻塞」按钮。review 轮次上限已由映射处理，不再是偏差：`review_requests_changes` 声明 `maxRounds: 3`，`mr.rounds = 3` 时该按钮在界面上禁用并显示「轮次已耗尽」提示，不会发出必然被拒的请求；宿主仍是权威（绕过 UI 直接 POST 仍返回 409 `review-rounds-exhausted`，工单进入 `blocked`）。
+### P3 真分析（分析子代理 + 方案审核）
 
-**P2 之后仍是「假引擎」的部分**：平台工单的同步/导入是真的 HTTP 数据，但「开始分析 → 方案 → 修复 → 建 MR → review → 合并」仍由看板按钮手工 POST 假 payload 驱动，不调用子代理、GitLab 或 worktree，也没有状态写回。
+| 能力 | 说明 |
+| --- | --- |
+| 开始分析 | `inbox` 工单点「开始分析」→ `POST /bug-workflow/api/analyze`。宿主先在状态机里落 `start_analysis`（`analyzing`），再启动后台子代理；路由只回「已受理」，**不把 200 当作分析在跑的证明** |
+| 真子代理 | 宿主经 `ctx.subagents.startActivation({ provider:'spawn', delivery:'caller', ... })` 在当前 live 会话的 Agent 下启动分析子代理；子代理继承当前会话的 provider/model，读取会话工作区代码。单工单单分析，重复点击不重复起子代理 |
+| 只读约束 | prompt 明确「只读」：不得修改/创建/删除任何文件，不得执行 `git commit/push/reset`、`rm`、格式化或安装依赖；只允许读取、搜索与只读命令 |
+| 方案写回 | 子代理只输出一个 JSON 对象；宿主校验后经 `analysis_done`（actor `agent`）写入 plan 六字段并进入 `plan_review`。非 JSON / 字段缺失或类型错 → `analysis-bad-output`，**绝不猜测性填充** |
+| 分析中反馈 | 详情页「AI 分析中…（最长约 10 分钟，可继续做其他操作）」+ 本地已运行时长；进度只信 snapshot `analysis.running`。运行期间隐藏 demo「分析完成」按钮 |
+| 失败/超时 | 静态分类：`analysis-failed`（执行失败）、`analysis-timeout`（10 分钟）、`analysis-bad-output`（输出格式）、`no-live-agent`（无可用会话 Agent）。工单进入 `blocked`，`blockedFrom='analyzing'`，原因写入 `blockedReason` 与 `meta['analysis.error:<code>']`；界面只显示静态文案 |
+| 重新分析 | 分析原因 blocked、或 `analyzing` 但已无运行任务（崩溃/卸载遗留）时显示「重新分析」；宿主自动 `retry`/重启并清旧错误，客户端**不需要**先发 `/action retry` |
+| 超时/成本 | 单次分析预算 **10 分钟**（代码级默认 `DEFAULT_ANALYSIS_TIMEOUT_MS=600000`，当前无 host setting）。真子代理会消耗模型 token 与真实时间，不是本地 mock；本机 live 样本 431.7 s（约 7 分 12 秒）完成，接近预算的 72% |
+| 测试 | 253 个用例（P3 新增 runner 22、analysis 25、routes 9 等） |
+
+**P3 前置条件（缺一不可）**
+
+1. **有 live 会话 Agent**：DSH host 正在运行且目标会话仍是 live Agent。runner 先按 `sessionId` 精确匹配 `agents.list()`，再回退最后一个 `agents.roots()`；没有可用 Agent → `/api/analyze` 503 `analysis-unavailable`，不会伪造或改走别的会话。
+2. **会话绑定工作区**：`workspace.resolve(sessionId)` 必须解析到目录（看板显示「未绑定工作区」时不能分析）；子代理读取的是**该 cwd 的仓库**，不是平台工单所属的业务仓库。
+3. **本机同用户**：沿用 P1/P2 的回环 socket + Host 白名单 + 同源 `Origin` + 仅 JSON + 64 KiB / 10 s 守卫；看板路由本身没有登录鉴权（设计取舍）。
+4. **平台 token 不是必需**：手动/平台工单都能分析；分析不访问星瞰河山平台，只用 snapshot 里的工单字段。
+
+**P3 已知限制（用户验收时重点看）**
+
+- **分析的是当前会话工作区**：本机验收工作区是插件仓库本身，而工单来自平台；子代理在 plan 里自行标注了「工作区归属存疑」。真实业务仓库分析需要在目标仓库打开会话后重跑，P4 应加归属校验/提示。
+- **GUI 视觉未验证**：P3 的 client 改动只有源码审阅与未提交的渲染 harness，没有截图/点击/窄栏验证；**client 代码更新后需要刷新页面**，否则可能仍加载上一版 bundle。
+- **计时是近似值**：宿主未持久化 `analysis.startedAt`，详情页计时从首次看到 `analysis.running` 起算，刷新/重开详情会从 0 开始；真实耗时以 `analysis_done` 时间线为准。
+- **无提交级 client 行为测试**：仓库内只有 `client-action-map.test.js` 的静态映射校验；分析交互（计时、重新分析、失败 banner、方案卡）没有提交的渲染/行为测试。
+- **真实失败路径未 live 覆盖**：超时/坏输出/无 Agent 只有单元测试；live 只验证了 404/409/400/405 等路由错误，10 分钟超时未在 live 触发。
+- **子代理会留下持久化子会话**（P0 已观察）：每次分析在会话列表新增一个 `analysis:<code>` 子会话，父会话多一条 `subagent/catalog`；P3 不删除，属预期副作用。
+- **多工单并行**只有设计/单测级保证，未 live 验证两路同时跑。
+
+> **动作映射的维护约束（每期必读）**：按钮只来自 `bug-workflow/client.js` 的 `ACTION_BY_STATE` 字面量（按 `workflow` 的静态列表）；宿主 `canApply` 是转移的权威，但两者是**两份独立数据**。`test/client-action-map.test.js` 只做单向校验（map → host：每个映射动作在该状态必须被 `canApply` 接受），**不校验 host → map**，所以新增宿主动作不会自动出现按钮。每加/改一个动作，必须同步更新该映射并运行 `node --test bug-workflow/test/*.test.js`。已知一处偏差：宿主支持 `block`（任意非终态可执行），但看板没有「阻塞」按钮。review 轮次上限已由映射处理，不再是偏差：`review_requests_changes` 声明 `maxRounds: 3`，`mr.rounds = 3` 时该按钮在界面上禁用并显示「轮次已耗尽」提示，不会发出必然被拒的请求；宿主仍是权威（绕过 UI 直接 POST 仍返回 409 `review-rounds-exhausted`，工单进入 `blocked`）。P3 的「开始分析」与「重新分析」是**唯一绕过该映射的入口**：两者都直接 POST `/api/analyze`，不经过 `/api/action`（`ACTION_BY_STATE` 里的 `start_analysis` 仍保留，作为 `inbox` 的按钮来源）。
+
+**P3 之后仍是「假引擎」的部分**：平台工单的同步/导入是真的 HTTP 数据，分析也已是真子代理；但「修复 → 建 MR → review → 合并」仍由看板按钮手工 POST 假 payload 驱动（`fix_done` / `submit_mr` / `mr_created` / `review_*` / `mr_merged`），不调用子代理、GitLab 或 worktree，也没有状态写回。P4 接修复子代理 + worktree，P5 接 GitLab MR/review/合并与平台写回。
 
 ## 平台接入
 
@@ -150,18 +181,18 @@ P2 **未对真实平台执行**同步/导入（无真实 token，用户不在场
 | 期 | 内容 | 状态 |
 | --- | --- | --- |
 | P2 | 平台接入：token、我的工单同步、详情、按编号导入、字典筛选 | **已完成（mock 验收；真实平台待用户联调）** |
-| P3 | 分析子代理 + 真实方案审核/驳回重跑 | 未开始 |
+| P3 | 分析子代理 + 真实方案审核/驳回重跑 | **已完成（live 真子代理验收；真实业务仓库与 GUI 待用户验收）** |
 | P4 | 修复子代理 + worktree、lint/test、人工测试与视觉留证 | 未开始 |
 | P5 | GitLab 交付：分支、MR 创建、review 轮询、回修、合并检测、完成归档、状态写回 | 未开始 |
 
-## 打包与交接（P3 前仍需处理）
+## 打包与交接（P4 前仍需处理）
 
 - **打包**：`package.json` 的 peerDependencies（`@deepseek-ai/dsh-storage-domain`、`zod`）仍是 `"*"`，且**没有 `license` 字段**（`private: true`）。发布前必须把 peer 收窄到实际验证过的范围、补 `license`，并按 `files` 清单做一次 `npm pack --dry-run` 检查（`locale/*.json` 目录尚未创建，导出仍写在那里）。
 - **`review_fix_done` 的 `verdict`**：只把 `workflow` 推回 `mr_open`，`mr.verdict` 保持 `changes`，直到 `review_pass` 才变 `pass`；P5 若用 `verdict` 判定「已修复 / 可合并」，必须先定义重置语义（或改用逐轮记录）。
 - **`fixes` payload**：宿主只校验 `z.array(z.unknown())`，元素形状是 P1 客户端约定，不是 host-enforced contract；P4 接修复子代理前必须补 host schema。
 - **设置「必填」**：`branchUser` / `commitType` 的必填校验只在 `client.js`（`validateSettings`）；宿主 `settingsSchema` 为 `z.string().default(...)`，`POST /api/settings` 会接受空串。P4 若要求服务端保证，需在 host 补校验与测试。
 - **worktree 字段**：domain v2 的 Ticket 没有 `worktree` 字段；P4 需要升 v3（或在 `branch`/meta 中存路径）并做迁移。
-- **子代理契约**：P0 已确认 `ctx.subagents.startActivation({ provider:'spawn', label, delivery:'caller', signal, request:{ prompt, parent, cwd } })`；父 Agent 用 `ctx.agents.roots()`（live Agent），不要依赖 `agent/created`。P3 必须把「分析子代理」挂在 live Agent 上并在会话销毁时转 `blocked`。
+- **子代理契约**：P0 已确认 `ctx.subagents.startActivation({ provider:'spawn', label, delivery:'caller', signal, request:{ prompt, parent, cwd } })`；父 Agent 用 `ctx.agents.roots()`（live Agent），不要依赖 `agent/created`。P3 已用该 seam 实现分析子代理（`src/host/agent-access.js`，live 验收见 P3 findings）；P4 修复子代理沿用同一 seam，仍需把「会话销毁 → 转 `blocked`」的分析语义同样覆盖到修复流程。
 - **review issue 形状**：P1 live 遗留的 `mr.blockingIssues` 是原始 `{id,severity,body}`，客户端 `IssueList` 按 `file/level/problem` 渲染会显示空标题；P4/P5 统一形状或让 UI 兼容。
 
 ## 设置字段
@@ -191,21 +222,22 @@ P2 **未对真实平台执行**同步/导入（无真实 token，用户不在场
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/bug-workflow/api/health` | `{ ok, domainOpenedAt, tickets }`；存储不可用时 500/503 带 `stage` |
-| GET | `/bug-workflow/api/snapshot?sessionId=` | `{ ok, workspace, settings, platform:{tokenPresent,lastSyncAt,lastSyncError}, dicts:{status,type,priority}, tickets, serverTime }` |
+| GET | `/bug-workflow/api/snapshot?sessionId=` | `{ ok, workspace, settings, platform:{tokenPresent,lastSyncAt,lastSyncError}, dicts:{status,type,priority}, analysis:{running,errors}, tickets, serverTime }` |
 | POST | `/bug-workflow/api/action` | `{ sessionId, actionId, code, action, payload? }` → `{ ok, ticket }` 或 `{ ok:false, code, message }`；`action:'create'` + `payload.code` 走平台按编号导入 |
+| POST | `/bug-workflow/api/analyze` | `{ sessionId, code }` → `{ ok:true, workflow:'analyzing', running:true }` 或 `{ ok:false, code, message }`；启动真分析子代理（重复点击返回 `running:true`，不重复起子代理） |
 | POST | `/bug-workflow/api/settings` | `{ sessionId, settings }` → `{ ok, settings }` |
 | POST | `/bug-workflow/api/platform-token` | `{ sessionId, token }` 保存；`{ token:null }` 清除 → `{ ok, tokenPresent }`；无 token 回显 |
 | POST | `/bug-workflow/api/sync` | `{ sessionId }` → `{ ok, synced, created, updated, total, filtered, lastSyncAt }` 或 `{ ok:false, code, message }` |
 
-错误映射：参数/设置/配置 400，`action-id-reused` / `invalid-transition` / `duplicate-code` / review 轮次耗尽 409，工单不存在 404，上游 401 映射 401，网络/上游异常 502，内部错误 500。`review_requests_changes` 第 4 次返回 409 `review-rounds-exhausted`，同时工单进入 `blocked`，`retry` 回到 `mr_open`。
+错误映射：参数/设置/配置 400，`action-id-reused` / `invalid-transition` / `duplicate-code` / review 轮次耗尽 409，工单不存在 404，上游 401 映射 401，网络/上游异常 502，内部错误 500。`review_requests_changes` 第 4 次返回 409 `review-rounds-exhausted`，同时工单进入 `blocked`，`retry` 回到 `mr_open`。`/analyze` 额外：无 live 会话 Agent 或分析服务未接线 → 503 `analysis-unavailable`；工单状态不能分析 → 409 `invalid-state`；未绑定工作区/空 `code`/缺 `sessionId` → 400；GET → 405。
 
 ## 数据位置
 
 - `~/.dsh/storages/bug_workflow.json`（storageDomain 的 JSON 后端，domain `bug_workflow` v2；`compatibleVersions:[1]` 兼容 P1 文件，open 时归一化并写回 v2 形状）。
-- `tickets`：**profile 全局**工单（P2 仍未按工作区隔离）；`settings`：按工作区 cwd 为 key；`meta`：domain 标记、`migration:tickets-v2`、`platform.dicts`、`platform.lastSyncAt`、`platform.lastSyncError`、`action:<actionId>` 幂等账本（最多 500 条）。
+- `tickets`：**profile 全局**工单（P2/P3 仍未按工作区隔离）；`settings`：按工作区 cwd 为 key；`meta`：domain 标记、`migration:tickets-v2`、`platform.dicts`、`platform.lastSyncAt`、`platform.lastSyncError`、`analysis.error:<code>`（分析失败的静态文案，成功/下次启动时清空）、`action:<actionId>` 幂等账本（最多 500 条）。
 - 平台 token：`~/.dsh/.credentials.yaml` 的 ref `BUG_WORKFLOW_PLATFORM_TOKEN`（由 `ctx.credentials` 管理，文件 0600）；不写入 storage/settings/snapshot。
-- 删除 storage 文件会清空工单/设置/幂等账本；P2 没有 UI 归档或删除入口，卸载插件不会删数据。
-- **遗留 demo 数据**：`YGFNXDJRFWDJSYJJYY-647`、`-648`、`HTSMART-12` 三张 mock 平台工单仍在 live storage，`platform.url` 指向已停止的 mock。保留/清理的取舍见 findings。清理脚本（只在 DSH 完全退出后、且只接受 platform + loopback URL 的工单）：
+- 删除 storage 文件会清空工单/设置/幂等账本；P2/P3 没有 UI 归档或删除入口，卸载插件不会删数据。
+- **遗留 demo 数据**：`YGFNXDJRFWDJSYJJYY-647`、`-648`、`HTSMART-12` 三张 mock 平台工单仍在 live storage，`platform.url` 指向已停止的 mock。P3 live E2E 把 **648 推进到 `fixing`**（plan 已由真子代理生成并通过），作为 P4 的修复起点保留；647 / HTSMART-12 仍是先前遗留的 `analyzing`。保留/清理的取舍见 findings。清理脚本（只在 DSH 完全退出后、且只接受 platform + loopback URL 的工单）：
 
   ```sh
   # 先 dry-run（不改文件）；确认后退出 DSH，再执行 --write
@@ -230,7 +262,11 @@ P2 **未对真实平台执行**同步/导入（无真实 token，用户不在场
 ## 已知限制
 
 - **真实平台未验证**：P2 的同步/导入只对 mock 跑通；真实 token、TLS/网关/WAF、分页字段类型/`size` 上限、评论编码、`file/list` 结构都未对真实平台实测。
-- **GUI 未目视验收**：client inspect 在本轮超时（`Slots.listSubTree` / `Theme.listTokens` 均 10 s timeout），没有截图/点击/窄宽布局验证；client 侧仅由 `node --check`、静态/渲染 harness（未提交）与代码审阅保证。P2 退出标准「看板可见真实结构工单 + 字典筛选可用」因此只能算**部分完成（数据层已证明；GUI 视觉/首次点击未验证；用户最终验收）**。
+- **GUI 未目视验收**：P2 轮次 client inspect 超时（`Slots.listSubTree` / `Theme.listTokens` 均 10 s timeout），没有截图/点击/窄宽布局验证；client 侧仅由 `node --check`、静态/渲染 harness（未提交）与代码审阅保证。P2 退出标准「看板可见真实结构工单 + 字典筛选可用」因此只能算**部分完成（数据层已证明；GUI 视觉/首次点击未验证；用户最终验收）**。P3 同样未目视，且热重载后**没有刷新页面**，浏览器可能仍加载上一版 client bundle。
+- **P3 计时是近似值**：宿主未持久化 `analysis.startedAt`，详情页计时从首次看到 `analysis.running` 起算，刷新/重开详情从 0 开始；真实耗时只看 `analysis_done` 时间线（P3 样本 431.7 s）。
+- **P3 无提交级 client 行为测试**：仓库内只有 `client-action-map.test.js` 的静态映射校验；分析中计时、重新分析、失败 banner、方案卡展示没有提交的渲染/行为测试，P4 必须补（见 P3 findings §6.3）。
+- **P3 分析的是当前会话工作区**：不是工单所属业务仓库；本机验收用插件仓库，子代理已在 plan 的 `risks` 里标注归属存疑，该 plan 不能当作工单的真实实现方案。
+- **P3 子代理留下持久化子会话**：每次分析在 DSH 会话列表新增一个 `analysis:<code>` 子会话，父会话多一条 `subagent/catalog`；P3 不删除，属预期副作用。
 - **v2 domain 迁移依赖安装版 storage-json**：本机 DSH 源码 checkout 的 single-unit 解析器不接受 `compatibleVersions`，只有已安装的 0.2.2-rc.1 运行时实测打开了 v2 domain。源码构建/更旧 DSH 可能因 `version-mismatch` 打不开看板，重建/升级后必须复验（详见「安装」）。
 - **写队列只保证单进程串行**：`store.create/applyAction/upsertPlatformRecords/putSettings/setMeta/setDicts` 经同一个 store 实例的 promise 链串行化（读操作不加锁），解决同一 host 进程内「同步/导入 upsert 覆盖本地动作」的竞争。跨进程/多窗口同时写同一个 storage 文件仍是最后写入者赢，没有文件锁；DSH desktop 是单 host 进程，因此正常使用不受影响。
 - **状态写回未实现**：`writebackStatus` 只是布尔设置，默认关；P2 不向平台写。
@@ -250,13 +286,15 @@ P2 **未对真实平台执行**同步/导入（无真实 token，用户不在场
 无构建步骤：host 是纯 ESM JavaScript，client 是自包含 React bundle（只 `require('react')`，由宿主 module table 提供）。
 
 ```sh
-# 全部单元测试（在仓库根目录执行）——P2 收尾 197/197
+# 全部单元测试（在仓库根目录执行）——P3 收尾 253/253
 node --test bug-workflow/test/*.test.js
 
 # 语法/静态检查
 node --check bug-workflow/index.js
 node --check bug-workflow/client.js
 node --check bug-workflow/src/host/routes.js
+node --check bug-workflow/src/host/agent-access.js
+node --check bug-workflow/src/host/analysis-service.js
 node --check bug-workflow/src/host/sync.js
 node --check bug-workflow/src/host/platform.js
 node --check bug-workflow/scripts/mock-platform.mjs
@@ -269,6 +307,11 @@ node bug-workflow/scripts/mock-platform.mjs --port 0 --token test-token \
 # live 冒烟（端口取当前 DSH Web GUI，示例 49254）
 curl -s http://127.0.0.1:49254/bug-workflow/api/health
 curl -s 'http://127.0.0.1:49254/bug-workflow/api/snapshot?sessionId=<session-id>'
+
+# 真分析（会在 live 会话下起真子代理、消耗 token；按需手动执行）
+curl -s -X POST http://127.0.0.1:49254/bug-workflow/api/analyze \
+  -H 'Content-Type: application/json' \
+  -d '{"sessionId":"<live-session-id>","code":"<ticket-code>"}'
 ```
 
 | 文件 | 作用 |
@@ -283,9 +326,11 @@ curl -s 'http://127.0.0.1:49254/bug-workflow/api/snapshot?sessionId=<session-id>
 | `src/host/credentials.js` | 平台 token 的 credentials 封装（get/set/clear/present） |
 | `src/host/platform.js` | 平台 HTTP 客户端（fetch、15 s 超时、结构化错误、不跟随重定向） |
 | `src/host/sync.js` | 同步引擎与按编号导入（分页、项目过滤、映射、upsert、lastSync 元数据） |
-| `src/host/routes.js` | 六个路由、安全守卫、错误映射 |
+| `src/host/agent-access.js` | 分析子代理 runner：活 Agent 解析、`startActivation`、只读 prompt、输出解析/校验、10 分钟超时/取消（零依赖依赖注入） |
+| `src/host/analysis-service.js` | 分析编排：`running` 占位、后台任务、`analysis_done`/`block` 落盘、失败 meta、重启语义、dispose 排水 |
+| `src/host/routes.js` | 七个路由（含 `/analyze`）、安全守卫、错误映射 |
 | `src/host/workspace.js` | sessionId → 工作区 cwd |
-| `client.js` | 右栏 tab/guide 注册与看板 UI（列表/详情/动作/设置/平台同步） |
+| `client.js` | 右栏 tab/guide 注册与看板 UI（列表/详情/动作/设置/平台同步/真分析进度与方案卡） |
 | `scripts/mock-platform.mjs` | 本地 mock 平台（fixtures、随机端口、token 校验） |
 | `scripts/fixtures/platform/` | mock 工单/详情/字典/评论/附件 fixtures |
 | `scripts/cleanup-demo-tickets.mjs` | 安全清理 mock 遗留工单（dry-run 默认、0600 备份、原子写） |
