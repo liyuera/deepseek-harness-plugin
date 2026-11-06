@@ -14,10 +14,13 @@
  *   4. Items are read from `需要关注的问题` and `历史未收敛问题`: `文件`, `FID`,
  *      `级别`, `门禁分类`, `位置`, `问题`, `建议` (other fields are ignored).
  *   5. `门禁分类 = 非阻塞建议` or `级别 = 低` -> nonBlocking, everything else -> blocking.
- *   6. Never guess: a `需要修改` verdict with no parsable item, a malformed item, or a
+ *   6. Never guess: a `需要修改` verdict with no parsable item, a malformed item, a
+ *      recognized issue section with text but no parsable item (format drift), or a
  *      pass note with no item and no explicit zero-issue statement yields `unknown`.
  *      A pass note may legitimately have zero items when the template states so
  *      (`历史未收敛: 0 条` / `剩余问题: 0 条`), e.g. an `AI Code Review 人工复核结果`.
+ *   7. Only the note's own unquoted lines count for the conclusion and the zero-issue
+ *      declaration. A human reply that quotes a passing note stays `unknown`.
  *
  * The module also works as a self-test entry point:
  *   node bug-workflow/scripts/review-parser.mjs
@@ -33,8 +36,12 @@ const SECTION_RE = /^[ \t]*(?:#{2,4}[ \t]+)?(?:\*\*)?(需要关注的问题|历�
 const HEADING_RE = /^[ \t]*#{1,6}[ \t]+\S/;
 const ITEM_START_RE = /^[ \t]*(?:\d+[.、)]|[-*+])[ \t]+(?:\*\*)?文件(?:\*\*)?[ \t]*[:：][ \t]*(.*)$/;
 const FIELD_RE = /^[ \t]*(?:[-*+][ \t]+)?(?:\*\*)?(FID|复验次数|级别|类型|门禁分类|提交人|位置|源码|状态|人工复核结果|问题|建议)(?:\*\*)?[ \t]*[:：][ \t]*(.*)$/;
-const VERDICT_RE = /^[ \t]*(?:>[ \t]*)?(?:\*\*)?结论(?:\*\*)?[ \t]*[:：][ \t]*(.*)$/m;
+const VERDICT_RE = /^[ \t]*(?:\*\*)?结论(?:\*\*)?[ \t]*[:：][ \t]*(.*)$/m;
 const INLINE_VERDICT_RE = /结论[ \t]*[:：][ \t]*(?:\*\*)?[ \t]*(可直接合并|需要修改)/;
+// A zero-issue declaration is a summary line of its own. Anchor it to the whole line so a
+// passing note quoted inside a human reply can never be read as the latest conclusion.
+const ZERO_ISSUE_RE =
+  /^[ \t]*(?:\*\*)?(?:历史未收敛|剩余问题)(?:\*\*)?[ \t]*[:：][ \t]*(?:[`*]+[ \t]*)*0(?:[ \t]*[`*]+)*[ \t]*(?:条)?[ \t]*$/m;
 
 /** Fields that map onto the ReviewIssue contract; the rest is deliberately dropped. */
 const FIELD_KEY = {
@@ -98,15 +105,26 @@ function visibleBody(body) {
   return body.slice(0, cut).replace(/<!--\s*AI_REVIEW_[\s\S]*?-->/g, '');
 }
 
-function extractVerdict(visible) {
-  const lineMatch = visible.match(VERDICT_RE);
+/**
+ * The note's own lines, i.e. everything a human did not quote from another note.
+ * A human reply quoting a passing AI note must not be mistaken for a review.
+ */
+function topLevelText(visible) {
+  return visible
+    .split('\n')
+    .filter((line) => !/^[ \t]*>/.test(line))
+    .join('\n');
+}
+
+function extractVerdict(topLevel) {
+  const lineMatch = topLevel.match(VERDICT_RE);
   if (lineMatch) {
     const value = lineMatch[1].replace(/\*\*/g, '').trim();
     if (value.startsWith('可直接合并')) return 'pass';
     if (value.startsWith('需要修改')) return 'changes';
     return 'unknown';
   }
-  const inlineMatch = visible.match(INLINE_VERDICT_RE);
+  const inlineMatch = topLevel.match(INLINE_VERDICT_RE);
   if (inlineMatch) return inlineMatch[1] === '可直接合并' ? 'pass' : 'changes';
   return 'unknown';
 }
@@ -140,6 +158,7 @@ function parseSection(lines) {
   let current = null;
   let currentField = null;
   let malformed = false;
+  let hasContent = false;
 
   const finish = () => {
     if (!current) return;
@@ -159,6 +178,8 @@ function parseSection(lines) {
   };
 
   for (const line of lines) {
+    if (line.trim()) hasContent = true;
+
     const itemMatch = line.match(ITEM_START_RE);
     if (itemMatch) {
       finish();
@@ -199,7 +220,7 @@ function parseSection(lines) {
   }
 
   finish();
-  return { items, malformed };
+  return { items, malformed, hasContent };
 }
 
 function isNonBlocking(issue) {
@@ -210,11 +231,8 @@ function isNonBlocking(issue) {
  * A clean review template says how many issues remain even when it has no item list.
  * Only trust an explicit `0`; an empty/broken body stays `unknown`.
  */
-function hasExplicitZeroIssues(visible) {
-  return (
-    /历史未收敛[ \t]*[:：][ \t]*[`*\s]*0[`*\s]*(?:条)?/.test(visible) ||
-    /剩余问题[ \t]*[:：][ \t]*[`*\s]*0[`*\s]*(?:条)?/.test(visible)
-  );
+function hasExplicitZeroIssues(topLevel) {
+  return ZERO_ISSUE_RE.test(topLevel);
 }
 
 /**
@@ -228,7 +246,10 @@ export function parseReview(body) {
   const visible = visibleBody(body);
   if (!visible.includes(AI_MARKER) || !/结论[ \t]*[:：]/.test(visible)) return unknownResult();
 
-  const verdict = extractVerdict(visible);
+  // A human reply quoting a passing note is not a review: the conclusion and the
+  // zero-issue declaration only count on the note's own (unquoted) lines.
+  const topLevel = topLevelText(visible);
+  const verdict = extractVerdict(topLevel);
   if (verdict === 'unknown') return unknownResult();
 
   const sections = extractIssueSections(visible);
@@ -236,17 +257,24 @@ export function parseReview(body) {
   const history = parseSection(sections.history);
   if (need.malformed || history.malformed) return unknownResult();
 
+  const items = [...need.items, ...history.items];
+  // Rule 6: a recognized issue section that has text but yielded no item is template
+  // drift, not a clean review - never let it fall through to `pass`.
+  if ((need.hasContent && need.items.length === 0) || (history.hasContent && history.items.length === 0)) {
+    return unknownResult();
+  }
+
   const blocking = [];
   const nonBlocking = [];
-  for (const issue of [...need.items, ...history.items]) {
+  for (const issue of items) {
     if (isNonBlocking(issue)) nonBlocking.push(issue);
     else blocking.push(issue);
   }
 
   // A `需要修改` verdict without items cannot tell P1 what to fix: never guess.
-  if (verdict === 'changes' && need.items.length + history.items.length === 0) return unknownResult();
+  if (verdict === 'changes' && items.length === 0) return unknownResult();
   // A pass with no items is only valid when the template explicitly reports zero.
-  if (verdict === 'pass' && need.items.length + history.items.length === 0 && !hasExplicitZeroIssues(visible)) {
+  if (verdict === 'pass' && items.length === 0 && !hasExplicitZeroIssues(topLevel)) {
     return unknownResult();
   }
 
@@ -343,6 +371,47 @@ function runSelfTest() {
     {
       label: 'pass without items and no zero statement -> unknown',
       body: '## AI Code Review\n\n结论: **可直接合并**\n',
+      expected: { verdict: 'unknown' },
+    },
+    {
+      label: 'quoted passing note -> unknown',
+      body: '> ## AI Code Review\n> 结论: **可直接合并**\n> 历史未收敛: `0` 条\n',
+      expected: { verdict: 'unknown' },
+    },
+    {
+      label: 'quoted conclusion does not authorize pass -> unknown',
+      body: '## AI Code Review\n\n> 结论: **可直接合并**\n\n历史未收敛: `0` 条\n',
+      expected: { verdict: 'unknown' },
+    },
+    {
+      label: 'quoted zero statement does not authorize pass -> unknown',
+      body: '## AI Code Review\n\n结论: **可直接合并**\n\n> 历史未收敛: `0` 条\n',
+      expected: { verdict: 'unknown' },
+    },
+    {
+      label: 'human reply quoting a pass note -> unknown',
+      body:
+        '> ## AI Code Review\n> 结论: **可直接合并**\n> 历史未收敛: `0` 条\n\n' +
+        '收到，已确认。\n',
+      expected: { verdict: 'unknown' },
+    },
+    {
+      label: 'pass with non-field-shaped section content -> unknown',
+      body:
+        '## AI Code Review\n\n结论: **可直接合并**\n\n历史未收敛: `0` 条\n\n' +
+        '### 需要关注的问题\n本次未发现需要关注的问题，详情见上方摘要。\n',
+      expected: { verdict: 'unknown' },
+    },
+    {
+      label: 'manual reconciliation note with top-level zero statements -> pass',
+      body:
+        '## AI Code Review 人工复核结果\n\n结论: **可直接合并**\n\n' +
+        '历史未收敛: `0` 条\n剩余问题: 0 条\n',
+      expected: { verdict: 'pass', blocking: 0, nonBlocking: 0 },
+    },
+    {
+      label: 'nonzero history does not authorize pass -> unknown',
+      body: '## AI Code Review\n\n结论: **可直接合并**\n\n历史未收敛: `10` 条\n',
       expected: { verdict: 'unknown' },
     },
     {
