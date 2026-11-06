@@ -8,11 +8,29 @@
  * Ticket shape (persisted; fields may be added but existing semantics must not
  * change), see the P1 plan "接口与数据契约":
  *   { code, title, type, status, version, priority, assignee, url,
- *     workflow, plan, branch, mr, fixes, timeline, createdAt, updatedAt }
+ *     workflow, blockedFrom, blockedReason, plan, branch, mr, fixes, timeline,
+ *     createdAt, updatedAt }
+ *
+ * Blocked lifecycle: `block` is valid from every non-terminal workflow
+ * (anything except `done` and `blocked`). It enters `blocked`, records the
+ * previous workflow in `blockedFrom` and the payload reason (default
+ * 'unknown') in `blockedReason`. `retry` returns to that exact workflow,
+ * clears both fields and keeps the rest of the context (plan/MR/...).
+ * `reject_plan` is the plan-review special case: it also enters `blocked` with
+ * `blockedFrom: 'plan_review'` and `blockedReason = payload.reason ??
+ * 'plan-rejected'`, while keeping the existing `plan.rejectedReason`
+ * behaviour. Legacy blocked tickets with `blockedFrom: null` keep the old
+ * retry rule (`plan ? plan_review : inbox`).
+ *
+ * Exhausted review rounds are deliberately NOT auto-blocked here: canApply()
+ * returns `review-rounds-exhausted` and the host action route maps that code to
+ * the `block` action (reason 'review-rounds-exhausted'), per the P1 plan
+ * Task 3. apply() must stay a single-step transition.
  *
  * Payloads used by this module:
  *   analysis_done:            { plan?: Plan, message?, actor? }
  *   reject_plan:              { reason?, rejectedReason?, message?, actor? }
+ *   block:                    { reason?, message?, actor? }
  *   mr_created:               { mr?: MRRecord, message?, actor? }
  *   review_requests_changes:  { blockingIssues?: ReviewIssue[], nonBlockingIssues?: ReviewIssue[], ... }
  *   every action:             { message?: string, actor?: 'user'|'agent'|'system' }
@@ -23,6 +41,7 @@ import {
   INITIAL_STATE,
   MAX_REVIEW_ROUNDS,
   STATES,
+  TERMINAL_STATE,
 } from './protocol.js';
 
 export { ACTIONS, MAX_REVIEW_ROUNDS, STATES };
@@ -30,8 +49,17 @@ export { ACTIONS, MAX_REVIEW_ROUNDS, STATES };
 const TIMELINE_ACTORS = Object.freeze(['user', 'agent', 'system']);
 
 /**
+ * States from which `block` is accepted: every workflow except the terminal
+ * state and `blocked` itself (spec §7 "任意状态 → blocked").
+ */
+const BLOCKABLE_STATES = Object.freeze(
+  STATES.filter((state) => state !== TERMINAL_STATE && state !== 'blocked'),
+);
+
+/**
  * Transition table. `to: null` means the target is computed by the reducer
- * (only `retry`: back to plan_review when a plan exists, otherwise inbox).
+ * (only `retry`: back to `blockedFrom` when set, else back to plan_review when
+ * a plan exists, otherwise inbox).
  */
 const TRANSITIONS = Object.freeze({
   start_analysis: { from: ['inbox'], to: 'analyzing', actor: 'user' },
@@ -50,6 +78,7 @@ const TRANSITIONS = Object.freeze({
   mr_merged: { from: ['mergeable'], to: 'merged', actor: 'system' },
   dismiss: { from: ['merged'], to: 'done', actor: 'user' },
   retry: { from: ['blocked'], to: null, actor: 'user' },
+  block: { from: BLOCKABLE_STATES, to: 'blocked', actor: 'system' },
 });
 
 const ACTION_MESSAGES = Object.freeze({
@@ -66,6 +95,7 @@ const ACTION_MESSAGES = Object.freeze({
   mr_merged: 'MR 已合并',
   dismiss: '已归档，工单完成',
   retry: '解除阻塞，继续流程',
+  block: '工单已阻塞',
 });
 
 /**
@@ -103,6 +133,8 @@ export function initialTicket(input = {}, at = nowIso()) {
     assignee: source.assignee ?? null,
     url: source.url ?? null,
     workflow: INITIAL_STATE,
+    blockedFrom: null,
+    blockedReason: null,
     plan: null,
     branch: null,
     mr: null,
@@ -185,19 +217,21 @@ export function apply(ticket, action, payload = {}, at = nowIso()) {
   const transition = TRANSITIONS[action];
   const data = isPlainObject(payload) ? payload : {};
   const next = structuredClone(ticket);
+  const previousWorkflow = next.workflow;
 
   next.workflow = action === 'retry'
-    ? (next.plan ? 'plan_review' : 'inbox')
+    ? (next.blockedFrom ?? (next.plan ? 'plan_review' : 'inbox'))
     : transition.to;
 
-  applyEffects(next, action, data, at);
+  applyEffects(next, action, data, at, previousWorkflow);
 
   next.updatedAt = at;
   next.timeline = [
     ...(Array.isArray(next.timeline) ? next.timeline : []),
     {
       at,
-      kind: action,
+      // `block` is a protocol action but its lifecycle event is `blocked`.
+      kind: action === 'block' ? 'blocked' : action,
       actor: resolveActor(data.actor, transition.actor),
       message: resolveMessage(action, next, data),
     },
@@ -206,7 +240,7 @@ export function apply(ticket, action, payload = {}, at = nowIso()) {
   return next;
 }
 
-function applyEffects(ticket, action, payload, at) {
+function applyEffects(ticket, action, payload, at, previousWorkflow) {
   switch (action) {
     case 'analysis_done': {
       if (isPlainObject(payload.plan)) {
@@ -232,10 +266,24 @@ function applyEffects(ticket, action, payload, at) {
     }
 
     case 'reject_plan': {
+      ticket.blockedFrom = 'plan_review';
+      ticket.blockedReason = payload.reason ?? 'plan-rejected';
       ticket.plan = {
         ...currentPlan(ticket),
         rejectedReason: resolveRejectionReason(payload),
       };
+      return;
+    }
+
+    case 'block': {
+      ticket.blockedFrom = previousWorkflow;
+      ticket.blockedReason = payload.reason ?? 'unknown';
+      return;
+    }
+
+    case 'retry': {
+      ticket.blockedFrom = null;
+      ticket.blockedReason = null;
       return;
     }
 
@@ -351,6 +399,12 @@ function resolveMessage(action, ticket, payload) {
   if (action === 'reject_plan') {
     const reason = ticket.plan?.rejectedReason;
     return reason ? `方案已驳回：${reason}` : ACTION_MESSAGES.reject_plan;
+  }
+  if (action === 'block') {
+    const reason = ticket.blockedReason;
+    return typeof reason === 'string' && reason && reason !== 'unknown'
+      ? `工单已阻塞：${reason}`
+      : ACTION_MESSAGES.block;
   }
 
   return ACTION_MESSAGES[action] ?? action;

@@ -20,7 +20,7 @@ const EXPECTED_ACTIONS = [
   'create', 'start_analysis', 'analysis_done', 'approve_plan', 'reject_plan',
   'fix_done', 'mark_test_passed', 'submit_mr', 'mr_created',
   'review_requests_changes', 'review_fix_done', 'review_pass', 'mr_merged',
-  'dismiss', 'retry',
+  'dismiss', 'retry', 'block',
 ];
 
 const PLAN = {
@@ -85,6 +85,8 @@ test('initialTicket() 生成 inbox 工单，timeline 只有一条 created', () =
   assert.equal(ticket.priority, '高');
   assert.equal(ticket.assignee, '张三');
   assert.equal(ticket.url, 'https://example.com/BUG-001');
+  assert.equal(ticket.blockedFrom, null);
+  assert.equal(ticket.blockedReason, null);
   assert.equal(ticket.plan, null);
   assert.equal(ticket.branch, null);
   assert.equal(ticket.mr, null);
@@ -228,15 +230,109 @@ test('reject_plan 进入 blocked 并保留驳回原因，retry 回到 plan_revie
 
   const blocked = apply(ticket, 'reject_plan', { reason: '根因不成立，需要重新分析' }, AT);
   assert.equal(blocked.workflow, 'blocked');
+  assert.equal(blocked.blockedFrom, 'plan_review');
+  assert.equal(blocked.blockedReason, '根因不成立，需要重新分析');
   assert.equal(blocked.plan.rejectedReason, '根因不成立，需要重新分析');
   assert.equal(blocked.timeline.at(-1).kind, 'reject_plan');
   assert.match(blocked.timeline.at(-1).message, /根因不成立/);
 
   const retried = apply(blocked, 'retry', {}, AT);
   assert.equal(retried.workflow, 'plan_review');
+  assert.equal(retried.blockedFrom, null);
+  assert.equal(retried.blockedReason, null);
   assert.equal(retried.plan.rejectedReason, '根因不成立，需要重新分析');
   assert.equal(retried.timeline.at(-1).kind, 'retry');
   assert.equal(canApply(blocked, 'retry').ok, true);
+});
+
+test('reject_plan 未给原因时 blockedReason 为 plan-rejected，plan.rejectedReason 仍为 null', () => {
+  let ticket = apply(inbox(), 'start_analysis', {}, AT);
+  ticket = apply(ticket, 'analysis_done', { plan: PLAN }, AT);
+
+  const blocked = apply(ticket, 'reject_plan', {}, AT);
+  assert.equal(blocked.workflow, 'blocked');
+  assert.equal(blocked.blockedFrom, 'plan_review');
+  assert.equal(blocked.blockedReason, 'plan-rejected');
+  assert.equal(blocked.plan.rejectedReason, null);
+});
+
+test('block 可从任意非终态进入 blocked，retry 回到原状态并清除阻塞字段', () => {
+  const blockableStates = EXPECTED_STATES.filter(
+    (state) => state !== 'done' && state !== 'blocked',
+  );
+
+  for (const state of blockableStates) {
+    const blocked = apply(ticketAt(state), 'block', {}, AT);
+    assert.equal(blocked.workflow, 'blocked', `${state} + block 应进入 blocked`);
+    assert.equal(blocked.blockedFrom, state, `${state} 的 blockedFrom`);
+    assert.equal(blocked.blockedReason, 'unknown', `${state} 的默认阻塞原因`);
+    assert.equal(blocked.updatedAt, AT);
+    assert.equal(blocked.timeline.length, 2, `${state} + block 只追加一条事件`);
+    assert.equal(blocked.timeline.at(-1).kind, 'blocked');
+    assert.equal(blocked.timeline.at(-1).actor, 'system');
+    assert.equal(blocked.timeline.at(-1).at, AT);
+
+    const retried = apply(blocked, 'retry', {}, AT);
+    assert.equal(retried.workflow, state, `${state} 的 retry 应回到原状态`);
+    assert.equal(retried.blockedFrom, null);
+    assert.equal(retried.blockedReason, null);
+    assert.equal(retried.timeline.at(-1).kind, 'retry');
+  }
+});
+
+test('block 从 fixing 进入 blocked 并记录 reason/actor，retry 回到 fixing', () => {
+  const fixing = ticketAt('fixing');
+  const blocked = apply(fixing, 'block', {
+    reason: 'worktree 脏状态，需要人工处理',
+    actor: 'user',
+  }, AT);
+
+  assert.equal(blocked.workflow, 'blocked');
+  assert.equal(blocked.blockedFrom, 'fixing');
+  assert.equal(blocked.blockedReason, 'worktree 脏状态，需要人工处理');
+  assert.equal(blocked.timeline.at(-1).kind, 'blocked');
+  assert.equal(blocked.timeline.at(-1).actor, 'user');
+
+  const retried = apply(blocked, 'retry', {}, AT);
+  assert.equal(retried.workflow, 'fixing');
+  assert.equal(retried.blockedFrom, null);
+  assert.equal(retried.blockedReason, null);
+});
+
+test('block 从 mr_open 进入 blocked，retry 回到 mr_open 并保留 mr 上下文', () => {
+  const before = mrOpen(2);
+  const blocked = apply(before, 'block', { reason: 'GitLab 登录失效' }, AT);
+
+  assert.equal(blocked.workflow, 'blocked');
+  assert.equal(blocked.blockedFrom, 'mr_open');
+  assert.equal(blocked.blockedReason, 'GitLab 登录失效');
+  assert.deepEqual(blocked.mr, before.mr);
+
+  const retried = apply(blocked, 'retry', {}, AT);
+  assert.equal(retried.workflow, 'mr_open');
+  assert.equal(retried.blockedFrom, null);
+  assert.equal(retried.blockedReason, null);
+  assert.deepEqual(retried.mr, before.mr);
+  assert.deepEqual(canApply(retried, 'review_pass'), { ok: true });
+});
+
+test('block 在 done 与 blocked 上被拒绝（invalid-transition）', () => {
+  for (const state of ['done', 'blocked']) {
+    const ticket = ticketAt(state);
+    const result = canApply(ticket, 'block');
+    assert.equal(result.ok, false, `${state} + block 应被拒绝`);
+    assert.equal(result.code, 'invalid-transition');
+
+    assert.throws(
+      () => apply(ticket, 'block', { reason: '不应发生' }, AT),
+      (error) => {
+        assert.ok(error instanceof StateError);
+        assert.equal(error.code, 'invalid-transition');
+        return true;
+      },
+      `${state} + block 应抛 StateError`,
+    );
+  }
 });
 
 test('blocked 且没有方案时 retry 回到 inbox', () => {

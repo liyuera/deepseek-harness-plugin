@@ -35,7 +35,9 @@ export const MAX_REVIEW_ROUNDS = 3;
  * Actions understood by the host action route and the state machine.
  *
  * `create` is a route-level action handled by `initialTicket()`; it is kept in
- * this list so clients and validation share one source of truth.
+ * this list so clients and validation share one source of truth. `block` is
+ * valid from any non-terminal workflow, and `retry` returns to the recorded
+ * `blockedFrom` (or the legacy plan/inbox fallback when it is null).
  */
 export const ACTIONS = Object.freeze([
   'create',
@@ -53,4 +55,5 @@ export const ACTIONS = Object.freeze([
   'mr_merged',
   'dismiss',
   'retry',
+  'block',
 ]);
