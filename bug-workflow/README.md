@@ -1,8 +1,10 @@
 # @liyuera/dsh-bug-workflow
 
-DeepSeek Harness（DSH）的 Bug 工作流看板，**P1 骨架版本 0.0.1**。右栏打开「Bug 看板」tab，即可用「假引擎」把一张工单从 `inbox` 一路驱动到 `done`：状态机、storageDomain 持久化、工作区设置、同源 HTTP 路由与安全守卫都是真实实现；平台登录、分析/修复子代理、GitLab MR 与 review 循环留给 P2–P5。
+DeepSeek Harness（DSH）的 Bug 工作流看板，**P2 平台接入版本 0.0.1**。右栏打开「Bug 看板」tab，即可把一张工单从 `inbox` 一路驱动到 `done`：状态机、storageDomain 持久化、工作区设置、同源 HTTP 路由与安全守卫都是真实实现；P2 起工单可来自星瞰河山一体化平台（token 凭据、我的工单同步、按编号导入、字典筛选）。分析/修复子代理、GitLab MR 与 review 循环、状态写回留给 P3–P5。
 
-> 当前为 `private` 包，尚未发布 npm；P1 用 `link:` 本地安装验收。验收记录见 [`docs/superpowers/spikes/2026-11-07-p1-findings.md`](../docs/superpowers/spikes/2026-11-07-p1-findings.md)。
+> 当前为 `private` 包，尚未发布 npm。P2 验收记录见 [`docs/superpowers/spikes/2026-11-07-p2-findings.md`](../docs/superpowers/spikes/2026-11-07-p2-findings.md)，P1 见 [`docs/superpowers/spikes/2026-11-07-p1-findings.md`](../docs/superpowers/spikes/2026-11-07-p1-findings.md)。
+>
+> P2 的 live 证据全部来自**本地 mock 平台**。真实平台联调、状态写回与 GUI 目视验收**尚未执行**，是用户的最终验收项（见「平台接入」）。
 
 ## 安装
 
@@ -10,60 +12,165 @@ DeepSeek Harness（DSH）的 Bug 工作流看板，**P1 骨架版本 0.0.1**。�
 # 当前：从本地 checkout 安装（路径替换为仓库内 bug-workflow 目录）
 dsh plugin --profile desktop add link:/path/to/deepseek-harness-plugin/bug-workflow
 
-# P2 发布 npm 后
+# 发布 npm 后
 dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 ```
 
 - `desktop` 是桌面应用独占的 profile；源码启动的 `pnpm dsh web` 使用 `web`。GUI 里也可在 **设置 → 插件 → 添加插件** 完成。
-- 安装/重装后重载 profile：新装 client 半边通常需要重启桌面应用；开发期只改宿主半边时，可对 bundle 执行「移除 → 重装」热重载（P1 验收即用此法，数据不丢）。client 代码更新后还需刷新页面。
-- P1 只在 **DSH 0.2.2-rc.1**（desktop profile）上验收；`@deepseek-ai/dsh-storage-domain` / `zod` 声明为 peerDependencies（由宿主提供），但当前版本范围是 `"*"`，尚未锁到验证过的版本——P2 发布前必须收窄（见「P2 打包与交接」）。
-- 卸载：`dsh plugin --profile desktop remove @liyuera/dsh-bug-workflow`。卸载不删除工单数据。
+- 安装/重装后重载 profile：新装 client 半边通常需要重启桌面应用；开发期只改宿主半边时，可对 bundle 执行「移除 → 重装」热重载（P1/P2 验收即用此法，数据不丢）。client 代码更新后还需刷新页面。
+- P2 只在 **DSH 0.2.2-rc.1**（desktop profile）上验收；`@deepseek-ai/dsh-storage-domain` / `zod` 声明为 peerDependencies（由宿主提供），但当前版本范围仍是 `"*"`，尚未锁到验证过的版本——**发布前必须收窄**（见「打包与交接」）。
+- 卸载：`dsh plugin --profile desktop remove @liyuera/dsh-bug-workflow`。卸载不删除工单数据，也不会清除平台 token。
 
 ## 入口
 
 - 右栏 guide 卡片 **「Bug 看板」** → 打开 `sidebar.right.pane.tab` 中的看板 tab（`kind: bug-board`）。
-- 看板按当前会话的工作区读取设置；会话没有工作区目录时显示「未绑定工作区」，列表/详情仍可读，写操作与演示建单禁用。
+- 看板按当前会话的工作区读取设置；会话没有工作区目录时显示「未绑定工作区」，列表/详情仍可读，写操作、同步与演示建单禁用。
 - P1 只做右栏 tab（P0 已证实第三方可占座），未实现会话标题栏抽屉兜底按钮。
 
-## P1 已实现
+## 已实现能力
+
+### P1 骨架
 
 | 能力 | 说明 |
 | --- | --- |
-| 看板列表 | 工作区名/绑定状态、状态与类型筛选、手动输入编号建单、演示建单、刷新、3 秒轮询；`done` 工单从进行中列表隐藏 |
+| 看板列表 | 工作区名/绑定状态、状态与类型筛选、同步/刷新、3 秒轮询；`done` 工单从进行中列表隐藏 |
 | 工单详情 | 工单字段；方案卡（摘要/根因/方案/改动文件/风险/测试建议，通过/驳回）；修复与测试区；MR/Review 卡（轮次、阻塞项、结论）；最近 20 条时间线 |
 | 动作按钮 | 由 client 内 `ACTION_BY_STATE` 字面量按 `workflow` 渲染（**不是**由宿主 `canApply` 派生）；全部二次确认（`window.confirm`，缺失时用内联确认）；POST 带唯一 `actionId`，宿主幂等重放 |
 | 状态机 | 12 个状态、16 个动作（含 `block`/`retry`/`reject_plan`）；review 变更轮次上限 3 轮，第 4 次请求由宿主转为 `blocked` |
-| 持久化 | storageDomain domain `bug_workflow` v1：`tickets` / `settings` / `meta` 三表；写前用真 zod schema 校验；`meta` 是 actionId 幂等账本（最多 500 条） |
-| 设置面板 | 同页面 overlay，9 个字段，按工作区 cwd 保存；`Esc` 关闭、焦点返回、未保存修改丢弃 |
+| 持久化 | storageDomain domain `bug_workflow` v2（兼容 v1）：`tickets` / `settings` / `meta` 三表；写前用真 zod schema 校验；`meta` 是 actionId 幂等账本（最多 500 条） |
+| 设置面板 | 同页面 overlay，11 个字段（P2 增加平台连接），按工作区 cwd 保存；`Esc` 关闭、焦点返回、未保存修改丢弃 |
 | 安全守卫 | 仅本机回环 socket + `Host` 白名单；POST 仅 `application/json`；`Origin` 必须同源；64 KiB / 10 s 限制；错误消息裁剪 |
-| 测试 | `node --test bug-workflow/test/*.test.js`，101 个用例全绿 |
+| 测试（P1+P2） | `node --test bug-workflow/test/*.test.js`，P2 收尾时 191 个用例全绿 |
 
-> **动作映射的维护约束（P2 必读）**：按钮只来自 `bug-workflow/client.js` 的 `ACTION_BY_STATE` 字面量（按 `workflow` 的静态列表）；宿主 `canApply` 是转移的权威，但两者是**两份独立数据**。`test/client-action-map.test.js` 只做单向校验（map → host：每个映射动作在该状态必须被 `canApply` 接受），**不校验 host → map**，所以新增宿主动作不会自动出现按钮。P2 每加/改一个动作，必须同步更新该映射并运行 `node --test bug-workflow/test/*.test.js`。已知两处偏差：① `mr_open` 且 `mr.rounds = 3` 时看板仍显示 `review_requests_changes`，点击后被宿主拒绝（409 `review-rounds-exhausted` → 工单进入 `blocked`）；② 宿主支持 `block`（任意非终态可执行），但 P1 看板没有「阻塞」按钮。
+### P2 平台接入
 
-P1 的「假引擎」含义：分析完成、修复完成、建 MR、review 结论、合并等都由看板按钮手工 POST 假 payload 驱动，不会调用平台、GitLab 或子代理。
+| 能力 | 说明 |
+| --- | --- |
+| 平台 token | 设置面板「平台连接」密文输入 + 保存/清除 + 状态点；token 只写入 DSH credentials（`BUG_WORKFLOW_PLATFORM_TOKEN`），永不回显、不进 snapshot/日志/错误 |
+| 我的工单同步 | 「同步」按钮 → `POST /api/sync`；仅同步平台「负责人 = 当前登录用户」的工单；`platformProjectCode` 前缀过滤；重复同步 upsert，不覆盖本地 workflow/plan/MR/修复记录/时间线 |
+| 按编号导入 | 手动输入编号（如 `YGFNXDJRFWDJSYJJYY-647`）→ 平台详情 → upsert；已存在工单保留本地 workflow；支持跨项目编号 |
+| 字典筛选 | 平台 `teamTaskStatus/teamTaskType/teamTaskPriority` 写入 snapshot `dicts`，驱动列表状态/类型筛选（保留平台颜色点）；字典未覆盖的旧值仍可筛选 |
+| 平台信息 | 列表显示来源 Badge（平台/手动）与平台类型/状态；详情显示类型/状态/负责人/版本/项目/描述摘要 + 「在平台打开」外链（仅 `http(s)`） |
+| 错误映射 | token 缺失/配置错误 400、token 失效 401、网络/上游 502、未知 500；界面给出可操作提示 |
+| 自动同步 | 有 token 时每 10 分钟对最近 live 会话的工作区执行一次同步（单飞，不会与手动同步并发）；**本项未在 live 观察到 tick** |
+| 测试 | 191 个用例（credentials / domain v2 / platform 客户端 / sync / routes / client 映射） |
+
+> **动作映射的维护约束（每期必读）**：按钮只来自 `bug-workflow/client.js` 的 `ACTION_BY_STATE` 字面量（按 `workflow` 的静态列表）；宿主 `canApply` 是转移的权威，但两者是**两份独立数据**。`test/client-action-map.test.js` 只做单向校验（map → host：每个映射动作在该状态必须被 `canApply` 接受），**不校验 host → map**，所以新增宿主动作不会自动出现按钮。每加/改一个动作，必须同步更新该映射并运行 `node --test bug-workflow/test/*.test.js`。已知两处偏差：① `mr_open` 且 `mr.rounds = 3` 时看板仍显示 `review_requests_changes`，点击后被宿主拒绝（409 `review-rounds-exhausted` → 工单进入 `blocked`）；② 宿主支持 `block`（任意非终态可执行），但看板没有「阻塞」按钮。
+
+**P2 之后仍是「假引擎」的部分**：平台工单的同步/导入是真的 HTTP 数据，但「开始分析 → 方案 → 修复 → 建 MR → review → 合并」仍由看板按钮手工 POST 假 payload 驱动，不调用子代理、GitLab 或 worktree，也没有状态写回。
+
+## 平台接入
+
+### 1. 前置条件
+
+1. 用浏览器登录星瞰河山一体化平台（`https://ecard.htwisdom.cn/HT_TEAM/…`）。P2 **不做登录自动化**，没有验证码/RSA/SSO 流程。
+2. 在平台页面打开开发者工具 → Console，读取：
+
+   ```js
+   localStorage.getItem('app/access-token')
+   ```
+
+   P0 实测的完整键名是 **`app/access-token`**（纯字符串，不是 JWT）；若你的页面版本只有 `access-token`，以实际键名为准。
+3. 复制返回值。**不要把 token 发到聊天、issue、日志或提交到 git**；本插件只需要它在宿主凭据里。
+
+### 2. 配置步骤（看板设置）
+
+打开看板 → 右上「设置」→「平台连接」区：
+
+1. **平台地址**：默认 `https://ecard.htwisdom.cn`。只接受 `http(s)`，拒绝内嵌用户名/密码；开发时可填 mock 的 `http://127.0.0.1:<port>`。
+2. **平台项目编码**：例如 `YGFNXDJRFWDJSYJJYY`。同步只保留 `taskCode` 以 `<编码>-` 开头的工单；留空 = 全部。按编号导入不受该过滤限制。
+3. **平台 token**：粘贴上一步的 token →「保存 token」。状态点显示「token 已配置 / 未配置」；「清除」只删托管层凭据（环境变量 fallback 可能让状态仍为已配置，见「已知限制」）。
+4. **同步**：token + 已绑定工作区时可用；成功提示「已同步：新增 X / 更新 Y」，标题栏显示上次同步时间/错误。
+5. **从平台导入**：在「从平台导入」输入编号（或复用旧的手动添加入口）→ 宿主按编号请求平台详情并 upsert；成功后自动选中该工单。
+
+设置按会话工作区 cwd 保存；token 是 **profile 全局**的，不按工作区隔离。工单也是 profile 全局的（P2 未做 workspace 归属）。
+
+### 3. 同步语义
+
+- 取数：`GET /user-auth-info` 拿当前用户 id → 分页 `GET /task?refHandlerPersonId=<id>&size=100&descs=createdTime`（上限 1000 条 / 12 页）→ `GET /dict/business/dictionary`（状态/类型/优先级三组）。字典失败会中止整次同步，避免「工单已更新、筛选字典还是旧的」。
+- 过滤：`platformProjectCode` 非空时只 upsert 前缀匹配的工单，其余计入 `filtered`；空则全部。
+- 合并：已存在的工单只更新标题/类型/状态/优先级/版本/负责人/URL/平台快照/`updatedAt`，**保留** `workflow`、`blocked*`、`plan`、`branch`、`mr`、`fixes`、`timeline`、`createdAt`；新工单从 `inbox` 开始、`source:'platform'`。
+- 元数据：`meta['platform.lastSyncAt']`、`meta['platform.lastSyncError']`、`meta['platform.dicts']`；成功同步会清空 `lastSyncError`。
+- **按编号导入不是同步**：不写 `lastSyncAt`/`lastSyncError`，失败不会污染「上次同步失败」。
+- 不做 prune：切换项目编码/平台不再返回的旧工单不会自动删除。
+
+### 4. 错误含义
+
+| 触发 | HTTP / code | 含义与处理 |
+| --- | --- | --- |
+| 未保存 token / 凭据服务不可用 | 400 `no-platform-token` | 到设置里保存 token |
+| 平台地址非法 | 400 `invalid-platform-config` | 检查 `platformBaseUrl`：必须 `http(s)`、无内嵌账号密码、非空 |
+| 同步时会话没有工作区 | 400 `unknown-workspace` | 换到有工作区目录的会话，或先保存工作区 |
+| 导入编号不合法 | 400 `invalid-code` | 只支持字母/数字/点/下划线/短横线，最长 128 字符 |
+| 平台 token 失效 | 401 `platform-unauthorized` | 重新从浏览器复制 token 并保存 |
+| 平台没有该工单 | 404 `platform-not-found` | 仅导入路径；确认编号存在且负责人是自己 |
+| 连不上/超时/重定向被拒 | 502 `platform-network` | 检查网络/VPN/平台地址；P2 不跟随重定向 |
+| 上游非 2xx、业务失败信封 | 502 `platform-http` | 平台侧故障或权限问题，稍后重试 |
+| 上游响应结构异常 | 502 `platform-bad-response` | 平台接口变更/被网关改写，保留现场后反馈 |
+| 存储/未知异常 | 500 `internal` | 查看宿主日志；数据未写入或已按单次批次校验 |
+
+> 同步路径把上游 404 也归为 502（列表/字典接口缺失是网关/平台故障）；只有「按编号导入」把上游 404 映射为 404。
+
+### 5. Mock 平台（仅开发/验收用）
+
+真实平台不可用时，用仓库内 mock 做端到端验证：
+
+```sh
+node bug-workflow/scripts/mock-platform.mjs --port 0 --token test-token \
+  --fixtures bug-workflow/scripts/fixtures/platform
+# 输出：MOCK_PLATFORM_URL=http://127.0.0.1:<随机端口>
+```
+
+- 在设置里把 **平台地址** 改成该 URL、**平台项目编码** 填 `YGFNXDJRFWDJSYJJYY`、**token** 填 `test-token`，点「同步」。
+- fixtures 含 3 张工单：`YGFNXDJRFWDJSYJJYY-647`（缺陷/进行中）、`YGFNXDJRFWDJSYJJYY-648`（需求/待验证）、`HTSMART-12`（智慧门户/待处理）。项目编码过滤后应得到 `synced:2 / total:3 / filtered:1`。
+- 字典 4/3/3 组；详情/评论/附件接口也由 mock 提供。`--latency <ms>` 可模拟慢响应。
+- mock 只监听回环、无 TLS/真实登录/网关；**不能当作真实平台证据**。停止用 `Ctrl-C`/SIGINT，确认端口无监听：
+
+  ```sh
+  lsof -nP -iTCP:<port> -sTCP:LISTEN
+  pgrep -fl mock-platform.mjs
+  ```
+
+- 验收后把设置恢复为 `platformBaseUrl=https://ecard.htwisdom.cn`、`platformProjectCode=`（清空），并清除 token。
+
+### 6. 真实平台联调（用户最终验收项）
+
+P2 **未对真实平台执行**同步/导入（无真实 token，用户不在场）。最终验收建议：
+
+1. 登录平台，复制 `app/access-token`，在设置里保存；平台地址保持官方域名，项目编码填实际项目。
+2. 点「同步」，确认新工单数量与平台「我的工单」一致；检查类型/状态/负责人/版本/描述与平台页面一致。
+3. 点开一张工单，确认「在平台打开」外链可跳转；用错误 token 验证 401 提示与恢复。
+4. **写回平台状态默认关闭**（`writebackStatus:false`），P2 只保存开关、不向平台写；P5 才接写回。
+5. 真实 token / 网关 / WAF / 分页字段类型与 P0 契约的差异，以这次联调为准；发现偏差请记录在 findings 并修 adapter。
 
 ## P2–P5 待办
 
-| 期 | 内容 |
-| --- | --- |
-| P2 | 平台接入：登录/验证码、字典、我的工单同步、详情、手动添加、状态写回（不可用时降级） |
-| P3 | 分析子代理 + 真实方案审核/驳回重跑 |
-| P4 | 修复子代理 + worktree、lint/test、人工测试与视觉留证 |
-| P5 | GitLab 交付：分支、MR 创建、review 轮询、回修、合并检测、完成归档、状态写回 |
+| 期 | 内容 | 状态 |
+| --- | --- | --- |
+| P2 | 平台接入：token、我的工单同步、详情、按编号导入、字典筛选 | **已完成（mock 验收；真实平台待用户联调）** |
+| P3 | 分析子代理 + 真实方案审核/驳回重跑 | 未开始 |
+| P4 | 修复子代理 + worktree、lint/test、人工测试与视觉留证 | 未开始 |
+| P5 | GitLab 交付：分支、MR 创建、review 轮询、回修、合并检测、完成归档、状态写回 | 未开始 |
 
-> **P2 打包与交接（P1 遗留语义，勿当成已实现契约）**：
-> - **打包**：`package.json` 的 peerDependencies（`@deepseek-ai/dsh-storage-domain`、`zod`）都是 `"*"`，且**没有 `license` 字段**（`private: true`）。P2 发布前必须把 peer 收窄到实际验证过的范围、补 `license`，并按 `files` 清单做一次 `npm pack --dry-run` 检查（`locale/*.json` 目录尚未创建，导出仍写在那里）。
-> - **`review_fix_done` 的 `verdict`**：只把 `workflow` 推回 `mr_open`，`mr.verdict` 保持 `changes`，直到 `review_pass` 才变 `pass`；P2/P5 若用 `verdict` 判定「已修复 / 可合并」，必须先定义重置语义（或改用逐轮记录）。
-> - **`fixes` payload**：见「已知限制」——宿主只校验 `z.array(z.unknown())`，元素形状是 P1 客户端约定，不是 host-enforced contract。
-> - **设置「必填」**：`branchUser` / `commitType` 的必填校验只在 `client.js`（`validateSettings`）；宿主 `settingsSchema` 为 `z.string().default(...)`，`POST /api/settings` 会接受空串。P2 若要求服务端保证，需在 host 补校验与测试。
+## 打包与交接（P3 前仍需处理）
+
+- **打包**：`package.json` 的 peerDependencies（`@deepseek-ai/dsh-storage-domain`、`zod`）仍是 `"*"`，且**没有 `license` 字段**（`private: true`）。发布前必须把 peer 收窄到实际验证过的范围、补 `license`，并按 `files` 清单做一次 `npm pack --dry-run` 检查（`locale/*.json` 目录尚未创建，导出仍写在那里）。
+- **`review_fix_done` 的 `verdict`**：只把 `workflow` 推回 `mr_open`，`mr.verdict` 保持 `changes`，直到 `review_pass` 才变 `pass`；P5 若用 `verdict` 判定「已修复 / 可合并」，必须先定义重置语义（或改用逐轮记录）。
+- **`fixes` payload**：宿主只校验 `z.array(z.unknown())`，元素形状是 P1 客户端约定，不是 host-enforced contract；P4 接修复子代理前必须补 host schema。
+- **设置「必填」**：`branchUser` / `commitType` 的必填校验只在 `client.js`（`validateSettings`）；宿主 `settingsSchema` 为 `z.string().default(...)`，`POST /api/settings` 会接受空串。P4 若要求服务端保证，需在 host 补校验与测试。
+- **worktree 字段**：domain v2 的 Ticket 没有 `worktree` 字段；P4 需要升 v3（或在 `branch`/meta 中存路径）并做迁移。
+- **子代理契约**：P0 已确认 `ctx.subagents.startActivation({ provider:'spawn', label, delivery:'caller', signal, request:{ prompt, parent, cwd } })`；父 Agent 用 `ctx.agents.roots()`（live Agent），不要依赖 `agent/created`。P3 必须把「分析子代理」挂在 live Agent 上并在会话销毁时转 `blocked`。
+- **review issue 形状**：P1 live 遗留的 `mr.blockingIssues` 是原始 `{id,severity,body}`，客户端 `IssueList` 按 `file/level/problem` 渲染会显示空标题；P4/P5 统一形状或让 UI 兼容。
 
 ## 设置字段
 
-看板内「设置」保存，按会话工作区 cwd 存储。
+看板内「设置」保存，按会话工作区 cwd 存储。token 不是 settings 字段，单独进 credentials。
 
 | 字段 | 界面标签 | 默认 | 用途 |
 | --- | --- | --- | --- |
-| `platformProjectCode` | 平台项目编码 | 空 | P2 平台项目标识，如 `YGFNXDJRFWDJSYJJYY` |
+| `platformBaseUrl` | 平台地址 | `https://ecard.htwisdom.cn` | P2 平台 API 根地址；仅 `http(s)`，允许 localhost（mock） |
+| `platformProjectCode` | 平台项目编码 | 空 | P2 同步过滤前缀，如 `YGFNXDJRFWDJSYJJYY`；空 = 全部 |
+| `writebackStatus` | 写回平台状态（P5 使用） | `false` | 布尔开关；P2 只保存，不写回 |
 | `gitlabProjectPath` | GitLab 项目路径 | 空 | `group/project`，P5 建分支/MR 用；留空表示未配置 |
 | `branchUser` | 个人分支后缀 | `ly` | 必填；个人分支名后缀 |
 | `gitlabReviewer` | GitLab Reviewer | 空 | P5 MR reviewer 用户名，可留空 |
@@ -73,7 +180,7 @@ P1 的「假引擎」含义：分析完成、修复完成、建 MR、review 结�
 | `devCommand` | 启动命令 | 空 | P4 预览/视觉留证 |
 | `previewUrl` | 预览地址 | 空 | P4 视觉留证 |
 
-> P1 live 验收时把本仓库工作区的 `gitlabProjectPath` 填成了 `wisdom-financial-service-platform/wisdom-financial-credit-platform-web`，只是**演示配置**，不代表真实项目绑定；`branchUser=ly`、`commitType=fix` 为默认值。
+> P1 live 验收时把本仓库工作区的 `gitlabProjectPath` 填成了 `wisdom-financial-service-platform/wisdom-financial-credit-platform-web`，只是**演示配置**，不代表真实项目绑定；`branchUser=ly`、`commitType=fix` 为默认值。P2 收尾已把平台地址/项目编码/token 恢复为默认，`gitlabProjectPath` 保留该演示值。
 
 ## HTTP 接口
 
@@ -82,49 +189,77 @@ P1 的「假引擎」含义：分析完成、修复完成、建 MR、review 结�
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/bug-workflow/api/health` | `{ ok, domainOpenedAt, tickets }`；存储不可用时 500/503 带 `stage` |
-| GET | `/bug-workflow/api/snapshot?sessionId=` | `{ ok, workspace, settings, tickets, serverTime }` |
-| POST | `/bug-workflow/api/action` | `{ sessionId, actionId, code, action, payload? }` → `{ ok, ticket }` 或 `{ ok:false, code, message }` |
+| GET | `/bug-workflow/api/snapshot?sessionId=` | `{ ok, workspace, settings, platform:{tokenPresent,lastSyncAt,lastSyncError}, dicts:{status,type,priority}, tickets, serverTime }` |
+| POST | `/bug-workflow/api/action` | `{ sessionId, actionId, code, action, payload? }` → `{ ok, ticket }` 或 `{ ok:false, code, message }`；`action:'create'` + `payload.code` 走平台按编号导入 |
 | POST | `/bug-workflow/api/settings` | `{ sessionId, settings }` → `{ ok, settings }` |
+| POST | `/bug-workflow/api/platform-token` | `{ sessionId, token }` 保存；`{ token:null }` 清除 → `{ ok, tokenPresent }`；无 token 回显 |
+| POST | `/bug-workflow/api/sync` | `{ sessionId }` → `{ ok, synced, created, updated, total, filtered, lastSyncAt }` 或 `{ ok:false, code, message }` |
 
-错误映射：参数/设置校验 400，`action-id-reused` / `invalid-transition` / `duplicate-code` / review 轮次耗尽 409，工单不存在 404，内部错误 500。`review_requests_changes` 第 4 次返回 409 `review-rounds-exhausted`，同时工单进入 `blocked`，`retry` 回到 `mr_open`。
+错误映射：参数/设置/配置 400，`action-id-reused` / `invalid-transition` / `duplicate-code` / review 轮次耗尽 409，工单不存在 404，上游 401 映射 401，网络/上游异常 502，内部错误 500。`review_requests_changes` 第 4 次返回 409 `review-rounds-exhausted`，同时工单进入 `blocked`，`retry` 回到 `mr_open`。
 
 ## 数据位置
 
-- `~/.dsh/storages/bug_workflow.json`（storageDomain 的 JSON 后端，domain `bug_workflow` v1）。
-- `tickets`：**profile 全局**工单（P1 未按工作区隔离）；`settings`：按工作区 cwd 为 key；`meta`：domain 标记 + actionId 幂等账本。
-- 删除该文件会清空工单/设置/幂等账本；P1 没有 UI 归档或清理入口，卸载插件不会删数据。
+- `~/.dsh/storages/bug_workflow.json`（storageDomain 的 JSON 后端，domain `bug_workflow` v2；`compatibleVersions:[1]` 兼容 P1 文件，open 时归一化并写回 v2 形状）。
+- `tickets`：**profile 全局**工单（P2 仍未按工作区隔离）；`settings`：按工作区 cwd 为 key；`meta`：domain 标记、`migration:tickets-v2`、`platform.dicts`、`platform.lastSyncAt`、`platform.lastSyncError`、`action:<actionId>` 幂等账本（最多 500 条）。
+- 平台 token：`~/.dsh/.credentials.yaml` 的 ref `BUG_WORKFLOW_PLATFORM_TOKEN`（由 `ctx.credentials` 管理，文件 0600）；不写入 storage/settings/snapshot。
+- 删除 storage 文件会清空工单/设置/幂等账本；P2 没有 UI 归档或删除入口，卸载插件不会删数据。
+- **遗留 demo 数据**：`YGFNXDJRFWDJSYJJYY-647`、`-648`、`HTSMART-12` 三张 mock 平台工单仍在 live storage，`platform.url` 指向已停止的 mock。保留/清理的取舍见 findings。清理脚本（只在 DSH 完全退出后、且只接受 platform + loopback URL 的工单）：
+
+  ```sh
+  # 先 dry-run（不改文件）；确认后退出 DSH，再执行 --write
+  node bug-workflow/scripts/cleanup-demo-tickets.mjs \
+    --codes YGFNXDJRFWDJSYJJYY-647,YGFNXDJRFWDJSYJJYY-648,HTSMART-12
+  node bug-workflow/scripts/cleanup-demo-tickets.mjs \
+    --codes YGFNXDJRFWDJSYJJYY-647,YGFNXDJRFWDJSYJJYY-648,HTSMART-12 --write
+  ```
+
+  脚本会校验 domain/JSON、只删 `source:'platform'` 且 URL 为 loopback 的工单、写 `0600` 备份、用同目录临时文件 + fsync + 原子 rename 落盘；运行中的宿主会用内存状态覆盖外部编辑，所以**必须退出 DSH**。
 
 ## 安全边界
 
 - 路由只接受**本机回环**连接（`socket.remoteAddress` 校验 + `Host` 文本白名单，DNS rebinding 不可绕过）。
 - POST 必须 `Content-Type: application/json`（跨站表单 `text/plain` 先 415）；带浏览器 `Origin` 时必须与请求 Host 同源，否则 403。
 - 请求体上限 64 KiB、读取超时 10 s；错误响应只带裁剪后的 message，完整错误进宿主日志。
-- **P1 没有鉴权，也不使用任何平台/GitLab 凭据**；信任边界是「同机同用户」。任何本机进程都能调这些接口，这是设计取舍，不是遗漏。
-- P2+ 的密码/token 必须走 `ctx.credentials`，不落插件配置、不落 session log；工单/review 文本按不可信数据处理。
+- 平台 token 只走 `ctx.credentials`；请求头 `Htwisdom-Auth` 是唯一出口，`credentials:'omit'`、`redirect:'error'`（不跟随重定向，避免 token 被带到别的源）；错误 message 为静态模板，不插值 token/上游正文。
+- 平台/GitLab 文本按不可信数据处理；「在平台打开」只渲染 `http(s)` URL，`target=_blank` 带 `noopener noreferrer`。
+- 看板路由本身**没有鉴权**：信任边界是「同机同用户」，任何本机进程都能调这些接口，这是设计取舍，不是遗漏。
+- 工单是 profile 全局的；token 是 profile 全局的；设置里的 `platformBaseUrl`/`platformProjectCode` 不是秘密。
 
 ## 已知限制
 
-- **假引擎**：动作是手工假 payload，不触发平台、GitLab、子代理或 worktree；P1 没有真实写回。
-- **工单是 profile 全局的**：设置按工作区隔离，但工单不按工作区隔离；P2 平台同步时要决定 workspace 归属与合并策略。
-- **`done` 工单不在列表显示**：仍保存在 `tickets` 表，没有归档视图，计数只算进行中工单。
-- **未接 locale**：文案硬编码中文，`locale/*.json` 尚未提供（P2 再接 `ctx.locale`）。
-- **视觉/交互验收未完成**：右栏 tab 的 guide/渲染、300–600px 窄宽布局、Electron 下 `window.confirm`/焦点行为未在本轮目视验证；client Slots inspect 在验收时 10 s 超时。详见 findings。
-- **app 重启未验证**：只验证了宿主半边「移除 → 重装」热重载后数据保留。
-- **`workspace.configured` 只表示会话解析到了目录**，不表示已保存设置；P2 若要区分「已绑定」需另加状态。
-- **无 GitLab/平台调用**：`plan` / `mr` 有宿主 zod schema，`fixes` 只校验为数组（`z.array(z.unknown())`）——元素形状只是 P1 看板客户端的约定，不是宿主强制契约；P2–P5 adapter 负责映射真实 API，并在接修复子代理前补 `fixes` 的 host schema。
+- **真实平台未验证**：P2 的同步/导入只对 mock 跑通；真实 token、TLS/网关/WAF、分页字段类型/`size` 上限、评论编码、`file/list` 结构都未对真实平台实测。
+- **GUI 未目视验收**：client inspect 在本轮超时（`Slots.listSubTree` / `Theme.listTokens` 均 10 s timeout），没有截图/点击/窄宽布局验证；client 侧仅由 `node --check`、静态/渲染 harness（未提交）与代码审阅保证。
+- **状态写回未实现**：`writebackStatus` 只是布尔设置，默认关；P2 不向平台写。
+- **600s 自动同步未观察到 tick**：只验证了 timer 服务可获取、重载不抛错；`run()` 正确性由单测覆盖。
+- **演示工单 URL 已失效**：647/648/HTSMART-12 的 `platform.url` 指向已停止的 mock；再次同步/导入会更新（需 mock 或真实平台）。
+- **无删除/归档/按工作区隔离**：`done` 工单仍保存在 `tickets` 表但列表隐藏；没有归档视图；切换项目编码不会 prune 旧工单；`tickets` 仍是 profile 全局。
+- **导入不更新 lastSyncAt**：导入是 upsert，不是同步；标题栏的「上次同步」不会因导入刷新。
+- **设置校验只在客户端**：`branchUser`/`commitType` 的服务端仍是空串可接受（见「打包与交接」）。
+- **app 重启未验证**：只验证了 host 半边「移除 → 重装」热重载后数据保留。
+- **未接 locale**：文案硬编码中文，`locale/*.json` 尚未提供。
+- **`lastSyncError` 不会因清 token 自动清除**：只有下一次成功同步才会清空；`lastSyncAt` 在恢复设置/停止 mock 后仍是上一次成功同步时间。
+- **凭据环境变量 fallback**：若用环境变量提供 token，`describe()` 会显示「已配置」，清除只删托管层；这是 credentials 服务的语义，P2 未改。
 
 ## 开发
 
 无构建步骤：host 是纯 ESM JavaScript，client 是自包含 React bundle（只 `require('react')`，由宿主 module table 提供）。
 
 ```sh
-# 全部单元测试（在仓库根目录执行）
+# 全部单元测试（在仓库根目录执行）——P2 收尾 191/191
 node --test bug-workflow/test/*.test.js
 
 # 语法/静态检查
 node --check bug-workflow/index.js
 node --check bug-workflow/client.js
 node --check bug-workflow/src/host/routes.js
+node --check bug-workflow/src/host/sync.js
+node --check bug-workflow/src/host/platform.js
+node --check bug-workflow/scripts/mock-platform.mjs
+node --check bug-workflow/scripts/cleanup-demo-tickets.mjs
+
+# 本地 mock 平台（随机端口，打印 MOCK_PLATFORM_URL）
+node bug-workflow/scripts/mock-platform.mjs --port 0 --token test-token \
+  --fixtures bug-workflow/scripts/fixtures/platform
 
 # live 冒烟（端口取当前 DSH Web GUI，示例 49254）
 curl -s http://127.0.0.1:49254/bug-workflow/api/health
@@ -133,16 +268,25 @@ curl -s 'http://127.0.0.1:49254/bug-workflow/api/snapshot?sessionId=<session-id>
 
 | 文件 | 作用 |
 | --- | --- |
-| `index.js` | 宿主入口：fallback 路由 → 打开 domain/store → 挂真实路由，fiber 释放时关 domain |
+| `index.js` | 宿主入口：fallback 路由 → 打开 domain/store → 组装 token store/sync → 挂真实路由，fiber 释放时关 domain |
 | `src/host/protocol.js` | 状态、动作、上限常量 |
 | `src/host/state-machine.js` | 纯状态机 `initialTicket/canApply/apply`，无 I/O |
-| `src/host/domain.js` | zod schema、`bug_workflow` domain 声明与打开/关闭 |
-| `src/host/store.js` | TicketStore：工单 CRUD、动作、设置、actionId 幂等账本 |
-| `src/host/routes.js` | 四个路由、安全守卫、错误映射 |
+| `src/host/domain.js` | zod schema、`bug_workflow` domain 声明与打开/关闭、v1→v2 归一化 |
+| `src/host/domain-spec.js` | 无依赖的 schema/spec 构造（供 plain Node 与 Electron 契约测试复用） |
+| `src/host/ticket-defaults.js` | v2 工单默认值（`source:'manual'`、`platform:null`） |
+| `src/host/store.js` | TicketStore：工单 CRUD、动作、设置、字典、平台 upsert、actionId 幂等账本 |
+| `src/host/credentials.js` | 平台 token 的 credentials 封装（get/set/clear/present） |
+| `src/host/platform.js` | 平台 HTTP 客户端（fetch、15 s 超时、结构化错误、不跟随重定向） |
+| `src/host/sync.js` | 同步引擎与按编号导入（分页、项目过滤、映射、upsert、lastSync 元数据） |
+| `src/host/routes.js` | 六个路由、安全守卫、错误映射 |
 | `src/host/workspace.js` | sessionId → 工作区 cwd |
-| `client.js` | 右栏 tab/guide 注册与看板 UI（列表/详情/动作/设置） |
+| `client.js` | 右栏 tab/guide 注册与看板 UI（列表/详情/动作/设置/平台同步） |
+| `scripts/mock-platform.mjs` | 本地 mock 平台（fixtures、随机端口、token 校验） |
+| `scripts/fixtures/platform/` | mock 工单/详情/字典/评论/附件 fixtures |
+| `scripts/cleanup-demo-tickets.mjs` | 安全清理 mock 遗留工单（dry-run 默认、0600 备份、原子写） |
+| `scripts/verify-domain-v2.mjs` | 用安装版 zod/domain 验证 v2 契约（Electron-as-node） |
 | `test/` | `node:test` 单元测试 |
 
 ## 许可
 
-内部私有包（`private: true`），仅用于本人 DSH profile；未发布 npm、未授予再分发许可。注意：`package.json` **当前没有 `license` 字段**（不是 `UNLICENSED` 声明），P2 发布前应补上（见「P2 打包与交接」）。
+内部私有包（`private: true`），仅用于本人 DSH profile；未发布 npm、未授予再分发许可。注意：`package.json` **当前没有 `license` 字段**（不是 `UNLICENSED` 声明），发布前应补上（见「打包与交接」）。
