@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>A · 指挥台 Command Deck</title>
+<style>
+  :root{
+    --bg:#0d1013; --panel:#14181d; --panel2:#1a1f26; --line:rgba(255,255,255,.08); --line2:rgba(255,255,255,.14);
+    --t1:#e8edf2; --t2:#9aa6b2; --t3:#67727e; --acc:#38d6c0; --acc2:#7aa2ff; --warn:#f2b34c; --danger:#ff6b6b; --ok:#4cd08a;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"PingFang SC",monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#07090b;color:var(--t1);font:13px/1.5 "PingFang SC","Helvetica Neue",Arial,sans-serif;padding:28px;display:flex;gap:28px;align-items:flex-start;justify-content:center;flex-wrap:wrap}
+  .device{display:flex;flex-direction:column;gap:8px}
+  .device-label{font-size:11px;color:var(--t3);letter-spacing:.4px;text-transform:uppercase}
+  .frame{border:1px solid var(--line);border-radius:14px;overflow:hidden;background:var(--bg);box-shadow:0 24px 60px rgba(0,0,0,.55)}
+  .narrow{width:430px;height:900px;display:flex;flex-direction:column}
+  .wide{width:980px;height:900px;display:flex;flex-direction:column}
+
+  /* header */
+  .hdr{flex:0 0 auto;padding:14px 16px 10px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px}
+  .logo{width:22px;height:22px;border-radius:6px;background:linear-gradient(135deg,var(--acc),#1f8f81);display:grid;place-items:center;color:#04110f;font-weight:800;font-size:12px}
+  .title{font-size:14px;font-weight:700;letter-spacing:.2px}
+  .sub{font-size:11px;color:var(--t3);margin-top:1px}
+  .hdr .grow{flex:1}
+  .icon-btn{width:26px;height:26px;border-radius:7px;border:1px solid var(--line);background:var(--panel);color:var(--t2);display:grid;place-items:center;font-size:13px}
+  .kbd{font:10px var(--mono);color:var(--t3);border:1px solid var(--line);border-bottom-color:var(--line2);border-radius:5px;padding:2px 5px;background:var(--panel)}
+  .live{display:flex;align-items:center;gap:5px;font-size:10.5px;color:var(--acc)}
+  .dot{width:5px;height:5px;border-radius:50%;background:var(--acc);box-shadow:0 0 0 3px rgba(56,214,192,.14)}
+
+  /* needs-you strip */
+  .needs{flex:0 0 auto;margin:12px 14px 0;padding:10px 12px;border-radius:10px;border:1px solid rgba(56,214,192,.26);background:rgba(56,214,192,.07);display:flex;align-items:center;gap:10px}
+  .needs b{color:var(--acc)}
+  .needs .btn{margin-left:auto;flex:0 0 auto;white-space:nowrap;font-size:11px;color:#04110f;background:var(--acc);border:0;border-radius:7px;padding:5px 9px;font-weight:700}
+  .needs .mini{font-size:11px;color:var(--t2)}
+
+  /* filters */
+  .filters{flex:0 0 auto;display:flex;gap:6px;padding:10px 14px;overflow:hidden}
+  .chip{font-size:11px;color:var(--t2);border:1px solid var(--line);background:var(--panel);border-radius:999px;padding:4px 9px;white-space:nowrap}
+  .chip.on{color:var(--acc);border-color:rgba(56,214,192,.45);background:rgba(56,214,192,.1)}
+  .chip .caret{opacity:.6;margin-left:3px}
+
+  /* list */
+  .list{flex:1 1 auto;min-height:0;overflow-y:auto;padding:2px 8px 12px}
+  .group{display:flex;align-items:center;gap:8px;margin:12px 6px 6px;font-size:10.5px;letter-spacing:.6px;color:var(--t3);text-transform:uppercase}
+  .group .line{flex:1;height:1px;background:var(--line)}
+  .row{position:relative;display:flex;gap:10px;padding:10px 10px 10px 12px;border:1px solid transparent;border-radius:10px;margin:2px 0;cursor:pointer}
+  .row:hover{background:var(--panel);border-color:var(--line)}
+  .row.sel{background:linear-gradient(90deg,rgba(56,214,192,.12),rgba(56,214,192,.03));border-color:rgba(56,214,192,.32)}
+  .rail{position:absolute;left:0;top:10px;bottom:10px;width:3px;border-radius:3px;background:var(--t3)}
+  .rail.ok{background:var(--ok)} .rail.run{background:var(--acc);animation:pulse 1.6s infinite}
+  .rail.warn{background:var(--warn)} .rail.bad{background:var(--danger)} .rail.info{background:var(--acc2)}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  .row .main{flex:1;min-width:0}
+  .code{font:11px/1.4 var(--mono);color:var(--t3);letter-spacing:.2px}
+  .row.sel .code{color:var(--acc)}
+  .ttl{font-size:12.5px;font-weight:600;color:var(--t1);margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .meta{display:flex;gap:8px;font-size:10.5px;color:var(--t3);margin-top:4px;flex-wrap:wrap}
+  .meta b{color:var(--t2);font-weight:500}
+  .right{flex:0 0 auto;display:flex;flex-direction:column;align-items:flex-end;gap:5px}
+  .pill{font-size:10.5px;padding:2px 7px;border-radius:6px;border:1px solid;white-space:nowrap}
+  .p-run{color:var(--acc);border-color:rgba(56,214,192,.4);background:rgba(56,214,192,.08)}
+  .p-warn{color:var(--warn);border-color:rgba(242,179,76,.4);background:rgba(242,179,76,.08)}
+  .p-bad{color:var(--danger);border-color:rgba(255,107,107,.4);background:rgba(255,107,107,.08)}
+  .p-ok{color:var(--ok);border-color:rgba(76,208,138,.4);background:rgba(76,208,138,.08)}
+  .p-mute{color:var(--t2);border-color:var(--line2);background:var(--panel2)}
+  .next{font-size:10.5px;color:var(--t2);display:flex;align-items:center;gap:4px}
+  .next b{color:var(--acc);font-weight:600}
+  .meter{width:64px;height:3px;border-radius:2px;background:rgba(255,255,255,.08);overflow:hidden}
+  .meter i{display:block;height:100%;background:var(--acc)}
+  .age{font:10px var(--mono);color:var(--t3)}
+
+  /* footer command bar */
+  .cmdbar{flex:0 0 auto;border-top:1px solid var(--line);background:var(--panel);padding:9px 14px;display:flex;align-items:center;gap:10px;font-size:11px;color:var(--t3)}
+  .cmdbar .hint{display:flex;gap:5px;align-items:center}
+  .cmdbar .grow{flex:1}
+  .undo{color:var(--acc2);font-size:11px}
+
+  /* wide detail */
+  .wide-body{flex:1 1 auto;min-height:0;display:flex}
+  .col-list{width:308px;border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
+  .col-detail{flex:1 1 auto;min-width:0;overflow-y:auto;padding:18px 22px}
+  .col-ai{width:236px;border-left:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
+  .col-hd{padding:10px 14px;border-bottom:1px solid var(--line);font-size:10.5px;letter-spacing:.6px;color:var(--t3);text-transform:uppercase;display:flex;align-items:center;gap:8px}
+  .col-hd .grow{flex:1}
+
+  .d-title{font-size:17px;font-weight:700;line-height:1.35}
+  .d-code{font:11px var(--mono);color:var(--acc);margin-bottom:6px}
+  .d-meta{display:flex;gap:14px;font-size:11px;color:var(--t3);margin-top:8px;flex-wrap:wrap}
+  .d-meta b{color:var(--t2);font-weight:500}
+  .actions{display:flex;gap:8px;margin-top:14px}
+  .btn{font:inherit;font-size:12px;padding:7px 13px;border-radius:8px;border:1px solid var(--line2);background:var(--panel);color:var(--t1);cursor:pointer}
+  .btn.primary{background:var(--acc);border-color:var(--acc);color:#04110f;font-weight:700}
+  .btn.ghost{background:transparent;color:var(--t2)}
+  .sec{margin-top:18px;border:1px solid var(--line);border-radius:12px;background:var(--panel);overflow:hidden}
+  .sec-hd{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--line);font-size:12px;font-weight:600}
+  .sec-hd .grow{flex:1}
+  .sec-hd .tag{font-size:10px;color:var(--t3);border:1px solid var(--line);border-radius:5px;padding:2px 6px}
+  .sec-bd{padding:12px;font-size:12px;color:var(--t2);line-height:1.7}
+  .plan-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .plan-cell{border:1px solid var(--line);border-radius:8px;padding:8px 10px;background:var(--panel2)}
+  .plan-cell .k{font-size:10px;color:var(--t3);margin-bottom:3px}
+  .plan-cell .v{font-size:12px;color:var(--t1)}
+  .files{display:flex;flex-direction:column;gap:4px;margin-top:8px}
+  .file{display:flex;gap:8px;font:11px var(--mono);color:var(--t2);align-items:center}
+  .file .add{color:var(--ok)} .file .del{color:var(--danger)}
+  .timeline{display:flex;flex-direction:column;gap:0;padding:4px 2px}
+  .ev{display:flex;gap:10px;position:relative;padding:7px 0 7px 2px}
+  .ev .dot2{width:7px;height:7px;border-radius:50%;background:var(--t3);margin-top:5px;flex:0 0 auto;z-index:1}
+  .ev.run .dot2{background:var(--acc);box-shadow:0 0 0 4px rgba(56,214,192,.12)}
+  .ev .txt{font-size:11.5px;color:var(--t2)}
+  .ev .txt b{color:var(--t1);font-weight:600}
+  .ev .time{font:10px var(--mono);color:var(--t3);margin-left:auto;flex:0 0 auto}
+  .ai-item{padding:10px 12px;border-bottom:1px solid var(--line);font-size:11.5px;color:var(--t2)}
+  .ai-item b{color:var(--t1)}
+  .ai-item .ai-act{margin-top:6px;display:inline-block;font-size:10.5px;color:var(--acc);border:1px solid rgba(56,214,192,.4);border-radius:6px;padding:3px 7px}
+  .palette{margin:0 12px 12px;border:1px solid var(--line2);border-radius:12px;background:var(--panel2);box-shadow:0 20px 40px rgba(0,0,0,.5);overflow:hidden}
+  .palette .ph{padding:9px 12px;border-bottom:1px solid var(--line);font-size:11px;color:var(--t3);display:flex;gap:8px;align-items:center}
+  .palette .pi{padding:8px 12px;font-size:12px;color:var(--t2);display:flex;gap:8px;align-items:center}
+  .palette .pi.on{background:rgba(56,214,192,.1);color:var(--t1)}
+  .palette .pi .k{margin-left:auto}
+
+  /* annotations */
+  .notes{border:1px solid var(--line);border-radius:14px;background:var(--panel);padding:16px 18px;max-width:760px;font-size:12px;color:var(--t2);line-height:1.75}
+  .notes h3{font-size:13px;color:var(--t1);margin-bottom:8px;display:flex;align-items:center;gap:8px}
+  .notes h3 span{font-size:10px;color:var(--acc);border:1px solid rgba(56,214,192,.4);border-radius:5px;padding:2px 6px}
+  .notes ul{margin:0;padding-left:18px}
+  .notes li{margin:2px 0}
+  .notes b{color:var(--t1)}
+  .notes .row2{display:flex;gap:18px;flex-wrap:wrap}
+  .notes .col{flex:1;min-width:280px}
+</style>
+</head>
+<body>
+
+<div class="device">
+  <div class="device-label">A · 指挥台 · 右栏 430px（列表 / 快捷操作）</div>
+  <div class="frame narrow">
+    <div class="hdr">
+      <div class="logo">B</div>
+      <div><div class="title">Bug 看板</div><div class="sub">3 张需要你 · 1 个 AI 任务运行中</div></div>
+      <div class="grow"></div>
+      <span class="live"><span class="dot"></span>已同步</span>
+      <div class="icon-btn">⟳</div>
+      <div class="icon-btn">⚙</div>
+    </div>
+
+    <div class="needs">
+      <div><b>3 张</b>工单在等你：<span class="mini">1 份方案待审 · 1 次人工测试 · 1 个 Review 需处理</span></div>
+      <button class="btn">逐张处理</button>
+    </div>
+
+    <div class="filters">
+      <span class="chip on">我负责 <span class="caret">▾</span></span>
+      <span class="chip">状态 <span class="caret">▾</span></span>
+      <span class="chip">类型 <span class="caret">▾</span></span>
+      <span class="chip">V1.2.0</span>
+    </div>
+
+    <div class="list">
+      <div class="group">需要你 · 3<span class="line"></span></div>
+
+      <div class="row sel">
+        <i class="rail warn"></i>
+        <div class="main">
+          <div class="code">HTSMART-12 · 任务</div>
+          <div class="ttl">权限中心批量授权后列表未刷新</div>
+          <div class="meta"><span>方案待审</span><span>V2.0.0</span><span>等了 <b>2 小时</b></span></div>
+        </div>
+        <div class="right"><span class="pill p-warn">待你审核</span><span class="next">下一步 <b>审方案 ⏎</b></span></div>
+      </div>
+
+      <div class="row">
+        <i class="rail ok"></i>
+        <div class="main">
+          <div class="code">YGFNXDJRFWDJSYJJYY-648 · 需求</div>
+          <div class="ttl">新增工单导出 Excel 能力</div>
+          <div class="meta"><span>待人工测试</span><span>改动 7 文件</span><span>修复耗时 5m45s</span></div>
+        </div>
+        <div class="right"><span class="pill p-ok">待你测试</span><span class="next">下一步 <b>标记通过 ⇧⏎</b></span></div>
+      </div>
+
+      <div class="row">
+        <i class="rail bad"></i>
+        <div class="main">
+          <div class="code">P1-E2E-2 · 缺陷</div>
+          <div class="ttl">支付回调重复入账（幂等键缺失）</div>
+          <div class="meta"><span>Review 需修改（1 阻塞）</span><span>MR !102</span></div>
+        </div>
+        <div class="right"><span class="pill p-bad">需处理</span><span class="next">下一步 <b>查看问题 →</b></span></div>
+      </div>
+
+      <div class="group">AI 正在处理 · 1<span class="line"></span></div>
+
+      <div class="row">
+        <i class="rail run"></i>
+        <div class="main">
+          <div class="code">YGFNXDJRFWDJSYJJYY-647 · 故障</div>
+          <div class="ttl">登录页验证码偶发失败</div>
+          <div class="meta"><span>AI 修复中 · 已 2m18s</span><span class="age">worktree feat-hot-V1.2.0-ly</span></div>
+        </div>
+        <div class="right"><span class="pill p-run">● 运行中</span><div class="meter"><i style="width:42%"></i></div></div>
+      </div>
+
+      <div class="group">等待外部 · 3<span class="line"></span></div>
+
+      <div class="row">
+        <i class="rail info"></i>
+        <div class="main">
+          <div class="code">HTSMART-15 · 需求</div>
+          <div class="ttl">结算单批量下载支持指定日期</div>
+          <div class="meta"><span>Review 中 · 轮次 1/3</span><span>MR !104</span><span class="age">60s 轮询</span></div>
+        </div>
+        <div class="right"><span class="pill p-mute">Review 中</span><span class="next">下次检查 <b>42s</b></span></div>
+      </div>
+
+      <div class="row">
+        <i class="rail ok"></i>
+        <div class="main">
+          <div class="code">HTSMART-18 · 需求</div>
+          <div class="ttl">工作台公告支持置顶</div>
+          <div class="meta"><span>可合并</span><span>MR !105</span></div>
+        </div>
+        <div class="right"><span class="pill p-ok">等你合并</span><span class="next">下一步 <b>去 GitLab ↗</b></span></div>
+      </div>
+
+      <div class="row">
+        <i class="rail"></i>
+        <div class="main">
+          <div class="code">DEMO-1 · 缺陷</div>
+          <div class="ttl">演示工单：导出按钮在窄栏下换行</div>
+          <div class="meta"><span>草稿</span><span>等待开始分析</span></div>
+        </div>
+        <div class="right"><span class="pill p-mute">未开始</span><span class="next">下一步 <b>分析</b></span></div>
+      </div>
+    </div>
+
+    <div class="cmdbar">
+      <span class="hint"><span class="kbd">J</span><span class="kbd">K</span>切换</span>
+      <span class="hint"><span class="kbd">⏎</span>下一步</span>
+      <span class="hint"><span class="kbd">⌘K</span>命令</span>
+      <span class="grow"></span>
+      <span class="undo">撤销刚才的操作</span>
+    </div>
+  </div>
+</div>
+
+<div class="device">
+  <div class="device-label">A · 指挥台 · 宽屏 980px（列表 + 详情 + 活动流 + 命令面板）</div>
+  <div class="frame wide">
+    <div class="hdr">
+      <div class="logo">B</div>
+      <div><div class="title">Bug 看板</div><div class="sub">星瞰河山一体化平台 · V1.2.0</div></div>
+      <div class="grow"></div>
+      <span class="live"><span class="dot"></span>已同步 2 分钟前</span>
+      <span class="kbd">⌘K</span>
+      <div class="icon-btn">⟳</div>
+      <div class="icon-btn">⚙</div>
+    </div>
+    <div class="wide-body">
+      <div class="col-list">
+        <div class="col-hd">队列 <b style="color:var(--t1)">8</b><span class="grow"></span><span>⌘K</span></div>
+        <div class="filters" style="padding:8px 10px">
+          <span class="chip on">全部</span><span class="chip">我负责</span><span class="chip">需要我</span>
+        </div>
+        <div class="list" style="padding:2px 6px 10px">
+          <div class="row sel">
+            <i class="rail warn"></i>
+            <div class="main"><div class="code">HTSMART-12</div><div class="ttl">权限中心批量授权后列表未刷新</div><div class="meta"><span>待审核</span></div></div>
+            <div class="right"><span class="pill p-warn">待审核</span></div>
+          </div>
+          <div class="row">
+            <i class="rail ok"></i>
+            <div class="main"><div class="code">…-648</div><div class="ttl">新增工单导出 Excel 能力</div><div class="meta"><span>待测试</span></div></div>
+            <div class="right"><span class="pill p-ok">待测试</span></div>
+          </div>
+          <div class="row">
+            <i class="rail bad"></i>
+            <div class="main"><div class="code">P1-E2E-2</div><div class="ttl">支付回调重复入账</div><div class="meta"><span>需处理</span></div></div>
+            <div class="right"><span class="pill p-bad">1 阻塞</span></div>
+          </div>
+          <div class="row">
+            <i class="rail run"></i>
+            <div class="main"><div class="code">…-647</div><div class="ttl">登录页验证码偶发失败</div><div class="meta"><span>AI 修复中</span></div></div>
+            <div class="right"><span class="pill p-run">● 运行</span></div>
+          </div>
+          <div class="row">
+            <i class="rail info"></i>
+            <div class="main"><div class="code">HTSMART-15</div><div class="ttl">结算单批量下载支持指定日期</div><div class="meta"><span>Review 中</span></div></div>
+            <div class="right"><span class="pill p-mute">1/3</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="col-detail">
+        <div class="d-code">HTSMART-12 · 任务 · V2.0.0 · 来源：星瞰河山平台</div>
+        <div class="d-title">权限中心批量授权后列表未刷新</div>
+        <div class="d-meta"><span>状态 <b>方案待审</b></span><span>负责人 <b>李昱</b></span><span>优先级 <b>中</b></span><span>更新 <b>2 小时前</b></span></div>
+        <div class="actions">
+          <button class="btn primary">通过方案 ⏎</button>
+          <button class="btn">驳回…</button>
+          <button class="btn ghost">查看原始工单 ↗</button>
+          <button class="btn ghost">稍后提醒</button>
+        </div>
+
+        <div class="sec">
+          <div class="sec-hd">AI 方案 <span class="tag">已生成 2h 前</span><span class="grow"></span><span style="font-size:11px;color:var(--t3)">6 段 · 3 文件</span></div>
+          <div class="sec-bd">
+            <div class="plan-grid">
+              <div class="plan-cell"><div class="k">根因</div><div class="v">批量授权后只更新了缓存，未失效列表查询键</div></div>
+              <div class="plan-cell"><div class="k">方案</div><div class="v">授权成功后失效 permission:list 查询并触发一次静默刷新</div></div>
+              <div class="plan-cell"><div class="k">影响</div><div class="v">权限中心列表、角色树</div></div>
+              <div class="plan-cell"><div class="k">测试计划</div><div class="v">单测 + 手工批量授权回归</div></div>
+            </div>
+            <div class="files">
+              <div class="file"><span class="add">M</span>src/features/permission/usePermissionList.ts</div>
+              <div class="file"><span class="add">M</span>src/features/permission/BatchGrantModal.tsx</div>
+              <div class="file"><span class="add">+</span>src/features/permission/__tests__/invalidate.test.ts</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="sec">
+          <div class="sec-hd">活动 <span class="grow"></span><span class="tag">全部</span></div>
+          <div class="sec-bd" style="padding:6px 12px">
+            <div class="timeline">
+              <div class="ev"><i class="dot2"></i><div class="txt"><b>AI 分析完成</b>，生成方案（431s）</div><span class="time">2h 前</span></div>
+              <div class="ev"><i class="dot2"></i><div class="txt">你发起了<b>开始分析</b></div><span class="time">2h 前</span></div>
+              <div class="ev"><i class="dot2"></i><div class="txt">工单从平台<b>同步</b>入列</div><span class="time">3h 前</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="palette">
+          <div class="ph"><b style="color:var(--t1)">命令面板</b><span>⌘K</span><span style="margin-left:auto">输入以搜索</span></div>
+          <div class="pi on"><span>⏎</span>通过当前方案<span class="k kbd">⌥⏎</span></div>
+          <div class="pi"><span>⌘J</span>跳到下一张需要我的工单<span class="k kbd">⌘J</span></div>
+          <div class="pi"><span>⟳</span>重新分析当前工单<span class="k kbd">⌘R</span></div>
+          <div class="pi"><span>⚙</span>打开设置<span class="k kbd">⌘,</span></div>
+        </div>
+      </div>
+
+      <div class="col-ai">
+        <div class="col-hd">活动 <span class="grow"></span><span style="color:var(--acc)">●</span></div>
+        <div class="ai-item"><b>AI 分析</b> · 431s<br><span style="color:var(--t3)">读取 12 个文件，产出 6 段方案</span><div><span class="ai-act">查看依据 →</span></div></div>
+        <div class="ai-item"><b>工单 648 修复完成</b> · 5m45s<br><span style="color:var(--t3)">7 文件 / +718 −22 · worktree 已就绪</span><div><span class="ai-act">打开 diff →</span></div></div>
+        <div class="ai-item"><b>MR !102 Review</b> · 1 阻塞<br><span style="color:var(--t3)">历史未收敛 2 条（非阻塞）</span><div><span class="ai-act">开始回修 →</span></div></div>
+        <div class="ai-item"><b>提示</b><br><span style="color:var(--t3)">连续 3 张工单都停留在「待审核」，试试 ⌘K → 批处理？</span></div>
+        <div class="cmdbar" style="border-top:1px solid var(--line);padding:8px 12px">
+          <span class="hint"><span class="kbd">⌘K</span>命令</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="notes">
+  <h3>风格 A · 指挥台 <span>高效率 · 键盘优先</span></h3>
+  <div class="row2">
+    <div class="col">
+      <ul>
+        <li><b>视觉</b>：深色底 + 青色状态光，信息密度最高；左侧 3px 状态轨替代大色块，扫描成本低。</li>
+        <li><b>信息架构</b>：列表按「需要你 / AI 处理中 / 等待外部」自动分组，每行直接给出<b>下一步动作</b>与耗时。</li>
+        <li><b>交互增强</b>：⌘K 命令面板、J/K 切换、⏎ 执行下一步、⌘J 跳到下一张待办、操作可撤销 Toast。</li>
+        <li><b>人性化</b>：「它等了多久」「它卡在哪」直接写在行内；批处理入口在需要你时出现。</li>
+      </ul>
+    </div>
+    <div class="col">
+      <ul>
+        <li><b>宽屏</b>：三栏（队列 / 详情 / 活动流），AI 活动与时间线常驻，不用来回切页面。</li>
+        <li><b>风险</b>：深色在 DSH 浅色主题下需要主题适配；信息密度高，新用户需要 1 次引导。</li>
+        <li><b>实现量</b>：中（新增命令面板 + 分组逻辑 + 快捷键层；不改状态机与接口）。</li>
+        <li><b>适合</b>：每天处理 10+ 工单、追求速度的重度用户。</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

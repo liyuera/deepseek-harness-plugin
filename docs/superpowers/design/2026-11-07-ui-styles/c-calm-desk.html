@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>C · 文档工作台 Calm Desk</title>
+<style>
+  :root{
+    --bg:#f7f5f0; --paper:#fffdf9; --ink:#22201c; --ink2:#57534b; --ink3:#8c867a; --rule:#e6e1d6; --rule2:#d6cfc0;
+    --accent:#2f6f5e; --accent-soft:rgba(47,111,94,.08); --amber:#a9741a; --red:#a4443a; --violet:#6b5b95;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --serif:"Songti SC","Noto Serif SC","Source Han Serif SC",Georgia,"PingFang SC",serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#ece8df;color:var(--ink);font:13px/1.7 "PingFang SC","Helvetica Neue",Arial,sans-serif;padding:28px;display:flex;gap:28px;align-items:flex-start;justify-content:center;flex-wrap:wrap}
+  .device{display:flex;flex-direction:column;gap:8px}
+  .device-label{font-size:11px;color:var(--ink3);letter-spacing:.4px;text-transform:uppercase}
+  .frame{border:1px solid var(--rule2);border-radius:6px;overflow:hidden;background:var(--paper);box-shadow:0 24px 50px rgba(60,50,30,.16)}
+  .narrow{width:430px;height:900px;display:flex;flex-direction:column}
+  .wide{width:980px;height:900px;display:flex;flex-direction:column}
+
+  .hdr{flex:0 0 auto;padding:16px 20px;border-bottom:1px solid var(--rule);display:flex;align-items:center;gap:10px;background:var(--paper)}
+  .mark{width:24px;height:24px;border:1px solid var(--ink2);border-radius:50%;display:grid;place-items:center;font-size:11px;color:var(--ink2)}
+  .title{font-family:var(--serif);font-size:15px;letter-spacing:.5px}
+  .sub{font-size:10.5px;color:var(--ink3);letter-spacing:.3px}
+  .grow{flex:1}
+  .icon-btn{width:26px;height:26px;border-radius:50%;border:1px solid var(--rule2);background:transparent;color:var(--ink2);display:grid;place-items:center;font-size:12px}
+  .zen{font-size:10.5px;color:var(--ink2);border:1px solid var(--rule2);border-radius:999px;padding:3px 9px}
+
+  .body{flex:1 1 auto;min-height:0;overflow-y:auto;padding:22px 24px 30px}
+  .kicker{font:10.5px var(--mono);color:var(--accent);letter-spacing:.6px;text-transform:uppercase}
+  h1{font-family:var(--serif);font-size:21px;line-height:1.4;font-weight:700;margin:6px 0 10px}
+  .meta{display:flex;gap:14px;font-size:11px;color:var(--ink3);flex-wrap:wrap;padding-bottom:12px;border-bottom:1px solid var(--rule)}
+  .meta b{color:var(--ink2);font-weight:500}
+  .lede{font-size:12.5px;color:var(--ink2);margin:14px 0 4px;line-height:1.8}
+  .section{margin-top:22px}
+  .section h2{font-family:var(--serif);font-size:14px;letter-spacing:.4px;display:flex;align-items:baseline;gap:8px}
+  .section h2 .no{font:10px var(--mono);color:var(--ink3)}
+  .section h2 .aside{margin-left:auto;font:10px var(--mono);color:var(--ink3)}
+  .rule{height:1px;background:var(--rule);margin:8px 0 10px}
+  .kv{display:grid;grid-template-columns:64px 1fr;gap:6px 12px;font-size:12px;color:var(--ink2)}
+  .kv .k{font-size:10.5px;color:var(--ink3);padding-top:2px}
+  .quote{border-left:2px solid var(--accent);padding:2px 0 2px 12px;color:var(--ink2);font-size:12.5px;margin:8px 0}
+  .files{display:flex;flex-direction:column;gap:3px;font:11px var(--mono);color:var(--ink2);margin-top:6px}
+  .files .m{color:var(--amber)} .files .a{color:var(--accent)}
+  .evidence{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+  .thumb{width:86px;height:62px;border:1px solid var(--rule2);border-radius:3px;background:
+    linear-gradient(135deg,#efece4 0 45%,#e3ded2 45% 55%,#efece4 55% 100%);position:relative}
+  .thumb::after{content:attr(data-l);position:absolute;left:6px;bottom:4px;font:9px var(--mono);color:var(--ink3)}
+  .record{display:flex;gap:10px;padding:8px 0;border-bottom:1px dashed var(--rule);font-size:12px;color:var(--ink2)}
+  .record .when{font:10px var(--mono);color:var(--ink3);flex:0 0 58px;padding-top:2px}
+  .record b{color:var(--ink);font-weight:600}
+  .foot-hint{font-size:10.5px;color:var(--ink3);margin-top:14px;font-style:italic}
+  .bar{flex:0 0 auto;border-top:1px solid var(--rule);background:var(--paper);padding:12px 20px;display:flex;align-items:center;gap:10px}
+  .bar .hint{font-size:10.5px;color:var(--ink3)}
+  .btn{font:inherit;font-size:12px;padding:7px 14px;border-radius:4px;border:1px solid var(--rule2);background:transparent;color:var(--ink);cursor:pointer}
+  .btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  .btn.quiet{border-color:transparent;color:var(--ink3)}
+
+  /* wide */
+  .wide-body{flex:1 1 auto;min-height:0;display:flex}
+  .outline{width:210px;flex:0 0 auto;border-right:1px solid var(--rule);padding:20px 14px;overflow-y:auto}
+  .outline .ot{font:10px var(--mono);color:var(--ink3);letter-spacing:.6px;text-transform:uppercase;margin-bottom:10px}
+  .outline a{display:block;font-size:11.5px;color:var(--ink2);text-decoration:none;padding:5px 8px;border-left:2px solid transparent;border-radius:0 3px 3px 0}
+  .outline a.on{color:var(--accent);border-left-color:var(--accent);background:var(--accent-soft)}
+  .outline .done{color:var(--ink3)}
+  .doc{flex:1 1 auto;min-width:0;overflow-y:auto;padding:26px 34px 40px}
+  .doc .page{max-width:620px;margin:0 auto}
+  .side{width:250px;flex:0 0 auto;border-left:1px solid var(--rule);padding:20px 16px;overflow-y:auto}
+  .side .st{font:10px var(--mono);color:var(--ink3);letter-spacing:.6px;text-transform:uppercase;margin:0 0 10px}
+  .step{display:flex;gap:8px;align-items:flex-start;padding:6px 0;font-size:11.5px;color:var(--ink3)}
+  .step i{width:7px;height:7px;border-radius:50%;border:1px solid var(--rule2);margin-top:5px;flex:0 0 auto}
+  .step.done i{background:var(--accent);border-color:var(--accent)}
+  .step.now{color:var(--ink)} .step.now i{background:var(--amber);border-color:var(--amber);box-shadow:0 0 0 3px rgba(169,116,26,.15)}
+  .side .note{margin-top:16px;border:1px solid var(--rule);border-radius:4px;padding:9px 10px;font-size:11px;color:var(--ink2);background:rgba(47,111,94,.04)}
+  .side .note b{display:block;font-family:var(--serif);font-size:12px;color:var(--ink);margin-bottom:3px}
+  .diff{border:1px solid var(--rule);border-radius:4px;font:10.5px/1.65 var(--mono);overflow:hidden;margin-top:8px}
+  .diff .h{background:#f2efe7;color:var(--ink3);padding:5px 9px;border-bottom:1px solid var(--rule)}
+  .diff .l{padding:1px 9px;white-space:pre-wrap}
+  .diff .add{background:rgba(47,111,94,.08);color:var(--accent)}
+  .diff .del{background:rgba(164,68,58,.07);color:var(--red)}
+  .approve{display:flex;gap:8px;margin-top:14px;align-items:center}
+  .approve .hint{font-size:10.5px;color:var(--ink3)}
+
+  .notes{border:1px solid var(--rule2);border-radius:6px;background:var(--paper);padding:18px 20px;max-width:760px;font-size:12px;color:var(--ink2);line-height:1.8}
+  .notes h3{font-family:var(--serif);font-size:14px;color:var(--ink);margin-bottom:8px;display:flex;align-items:center;gap:8px}
+  .notes h3 span{font:10px var(--mono);color:var(--violet);border:1px solid rgba(107,91,149,.35);border-radius:3px;padding:2px 6px}
+  .notes .row2{display:flex;gap:20px;flex-wrap:wrap}
+  .notes .col{flex:1;min-width:280px}
+  .notes ul{margin:0;padding-left:18px}
+  .notes li{margin:2px 0}
+  .notes b{color:var(--ink)}
+</style>
+</head>
+<body>
+
+<div class="device">
+  <div class="device-label">C · 文档工作台 · 右栏 430px（阅读 + 就地审核）</div>
+  <div class="frame narrow">
+    <div class="hdr">
+      <div class="mark">阅</div>
+      <div><div class="title">Bug 看板</div><div class="sub">像读一份文档一样处理工单</div></div>
+      <div class="grow"></div>
+      <span class="zen">专注</span>
+      <div class="icon-btn">☰</div>
+    </div>
+
+    <div class="body">
+      <div class="kicker">修复完成 · 待你测试</div>
+      <h1>新增工单导出 Excel 能力</h1>
+      <div class="meta"><span><b>YGFNXDJRFWDJSYJJYY-648</b></span><span>需求</span><span>V1.2.0</span><span>更新于 2 分钟前</span></div>
+
+      <p class="lede">AI 已按你批准的方案在独立工作树中完成修复，共改动 7 个文件。下面是方案、改动与测试依据——读完点「标记测试通过」即可进入提交。</p>
+
+      <div class="section">
+        <h2><span class="no">01</span>方案摘要<span class="aside">已批准</span></h2>
+        <div class="rule"></div>
+        <div class="kv">
+          <div class="k">根因</div><div>看板列表只有筛选与渲染，没有导出列模型与文件下载链路；宿主也缺少 xlsx 生成与导出路由。</div>
+          <div class="k">做法</div><div>客户端复用列表字段生成表格并请求宿主；宿主零依赖写出 SpreadsheetML（ZIP STORE），避免新增 npm 依赖。</div>
+          <div class="k">风险</div><div>下载策略可能被桌面端拦截 → 已内置失败横幅；Excel 兼容性需实际打开验证。</div>
+        </div>
+      </div>
+
+      <div class="section">
+        <h2><span class="no">02</span>改动<span class="aside">+718 −22</span></h2>
+        <div class="rule"></div>
+        <div class="files">
+          <div><span class="a">A</span> bug-workflow/src/host/xlsx.js <span style="color:var(--ink3)">新文件 · 生成 xlsx</span></div>
+          <div><span class="m">M</span> bug-workflow/src/host/routes.js <span style="color:var(--ink3)">/api/export</span></div>
+          <div><span class="m">M</span> bug-workflow/client.js <span style="color:var(--ink3)">导出按钮/下载</span></div>
+          <div><span class="m">M</span> bug-workflow/README.md</div>
+        </div>
+      </div>
+
+      <div class="section">
+        <h2><span class="no">03</span>测试与证据<span class="aside">AI 已跑</span></h2>
+        <div class="rule"></div>
+        <div class="record"><span class="when">12:34</span><div><b>全量单测 372/372 通过</b><br><span style="color:var(--ink3)">含新增 xlsx 9、路由 5、列契约 8</span></div></div>
+        <div class="record"><span class="when">12:36</span><div><b>openpyxl 打开生成文件成功</b><br><span style="color:var(--ink3)">表头/中文/公式注入/冻结首行校验通过</span></div></div>
+        <div class="evidence"><div class="thumb" data-l="表头截图"></div><div class="thumb" data-l="下载成功"></div><div class="thumb" data-l="窄栏布局"></div></div>
+        <div class="foot-hint">人工测试由你完成：打开看板 → 筛选 → 点「导出 Excel」。</div>
+      </div>
+    </div>
+
+    <div class="bar">
+      <span class="hint">已读到最后 · 下一步</span>
+      <div class="grow"></div>
+      <button class="btn quiet">查看 diff</button>
+      <button class="btn primary">标记测试通过</button>
+    </div>
+  </div>
+</div>
+
+<div class="device">
+  <div class="device-label">C · 文档工作台 · 宽屏 980px（大纲 + 文档 + 步骤/证据侧栏）</div>
+  <div class="frame wide">
+    <div class="hdr">
+      <div class="mark">阅</div>
+      <div><div class="title">Bug 看板 · 工单阅读</div><div class="sub">星瞰河山一体化平台</div></div>
+      <div class="grow"></div>
+      <span class="zen">专注模式</span>
+      <div class="icon-btn">☰</div>
+      <div class="icon-btn">⚙</div>
+    </div>
+
+    <div class="wide-body">
+      <div class="outline">
+        <div class="ot">队列 · 8</div>
+        <a class="done" href="#">HTSMART-12 · 权限中心…</a>
+        <a class="on" href="#">…-648 · 新增工单导出…</a>
+        <a href="#">P1-E2E-2 · 支付回调…</a>
+        <a href="#">…-647 · 登录页验证码…</a>
+        <a href="#">HTSMART-15 · 结算单批量…</a>
+        <a class="done" href="#">HTSMART-18 · 工作台公告…</a>
+        <div class="ot" style="margin-top:20px">本页目录</div>
+        <a href="#">方案摘要</a>
+        <a href="#">改动文件</a>
+        <a href="#">测试与证据</a>
+        <a href="#">活动记录</a>
+      </div>
+
+      <div class="doc">
+        <div class="page">
+          <div class="kicker">修复完成 · 待人工测试 · 2026-11-07 12:36</div>
+          <h1>新增工单导出 Excel 能力</h1>
+          <div class="meta"><span><b>YGFNXDJRFWDJSYJJYY-648</b></span><span>需求</span><span>V1.2.0</span><span>来源：星瞰河山平台 ↗</span></div>
+          <p class="lede">AI 按已批准方案在独立工作树完成修复。人工测试通过后，插件会按团队提交模板提交、推送个人分支并创建 MR。</p>
+
+          <div class="section">
+            <h2><span class="no">01</span>方案摘要<span class="aside">你于 11-06 23:25 批准</span></h2>
+            <div class="rule"></div>
+            <div class="kv">
+              <div class="k">根因</div><div>列表只有筛选与渲染，没有导出列模型；宿主无 xlsx 生成/导出路由。</div>
+              <div class="k">做法</div><div>客户端复用列表字段生成二维表 → POST 导出接口；宿主零依赖写 SpreadsheetML，inlineStr 防公式注入。</div>
+              <div class="k">影响</div><div>看板列表、宿主路由、README；不动状态机与 domain。</div>
+            </div>
+            <div class="diff">
+              <div class="h">bug-workflow/client.js · 导出入口</div>
+              <div class="l add">+ const EXPORT_COLUMNS = ['编号','标题','来源', …]</div>
+              <div class="l add">+ async function requestBlob(url, body) { … }</div>
+              <div class="l del">- // 列表统计行（原实现）</div>
+              <div class="l add">+ &lt;button onClick={exportExcel}&gt;导出 Excel&lt;/button&gt;</div>
+            </div>
+          </div>
+
+          <div class="section">
+            <h2><span class="no">02</span>测试与证据<span class="aside">2 项 AI 已验证</span></h2>
+            <div class="rule"></div>
+            <div class="record"><span class="when">12:34</span><div><b>全量单测 372/372</b> · 新增 xlsx 9 / 路由 5 / 列契约 8</div></div>
+            <div class="record"><span class="when">12:36</span><div><b>openpyxl 打开通过</b> · 表头、中文、公式注入、冻结首行</div></div>
+            <div class="evidence"><div class="thumb" data-l="表头"></div><div class="thumb" data-l="中文"></div><div class="thumb" data-l="窄栏"></div><div class="thumb" data-l="下载"></div></div>
+            <div class="approve">
+              <button class="btn primary">标记测试通过</button>
+              <button class="btn">标记为未通过…</button>
+              <span class="hint">⌘⏎ 通过 · ⌘⇧B 阻塞</span>
+            </div>
+          </div>
+
+          <div class="section">
+            <h2><span class="no">03</span>活动记录</h2>
+            <div class="rule"></div>
+            <div class="record"><span class="when">12:36</span><div>AI 修复完成 · 7 文件 · 5m45s · <span style="color:var(--ink3)">worktree .dsh-worktrees/…-648</span></div></div>
+            <div class="record"><span class="when">11-06</span><div>方案通过，进入修复</div></div>
+            <div class="record"><span class="when">11-06</span><div>AI 分析完成（431s）</div></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="side">
+        <div class="st">流程</div>
+        <div class="step done"><i></i><span>同步</span></div>
+        <div class="step done"><i></i><span>分析</span></div>
+        <div class="step done"><i></i><span>方案审核</span></div>
+        <div class="step done"><i></i><span>修复</span></div>
+        <div class="step now"><i></i><span>人工测试 ← 你在这里</span></div>
+        <div class="step"><i></i><span>提交 / MR</span></div>
+        <div class="step"><i></i><span>AI Review</span></div>
+        <div class="step"><i></i><span>合并归档</span></div>
+        <div class="note"><b>下一步会怎样？</b>标记通过 → 插件跑 lint/test → 提交并推送 <code style="font:10.5px var(--mono)">feat-V1.2.0-ly</code> → 创建 MR（目标 <code style="font:10.5px var(--mono)">feature-V1.2.0</code>）。</div>
+        <div class="note"><b>阅读时长</b>约 1 分 30 秒 · 上次读到「测试与证据」</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="notes">
+  <h3>风格 C · 文档工作台 <span>低压力 · 阅读优先</span></h3>
+  <div class="row2">
+    <div class="col">
+      <ul>
+        <li><b>视觉</b>：纸感米白 + 衬线标题 + 细线分隔；无边框卡片、无表格，信息像文档一样可读。</li>
+        <li><b>信息架构</b>：工单 = 一份文档（摘要 → 改动 → 证据 → 活动），大纲与流程常驻侧栏；窄栏用章节堆叠。</li>
+        <li><b>交互增强</b>：就地审核（读完点通过）、diff 内联展开、证据缩略图灯箱、专注模式、⌘⏎/⌘⇧B 快捷键、阅读位置记忆。</li>
+        <li><b>人性化</b>：先给「下一步会怎样」再让你操作；风险/人工测试要点直接写在文末；不制造红黄绿焦虑色块。</li>
+      </ul>
+    </div>
+    <div class="col">
+      <ul>
+        <li><b>宽屏</b>：三栏（队列大纲 / 文档 / 流程&提示），适合逐张深读、评审投屏。</li>
+        <li><b>风险</b>：列表总数多时大纲信息密度低；需要额外提供「紧凑列表」切换；衬线字体依赖系统字体。</li>
+        <li><b>实现量</b>：中（主要重组布局与排版；diff 预览复用现有 diff 字段）。</li>
+        <li><b>适合</b>：审核/测试为主、需要认真读方案与改动的用户。</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

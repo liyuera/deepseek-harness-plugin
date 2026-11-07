@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>B · 泳道 Flow Lanes</title>
+<style>
+  :root{
+    --bg:#f5f7fa; --paper:#ffffff; --line:#e6eaf0; --line2:#d4dae3;
+    --t1:#1c2430; --t2:#5b6676; --t3:#8b97a8;
+    --blue:#3b6cf6; --violet:#7a5cf0; --teal:#0ea5a5; --amber:#e0930c; --green:#16a34a; --red:#e0484b;
+    --shadow:0 1px 2px rgba(20,30,50,.05),0 8px 22px rgba(20,30,50,.06);
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#eef1f6;color:var(--t1);font:13px/1.55 "PingFang SC","Helvetica Neue",Arial,sans-serif;padding:28px;display:flex;gap:28px;align-items:flex-start;justify-content:center;flex-wrap:wrap}
+  .device{display:flex;flex-direction:column;gap:8px}
+  .device-label{font-size:11px;color:var(--t3);letter-spacing:.4px;text-transform:uppercase}
+  .frame{border:1px solid var(--line2);border-radius:16px;overflow:hidden;background:var(--bg);box-shadow:0 24px 55px rgba(20,30,50,.14)}
+  .narrow{width:430px;height:900px;display:flex;flex-direction:column}
+  .wide{width:1180px;height:900px;display:flex;flex-direction:column}
+
+  .hdr{flex:0 0 auto;padding:14px 16px;background:var(--paper);border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px}
+  .logo{width:26px;height:26px;border-radius:8px;background:linear-gradient(135deg,#5b8cff,#3b6cf6);display:grid;place-items:center;color:#fff;font-weight:800;font-size:12px}
+  .title{font-size:14px;font-weight:700}
+  .sub{font-size:11px;color:var(--t3)}
+  .grow{flex:1}
+  .icon-btn{width:28px;height:28px;border-radius:8px;border:1px solid var(--line);background:var(--paper);color:var(--t2);display:grid;place-items:center;font-size:13px}
+  .sync{font-size:10.5px;color:var(--teal);background:rgba(14,165,165,.08);border:1px solid rgba(14,165,165,.22);border-radius:999px;padding:3px 8px}
+
+  /* lane overview */
+  .overview{flex:0 0 auto;background:var(--paper);border-bottom:1px solid var(--line);padding:10px 14px;display:flex;gap:6px;align-items:center;overflow-x:auto}
+  .ov{flex:0 0 auto;display:flex;align-items:center;gap:6px;font-size:10.5px;color:var(--t2);border:1px solid var(--line);border-radius:999px;padding:4px 8px;background:var(--bg)}
+  .ov i{width:6px;height:6px;border-radius:50%;background:var(--t3)}
+  .ov b{color:var(--t1)}
+  .ov.on{border-color:rgba(59,108,246,.35);background:rgba(59,108,246,.07);color:var(--blue)}
+
+  .content{flex:1 1 auto;min-height:0;overflow-y:auto;padding:12px 12px 18px}
+  .lane{margin-bottom:14px}
+  .lane-hd{display:flex;align-items:center;gap:8px;padding:0 4px 7px;font-size:12px;font-weight:700;color:var(--t1)}
+  .lane-hd .bar{width:4px;height:14px;border-radius:3px;background:var(--t3)}
+  .lane-hd .cnt{font-size:10.5px;color:var(--t3);font-weight:500;border:1px solid var(--line);border-radius:999px;padding:1px 7px;background:var(--paper)}
+  .lane-hd .wip{margin-left:auto;font-size:10px;color:var(--t3);font-weight:400}
+  .lane-hd .hint{font-size:10px;color:var(--t3);font-weight:400}
+  .card{background:var(--paper);border:1px solid var(--line);border-radius:12px;padding:10px 11px;box-shadow:var(--shadow);margin:6px 0;position:relative}
+  .card:hover{border-color:#c3cede;transform:translateY(-1px);transition:.15s}
+  .card .top{display:flex;align-items:center;gap:6px}
+  .code{font:10.5px var(--mono);color:var(--t3)}
+  .type{font-size:9.5px;padding:1px 5px;border-radius:4px;background:var(--bg);color:var(--t2);border:1px solid var(--line)}
+  .card .ttl{font-size:12.5px;font-weight:600;margin-top:4px;line-height:1.45}
+  .card .row{display:flex;align-items:center;gap:6px;margin-top:7px;font-size:10.5px;color:var(--t3);flex-wrap:wrap}
+  .who{display:inline-flex;align-items:center;gap:4px}
+  .av{width:14px;height:14px;border-radius:50%;background:#dfe6f2;color:var(--t2);font-size:8px;display:grid;place-items:center;font-weight:700}
+  .av.ai{background:rgba(59,108,246,.12);color:var(--blue)}
+  .tag{font-size:10px;border-radius:5px;padding:1px 6px;border:1px solid}
+  .t-wait{color:var(--amber);border-color:rgba(224,147,12,.3);background:rgba(224,147,12,.07)}
+  .t-run{color:var(--blue);border-color:rgba(59,108,246,.3);background:rgba(59,108,246,.07)}
+  .t-ok{color:var(--green);border-color:rgba(22,163,74,.3);background:rgba(22,163,74,.07)}
+  .t-bad{color:var(--red);border-color:rgba(224,72,75,.3);background:rgba(224,72,75,.07)}
+  .t-mute{color:var(--t2);border-color:var(--line);background:var(--bg)}
+  .pulse{display:inline-flex;gap:4px;align-items:center;color:var(--blue);font-size:10px}
+  .pulse i{width:5px;height:5px;border-radius:50%;background:var(--blue);animation:p 1.4s infinite}
+  .pulse i:nth-child(2){animation-delay:.2s}.pulse i:nth-child(3){animation-delay:.4s}
+  @keyframes p{0%,100%{opacity:.25;transform:translateY(0)}50%{opacity:1;transform:translateY(-1px)}}
+  .card.fixed{border-left:3px solid var(--blue)}
+  .card.done{border-left:3px solid var(--green)}
+  .card.wait{border-left:3px solid var(--amber)}
+  .card.blocked{border-left:3px solid var(--red)}
+  .drag{position:absolute;right:8px;top:8px;color:#c3cede;font-size:13px;cursor:grab}
+
+  /* wide lanes */
+  .lanes{flex:1 1 auto;min-height:0;display:flex;gap:8px;overflow-x:auto;padding:14px}
+  .col{width:152px;flex:0 0 auto;display:flex;flex-direction:column;min-height:0}
+  .col-hd{flex:0 0 auto;display:flex;align-items:center;gap:7px;padding:0 2px 8px;font-size:11.5px;font-weight:700}
+  .col-hd .bar{width:4px;height:13px;border-radius:3px}
+  .col-hd .cnt{font-size:10px;color:var(--t3);border:1px solid var(--line);border-radius:999px;padding:1px 6px;background:var(--paper)}
+  .col-hd .wip{margin-left:auto;font-size:9.5px;color:var(--t3)}
+  .col-body{flex:1 1 auto;min-height:0;overflow-y:auto;background:rgba(255,255,255,.45);border:1px dashed var(--line2);border-radius:12px;padding:5px}
+  .col.hot .col-body{background:rgba(224,147,12,.05);border-color:rgba(224,147,12,.3)}
+  .empty{font-size:10.5px;color:var(--t3);text-align:center;padding:16px 6px;line-height:1.6}
+
+  /* detail drawer */
+  .drawer{flex:0 0 auto;background:var(--paper);border-top:1px solid var(--line);padding:12px 16px;display:flex;gap:16px;align-items:flex-start}
+  .d-main{flex:1;min-width:0}
+  .d-code{font:10.5px var(--mono);color:var(--blue)}
+  .d-ttl{font-size:14px;font-weight:700;margin-top:3px}
+  .d-meta{display:flex;gap:12px;font-size:10.5px;color:var(--t3);margin-top:6px;flex-wrap:wrap}
+  .d-meta b{color:var(--t2);font-weight:500}
+  .steps{display:flex;gap:4px;align-items:center;margin-top:9px;flex-wrap:wrap}
+  .step{font-size:10px;color:var(--t3);border:1px solid var(--line);border-radius:999px;padding:2px 7px;background:var(--bg)}
+  .step.done{color:var(--green);border-color:rgba(22,163,74,.3);background:rgba(22,163,74,.06)}
+  .step.now{color:#fff;background:var(--blue);border-color:var(--blue)}
+  .d-right{flex:0 0 auto;display:flex;flex-direction:column;gap:6px;align-items:flex-end}
+  .btn{font:inherit;font-size:11.5px;padding:6px 12px;border-radius:8px;border:1px solid var(--line2);background:var(--paper);color:var(--t1);cursor:pointer}
+  .btn.primary{background:var(--blue);border-color:var(--blue);color:#fff;font-weight:600}
+  .next-hint{font-size:10.5px;color:var(--t3);text-align:right;line-height:1.5}
+
+  .notes{border:1px solid var(--line2);border-radius:16px;background:var(--paper);padding:16px 18px;max-width:760px;font-size:12px;color:var(--t2);line-height:1.75}
+  .notes h3{font-size:13px;color:var(--t1);margin-bottom:8px;display:flex;align-items:center;gap:8px}
+  .notes h3 span{font-size:10px;color:var(--violet);border:1px solid rgba(122,92,240,.35);border-radius:5px;padding:2px 6px}
+  .notes .row2{display:flex;gap:18px;flex-wrap:wrap}
+  .notes .col{flex:1;min-width:280px}
+  .notes ul{margin:0;padding-left:18px}
+  .notes li{margin:2px 0}
+  .notes b{color:var(--t1)}
+</style>
+</head>
+<body>
+
+<div class="device">
+  <div class="device-label">B · 泳道 · 右栏 430px（阶段堆叠 + 卡片流）</div>
+  <div class="frame narrow">
+    <div class="hdr">
+      <div class="logo">B</div>
+      <div><div class="title">Bug 看板</div><div class="sub">工单沿着流程走，卡在哪一眼看到</div></div>
+      <div class="grow"></div>
+      <span class="sync">已同步</span>
+      <div class="icon-btn">⚙</div>
+    </div>
+
+    <div class="overview">
+      <span class="ov"><i style="background:var(--t3)"></i>草稿 <b>1</b></span>
+      <span class="ov on"><i style="background:var(--violet)"></i>分析 <b>1</b></span>
+      <span class="ov"><i style="background:var(--amber)"></i>方案 <b>1</b></span>
+      <span class="ov"><i style="background:var(--blue)"></i>修复 <b>1</b></span>
+      <span class="ov"><i style="background:var(--teal)"></i>测试 <b>1</b></span>
+      <span class="ov"><i style="background:var(--violet)"></i>Review <b>1</b></span>
+      <span class="ov"><i style="background:var(--green)"></i>合并 <b>1</b></span>
+    </div>
+
+    <div class="content">
+      <div class="lane">
+        <div class="lane-hd"><span class="bar" style="background:var(--amber)"></span>方案待审<span class="cnt">1</span><span class="wip">下一步由你决定</span></div>
+        <div class="card wait">
+          <div class="top"><span class="code">HTSMART-12</span><span class="type">任务</span><span style="margin-left:auto" class="tag t-wait">等你审核</span></div>
+          <div class="ttl">权限中心批量授权后列表未刷新</div>
+          <div class="row"><span class="who">方案 6 段 · 3 文件</span><span>·</span><span>等了 2 小时</span></div>
+          <div class="row"><span class="tag t-mute">V2.0.0</span><span style="color:var(--t3)">通过后自动进入修复</span></div>
+          <span class="drag">⠿</span>
+        </div>
+      </div>
+
+      <div class="lane">
+        <div class="lane-hd"><span class="bar" style="background:var(--blue)"></span>修复中<span class="cnt">1</span><span class="pulse" style="margin-left:auto"><i></i><i></i><i></i>AI 运行中</span></div>
+        <div class="card fixed">
+          <div class="top"><span class="code">YGFNXDJRFWDJSYJJYY-647</span><span class="type">故障</span><span style="margin-left:auto" class="tag t-run">已 2m18s</span></div>
+          <div class="ttl">登录页验证码偶发失败</div>
+          <div class="row"><span class="who"><span class="av ai">AI</span>修复子代理</span><span>·</span><span>worktree feat-hot-V1.2.0-ly</span></div>
+          <div class="row"><span class="tag t-mute">预计 ≤15 分钟</span><span style="color:var(--t3)">你可以先处理别的</span></div>
+          <span class="drag">⠿</span>
+        </div>
+      </div>
+
+      <div class="lane">
+        <div class="lane-hd"><span class="bar" style="background:var(--teal)"></span>待人工测试<span class="cnt">1</span><span class="wip">修复完成</span></div>
+        <div class="card done">
+          <div class="top"><span class="code">…-648</span><span class="type">需求</span><span style="margin-left:auto" class="tag t-ok">可以测试</span></div>
+          <div class="ttl">新增工单导出 Excel 能力</div>
+          <div class="row"><span>7 文件 · +718 −22</span><span>·</span><span>修复 5m45s</span></div>
+          <div class="row"><span class="tag t-mute">worktree 已就绪</span><span style="color:var(--t3)">点开看 diff 与测试结果</span></div>
+          <span class="drag">⠿</span>
+        </div>
+      </div>
+
+      <div class="lane">
+        <div class="lane-hd"><span class="bar" style="background:var(--violet)"></span>Review 中<span class="cnt">1</span><span class="wip">60s 自动检查</span></div>
+        <div class="card blocked">
+          <div class="top"><span class="code">P1-E2E-2</span><span class="type">缺陷</span><span style="margin-left:auto" class="tag t-bad">1 阻塞</span></div>
+          <div class="ttl">支付回调重复入账（幂等键缺失）</div>
+          <div class="row"><span>MR !102</span><span>·</span><span>轮次 1/3</span></div>
+          <div class="row"><span class="tag t-run">AI 将自动回修</span><span style="color:var(--t3)">无需操作</span></div>
+          <span class="drag">⠿</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="device">
+  <div class="device-label">B · 泳道 · 宽屏 1180px（横向泳道 + 底部详情抽屉）</div>
+  <div class="frame wide">
+    <div class="hdr">
+      <div class="logo">B</div>
+      <div><div class="title">Bug 看板</div><div class="sub">星瞰河山一体化平台 · 拖拽卡片可推进状态（受控）</div></div>
+      <div class="grow"></div>
+      <span class="sync">已同步 2 分钟前</span>
+      <div class="icon-btn">⚙</div>
+    </div>
+
+    <div class="lanes">
+      <div class="col">
+        <div class="col-hd"><span class="bar" style="background:var(--t3)"></span>草稿<span class="cnt">2</span><span class="wip">WIP 3</span></div>
+        <div class="col-body">
+          <div class="card">
+            <div class="top"><span class="code">DEMO-1</span><span class="type">缺陷</span></div>
+            <div class="ttl">演示工单：导出按钮窄栏换行</div>
+            <div class="row"><span class="tag t-mute">未开始</span><span>等待分析</span></div>
+          </div>
+          <div class="card">
+            <div class="top"><span class="code">DEMO-SEC-1</span><span class="type">任务</span></div>
+            <div class="ttl">安全巡检：登录设备指纹</div>
+            <div class="row"><span class="tag t-mute">未开始</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="col">
+        <div class="col-hd"><span class="bar" style="background:var(--violet)"></span>分析中<span class="cnt">1</span></div>
+        <div class="col-body">
+          <div class="card fixed">
+            <div class="top"><span class="code">YGFNXDJRFWDJSYJJYY-647</span><span class="type">故障</span></div>
+            <div class="ttl">登录页验证码偶发失败</div>
+            <div class="row"><span class="pulse"><i></i><i></i><i></i>AI 分析中</span><span>已 38s</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="col hot">
+        <div class="col-hd"><span class="bar" style="background:var(--amber)"></span>方案待审<span class="cnt">1</span><span class="wip">等你</span></div>
+        <div class="col-body">
+          <div class="card wait">
+            <div class="top"><span class="code">HTSMART-12</span><span class="type">任务</span></div>
+            <div class="ttl">权限中心批量授权后列表未刷新</div>
+            <div class="row"><span class="tag t-wait">等你审核</span><span>等了 2 小时</span></div>
+            <div class="row"><span class="tag t-mute">V2.0.0</span><span>3 文件</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="col">
+        <div class="col-hd"><span class="bar" style="background:var(--blue)"></span>修复中<span class="cnt">1</span></div>
+        <div class="col-body">
+          <div class="card fixed">
+            <div class="top"><span class="code">HTSMART-21</span><span class="type">需求</span></div>
+            <div class="ttl">批量导入模板下载失败</div>
+            <div class="row"><span class="pulse"><i></i><i></i><i></i>AI 修复中</span><span>已 4m02s</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="col">
+        <div class="col-hd"><span class="bar" style="background:var(--teal)"></span>待人工测试<span class="cnt">1</span></div>
+        <div class="col-body">
+          <div class="card done">
+            <div class="top"><span class="code">…-648</span><span class="type">需求</span></div>
+            <div class="ttl">新增工单导出 Excel 能力</div>
+            <div class="row"><span class="tag t-ok">可以测试</span><span>7 文件</span></div>
+            <div class="row"><span class="who"><span class="av">李</span>需要你</span><span>·</span><span>等你 26m</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="col">
+        <div class="col-hd"><span class="bar" style="background:var(--violet)"></span>Review 中<span class="cnt">1</span></div>
+        <div class="col-body">
+          <div class="card blocked">
+            <div class="top"><span class="code">P1-E2E-2</span><span class="type">缺陷</span></div>
+            <div class="ttl">支付回调重复入账</div>
+            <div class="row"><span class="tag t-bad">1 阻塞</span><span>轮次 1/3</span></div>
+            <div class="row"><span class="tag t-run">AI 回修中</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="col">
+        <div class="col-hd"><span class="bar" style="background:var(--green)"></span>等你合并<span class="cnt">1</span></div>
+        <div class="col-body">
+          <div class="card done">
+            <div class="top"><span class="code">HTSMART-18</span><span class="type">需求</span></div>
+            <div class="ttl">工作台公告支持置顶</div>
+            <div class="row"><span class="tag t-ok">AI Review 通过</span><span>MR !105</span></div>
+            <div class="row"><span style="color:var(--t3)">插件不会自动合并</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="drawer">
+      <div class="d-main">
+        <div class="d-code">HTSMART-12 · 任务 · V2.0.0 · 星瞰河山平台</div>
+        <div class="d-ttl">权限中心批量授权后列表未刷新</div>
+        <div class="d-meta"><span>负责人 <b>李昱</b></span><span>优先级 <b>中</b></span><span>等了 <b>2 小时</b></span><span>方案 <b>6 段 / 3 文件</b></span></div>
+        <div class="steps">
+          <span class="step done">同步</span><span class="step done">分析</span><span class="step now">方案待审</span><span class="step">修复</span><span class="step">人工测试</span><span class="step">MR</span><span class="step">Review</span><span class="step">合并</span>
+        </div>
+      </div>
+      <div class="d-right">
+        <div style="display:flex;gap:6px"><button class="btn">查看方案</button><button class="btn primary">通过方案</button><button class="btn">驳回…</button></div>
+        <div class="next-hint">通过后自动开始修复（独立 worktree）<br>拖动卡片也可推进，但会被状态机校验</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="notes">
+  <h3>风格 B · 流程泳道 <span>状态可视化 · 引导式推进</span></h3>
+  <div class="row2">
+    <div class="col">
+      <ul>
+        <li><b>视觉</b>：浅色卡片 + 阶段色条；「人在等你」的泳道高亮（琥珀色背景），AI 运行中用脉冲点。</li>
+        <li><b>信息架构</b>：横向泳道对应真实状态机；窄栏自动降级为「阶段分组 + 卡片流」，不丢信息。</li>
+        <li><b>交互增强</b>：卡片可拖拽推进（宿主状态机二次校验，非法即回弹并提示原因）、WIP 上限提示、底部详情抽屉不遮挡泳道。</li>
+        <li><b>人性化</b>：每张卡写明「卡在哪/等谁/等了多久/下一步会怎样」；进度步骤条让新手知道自己在第几步。</li>
+      </ul>
+    </div>
+    <div class="col">
+      <ul>
+        <li><b>宽屏</b>：7 条泳道全览，横向滚动 + 底部抽屉；适合站会/评审投屏。</li>
+        <li><b>风险</b>：泳道宽度多（12 状态）→ 需要合并展示（如「交付中」聚合 submitting/mr_open），需在实现时定义泳道映射。</li>
+        <li><b>实现量</b>：中偏高（拖拽 + 抽屉 + 泳道映射）；窄栏与宽栏两套布局。</li>
+        <li><b>适合</b>：需要向团队解释流程、喜欢「一眼看全局」的用户。</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

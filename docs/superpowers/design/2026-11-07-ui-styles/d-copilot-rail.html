@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>D · AI 副驾 Copilot Rail</title>
+<style>
+  :root{
+    --bg:#f6f7fb; --paper:#ffffff; --line:#e7e9f2; --line2:#d9dcea;
+    --t1:#1b1d2a; --t2:#5a5f75; --t3:#8a8fa6;
+    --indigo:#5b5bd6; --indigo-soft:#eeeefb; --cyan:#0e9aa7; --amber:#c47f13; --red:#cf4b4b; --green:#1f9d63;
+    --shadow:0 1px 2px rgba(30,30,60,.04),0 10px 28px rgba(30,30,60,.07);
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#ebedf5;color:var(--t1);font:13px/1.55 "PingFang SC","Helvetica Neue",Arial,sans-serif;padding:28px;display:flex;gap:28px;align-items:flex-start;justify-content:center;flex-wrap:wrap}
+  .device{display:flex;flex-direction:column;gap:8px}
+  .device-label{font-size:11px;color:var(--t3);letter-spacing:.4px;text-transform:uppercase}
+  .frame{border:1px solid var(--line2);border-radius:18px;overflow:hidden;background:var(--bg);box-shadow:0 24px 55px rgba(30,30,60,.16)}
+  .narrow{width:430px;height:900px;display:flex;flex-direction:column}
+  .wide{width:980px;height:900px;display:flex;flex-direction:column}
+
+  .hdr{flex:0 0 auto;padding:14px 16px;background:var(--paper);border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px}
+  .logo{width:26px;height:26px;border-radius:9px;background:linear-gradient(135deg,#7b7bf0,#5b5bd6);display:grid;place-items:center;color:#fff;font-size:12px;font-weight:800}
+  .title{font-size:14px;font-weight:700}
+  .sub{font-size:11px;color:var(--t3)}
+  .grow{flex:1}
+  .icon-btn{width:28px;height:28px;border-radius:9px;border:1px solid var(--line);background:var(--paper);color:var(--t2);display:grid;place-items:center;font-size:13px}
+  .ai-badge{display:inline-flex;align-items:center;gap:5px;font-size:10.5px;color:var(--indigo);background:var(--indigo-soft);border:1px solid rgba(91,91,214,.22);border-radius:999px;padding:3px 8px}
+
+  /* suggestion cards */
+  .ask{padding:12px 14px 4px}
+  .ask h4{font-size:11px;color:var(--t3);letter-spacing:.4px;margin-bottom:7px;font-weight:600}
+  .sugg{display:flex;gap:9px;align-items:flex-start;background:var(--paper);border:1px solid var(--line);border-radius:12px;padding:10px 12px;box-shadow:var(--shadow);margin-bottom:8px}
+  .sugg .ico{width:22px;height:22px;border-radius:7px;background:var(--indigo-soft);display:grid;place-items:center;font-size:11px;flex:0 0 auto}
+  .sugg .tx{flex:1;font-size:12px;line-height:1.55;color:var(--t2)}
+  .sugg .tx b{color:var(--t1)}
+  .sugg .go{font-size:10.5px;color:var(--indigo);font-weight:600;white-space:nowrap;padding-top:1px}
+  .sugg .meta{font-size:10px;color:var(--t3);margin-top:2px}
+
+  /* list */
+  .list{flex:1 1 auto;min-height:0;overflow-y:auto;padding:4px 12px 12px}
+  .row{display:flex;gap:10px;align-items:center;background:var(--paper);border:1px solid var(--line);border-radius:12px;padding:10px 12px;margin:6px 0;cursor:pointer}
+  .row:hover{border-color:#c9cbe8}
+  .row.sel{border-color:rgba(91,91,214,.4);box-shadow:0 0 0 3px rgba(91,91,214,.08)}
+  .st{width:8px;height:8px;border-radius:50%;flex:0 0 auto}
+  .s-run{background:var(--indigo);box-shadow:0 0 0 4px rgba(91,91,214,.12);animation:pl 1.6s infinite}
+  .s-wait{background:var(--amber)} .s-ok{background:var(--green)} .s-bad{background:var(--red)} .s-idle{background:var(--t3)}
+  @keyframes pl{0%,100%{opacity:1}50%{opacity:.35}}
+  .row .main{flex:1;min-width:0}
+  .code{font:10px var(--mono);color:var(--t3)}
+  .ttl{font-size:12.5px;font-weight:600;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .meta{font-size:10.5px;color:var(--t3);margin-top:3px}
+  .chip{font-size:10px;border-radius:6px;padding:2px 7px;border:1px solid var(--line);background:var(--bg);color:var(--t2);white-space:nowrap}
+  .c-wait{color:var(--amber);border-color:rgba(196,127,19,.3);background:rgba(196,127,19,.07)}
+  .c-run{color:var(--indigo);border-color:rgba(91,91,214,.3);background:var(--indigo-soft)}
+  .c-ok{color:var(--green);border-color:rgba(31,157,99,.3);background:rgba(31,157,99,.07)}
+  .c-bad{color:var(--red);border-color:rgba(207,75,75,.3);background:rgba(207,75,75,.07)}
+
+  /* AI dock */
+  .dock{flex:0 0 auto;background:var(--paper);border-top:1px solid var(--line);padding:10px 12px 12px}
+  .dock .ai-act{display:flex;gap:7px;align-items:center;font-size:10.5px;color:var(--t3);margin-bottom:7px}
+  .dock .ai-act b{color:var(--indigo);font-weight:600}
+  .input{display:flex;align-items:center;gap:8px;border:1px solid var(--line2);border-radius:12px;padding:8px 10px;background:var(--bg)}
+  .input .ph{flex:1;font-size:11.5px;color:var(--t3)}
+  .input .send{width:24px;height:24px;border-radius:8px;background:var(--indigo);color:#fff;display:grid;place-items:center;font-size:12px}
+  .quick{display:flex;gap:6px;margin-top:7px;flex-wrap:wrap}
+  .quick span{font-size:10px;color:var(--t2);border:1px solid var(--line);background:var(--bg);border-radius:999px;padding:3px 8px}
+
+  /* wide layout */
+  .wide-body{flex:1 1 auto;min-height:0;display:flex}
+  .col-board{width:250px;flex:0 0 auto;border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0;background:var(--bg)}
+  .col-detail{flex:1 1 auto;min-width:0;overflow-y:auto;padding:18px 20px;background:rgba(255,255,255,.55)}
+  .col-ai{width:300px;flex:0 0 auto;border-left:1px solid var(--line);background:var(--paper);display:flex;flex-direction:column;min-height:0}
+  .chd{flex:0 0 auto;padding:11px 14px;border-bottom:1px solid var(--line);font-size:10.5px;color:var(--t3);letter-spacing:.5px;text-transform:uppercase;display:flex;align-items:center;gap:8px}
+  .chd .grow{flex:1}
+
+  .d-code{font:10px var(--mono);color:var(--indigo)}
+  .d-title{font-size:16px;font-weight:700;margin-top:4px;line-height:1.4}
+  .d-meta{display:flex;gap:12px;font-size:10.5px;color:var(--t3);margin-top:6px;flex-wrap:wrap}
+  .d-meta b{color:var(--t2);font-weight:500}
+  .card{background:var(--paper);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);margin-top:14px;overflow:hidden}
+  .card .hd{padding:10px 13px;border-bottom:1px solid var(--line);font-size:12px;font-weight:600;display:flex;align-items:center;gap:8px}
+  .card .hd .grow{flex:1}
+  .card .hd .tag{font:10px var(--mono);color:var(--t3);border:1px solid var(--line);border-radius:5px;padding:1px 6px}
+  .card .bd{padding:12px 13px;font-size:12px;color:var(--t2);line-height:1.7}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .cell{border:1px solid var(--line);border-radius:9px;padding:8px 10px;background:var(--bg)}
+  .cell .k{font-size:9.5px;color:var(--t3);margin-bottom:2px}
+  .cell .v{font-size:11.5px;color:var(--t1)}
+  .actions{display:flex;gap:8px;margin-top:12px}
+  .btn{font:inherit;font-size:11.5px;padding:7px 13px;border-radius:10px;border:1px solid var(--line2);background:var(--paper);color:var(--t1);cursor:pointer}
+  .btn.primary{background:var(--indigo);border-color:var(--indigo);color:#fff;font-weight:600}
+  .btn.ghost{color:var(--t2);background:transparent}
+
+  /* chat */
+  .chat{flex:1 1 auto;min-height:0;overflow-y:auto;padding:12px 14px}
+  .msg{display:flex;gap:8px;margin-bottom:12px}
+  .msg .ava{width:22px;height:22px;border-radius:7px;background:var(--indigo-soft);color:var(--indigo);display:grid;place-items:center;font-size:11px;flex:0 0 auto}
+  .msg .bub{flex:1;font-size:11.5px;color:var(--t2);line-height:1.65}
+  .msg .bub b{color:var(--t1)}
+  .msg .bub .ev{display:inline-block;font-size:10px;color:var(--indigo);border:1px solid rgba(91,91,214,.25);border-radius:6px;padding:2px 6px;margin-top:4px}
+  .actcard{border:1px solid rgba(91,91,214,.28);border-radius:12px;padding:10px 11px;background:linear-gradient(180deg,rgba(91,91,214,.05),rgba(91,91,214,.02));margin-top:6px}
+  .actcard .t{font-size:11.5px;font-weight:600;color:var(--t1)}
+  .actcard .d{font-size:10.5px;color:var(--t3);margin-top:2px}
+  .actcard .b{display:flex;gap:6px;margin-top:8px}
+  .actcard .b span{font-size:10px;border:1px solid var(--line2);border-radius:7px;padding:4px 9px;background:var(--paper);color:var(--t2)}
+  .actcard .b .p{background:var(--indigo);border-color:var(--indigo);color:#fff;font-weight:600}
+  .you .ava{background:#e8eaf6;color:var(--t2)}
+
+  .notes{border:1px solid var(--line2);border-radius:18px;background:var(--paper);padding:16px 18px;max-width:760px;font-size:12px;color:var(--t2);line-height:1.75}
+  .notes h3{font-size:13px;color:var(--t1);margin-bottom:8px;display:flex;align-items:center;gap:8px}
+  .notes h3 span{font-size:10px;color:var(--cyan);border:1px solid rgba(14,154,167,.35);border-radius:5px;padding:2px 6px}
+  .notes .row2{display:flex;gap:18px;flex-wrap:wrap}
+  .notes .col{flex:1;min-width:280px}
+  .notes ul{margin:0;padding-left:18px}
+  .notes li{margin:2px 0}
+  .notes b{color:var(--t1)}
+</style>
+</head>
+<body>
+
+<div class="device">
+  <div class="device-label">D · AI 副驾 · 右栏 430px（列表 + 主动建议 + 对话指令）</div>
+  <div class="frame narrow">
+    <div class="hdr">
+      <div class="logo">B</div>
+      <div><div class="title">Bug 看板</div><div class="sub">AI 盯着流程，你只需要决定</div></div>
+      <div class="grow"></div>
+      <span class="ai-badge">● AI 在线</span>
+      <div class="icon-btn">⚙</div>
+    </div>
+
+    <div class="ask">
+      <h4>AI 建议 · 现在最值得做的 2 件事</h4>
+      <div class="sugg">
+        <div class="ico">◆</div>
+        <div class="tx"><b>HTSMART-12 的方案可以过了。</b>AI 已核对 3 个改动文件，风险低。<div class="meta">审完约 1 分钟 · 通过后自动修复</div></div>
+        <div class="go">去审核 →</div>
+      </div>
+      <div class="sugg">
+        <div class="ico">⏱</div>
+        <div class="tx"><b>648 已修好 26 分钟</b>，还没人测。要不要现在花 2 分钟验一下？<div class="meta">7 文件 · 单测 372/372 通过</div></div>
+        <div class="go">开始测试 →</div>
+      </div>
+    </div>
+
+    <div class="list">
+      <div class="row sel">
+        <span class="st s-wait"></span>
+        <div class="main"><div class="code">HTSMART-12</div><div class="ttl">权限中心批量授权后列表未刷新</div><div class="meta">方案待审 · 等了 2 小时</div></div>
+        <span class="chip c-wait">待你决定</span>
+      </div>
+      <div class="row">
+        <span class="st s-ok"></span>
+        <div class="main"><div class="code">YGFNXDJRFWDJSYJJYY-648</div><div class="ttl">新增工单导出 Excel 能力</div><div class="meta">修复完成 · 7 文件</div></div>
+        <span class="chip c-ok">待你测试</span>
+      </div>
+      <div class="row">
+        <span class="st s-bad"></span>
+        <div class="main"><div class="code">P1-E2E-2</div><div class="ttl">支付回调重复入账（幂等键缺失）</div><div class="meta">Review 1 阻塞 · AI 即将回修</div></div>
+        <span class="chip c-bad">AI 处理中</span>
+      </div>
+      <div class="row">
+        <span class="st s-run"></span>
+        <div class="main"><div class="code">YGFNXDJRFWDJSYJJYY-647</div><div class="ttl">登录页验证码偶发失败</div><div class="meta">AI 修复中 · 已 2m18s</div></div>
+        <span class="chip c-run">● 运行中</span>
+      </div>
+      <div class="row">
+        <span class="st s-idle"></span>
+        <div class="main"><div class="code">HTSMART-15</div><div class="ttl">结算单批量下载支持指定日期</div><div class="meta">Review 中 · 轮次 1/3 · 下次检查 42s</div></div>
+        <span class="chip">Review 中</span>
+      </div>
+    </div>
+
+    <div class="dock">
+      <div class="ai-act"><span style="color:var(--indigo)">●</span>AI 正在盯 <b>2</b> 个运行中任务，无需你操作</div>
+      <div class="input">
+        <span class="ph">问问 AI，比如「本周要交付的有哪些？」</span>
+        <span class="send">↑</span>
+      </div>
+      <div class="quick"><span>本周要交付的</span><span>哪些在等我</span><span>批量通过低风险方案</span></div>
+    </div>
+  </div>
+</div>
+
+<div class="device">
+  <div class="device-label">D · AI 副驾 · 宽屏 980px（队列 + 详情 + AI 对话轨道）</div>
+  <div class="frame wide">
+    <div class="hdr">
+      <div class="logo">B</div>
+      <div><div class="title">Bug 看板</div><div class="sub">星瞰河山一体化平台 · AI 副驾已连接</div></div>
+      <div class="grow"></div>
+      <span class="ai-badge">● AI 在线 · 2 个任务运行中</span>
+      <div class="icon-btn">⚙</div>
+    </div>
+
+    <div class="wide-body">
+      <div class="col-board">
+        <div class="chd">队列 <b style="color:var(--t1)">8</b><span class="grow"></span>⌘K</div>
+        <div class="list" style="padding:0 8px 8px">
+          <div class="row sel">
+            <span class="st s-wait"></span>
+            <div class="main"><div class="code">HTSMART-12</div><div class="ttl">权限中心批量授权…</div><div class="meta">待审 · 2h</div></div>
+          </div>
+          <div class="row">
+            <span class="st s-ok"></span>
+            <div class="main"><div class="code">…-648</div><div class="ttl">新增工单导出 Excel…</div><div class="meta">待测试</div></div>
+          </div>
+          <div class="row">
+            <span class="st s-bad"></span>
+            <div class="main"><div class="code">P1-E2E-2</div><div class="ttl">支付回调重复入账</div><div class="meta">1 阻塞</div></div>
+          </div>
+          <div class="row">
+            <span class="st s-run"></span>
+            <div class="main"><div class="code">…-647</div><div class="ttl">登录页验证码偶发失败</div><div class="meta">AI 修复中</div></div>
+          </div>
+          <div class="row">
+            <span class="st s-idle"></span>
+            <div class="main"><div class="code">HTSMART-15</div><div class="ttl">结算单批量下载…</div><div class="meta">Review 中</div></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="col-detail">
+        <div class="d-code">HTSMART-12 · 任务 · V2.0.0 · 星瞰河山平台</div>
+        <div class="d-title">权限中心批量授权后列表未刷新</div>
+        <div class="d-meta"><span>状态 <b>方案待审</b></span><span>负责人 <b>李昱</b></span><span>优先级 <b>中</b></span><span>等了 <b>2 小时</b></span></div>
+        <div class="actions">
+          <button class="btn primary">通过方案（AI 建议）</button>
+          <button class="btn">让 AI 再核对一遍</button>
+          <button class="btn ghost">驳回…</button>
+        </div>
+
+        <div class="card">
+          <div class="hd">AI 方案 <span class="tag">已核对 3 文件</span><span class="grow"></span><span style="font-size:10px;color:var(--t3)">点击展开原文</span></div>
+          <div class="bd">
+            <div class="grid">
+              <div class="cell"><div class="k">根因</div><div class="v">批量授权后只更新缓存，未失效列表查询键</div></div>
+              <div class="cell"><div class="k">方案</div><div class="v">授权成功后失效 permission:list 并静默刷新</div></div>
+            </div>
+            <div style="margin-top:9px;font-size:11px;color:var(--t3)">AI：这个方案只动 3 个文件，与最近 5 个相似工单的处理方式一致；风险低，建议通过。</div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="hd">AI 已准备的动作</div>
+          <div class="bd" style="display:flex;flex-direction:column;gap:8px">
+            <div class="actcard">
+              <div class="t">通过方案并开始修复</div>
+              <div class="d">通过后会在独立 worktree 建 feat-V2.0.0-ly，预计 8–15 分钟；失败可重试。</div>
+              <div class="b"><span class="p">确认执行</span><span>修改方案</span><span>先不动</span></div>
+            </div>
+            <div class="actcard">
+              <div class="t">批量处理：还有 1 份低风险方案</div>
+              <div class="d">HTSMART-15 的方案同样只动 2 个文件，可一起通过。</div>
+              <div class="b"><span class="p">一起通过</span><span>逐张看</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="col-ai">
+        <div class="chd">AI 副驾<span class="grow"></span><span style="color:var(--indigo)">●</span></div>
+        <div class="chat">
+          <div class="msg you"><div class="ava">李</div><div class="bub">帮我看看今天有哪些要盯的？</div></div>
+          <div class="msg"><div class="ava">AI</div><div class="bub">
+            今天有 <b>3 件事需要你</b>：1 份方案待审（低风险）、1 张待人工测试、1 个 Review 阻塞（AI 会自动回修）。<br>
+            另外 <b>2 个任务在后台跑</b>，完成后我会提醒你。<div class="ev">查看明细</div>
+          </div></div>
+          <div class="msg"><div class="ava">AI</div><div class="bub">
+            <b>HTSMART-12 的方案</b>我看过了：只改 3 个文件，测试计划完整，和团队最近的写法一致。<br>
+            <div class="actcard">
+              <div class="t">通过方案 → 自动修复</div>
+              <div class="d">状态机会校验 → 建 worktree → 启动修复子代理</div>
+              <div class="b"><span class="p">通过</span><span>看证据</span><span>再等等</span></div>
+            </div>
+          </div></div>
+          <div class="msg"><div class="ava">AI</div><div class="bub">
+            P1-E2E-2 的 Review 有 1 个阻塞项（幂等键），我已自动进入回修队列，预计 5 分钟。<span style="color:var(--t3)">（插件不会自动合并）</span>
+          </div></div>
+        </div>
+        <div class="dock">
+          <div class="input"><span class="ph">继续问，或用「/」快捷指令</span><span class="send">↑</span></div>
+          <div class="quick"><span>/下一个待办</span><span>/本周交付</span><span>/解释这个方案</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="notes">
+  <h3>风格 D · AI 副驾 <span>主动式 · 对话驱动</span></h3>
+  <div class="row2">
+    <div class="col">
+      <ul>
+        <li><b>视觉</b>：中性浅色 + 靛蓝 AI 色；AI 元素用徽章/渐变边框与人类操作区分，避免「AI 抢戏」。</li>
+        <li><b>信息架构</b>：三栏 = 队列 / 详情 / AI 轨道；AI 主动给出「最值得做的 N 件事」与可执行动作卡。</li>
+        <li><b>交互增强</b>：自然语言过滤与指令（/下一个待办、/本周交付）、对话内确认卡、AI 建议可追问「为什么」、风险分级批量操作。</li>
+        <li><b>人性化</b>：把「你需要决定什么」放在最上面；AI 明确说自己会做什么、不会做什么（如不自动合并）；每步可撤销。</li>
+      </ul>
+    </div>
+    <div class="col">
+      <ul>
+        <li><b>宽屏</b>：AI 轨道常驻，对话与工单上下文互相引用（引用卡片可点开）。</li>
+        <li><b>风险</b>：对话式交互的实现与提示词成本最高；需要防止「AI 建议」被视为自动化承诺（所有动作仍走按钮+状态机）。</li>
+        <li><b>实现量</b>：高（对话/建议需要新接口或前端聚合；先做 1 个本地建议引擎更稳）。</li>
+        <li><b>适合</b>：希望 AI 主动分担判断、减少「盯状态」的用户。</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>
