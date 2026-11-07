@@ -13,11 +13,28 @@
  *     refExists(repo, ref)                  -> Promise<{ok:true, exists:boolean}>,
  *     worktreePath({repo, code})            -> {ok:true, path:string}, // sync
  *     worktreeAdd({repo,path,branch,base})  -> Promise<{created:boolean}>,
+ *     listWorktrees(repo)                   -> Promise<{ok:true, entries:Array<{path,branch}>}>,
+ *     probeWorktree(repo, path, branch)     -> Promise<{ok:true, state:'absent'|'unregistered'|'same'|'different'}>,
  *     status(root)                          -> Promise<string>,   // porcelain
  *     diffStat(root)                        -> Promise<string>,
  *     diff(root, {maxChars?})               -> Promise<string>,
  *     worktreeRemove({repo,path,force?})    -> Promise<void>,
+ *     revParse(repo, ref)                   -> Promise<string>,   // full sha
+ *     commitAll({root, message})            -> Promise<{ok:true, sha:string|null}>,
+ *     pushBranch({root,remote?,branch})     -> Promise<{ok:true, branch, remote}>,
  *   }
+ *
+ * P5 adds the delivery half: `commitAll` stages everything inside the worktree
+ * and creates exactly one commit (never an empty one), `pushBranch` pushes the
+ * personal branch to `origin` with upstream tracking and NEVER force-pushes,
+ * and {@link assertPushableBranch} refuses every protected integration branch
+ * (`main`/`master`/`dev`/`develop`, `feature-*`, `hotfix-*`, `release-*`,
+ * case-insensitive, with or without the `refs/heads/` prefix) before git is
+ * even spawned.
+ *
+ * `listWorktrees` / `probeWorktree` were private P4 closures; they are public
+ * P5 API because the branch/worktree conflict diagnosis (and later the review
+ * service) needs the same registered-worktree mapping outside `worktreeAdd`.
  *
  * Success values are the raw values shown above (string/boolean/undefined);
  * any expected failure resolves to a STATIC structured object instead of
@@ -77,8 +94,16 @@ import { realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 
+import { isSafeBranchName } from './branch.js';
+
 /** Default per-command timeout (P4 global constraint). */
 export const DEFAULT_GIT_TIMEOUT_MS = 30_000;
+
+/** `git push` network budget (P5 delivery). */
+export const PUSH_TIMEOUT_MS = 60_000;
+
+/** Hard upper bound for a commit message (defensive only). */
+export const MAX_COMMIT_MESSAGE_CHARS = 10_000;
 
 /** Default diff clip length (module constant; not read from the plan). */
 export const DIFF_MAX_CHARS = 20_000;
@@ -104,6 +129,9 @@ const MESSAGE = Object.freeze({
   conflict: '工作树已存在且分支与目标分支不一致',
   invalid: 'git 命令参数不合法',
   invalidWorktreePath: '工单号无法生成安全的工作树路径',
+  invalidBranch: '分支名不合法，不允许推送',
+  protectedBranch: '受保护的分支不允许推送',
+  invalidMessage: '提交信息不合法',
 });
 
 /** Static command labels carried by failures (never include argv/paths). */
@@ -117,7 +145,65 @@ const COMMAND = Object.freeze({
   diffStat: 'git diff --stat',
   diff: 'git diff',
   worktreeRemove: 'git worktree remove',
+  revParse: 'git rev-parse',
+  addAll: 'git add -A',
+  stagedCheck: 'git diff --cached --quiet',
+  commit: 'git commit',
+  push: 'git push -u',
 });
+
+/**
+ * Branches that must never be pushed. The integration branches are matched
+ * case-insensitively after the `refs/heads/` prefix (if any) is stripped:
+ * `main`, `master`, `dev`, `develop`, `feature-*`, `hotfix-*`, `release-*`.
+ * `master`/`develop` are included as the conservative aliases of the spec's
+ * `main`/`dev` rules.
+ */
+const PROTECTED_EXACT = Object.freeze(['main', 'master', 'dev', 'develop']);
+
+/** `feature-*` / `feature/…` (and the hotfix/release families). */
+const PROTECTED_PREFIX = /^(?:feature|hotfix|release)(?:-|\/|$)/i;
+
+/**
+ * Thrown for a branch that must not be pushed. `code` is `protected-branch`
+ * for an integration branch and `invalid-branch` for a malformed name; the
+ * message is static and never echoes the rejected value.
+ */
+export class GitError extends Error {
+  /**
+   * @param {'protected-branch'|'invalid-branch'} code stable failure code
+   * @param {string} message static Chinese description
+   */
+  constructor(code, message) {
+    super(message);
+    this.name = 'GitError';
+    this.code = code;
+  }
+}
+
+/**
+ * Refuse a protected or malformed push target before any git invocation.
+ *
+ * Accepts the personal branch shapes `feat-<X>-<user>` / `hot-<X>-<user>` and
+ * any other non-protected, ref-safe branch name. `refs/heads/<name>` is
+ * accepted for the check and normalized to `<name>` (that is also what
+ * `pushBranch` pushes). Rejection is a thrown {@link GitError}; the delivery
+ * service maps it to a static `protected-branch` failure.
+ *
+ * @param {unknown} name branch name
+ * @returns {string} normalized branch name that may be pushed
+ * @throws {GitError} `protected-branch` / `invalid-branch`
+ */
+export function assertPushableBranch(name) {
+  const branch = normalizePushBranch(name);
+  if (branch === undefined || !isSafeBranchName(branch)) {
+    throw new GitError('invalid-branch', MESSAGE.invalidBranch);
+  }
+  if (isProtectedBranch(branch)) {
+    throw new GitError('protected-branch', MESSAGE.protectedBranch);
+  }
+  return branch;
+}
 
 /**
  * Build and validate the product worktree path for one ticket.
@@ -174,18 +260,26 @@ export function createGit(options = {}) {
    *
    * @param {unknown} dir repository or worktree directory (`-C` target)
    * @param {string[]} args git argv (without the leading `git -C dir`)
-   * @param {{command: string, missingRef?: boolean}} labels static failure label;
+   * @param {{command: string, missingRef?: boolean, timeout?: number,
+   *   allowedExitCodes?: number[]}} labels static failure label;
    *   `missingRef` maps a `rev-parse --verify --quiet` exit code 1 to a
-   *   successful "missing" outcome instead of a failure
-   * @returns {Promise<{ok: true, stdout: string, missing?: boolean} | {ok: false, code: string, message: string, command: string}>}
+   *   successful "missing" outcome instead of a failure; `allowedExitCodes`
+   *   turns specific non-zero exit codes (e.g. 1 for "diff exists") into
+   *   `{ok:true, exitCode}` results
+   * @returns {Promise<{ok: true, stdout: string, exitCode?: number, missing?: boolean} | {ok: false, code: string, message: string, command: string}>}
    */
-  async function run(dir, args, { command, missingRef = false }) {
+  async function run(dir, args, {
+    command,
+    missingRef = false,
+    timeout = timeoutMs,
+    allowedExitCodes,
+  }) {
     if (!isSafePath(dir)) return failure('git-failed', MESSAGE.invalid, command);
 
     let result;
     try {
       result = await execFile('git', ['-C', dir, ...args], {
-        timeout: timeoutMs,
+        timeout,
         maxBuffer: MAX_BUFFER,
         encoding: 'utf8',
         windowsHide: true,
@@ -193,6 +287,9 @@ export function createGit(options = {}) {
     } catch (error) {
       if (missingRef && isMissingRef(error)) {
         return { ok: true, stdout: '', missing: true };
+      }
+      if (isAllowedExit(error, allowedExitCodes)) {
+        return { ok: true, stdout: '', exitCode: error.code };
       }
       return normalizeFailure(error, command);
     }
@@ -392,7 +489,122 @@ export function createGit(options = {}) {
     return undefined;
   }
 
-  return { repoRoot, refExists, worktreePath, worktreeAdd, status, diffStat, diff, worktreeRemove };
+  /**
+   * Resolve one ref to its full object name (sha).
+   *
+   * @param {unknown} repo repository/worktree path
+   * @param {unknown} ref ref or commit-ish (never an option: `--` is not used,
+   *   so a leading `-` is rejected)
+   * @returns {Promise<string | {ok:false, code:string, message:string, command:string}>}
+   */
+  async function revParse(repo, ref) {
+    if (!isSafePath(repo) || !isSafeRef(ref)) {
+      return failure('git-failed', MESSAGE.invalid, COMMAND.revParse);
+    }
+    const result = await run(repo, ['rev-parse', '--verify', ref], { command: COMMAND.revParse });
+    if (!result.ok) return result;
+    const sha = result.stdout.trim();
+    if (!/^[0-9a-f]{40,64}$/i.test(sha)) {
+      return failure('git-failed', MESSAGE.failed, COMMAND.revParse);
+    }
+    return sha;
+  }
+
+  /**
+   * Stage every change inside `root` and create one commit.
+   *
+   * `git add -A` runs first; `git diff --cached --quiet` then decides whether
+   * there is anything to commit (exit 1 means staged changes exist). An empty
+   * worktree resolves to `{ok:true, sha:null}` and creates NO empty commit.
+   * The commit message is passed as a single `-m` argv element — no shell, so
+   * ticket text in the template can never be interpreted as a command.
+   *
+   * @param {{root?: unknown, message?: unknown}} input
+   * @returns {Promise<{ok:true, sha:string|null}
+   *   | {ok:false, code:string, message:string, command:string}>}
+   */
+  async function commitAll(input = {}) {
+    if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+      return failure('git-failed', MESSAGE.invalid, COMMAND.commit);
+    }
+    const { root, message } = input;
+    if (!isSafePath(root) || !isSafeCommitMessage(message)) {
+      return failure('git-failed', MESSAGE.invalidMessage, COMMAND.commit);
+    }
+
+    const added = await run(root, ['add', '-A'], { command: COMMAND.addAll });
+    if (!added.ok) return added;
+
+    const staged = await run(root, ['diff', '--cached', '--quiet'], {
+      command: COMMAND.stagedCheck,
+      allowedExitCodes: [1],
+    });
+    if (!staged.ok) return staged;
+    if (staged.exitCode !== 1) return { ok: true, sha: null };
+
+    const committed = await run(root, ['commit', '-m', message], { command: COMMAND.commit });
+    if (!committed.ok) return committed;
+
+    const sha = await revParse(root, 'HEAD');
+    if (typeof sha !== 'string') {
+      return failure(sha?.code === 'git-timeout' ? 'git-timeout' : 'git-failed', MESSAGE.failed, COMMAND.commit);
+    }
+    return { ok: true, sha };
+  }
+
+  /**
+   * Push one personal branch to a remote with upstream tracking.
+   *
+   * The branch is validated by {@link assertPushableBranch} BEFORE any git
+   * process is spawned; a protected branch resolves to
+   * `{ok:false, code:'protected-branch'}` (never a git error). The argv is
+   * exactly `push -u <remote> <branch>` — no `--force`, no force-with-lease,
+   * no arbitrary refspec — and the command gets the 60 s push budget.
+   *
+   * @param {{root?: unknown, remote?: unknown, branch?: unknown}} input
+   * @returns {Promise<{ok:true, branch:string, remote:string}
+   *   | {ok:false, code:string, message:string, command:string}>}
+   */
+  async function pushBranch(input = {}) {
+    if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+      return failure('git-failed', MESSAGE.invalid, COMMAND.push);
+    }
+    const { root, remote = 'origin', branch: rawBranch } = input;
+    if (!isSafePath(root) || !isSafeRemote(remote)) {
+      return failure('git-failed', MESSAGE.invalid, COMMAND.push);
+    }
+
+    let branch;
+    try {
+      branch = assertPushableBranch(rawBranch);
+    } catch (error) {
+      if (error instanceof GitError) return failure(error.code, error.message, COMMAND.push);
+      return failure('git-failed', MESSAGE.invalid, COMMAND.push);
+    }
+
+    const result = await run(root, ['push', '-u', remote, branch], {
+      command: COMMAND.push,
+      timeout: PUSH_TIMEOUT_MS,
+    });
+    if (!result.ok) return result;
+    return { ok: true, branch, remote };
+  }
+
+  return {
+    repoRoot,
+    refExists,
+    worktreePath,
+    worktreeAdd,
+    listWorktrees,
+    probeWorktree,
+    status,
+    diffStat,
+    diff,
+    worktreeRemove,
+    revParse,
+    commitAll,
+    pushBranch,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -477,6 +689,61 @@ function isMissingRef(error) {
     && typeof error === 'object'
     && error.code === 1
     && error.signal == null;
+}
+
+/**
+ * A caller-declared tolerable exit code (e.g. 1 for `git diff --cached
+ * --quiet`). Timeouts and buffer overflows are never tolerated.
+ */
+function isAllowedExit(error, allowedExitCodes) {
+  if (!Array.isArray(allowedExitCodes) || allowedExitCodes.length === 0) return false;
+  if (isMaxBufferError(error) || isTimeoutError(error)) return false;
+  return error !== null
+    && typeof error === 'object'
+    && error.signal == null
+    && typeof error.code === 'number'
+    && allowedExitCodes.includes(error.code);
+}
+
+/** Strip an optional `refs/heads/` prefix and validate the snapshot shape. */
+function normalizePushBranch(value) {
+  if (typeof value !== 'string') return undefined;
+  let branch = value.trim();
+  if (branch.toLowerCase().startsWith('refs/heads/')) {
+    branch = branch.slice('refs/heads/'.length);
+  }
+  // Only a plain branch name may be pushed. Any other full ref (`refs/tags/…`,
+  // `refs/remotes/…`) could smuggle a non-branch refspec into `git push`.
+  if (branch.toLowerCase().startsWith('refs/')) return undefined;
+  return branch === '' ? undefined : branch;
+}
+
+/** True for every protected integration branch family (case-insensitive). */
+function isProtectedBranch(branch) {
+  const lower = branch.toLowerCase();
+  if (PROTECTED_EXACT.includes(lower)) return true;
+  return PROTECTED_PREFIX.test(lower);
+}
+
+/**
+ * A push remote is operator configuration (`origin` by default): a non-blank
+ * string that cannot become a git option and contains no control characters.
+ * It is deliberately broader than a ref name because it may be a path or URL.
+ */
+function isSafeRemote(value) {
+  if (typeof value !== 'string') return false;
+  const remote = value.trim();
+  if (remote === '' || remote.length > 1024) return false;
+  if (remote.startsWith('-')) return false;
+  return !/[\u0000\r\n\t\s]/.test(remote);
+}
+
+/** A commit message: non-empty, bounded, NUL-free (newlines are allowed). */
+function isSafeCommitMessage(value) {
+  if (typeof value !== 'string') return false;
+  if (value.trim() === '') return false;
+  if (value.length > MAX_COMMIT_MESSAGE_CHARS) return false;
+  return !value.includes('\u0000');
 }
 
 /** Default `execFile` resolves `{stdout, stderr}`; accept a bare string too. */
