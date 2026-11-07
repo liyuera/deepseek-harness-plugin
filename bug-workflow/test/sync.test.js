@@ -19,6 +19,7 @@ import {
   LAST_SYNC_ERROR_KEY,
   createSyncService,
   mapDicts,
+  normalizePlatformDescription,
 } from '../src/host/sync.js';
 
 // ---------------------------------------------------------------------------
@@ -435,6 +436,44 @@ test('a participant-list failure aborts the sync before writing tickets', async 
     lastSyncAt: null,
     lastSyncError: '平台请求失败，请稍后重试',
   });
+});
+
+test('normalizePlatformDescription decodes the live percent-encoded rich text', () => {
+  // Live shape for a screenshot-only bug report (632): encoded <p><img …>.
+  const encoded = encodeURIComponent('<p><img src="/oss/a.png" data-original-name="image.png"></p>');
+  assert.equal(normalizePlatformDescription(encoded), '[图片]');
+  assert.equal(
+    normalizePlatformDescription('%3Cp%3E%E5%A4%8D%E7%8E%B0%E6%AD%A5%E9%AA%A4%3Cbr%3E%E7%AC%AC%E4%BA%8C%E6%AD%A5%3C%2Fp%3E'),
+    '复现步骤\n第二步',
+  );
+  assert.equal(normalizePlatformDescription('纯文本描述'), '纯文本描述');
+  assert.equal(normalizePlatformDescription('<p>a &amp; b<br>c</p>'), 'a & b\nc');
+  assert.equal(normalizePlatformDescription('<script>alert(1)</script>安全'), '安全');
+  assert.equal(normalizePlatformDescription(null), '');
+  assert.equal(normalizePlatformDescription(''), '');
+});
+
+test('sync fills a missing list description from the detail endpoint once', async () => {
+  const encoded = encodeURIComponent('<p><img src="/oss/a.png"></p>');
+  const task = { ...TASK_FIXTURE[0], description: null };
+  const { store, sync, fake } = createSetup({
+    tasks: [task],
+    platform: {
+      getTask: (code) => ({ ok: true, data: { taskCode: code, description: encoded } }),
+    },
+  });
+
+  const first = await sync.run(CWD);
+  assert.equal(first.ok, true);
+  const code = `${PROJECT_CODE}-647`;
+  assert.equal(store.get(code).platform.description, '[图片]');
+  assert.deepEqual(fake.calls.task, [code]);
+
+  // A second sync reuses the stored description instead of re-fetching detail.
+  const second = await sync.run(CWD);
+  assert.equal(second.ok, true);
+  assert.equal(store.get(code).platform.description, '[图片]');
+  assert.deepEqual(fake.calls.task, [code]);
 });
 
 test('run() stores mapped dictionaries in meta and reports them via status()', async () => {

@@ -100,7 +100,7 @@ window.__ModuleLoader__.load({
     const h = React.createElement;
     const ID = '@liyuera/dsh-bug-workflow';
     /** Visible build tag so the running UI can be verified after a reload. */
-    const CLIENT_BUILD = 'p6-login.2026-11-08.6';
+    const CLIENT_BUILD = 'p6-login.2026-11-08.7';
 
     /** Snapshot/action endpoints (same origin as the Harness Web page). */
     const API = Object.freeze({
@@ -4328,7 +4328,9 @@ window.__ModuleLoader__.load({
           h('div', { style: fieldValueStyle }, value)))),
         description === ''
           ? h('p', { style: emptyTextStyle }, '平台没有填写描述。')
-          : h('div', { style: { display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 } },
+          : description === '[图片]'
+            ? h('p', { style: emptyTextStyle }, '描述为图片，请点「在平台打开」查看原图。')
+            : h('div', { style: { display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 } },
             h('div', { style: fieldLabelStyle }, '描述摘要'),
             h('div', {
               title: description,

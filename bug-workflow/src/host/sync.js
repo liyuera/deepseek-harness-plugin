@@ -409,9 +409,15 @@ export function createSyncService(deps = {}) {
       kept.push({ code, record });
     }
 
+    // The list endpoint never carries `description` (live platform: null for
+    // every row); the detail endpoint does (percent-encoded HTML). Fill the
+    // description once per ticket and keep it on later syncs to avoid N+1
+    // detail calls every time.
+    const described = await fillMissingDescriptions(client, kept);
+
     const now = readNow(clock);
     const baseUrl = pickBaseUrl(client, settings);
-    const mapped = kept
+    const mapped = described
       .map(({ record }) => mapRecordToPlatformTicket(record, { baseUrl, projectCode, now }))
       // Kept records always carry a code, so this only guards a future change.
       .filter((ticket) => ticket !== null);
@@ -446,6 +452,62 @@ export function createSyncService(deps = {}) {
       filtered,
       lastSyncAt: now,
     };
+  }
+
+  /**
+   * Fill `record.description` from `detailByTaskCode` for tickets whose list
+   * record has no description and whose stored ticket has none either. Fetches
+   * run with a small concurrency pool; a failed detail call leaves the record
+   * untouched (the sync must not fail because one description is unavailable).
+   *
+   * @param {object} client platform client
+   * @param {{code: string, record: object}[]} kept project-filtered records
+   * @returns {Promise<{code: string, record: object}[]>}
+   */
+  async function fillMissingDescriptions(client, kept) {
+    let prior = new Map();
+    try {
+      prior = new Map(store.list().map((ticket) => [ticket.code, ticket]));
+    } catch {
+      // An unreadable store just means every description is fetched.
+    }
+    const hasStoredDescription = (code) => {
+      const existing = prior.get(code);
+      return isPlainObject(existing?.platform)
+        && typeof existing.platform.description === 'string'
+        && existing.platform.description.trim() !== '';
+    };
+    // The list shape never has a description, so keep the stored one on the
+    // record before mapping (otherwise a later sync would empty it again).
+    const prefilled = kept.map(({ code, record }) => {
+      const listDescription = typeof record?.description === 'string' ? record.description.trim() : '';
+      if (listDescription !== '') return { code, record };
+      const existing = prior.get(code);
+      const stored = isPlainObject(existing?.platform) && typeof existing.platform.description === 'string'
+        ? existing.platform.description
+        : '';
+      return stored !== '' ? { code, record: { ...record, description: stored } } : { code, record };
+    });
+    const targets = prefilled.filter(({ code, record }) => {
+      const description = typeof record?.description === 'string' ? record.description.trim() : '';
+      return description === '' && !hasStoredDescription(code);
+    });
+    if (targets.length === 0) return prefilled;
+
+    const details = new Map();
+    await runWithConcurrency(targets.map(({ code }) => code), 4, async (code) => {
+      try {
+        const detail = await client.getTask(code);
+        if (detail?.ok && isPlainObject(detail.data)) {
+          details.set(code, typeof detail.data.description === 'string' ? detail.data.description : '');
+        }
+      } catch {
+        // Best-effort enrichment: keep the list record as-is.
+      }
+    });
+    return prefilled.map(({ code, record }) => (
+      details.has(code) ? { code, record: { ...record, description: details.get(code) } } : { code, record }
+    ));
   }
 
   /**
@@ -592,7 +654,11 @@ function mapRecordToPlatformTicket(record, { baseUrl, projectCode, now } = {}) {
       projectName: textValue(record.refProjectName) ?? null,
       assigneeId: normalizeId(record.refHandlePersonId) ?? null,
       assigneeName: textValue(record.refHandlePersonName) ?? null,
-      description: typeof record.description === 'string' ? record.description : '',
+      description: (() => {
+        const normalized = normalizePlatformDescription(record.description);
+        if (record.taskCode === 'YGFNXDJRFWDJSYJJYY-647') console.error('DBG map', JSON.stringify(record.description), '->', JSON.stringify(normalized));
+        return normalized;
+      })(),
       url,
       syncedAt: Date.parse(now),
     },
@@ -732,4 +798,69 @@ function countOf(value) {
 
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * Normalize a platform description for the board and the AI prompts.
+ *
+ * The live platform returns percent-encoded rich-text HTML in both the list and
+ * detail payloads (e.g. `%3Cp%3E%3Cimg ...` for a screenshot-only report). The
+ * board renders plain text, so decode + flatten it here: images become
+ * `[图片]`, block tags become newlines, entities are decoded, and anything
+ * script/style is dropped.
+ *
+ * @param {unknown} raw platform description
+ * @returns {string} plain-text description ('' when empty)
+ */
+export function normalizePlatformDescription(raw) {
+  if (typeof raw !== 'string') return '';
+  let text = raw.trim();
+  if (text === '') return '';
+  // Only decode when the payload looks URI-encoded and not already HTML.
+  if (!text.includes('<') && /%[0-9A-Fa-f]{2}/.test(text)) {
+    try {
+      text = decodeURIComponent(text);
+    } catch {
+      // Keep the raw text when the percent-encoding is malformed.
+    }
+  }
+  return text
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<img\b[^>]*>/gi, '[图片]')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/(p|div|li|h[1-6]|tr|blockquote)>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&amp;/g, '&')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+/**
+ * Run `worker` over `items` with at most `limit` in flight. Used for the
+ * best-effort detail-description fetch; it preserves no particular order.
+ *
+ * @template T
+ * @param {T[]} items
+ * @param {number} limit
+ * @param {(item: T) => Promise<void>} worker
+ * @returns {Promise<void>}
+ */
+async function runWithConcurrency(items, limit, worker) {
+  let next = 0;
+  const size = Math.max(1, Math.min(limit, items.length));
+  const lanes = Array.from({ length: size }, async () => {
+    while (next < items.length) {
+      const index = next;
+      next += 1;
+      await worker(items[index]);
+    }
+  });
+  await Promise.all(lanes);
 }
