@@ -1195,3 +1195,136 @@ test('patchTicket() reports unknown tickets and invalid codes without throwing',
     assert.equal(invalid.code, 'invalid-input', String(code));
   }
 });
+
+// ---------------------------------------------------------------------------
+// patchTicket() P5 metadata (mr / reviewRounds)
+// ---------------------------------------------------------------------------
+
+const MR_METADATA = Object.freeze({
+  iid: 17,
+  url: 'https://gitlab.example.com/group/project/-/merge_requests/17',
+  sourceBranch: 'feat-V1-ly',
+  targetBranch: 'feature-V1',
+  state: 'opened',
+  verdict: 'unknown',
+  blockingIssues: [],
+  nonBlockingIssues: [],
+  rounds: 0,
+});
+
+const REVIEW_ROUND = Object.freeze({
+  round: 1,
+  noteId: 101,
+  verdict: 'changes',
+  startedAt: T2,
+  finishedAt: T3,
+  changedFiles: ['src/a.js'],
+  status: 'succeeded',
+});
+
+test('patchTicket() persists mr metadata with one patch event and no fix-run event', async () => {
+  const domain = createFakeDomain();
+  const store = createStrictStore(domain, clockFrom(T1, T2));
+  await store.create({ code: 'BUG-1', title: 'BUG-1' });
+
+  const result = await store.patchTicket(
+    'BUG-1',
+    { mr: cloneJson(MR_METADATA) },
+    { actionId: 'mr-1' },
+  );
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.ticket.mr, MR_METADATA);
+  assert.equal(result.ticket.workflow, 'inbox');
+  assert.equal(result.ticket.updatedAt, T2);
+  assert.deepEqual(result.ticket.timeline.at(-1), {
+    at: T2,
+    kind: 'patch',
+    actor: 'system',
+    message: '交付信息已更新',
+  });
+  assert.equal(
+    result.ticket.timeline.filter((entry) => entry.kind === 'fix-run').length,
+    0,
+    'an mr-only patch must never look like an AI fix run',
+  );
+  assert.equal(result.ticket.timeline.length, 2, 'exactly one event per patch');
+});
+
+test('patchTicket() persists reviewRounds and validates the array shape', async () => {
+  const domain = createFakeDomain();
+  const store = createStrictStore(domain, clockFrom(T1, T2, T3, T4));
+  await store.create({ code: 'BUG-1', title: 'BUG-1' });
+
+  const result = await store.patchTicket('BUG-1', {
+    reviewRounds: [cloneJson(REVIEW_ROUND)],
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.ticket.reviewRounds, [REVIEW_ROUND]);
+  assert.equal(result.ticket.timeline.at(-1).kind, 'patch');
+
+  const invalid = [
+    { reviewRounds: {} },
+    { reviewRounds: 'nope' },
+    { reviewRounds: [1] },
+    { reviewRounds: [null] },
+    { reviewRounds: [cloneJson(REVIEW_ROUND), 'x'] },
+  ];
+  for (const [index, patch] of invalid.entries()) {
+    const rejected = await store.patchTicket('BUG-1', patch, { actionId: `bad-rounds-${index}` });
+    assert.equal(rejected.ok, false, `invalid reviewRounds #${index}`);
+    assert.equal(rejected.code, 'invalid-input', `invalid reviewRounds #${index}`);
+    assert.equal(rejected.message, 'reviewRounds 必须是对象数组');
+  }
+  assert.equal(store.get('BUG-1').timeline.length, 2, 'rejected patches append nothing');
+});
+
+test('patchTicket() rejects malformed mr values and still updates the field whitelist message', async () => {
+  const domain = createFakeDomain();
+  const store = createStrictStore(domain, clockFrom(T1, T2));
+  await store.create({ code: 'BUG-1', title: 'BUG-1' });
+
+  for (const [index, mr] of ['x', [], 42, true].entries()) {
+    const rejected = await store.patchTicket('BUG-1', { mr }, { actionId: `bad-mr-${index}` });
+    assert.equal(rejected.ok, false, `invalid mr #${index}`);
+    assert.equal(rejected.code, 'invalid-input');
+    assert.equal(rejected.message, 'mr 必须是普通对象或 null');
+  }
+
+  const unknown = await store.patchTicket('BUG-1', { workflow: 'done' });
+  assert.equal(unknown.ok, false);
+  assert.equal(unknown.code, 'invalid-input');
+  assert.equal(unknown.message, 'patchTicket 只允许修改 branch、fixes、mr 与 reviewRounds');
+  assert.equal(store.get('BUG-1').timeline.length, 1);
+});
+
+test('patchTicket() keeps exactly one event and lets branch/fixes win over mr', async () => {
+  const domain = createFakeDomain();
+  const store = createStrictStore(domain, clockFrom(T1, T2, T3));
+  await store.create({ code: 'BUG-1', title: 'BUG-1' });
+
+  const branchAndMr = await store.patchTicket('BUG-1', {
+    branch: cloneJson(BRANCH_METADATA),
+    mr: cloneJson(MR_METADATA),
+  });
+  assert.equal(branchAndMr.ok, true);
+  assert.deepEqual(branchAndMr.ticket.timeline.at(-1), {
+    at: T2,
+    kind: 'worktree',
+    actor: 'system',
+    message: '已创建个人分支与工作树',
+  });
+
+  const fixesAndRounds = await store.patchTicket('BUG-1', {
+    fixes: [cloneJson(FIX_ENTRY)],
+    reviewRounds: [cloneJson(REVIEW_ROUND)],
+  });
+  assert.equal(fixesAndRounds.ok, true);
+  assert.deepEqual(fixesAndRounds.ticket.timeline.at(-1), {
+    at: T3,
+    kind: 'fix-run',
+    actor: 'agent',
+    message: 'AI 修复已执行',
+  });
+  assert.equal(fixesAndRounds.ticket.timeline.length, 3);
+});

@@ -413,6 +413,14 @@ function fixBody(overrides = {}) {
   });
 }
 
+function deliverBody(overrides = {}) {
+  return JSON.stringify({
+    sessionId: SESSION_ID,
+    code: 'BUG-1',
+    ...overrides,
+  });
+}
+
 function settingsBody(overrides = {}) {
   return JSON.stringify({
     sessionId: SESSION_ID,
@@ -546,6 +554,31 @@ function createFakeFix({ start, status } = {}) {
   };
 }
 
+/**
+ * Fake delivery service (P5). Same contract as `createFakeAnalysis`/
+ * `createFakeFix`: the route only consumes `start()`'s structured result and
+ * `status()`'s snapshot block.
+ */
+function createFakeDelivery({ start, status } = {}) {
+  const calls = { start: [], status: 0 };
+  return {
+    calls,
+    service: {
+      async start(sessionId, cwd, code) {
+        calls.start.push({ sessionId, cwd, code });
+        if (typeof start === 'function') return start(sessionId, cwd, code);
+        return { ok: true, running: true };
+      },
+      status() {
+        calls.status += 1;
+        if (typeof status === 'function') return status();
+        if (status !== undefined) return clone(status);
+        return { running: [], errors: {} };
+      },
+    },
+  };
+}
+
 /** Fake credentials service used by the token-store integration. */
 function createFakeCredentials(initial = {}) {
   const values = new Map(Object.entries(initial));
@@ -589,6 +622,7 @@ function handlersWith({
   importTask,
   analysis,
   fix,
+  delivery,
   clock = () => SERVER_TIME,
   domainOpenedAt = OPENED_AT,
 } = {}) {
@@ -605,6 +639,8 @@ function handlersWith({
   const analysisDeps = analysis === undefined ? createFakeAnalysis() : analysis;
   // Same convention for the P4 fix service.
   const fixDeps = fix === undefined ? createFakeFix() : fix;
+  // Same convention for the P5 delivery service.
+  const deliveryDeps = delivery === undefined ? createFakeDelivery() : delivery;
   return {
     store,
     workspace,
@@ -614,6 +650,7 @@ function handlersWith({
     importTask: importTaskFn,
     analysis: analysisDeps,
     fix: fixDeps,
+    delivery: deliveryDeps,
     handlers: createHandlers({
       store,
       workspace,
@@ -623,6 +660,7 @@ function handlersWith({
       importTask: importTaskFn,
       analysis: analysisDeps,
       fix: fixDeps,
+      delivery: deliveryDeps,
       clock,
       domainOpenedAt,
     }),
@@ -730,6 +768,7 @@ test('GET /snapshot composes workspace, settings, tickets and serverTime', async
     dicts: { status: [], type: [], priority: [] },
     analysis: { running: [], errors: {} },
     fix: { running: [], errors: {} },
+    delivery: { running: [], errors: {} },
     tickets: [ticket],
     serverTime: SERVER_TIME,
   });
@@ -974,6 +1013,61 @@ test('GET /snapshot sanitizes malformed fix status fields', async () => {
   assert.deepEqual(json.fix, {
     running: ['BUG-2'],
     errors: { 'BUG-1': '修复失败' },
+  });
+});
+
+test('GET /snapshot reports the delivery running set and delivery-specific errors', async () => {
+  const delivery = createFakeDelivery({
+    status: {
+      running: ['BUG-4'],
+      errors: { 'BUG-1': '提交前 lint 未通过，请修复后重试' },
+    },
+  });
+  const { handlers } = handlersWith({ delivery });
+  const { res, json } = await call(handlers.snapshot, { url: snapshotUrl() });
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(json.delivery, {
+    running: ['BUG-4'],
+    errors: { 'BUG-1': '提交前 lint 未通过，请修复后重试' },
+  });
+  assert.equal(delivery.calls.status, 1);
+  // The delivery error block is parallel to fix; it never reuses fix errors.
+  assert.deepEqual(json.fix, { running: [], errors: {} });
+});
+
+test('GET /snapshot degrades delivery to empty when unwired or failing', async () => {
+  const unwired = await call(handlersWith({ delivery: null }).handlers.snapshot, {
+    url: snapshotUrl(),
+  });
+  assert.equal(unwired.res.statusCode, 200);
+  assert.deepEqual(unwired.json.delivery, { running: [], errors: {} });
+
+  const failing = createFakeDelivery({
+    status: () => {
+      throw new Error('delivery status unavailable');
+    },
+  });
+  const { res, json } = await call(handlersWith({ delivery: failing }).handlers.snapshot, {
+    url: snapshotUrl(),
+  });
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(json.delivery, { running: [], errors: {} });
+});
+
+test('GET /snapshot sanitizes malformed delivery status fields', async () => {
+  const delivery = createFakeDelivery({
+    status: {
+      running: ['BUG-2', '', 42],
+      errors: { 'BUG-1': '交付失败', 'BUG-3': null },
+    },
+  });
+  const { json } = await call(handlersWith({ delivery }).handlers.snapshot, {
+    url: snapshotUrl(),
+  });
+  assert.deepEqual(json.delivery, {
+    running: ['BUG-2'],
+    errors: { 'BUG-1': '交付失败' },
   });
 });
 
@@ -1738,6 +1832,126 @@ test('POST /fix maps an unexpected service failure to 500 internal', async () =>
 });
 
 // ---------------------------------------------------------------------------
+// Deliver (P5 delivery: lint/test -> commit -> push -> MR)
+// ---------------------------------------------------------------------------
+
+test('POST /deliver starts delivery for the resolved workspace', async () => {
+  const delivery = createFakeDelivery();
+  const { handlers } = handlersWith({ delivery });
+  const { res, json } = await call(handlers.deliver, {
+    method: 'POST',
+    url: API_PATHS.deliver,
+    body: deliverBody({ code: '  BUG-1  ' }),
+  });
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(json, { ok: true, workflow: 'submitting', running: true });
+  assert.deepEqual(delivery.calls.start, [
+    { sessionId: SESSION_ID, cwd: WORKSPACE, code: 'BUG-1' },
+  ]);
+});
+
+test('POST /deliver validates session, code and workspace before starting', async () => {
+  const delivery = createFakeDelivery();
+  const { handlers } = handlersWith({ delivery });
+
+  const missingSession = await call(handlers.deliver, {
+    method: 'POST',
+    url: API_PATHS.deliver,
+    body: deliverBody({ sessionId: '   ' }),
+  });
+  assert.equal(missingSession.res.statusCode, 400);
+  assert.equal(missingSession.json.code, 'missing-session');
+
+  for (const code of ['', '   ', undefined]) {
+    const missingCode = await call(handlers.deliver, {
+      method: 'POST',
+      url: API_PATHS.deliver,
+      body: deliverBody({ code }),
+    });
+    assert.equal(missingCode.res.statusCode, 400, String(code));
+    assert.equal(missingCode.json.code, 'invalid-code', String(code));
+  }
+
+  const unbound = await call(handlers.deliver, {
+    method: 'POST',
+    url: API_PATHS.deliver,
+    body: deliverBody({ sessionId: UNBOUND_SESSION_ID }),
+  });
+  assert.equal(unbound.res.statusCode, 400);
+  assert.equal(unbound.json.code, 'unknown-workspace');
+  assert.equal(delivery.calls.start.length, 0);
+});
+
+test('POST /deliver maps service failures to static HTTP statuses', async () => {
+  const cases = [
+    ['ticket-not-found', 404],
+    ['not-submitting', 409],
+    ['delivery-busy', 409],
+    ['delivery-no-changes', 409],
+    ['protected-branch', 409],
+    ['invalid-branch', 400],
+    ['worktree-missing', 400],
+    ['invalid-gitlab-settings', 400],
+    ['invalid-code', 400],
+    ['unknown-workspace', 400],
+    ['missing-gitlab-token', 503],
+    ['delivery-unavailable', 503],
+    ['git-failed', 500],
+    ['push-failed', 500],
+    ['mr-failed', 500],
+    ['internal', 500],
+  ];
+  for (const [code, status] of cases) {
+    const delivery = createFakeDelivery({
+      start: () => ({ ok: false, code, message: `失败 ${code}` }),
+    });
+    const { handlers } = handlersWith({ delivery });
+    const { res, json } = await call(handlers.deliver, {
+      method: 'POST',
+      url: API_PATHS.deliver,
+      body: deliverBody(),
+    });
+    assert.equal(res.statusCode, status, code);
+    assert.equal(json.ok, false, code);
+    assert.equal(json.code, code, code);
+    assert.equal(json.message, `失败 ${code}`, code);
+  }
+});
+
+test('POST /deliver answers 503 delivery-unavailable when the service is not wired', async () => {
+  const { handlers } = handlersWith({ delivery: null });
+  const { res, json } = await call(handlers.deliver, {
+    method: 'POST',
+    url: API_PATHS.deliver,
+    body: deliverBody(),
+  });
+
+  assert.equal(res.statusCode, 503);
+  assert.equal(json.ok, false);
+  assert.equal(json.code, 'delivery-unavailable');
+  assert.match(json.message, /交付/);
+});
+
+test('POST /deliver maps an unexpected service failure to 500 internal', async () => {
+  const failing = createFakeDelivery({
+    start: () => {
+      throw new Error('delivery blew up');
+    },
+  });
+  const { handlers } = handlersWith({ delivery: failing });
+  const { res, json } = await call(handlers.deliver, {
+    method: 'POST',
+    url: API_PATHS.deliver,
+    body: deliverBody(),
+  });
+
+  assert.equal(res.statusCode, 500);
+  assert.equal(json.code, 'internal');
+  assert.match(json.message, /delivery blew up/);
+});
+
+// ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
 
@@ -2336,6 +2550,8 @@ test('every route rejects a non-loopback Host with 403', async () => {
     ['snapshot', 'GET', snapshotUrl(), undefined],
     ['action', 'POST', API_PATHS.action, actionBody()],
     ['analyze', 'POST', API_PATHS.analyze, analyzeBody()],
+    ['fix', 'POST', API_PATHS.fix, fixBody()],
+    ['deliver', 'POST', API_PATHS.deliver, deliverBody()],
     ['settings', 'POST', API_PATHS.settings, settingsBody()],
     ['platformToken', 'POST', API_PATHS.platformToken, platformTokenBody()],
     ['gitlabToken', 'POST', API_PATHS.gitlabToken, gitlabTokenBody()],
@@ -2389,6 +2605,7 @@ test('every route rejects the wrong HTTP method with 405 and an Allow header', a
     ['action', 'GET', API_PATHS.action, 'POST'],
     ['analyze', 'GET', API_PATHS.analyze, 'POST'],
     ['fix', 'GET', API_PATHS.fix, 'POST'],
+    ['deliver', 'GET', API_PATHS.deliver, 'POST'],
     ['settings', 'GET', API_PATHS.settings, 'POST'],
     ['platformToken', 'GET', API_PATHS.platformToken, 'POST'],
     ['gitlabToken', 'GET', API_PATHS.gitlabToken, 'POST'],
@@ -2410,6 +2627,7 @@ const POST_ROUTES = [
   ['action', API_PATHS.action, () => actionBody()],
   ['analyze', API_PATHS.analyze, () => analyzeBody()],
   ['fix', API_PATHS.fix, () => fixBody()],
+  ['deliver', API_PATHS.deliver, () => deliverBody()],
   ['settings', API_PATHS.settings, () => settingsBody()],
   ['platformToken', API_PATHS.platformToken, () => platformTokenBody()],
   ['gitlabToken', API_PATHS.gitlabToken, () => gitlabTokenBody()],
@@ -2528,6 +2746,7 @@ test('every route rejects a non-loopback remote address with 403', async () => {
     ['action', 'POST', API_PATHS.action, () => actionBody()],
     ['analyze', 'POST', API_PATHS.analyze, () => analyzeBody()],
     ['fix', 'POST', API_PATHS.fix, () => fixBody()],
+    ['deliver', 'POST', API_PATHS.deliver, () => deliverBody()],
     ['settings', 'POST', API_PATHS.settings, () => settingsBody()],
     ['platformToken', 'POST', API_PATHS.platformToken, () => platformTokenBody()],
     ['gitlabToken', 'POST', API_PATHS.gitlabToken, () => gitlabTokenBody()],
@@ -2688,6 +2907,13 @@ test('registerUnavailableRoutes() keeps health 500/503 and all data routes 503 u
   });
   assert.equal(fix.res.statusCode, 503);
   assert.equal(fix.json.code, 'storage-unavailable');
+
+  const deliver = await callRegistered(webServer, API_PATHS.deliver, {
+    method: 'POST',
+    body: deliverBody(),
+  });
+  assert.equal(deliver.res.statusCode, 503);
+  assert.equal(deliver.json.code, 'storage-unavailable');
 
   dispose();
   assert.equal(webServer.routes.size, 0);

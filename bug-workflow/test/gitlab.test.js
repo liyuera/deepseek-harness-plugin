@@ -753,7 +753,14 @@ test('the AbortController timeout maps to timeout', async () => {
       assert.equal(JSON.stringify(error).includes(TOKEN), false);
       return true;
     });
-    assert.ok(Date.now() - startedAt < 1000, 'timeout should fire quickly');
+    // Review M1: the mock delays 250 ms, so an implementation that merely
+    // notices the timeout AFTER the response arrives would take >=250 ms. The
+    // abort must fire near the 25 ms deadline instead.
+    const elapsed = Date.now() - startedAt;
+    assert.ok(
+      elapsed >= 20 && elapsed < 200,
+      `abort should fire near the 25ms deadline, got ${elapsed}ms`,
+    );
     // The request did reach the mock before the abort.
     assert.equal(mock.requests.length, 1);
     assert.equal(mock.requests[0].auth, true);
