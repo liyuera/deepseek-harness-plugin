@@ -7,7 +7,8 @@
  * `{ file, fid, level, gateCategory, location, problem, suggestion }`.
  *
  * Rules (see docs/superpowers/spikes/2026-11-06-p0-findings.md, Spike C):
- *   1. A note is a review only when it contains both `AI Code Review` and `结论:`.
+ *   1. A note is a review only when its own top-level lines contain both
+ *      `AI Code Review` and `结论:` (see `isReviewBody()`).
  *   2. Everything from `备注：以下隐藏数据仅用于统计` on is dropped before parsing;
  *      the JSON inside that hidden block never reaches the returned issues.
  *   3. `结论: 可直接合并` -> pass, `结论: 需要修改` -> changes.
@@ -263,6 +264,31 @@ function hasExplicitZeroIssues(own) {
 }
 
 /**
+ * The marker + `结论:` gate, evaluated on the note's own top-level lines only.
+ * `VERDICT_RE` is start-of-line anchored, so an inline "之前的结论: ..." in a
+ * human reply is not a review (there is no inline-verdict fallback).
+ */
+function hasReviewGate(own) {
+  return own.includes(AI_MARKER) && VERDICT_RE.test(own);
+}
+
+/**
+ * True when `body` is (structurally) an AI review note: a non-empty body whose
+ * OWN top-level lines carry both the `AI Code Review` marker and a `结论:` line.
+ * This is the exact same gate `parseReview()` applies before it looks at the
+ * verdict, exported so consumers (the review service's note filter) never
+ * re-implement it with a raw substring search: a human reply that quotes or
+ * pastes a review inside a blockquote/fence/indented block is not a review.
+ *
+ * @param {unknown} body raw GitLab note body
+ * @returns {boolean}
+ */
+export function isReviewBody(body) {
+  if (typeof body !== 'string' || !body.length) return false;
+  return hasReviewGate(ownLines(visibleBody(body)));
+}
+
+/**
  * Parse one GitLab note body.
  * @param {string} body raw `body` field from the GitLab notes API (Markdown)
  * @returns {{ verdict: 'pass'|'changes'|'unknown', blocking: object[], nonBlocking: object[] }}
@@ -274,9 +300,9 @@ export function parseReview(body) {
 
   // A human reply quoting or pasting a note is not a review: marker, conclusion,
   // zero-issue declaration and issue sections only count on the note's own top-level
-  // lines (see ownLines).
+  // lines (see ownLines and isReviewBody).
   const own = ownLines(visible);
-  if (!own.includes(AI_MARKER) || !/结论[ \t]*[:：]/.test(own)) return unknownResult();
+  if (!hasReviewGate(own)) return unknownResult();
 
   const verdict = extractVerdict(own);
   if (verdict === 'unknown') return unknownResult();

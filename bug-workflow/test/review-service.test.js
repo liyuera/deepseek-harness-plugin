@@ -43,9 +43,11 @@ import { createGitlabClient } from '../src/host/gitlab.js';
 import {
   REVIEW_CONTEXT_MISSING_MESSAGE,
   REVIEW_ERROR_META_PREFIX,
+  REVIEW_FIX_COMMIT_META_PREFIX,
   REVIEW_GITLAB_CONFIG_MESSAGE,
   REVIEW_LAST_NOTE_META_PREFIX,
   REVIEW_REASON_MESSAGES,
+  REVIEW_STALE_MESSAGE,
   createReviewService,
   pickLatestAiNote,
 } from '../src/host/review-service.js';
@@ -355,6 +357,85 @@ function createCountingLock() {
 }
 
 /**
+ * Store double that returns `stale-workflow` for `action` a bounded number of
+ * times. Used to reproduce the I2 "patch succeeded, transition write lost" gap
+ * without touching the real store implementation.
+ */
+function createStaleActionStore(base, action, { times = 1 } = {}) {
+  let remaining = times;
+  return {
+    ...base,
+    applyAction(code, name, payload, options) {
+      if (name === action && remaining > 0) {
+        remaining -= 1;
+        return Promise.resolve({
+          ok: false,
+          code: 'stale-workflow',
+          message: 'forced stale-workflow (test)',
+        });
+      }
+      return base.applyAction(code, name, payload, options);
+    },
+  };
+}
+
+/**
+ * Store double whose `review.last-note` claim write fails until released.
+ * Reproduces the M2 "best-effort dedupe" duplicate-round bug.
+ */
+function createFailingLastNoteStore(base) {
+  let failing = true;
+  return {
+    ...base,
+    setMeta(key, value) {
+      if (failing && key === REVIEW_LAST_NOTE_META_PREFIX + CODE) {
+        return Promise.reject(new Error('forced review.last-note write failure'));
+      }
+      return base.setMeta(key, value);
+    },
+    allowLastNoteWrites() {
+      failing = false;
+    },
+  };
+}
+
+/**
+ * A changes note with many/large findings. The parser yields every item; the
+ * service must bound what it persists and what it hands to the child.
+ */
+function bigChangesBody({ blocking = 25, nonBlocking = 15, fieldChars = 2_000 } = {}) {
+  const lines = [
+    '## AI Code Review',
+    '',
+    '结论: **需要修改**',
+    '',
+    '### 需要关注的问题',
+  ];
+  let index = 0;
+  for (let item = 0; item < blocking; item += 1) {
+    index += 1;
+    lines.push(
+      `${index}. **文件**: \`src/big-${item}.ts\``,
+      '   - 级别: 中',
+      '   - 门禁分类: 逻辑错误',
+      `   - 问题: ${'问'.repeat(fieldChars)}`,
+      `   - 建议: ${'建'.repeat(fieldChars)}`,
+    );
+  }
+  for (let item = 0; item < nonBlocking; item += 1) {
+    index += 1;
+    lines.push(
+      `${index}. **文件**: \`src/low-${item}.ts\``,
+      '   - 级别: 低',
+      '   - 门禁分类: 非阻塞建议',
+      `   - 问题: ${'低'.repeat(fieldChars)}`,
+    );
+  }
+  lines.push('');
+  return lines.join('\n');
+}
+
+/**
  * Fake review-fix child. The default edits the tracked `readme.md` in the
  * ticket worktree so the HOST's `git status`/commit/push path is real.
  */
@@ -544,7 +625,10 @@ async function createHarness(t, options = {}) {
     notes: options.notes,
   });
   const domain = createFakeDomain();
-  const store = createStore(domain, () => STORE_TIME);
+  const baseStore = createStore(domain, () => STORE_TIME);
+  const store = typeof options.storeFactory === 'function'
+    ? options.storeFactory(baseStore)
+    : baseStore;
   const tokenStore = options.tokenStore ?? createFakeTokenStore();
   const runner = options.runner ?? createFakeRunner();
   const lock = options.lock ?? createCountingLock();
@@ -696,6 +780,16 @@ test('a missing/invalid delivery context writes only the static review error', a
   assert.equal(
     invalid.store.getMeta(REVIEW_ERROR_META_PREFIX + CODE),
     REVIEW_CONTEXT_MISSING_MESSAGE,
+  );
+});
+
+test('the missing delivery-context error is the actionable P4/P5 handoff copy', async (t) => {
+  const h = await createHarness(t, { context: null });
+  await h.service.tick();
+
+  assert.equal(
+    h.store.getMeta(REVIEW_ERROR_META_PREFIX + CODE),
+    '缺少交付上下文，需人工检查（P4/P5 交接）',
   );
 });
 
@@ -934,6 +1028,47 @@ test('template drift (unknown verdict) blocks review-parse-failed and does not a
   assert.deepEqual(h.store.get(CODE), blocked);
 });
 
+test('a human reply quoting an AI review note never blocks the ticket', async (t) => {
+  const quotedPass = [
+    '> ## AI Code Review',
+    '>',
+    '> 结论: **可直接合并**',
+    '> 历史未收敛: `0` 条',
+  ].join('\n');
+  const fencedChanges = [
+    '引用 AI Review 原文：',
+    '',
+    '```markdown',
+    '## AI Code Review',
+    '',
+    '结论: **需要修改**',
+    '',
+    '### 需要关注的问题',
+    '1. **文件**: `src/quoted.ts`',
+    '   - 问题: 引用的问题。',
+    '```',
+  ].join('\n');
+  // The canonical parser already rejects both; the service filter must agree.
+  assert.equal(parseReview(quotedPass).verdict, 'unknown');
+  assert.equal(parseReview(fencedChanges).verdict, 'unknown');
+
+  const h = await createHarness(t, {
+    notes: [
+      note(56, quotedPass, '2026-11-07T04:00:10.000Z'),
+      note(57, fencedChanges, '2026-11-07T04:00:20.000Z'),
+    ],
+  });
+  const before = structuredClone(h.store.get(CODE));
+  const result = await h.service.tick();
+
+  assert.deepEqual(result, { checked: 1, transitioned: 0 });
+  const ticket = h.store.get(CODE);
+  assert.equal(ticket.workflow, 'mr_open');
+  assert.deepEqual(ticket, before);
+  assert.ok(h.store.getMeta(REVIEW_ERROR_META_PREFIX + CODE) == null);
+  assert.equal(h.runner.calls.length, 0);
+});
+
 test('non-AI notes, other bots and system notes are filtered before the latest-note pick', async (t) => {
   const h = await createHarness(t, {
     notes: [
@@ -999,6 +1134,21 @@ test('the hidden statistics block never reaches the review-fix child or its prom
   const ticket = h.store.get(CODE);
   assert.equal(ticket.workflow, 'mr_open');
   assert.equal(ticket.fixes.length, 1);
+});
+
+test('a successful poll with no new note clears a stale transient review error', async (t) => {
+  const stale = '上一次轮询的瞬时错误';
+
+  const mrOpen = await createHarness(t);
+  await mrOpen.store.setMeta(REVIEW_ERROR_META_PREFIX + CODE, stale);
+  assert.deepEqual(await mrOpen.service.tick(), { checked: 1, transitioned: 0 });
+  assert.equal(mrOpen.store.getMeta(REVIEW_ERROR_META_PREFIX + CODE), null);
+  assert.deepEqual(mrOpen.service.status(), { running: [], errors: {} });
+
+  const mergeable = await createHarness(t, { workflow: 'mergeable' });
+  await mergeable.store.setMeta(REVIEW_ERROR_META_PREFIX + CODE, stale);
+  assert.deepEqual(await mergeable.service.tick(), { checked: 1, transitioned: 0 });
+  assert.equal(mergeable.store.getMeta(REVIEW_ERROR_META_PREFIX + CODE), null);
 });
 
 test('the same note id never triggers a second fix (dedupe by note id)', async (t) => {
@@ -1173,6 +1323,425 @@ test('an unregistered/unrelated worktree blocks review-fix-failed before any git
   assert.equal(bareHasBranch(h.fixture.origin, BRANCH.name), false);
 });
 
+test('runner failure codes map to distinct static review-fix reasons', async (t) => {
+  const cases = [
+    ['analysis-timeout', 'review-fix-timeout', 'AI Review 修复超时，请稍后重试'],
+    [
+      'analysis-unavailable',
+      'review-fix-unavailable',
+      '无法启动 AI Review 修复子代理，请检查会话与工作区后重试',
+    ],
+    ['analysis-bad-output', 'review-fix-failed', 'AI Review 修复失败，请检查工作区后重试'],
+    ['analysis-failed', 'review-fix-failed', 'AI Review 修复失败，请检查工作区后重试'],
+  ];
+  for (const [code, reason, message] of cases) {
+    const h = await createHarness(t, {
+      notes: [note(160, CHANGES_BODY, '2026-11-07T04:00:10.000Z')],
+      runner: createFakeRunner(() => ({ ok: false, code, message: 'boom' })),
+    });
+    await h.service.tick();
+    await waitForIdle(h.service);
+
+    const ticket = h.store.get(CODE);
+    assert.equal(ticket.workflow, 'blocked', code);
+    assert.equal(ticket.blockedFrom, 'fixing_review', code);
+    assert.equal(ticket.blockedReason, reason, code);
+    assert.equal(h.store.getMeta(REVIEW_ERROR_META_PREFIX + CODE), message, code);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Recovery: blocked -> retry -> fixing_review (C1), pending commit (I1),
+// lost review_fix_done write (I2)
+// ---------------------------------------------------------------------------
+
+test('a failed review-fix run restarts on the next tick after retry without a second round', async (t) => {
+  const h = await createHarness(t, {
+    notes: [note(170, CHANGES_BODY, '2026-11-07T04:00:10.000Z')],
+    runner: createFakeRunner((input, count) => {
+      if (count === 1) return { ok: false, code: 'analysis-failed', message: 'child failed' };
+      appendFileSync(join(input.worktreePath, 'readme.md'), '\nfixed after retry\n');
+      return {
+        ok: true,
+        result: {
+          summary: 'retry fixed the findings',
+          changedFiles: ['readme.md'],
+          testResult: 'ok',
+          notes: '',
+        },
+        childId: 'child-retry',
+        elapsedMs: 4,
+      };
+    }),
+  });
+
+  await h.service.tick();
+  await waitForIdle(h.service);
+  let ticket = h.store.get(CODE);
+  assert.equal(ticket.workflow, 'blocked');
+  assert.equal(ticket.blockedFrom, 'fixing_review');
+  assert.equal(ticket.blockedReason, 'review-fix-failed');
+  assert.equal(ticket.mr.rounds, 1);
+  const persistedBlocking = structuredClone(ticket.mr.blockingIssues);
+  assert.ok(persistedBlocking.length > 0);
+
+  const retried = await h.store.applyAction(CODE, 'retry', { actor: 'user' });
+  assert.equal(retried.ok, true);
+  assert.equal(retried.ticket.workflow, 'fixing_review');
+
+  // Recovery must NOT need a new note: the persisted findings are enough.
+  const notesBefore = h.mock.requests.filter((request) => request.path.endsWith('/notes')).length;
+  const recoveryTick = await h.service.tick();
+  assert.equal(recoveryTick.transitioned, 0); // restarting a job is not a transition
+  assert.equal(
+    h.mock.requests.filter((request) => request.path.endsWith('/notes')).length,
+    notesBefore,
+  );
+
+  await waitFor(() => h.runner.calls.length === 2, 'review-fix restart');
+  assert.equal(h.runner.calls[1].mr.rounds, 1);
+  assert.deepEqual(h.runner.calls[1].findings.blocking, persistedBlocking);
+  await waitForIdle(h.service);
+
+  ticket = h.store.get(CODE);
+  assert.equal(ticket.workflow, 'mr_open');
+  assert.equal(ticket.mr.rounds, 1);
+  assert.equal(ticket.reviewRounds.length, 1);
+  assert.equal(ticket.reviewRounds[0].round, 1);
+  assert.equal(ticket.fixes.length, 1);
+  assert.equal(ticket.fixes[0].childId, 'child-retry');
+  assert.equal(h.runner.calls.length, 2);
+  // init + exactly one review-fix commit; nothing was committed twice.
+  assert.equal(gitSync(h.fixture.worktree, ['rev-list', '--count', 'HEAD']), '2');
+  assert.equal(h.store.getMeta(REVIEW_ERROR_META_PREFIX + CODE), null);
+});
+
+test('a NEW AI review note while fixing_review recovers the persisted round first', async (t) => {
+  const blocking = parseReview(CHANGES_BODY).blocking;
+  const h = await createHarness(t, {
+    workflow: 'fixing_review',
+    rounds: 1,
+    mr: {
+      ...MR,
+      rounds: 1,
+      verdict: 'changes',
+      blockingIssues: blocking,
+      nonBlockingIssues: [],
+    },
+    lastNoteId: 30,
+    notes: [note(31, PASS_BODY, '2026-11-07T04:00:20.000Z')],
+  });
+
+  const recoveryTick = await h.service.tick();
+  assert.equal(recoveryTick.transitioned, 0);
+  // The recovery branch runs BEFORE note polling: the new pass note is not
+  // consumed while the ticket is still fixing_review.
+  assert.equal(h.mock.requests.filter((request) => request.path.endsWith('/notes')).length, 0);
+  await waitFor(() => h.runner.calls.length === 1, 'review-fix restart');
+  assert.equal(h.runner.calls[0].mr.rounds, 1);
+  await waitForIdle(h.service);
+
+  let ticket = h.store.get(CODE);
+  assert.equal(ticket.workflow, 'mr_open');
+  assert.equal(ticket.mr.rounds, 1);
+  assert.equal(ticket.reviewRounds.length, 1);
+
+  // Only after the round completed is the new note processed (pass -> mergeable)
+  // and it must not start another fix round.
+  const noteTick = await h.service.tick();
+  assert.equal(noteTick.transitioned, 1);
+  ticket = h.store.get(CODE);
+  assert.equal(ticket.workflow, 'mergeable');
+  assert.equal(ticket.mr.rounds, 1);
+  assert.equal(ticket.reviewRounds.length, 1);
+  assert.equal(h.runner.calls.length, 1);
+});
+
+test('a fresh service instance restarts a round orphaned by dispose', async (t) => {
+  const gate = deferred();
+  const h = await createHarness(t, {
+    notes: [note(175, CHANGES_BODY, '2026-11-07T04:00:10.000Z')],
+    runner: createFakeRunner((input, count) => {
+      if (count === 1) return gate.promise;
+      appendFileSync(join(input.worktreePath, 'readme.md'), '\nfixed by restarted instance\n');
+      return {
+        ok: true,
+        result: {
+          summary: 'restarted instance fixed it',
+          changedFiles: ['readme.md'],
+          testResult: '',
+          notes: '',
+        },
+        childId: 'child-restarted',
+        elapsedMs: 2,
+      };
+    }),
+  });
+
+  await h.service.tick();
+  await waitFor(() => h.runner.calls.length === 1, 'first runner call');
+  const disposing = h.service.dispose();
+  gate.resolve({
+    ok: true,
+    result: { summary: 'late result', changedFiles: ['readme.md'], testResult: '', notes: '' },
+    childId: 'child-late',
+    elapsedMs: 1,
+  });
+  await disposing;
+  await settle();
+
+  let ticket = h.store.get(CODE);
+  assert.equal(ticket.workflow, 'fixing_review');
+  assert.equal(ticket.fixes.length, 0);
+  assert.equal(ticket.reviewRounds.length, 0);
+
+  // A brand-new instance over the SAME store/git/mock = host reload.
+  const restarted = createReviewService({
+    store: h.store,
+    git: h.git,
+    runner: h.runner,
+    tokenStore: h.tokenStore,
+    gitlabClientFor: () => createGitlabClient({
+      baseUrl: h.mock.url,
+      tokenProvider: () => h.tokenStore.get(),
+    }),
+    clock: createServiceClock(),
+    lock: h.lock,
+    drainTimeoutMs: 100,
+  });
+  t.after(async () => {
+    await restarted.dispose();
+  });
+
+  assert.equal((await restarted.tick()).checked, 1);
+  await waitFor(() => h.runner.calls.length === 2, 'restarted runner call');
+  await waitForIdle(restarted);
+
+  ticket = h.store.get(CODE);
+  assert.equal(ticket.workflow, 'mr_open');
+  assert.equal(ticket.mr.rounds, 1);
+  assert.equal(ticket.reviewRounds.length, 1);
+  assert.equal(ticket.fixes.length, 1);
+  assert.equal(ticket.fixes[0].childId, 'child-restarted');
+});
+
+test('a fixing_review ticket without persisted findings blocks review-recovery-unavailable', async (t) => {
+  const h = await createHarness(t, {
+    workflow: 'fixing_review',
+    rounds: 1,
+    mr: {
+      ...MR,
+      rounds: 1,
+      verdict: 'changes',
+      blockingIssues: [],
+      nonBlockingIssues: [],
+    },
+  });
+
+  const result = await h.service.tick();
+  assert.equal(result.transitioned, 1);
+
+  const ticket = h.store.get(CODE);
+  assert.equal(ticket.workflow, 'blocked');
+  assert.equal(ticket.blockedFrom, 'fixing_review');
+  assert.equal(ticket.blockedReason, 'review-recovery-unavailable');
+  assert.equal(
+    h.store.getMeta(REVIEW_ERROR_META_PREFIX + CODE),
+    'Review 修复恢复条件不足，请人工检查',
+  );
+  assert.equal(h.runner.calls.length, 0);
+});
+
+test('a push failure records the pending commit and the retry pushes it without a child rerun', async (t) => {
+  const h = await createHarness(t, {
+    notes: [note(180, CHANGES_BODY, '2026-11-07T04:00:10.000Z')],
+  });
+  const realOrigin = h.fixture.origin;
+  gitSync(h.fixture.repo, [
+    'remote',
+    'set-url',
+    'origin',
+    join(h.fixture.root, 'missing-origin.git'),
+  ]);
+
+  await h.service.tick();
+  await waitForIdle(h.service);
+
+  let ticket = h.store.get(CODE);
+  assert.equal(ticket.workflow, 'blocked');
+  assert.equal(ticket.blockedFrom, 'fixing_review');
+  assert.equal(ticket.blockedReason, 'review-fix-failed');
+  assert.equal(ticket.mr.rounds, 1);
+  assert.equal(ticket.fixes.length, 0);
+  assert.equal(ticket.reviewRounds.length, 0);
+  assert.equal(h.runner.calls.length, 1);
+  assert.equal(bareHasBranch(h.fixture.origin, BRANCH.name), false);
+  const sha = gitSync(h.fixture.worktree, ['rev-parse', 'HEAD']);
+
+  const record = h.store.getMeta(REVIEW_FIX_COMMIT_META_PREFIX + CODE);
+  assert.ok(record, 'the pre-push commit record must exist');
+  assert.equal(record.sha, sha);
+  assert.equal(record.worktree, h.fixture.worktree);
+  assert.equal(record.branch, BRANCH.name);
+  assert.equal(record.round, 1);
+  assert.equal(record.noteId, 180);
+  assert.equal(record.status, 'succeeded');
+  assert.equal(JSON.stringify(record).includes(TOKEN), false);
+
+  // Fix the remote and retry exactly as the UI copy tells the user to.
+  gitSync(h.fixture.repo, ['remote', 'set-url', 'origin', realOrigin]);
+  const retried = await h.store.applyAction(CODE, 'retry', { actor: 'user' });
+  assert.equal(retried.ok, true);
+  assert.equal(retried.ticket.workflow, 'fixing_review');
+
+  const recoveryTick = await h.service.tick();
+  assert.equal(recoveryTick.transitioned, 1);
+  await waitForIdle(h.service);
+
+  ticket = h.store.get(CODE);
+  assert.equal(ticket.workflow, 'mr_open');
+  assert.equal(ticket.mr.rounds, 1);
+  assert.equal(ticket.reviewRounds.length, 1);
+  assert.equal(ticket.reviewRounds[0].round, 1);
+  assert.equal(ticket.fixes.length, 1);
+  assert.equal(ticket.fixes[0].runId, record.runId);
+  // The same commit was pushed; the child ran exactly once (no empty rerun).
+  assert.equal(h.runner.calls.length, 1);
+  assert.equal(gitSync(h.fixture.worktree, ['rev-parse', 'HEAD']), sha);
+  assert.equal(gitSync(h.fixture.worktree, ['rev-list', '--count', 'HEAD']), '2');
+  assert.equal(gitSync(h.fixture.worktree, ['status', '--porcelain']), '');
+  assert.equal(bareRef(realOrigin, `refs/heads/${BRANCH.name}`), sha);
+  assert.equal(h.store.getMeta(REVIEW_FIX_COMMIT_META_PREFIX + CODE), null);
+  assert.equal(h.store.getMeta(REVIEW_ERROR_META_PREFIX + CODE), null);
+});
+
+test('a lost review_fix_done write is reconciled on the next tick without duplicating the ledger', async (t) => {
+  const h = await createHarness(t, {
+    notes: [note(190, CHANGES_BODY, '2026-11-07T04:00:10.000Z')],
+    storeFactory: (base) => createStaleActionStore(base, 'review_fix_done'),
+  });
+
+  await h.service.tick();
+  await waitForIdle(h.service);
+
+  let ticket = h.store.get(CODE);
+  assert.equal(ticket.workflow, 'fixing_review');
+  assert.equal(ticket.mr.rounds, 1);
+  assert.equal(ticket.fixes.length, 1);
+  assert.equal(ticket.reviewRounds.length, 1);
+  assert.equal(h.store.getMeta(REVIEW_ERROR_META_PREFIX + CODE), REVIEW_STALE_MESSAGE);
+  const sha = gitSync(h.fixture.worktree, ['rev-parse', 'HEAD']);
+
+  const recoveryTick = await h.service.tick();
+  assert.equal(recoveryTick.transitioned, 1);
+  await waitForIdle(h.service);
+
+  ticket = h.store.get(CODE);
+  assert.equal(ticket.workflow, 'mr_open');
+  // Idempotent replay: the ledger is NOT appended a second time.
+  assert.equal(ticket.fixes.length, 1);
+  assert.equal(ticket.reviewRounds.length, 1);
+  assert.equal(ticket.mr.rounds, 1);
+  assert.equal(h.runner.calls.length, 1);
+  assert.equal(gitSync(h.fixture.worktree, ['rev-parse', 'HEAD']), sha);
+  assert.equal(gitSync(h.fixture.worktree, ['rev-list', '--count', 'HEAD']), '2');
+  assert.equal(h.store.getMeta(REVIEW_FIX_COMMIT_META_PREFIX + CODE), null);
+  assert.equal(h.store.getMeta(REVIEW_ERROR_META_PREFIX + CODE), null);
+});
+
+test('a persistently lost review_fix_done write blocks review-fix-write-failed', async (t) => {
+  const h = await createHarness(t, {
+    notes: [note(191, CHANGES_BODY, '2026-11-07T04:00:10.000Z')],
+    storeFactory: (base) => createStaleActionStore(base, 'review_fix_done', { times: Infinity }),
+  });
+
+  await h.service.tick();
+  await waitForIdle(h.service);
+  assert.equal(h.store.get(CODE).workflow, 'fixing_review');
+
+  const recoveryTick = await h.service.tick();
+  assert.equal(recoveryTick.transitioned, 1);
+
+  const ticket = h.store.get(CODE);
+  assert.equal(ticket.workflow, 'blocked');
+  assert.equal(ticket.blockedFrom, 'fixing_review');
+  assert.equal(ticket.blockedReason, 'review-fix-write-failed');
+  assert.equal(ticket.fixes.length, 1);
+  assert.equal(ticket.reviewRounds.length, 1);
+  assert.equal(h.runner.calls.length, 1);
+  assert.equal(
+    h.store.getMeta(REVIEW_ERROR_META_PREFIX + CODE),
+    REVIEW_REASON_MESSAGES['review-fix-write-failed'],
+  );
+});
+
+test('a failed review.last-note claim blocks review-save-failed before the round starts', async (t) => {
+  const h = await createHarness(t, {
+    notes: [note(200, CHANGES_BODY, '2026-11-07T04:00:10.000Z')],
+    storeFactory: (base) => createFailingLastNoteStore(base),
+  });
+
+  const result = await h.service.tick();
+  assert.equal(result.transitioned, 1);
+
+  let ticket = h.store.get(CODE);
+  assert.equal(ticket.workflow, 'blocked');
+  assert.equal(ticket.blockedFrom, 'mr_open');
+  assert.equal(ticket.blockedReason, 'review-save-failed');
+  assert.equal(ticket.mr.rounds, 0);
+  assert.equal(h.runner.calls.length, 0);
+  assert.equal(h.store.getMeta(REVIEW_LAST_NOTE_META_PREFIX + CODE), undefined);
+  assert.equal(
+    h.store.getMeta(REVIEW_ERROR_META_PREFIX + CODE),
+    REVIEW_REASON_MESSAGES['review-save-failed'],
+  );
+
+  // Once the store recovers, retry starts exactly ONE round for the same note.
+  h.store.allowLastNoteWrites();
+  const retried = await h.store.applyAction(CODE, 'retry', { actor: 'user' });
+  assert.equal(retried.ok, true);
+  assert.equal(retried.ticket.workflow, 'mr_open');
+
+  assert.equal((await h.service.tick()).transitioned, 1);
+  await waitForIdle(h.service);
+
+  ticket = h.store.get(CODE);
+  assert.equal(ticket.workflow, 'mr_open');
+  assert.equal(ticket.mr.rounds, 1);
+  assert.equal(ticket.reviewRounds.length, 1);
+  assert.equal(h.runner.calls.length, 1);
+  assert.equal(h.store.getMeta(REVIEW_LAST_NOTE_META_PREFIX + CODE).id, 200);
+});
+
+test('parsed findings are bounded before they are persisted and sent to the child', async (t) => {
+  const body = bigChangesBody();
+  const parsed = parseReview(body);
+  assert.equal(parsed.verdict, 'changes');
+  assert.equal(parsed.blocking.length, 25);
+  assert.equal(parsed.nonBlocking.length, 15);
+
+  const h = await createHarness(t, {
+    notes: [note(210, body, '2026-11-07T04:00:10.000Z')],
+  });
+
+  await h.service.tick();
+  const ticket = h.store.get(CODE);
+  assert.equal(ticket.mr.blockingIssues.length, 20);
+  assert.equal(ticket.mr.nonBlockingIssues.length, 10);
+  for (const issue of [...ticket.mr.blockingIssues, ...ticket.mr.nonBlockingIssues]) {
+    for (const field of ['file', 'fid', 'level', 'gateCategory', 'location', 'problem', 'suggestion']) {
+      assert.ok(issue[field].length <= 600, `${field} is bounded`);
+    }
+  }
+
+  await waitFor(() => h.runner.calls.length === 1, 'runner');
+  const input = h.runner.calls[0];
+  assert.equal(input.findings.blocking.length, 20);
+  assert.equal(input.findings.nonBlocking.length, 10);
+  assert.deepEqual(input.findings.blocking, ticket.mr.blockingIssues);
+  await waitForIdle(h.service);
+});
+
 // ---------------------------------------------------------------------------
 // Lifecycle: dispose / timer / single-flight
 // ---------------------------------------------------------------------------
@@ -1213,6 +1782,37 @@ test('dispose() aborts an in-flight review-fix job without writing any state', a
   assert.equal(gitSync(h.fixture.worktree, ['rev-parse', 'HEAD']), branchHeadBefore);
   assert.equal(h.timer.intervals[0].cleared, true);
   assert.deepEqual(h.service.status().running, []);
+});
+
+test('dispose() during an in-flight tick writes no state', async (t) => {
+  const started = deferred();
+  const gate = deferred();
+  const h = await createHarness(t, {
+    notes: [note(150, PASS_BODY, '2026-11-07T04:00:10.000Z')],
+    gitlabClientFor: () => ({
+      async getMergeRequest() {
+        started.resolve();
+        await gate.promise;
+        return { iid: MR.iid, state: 'opened' };
+      },
+      async listNotes() {
+        return [note(150, PASS_BODY, '2026-11-07T04:00:10.000Z')];
+      },
+    }),
+  });
+  const before = structuredClone(h.store.get(CODE));
+
+  const tickPromise = h.service.tick();
+  await started.promise;
+  await h.service.dispose();
+  gate.resolve();
+  await tickPromise;
+  await settle();
+
+  assert.deepEqual(h.store.get(CODE), before);
+  assert.equal(h.store.getMeta(REVIEW_ERROR_META_PREFIX + CODE), undefined);
+  assert.equal(h.store.getMeta(REVIEW_LAST_NOTE_META_PREFIX + CODE), undefined);
+  assert.equal(h.runner.calls.length, 0);
 });
 
 test('start(timer) registers one 60 s interval; dispose clears it and stops polling', async (t) => {

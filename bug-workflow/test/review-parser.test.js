@@ -12,7 +12,7 @@ import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { parseReview } from '../src/host/review-parser.js';
+import { isReviewBody, parseReview } from '../src/host/review-parser.js';
 
 const MARKER = '## AI Code Review';
 const SCRIPT = fileURLToPath(new URL('../scripts/review-parser.mjs', import.meta.url));
@@ -546,6 +546,77 @@ test('parseReview() rejects a human reply that quotes a passing note', () => {
     '收到，已确认。',
   ]);
   assert.deepEqual(parseReview(body), unknown());
+});
+
+// ---------------------------------------------------------------------------
+// isReviewBody(): the marker + 结论 gate exported for note filtering
+// ---------------------------------------------------------------------------
+
+test('isReviewBody() accepts genuine pass and changes notes', () => {
+  assert.equal(isReviewBody(passBody()), true);
+  assert.equal(isReviewBody(changesBody(issue())), true);
+});
+
+test('isReviewBody() rejects empty/non-string bodies and marker-only notes', () => {
+  for (const body of [undefined, null, 42, {}, [], '', '   ']) {
+    assert.equal(isReviewBody(body), false, String(body));
+  }
+  assert.equal(isReviewBody(`${MARKER}\n\n摘要: 正在分析。\n`), false);
+  assert.equal(isReviewBody('结论: **需要修改**\n'), false);
+});
+
+test('isReviewBody() agrees with parseReview() on quoted and pasted notes', () => {
+  const bodies = [
+    review([
+      '> ## AI Code Review',
+      '> 结论: **可直接合并**',
+      '> 历史未收敛: `0` 条',
+    ]),
+    review([
+      '以下为上一轮 AI Review 原文引用：',
+      '',
+      '```markdown',
+      MARKER,
+      '',
+      '结论: **可直接合并**',
+      '',
+      '历史未收敛: `0` 条',
+      '```',
+    ]),
+    review([
+      '收到，原 note 如下：',
+      '',
+      '    ## AI Code Review',
+      '',
+      '    结论: **可直接合并**',
+      '',
+      '    历史未收敛: `0` 条',
+    ]),
+    review([
+      MARKER,
+      '',
+      '> 结论: **可直接合并**',
+      '',
+      '历史未收敛: `0` 条',
+    ]),
+    review([
+      MARKER,
+      '',
+      '补充说明：之前的结论: 可直接合并。',
+      '',
+      '历史未收敛: 0 条',
+    ]),
+  ];
+  for (const body of bodies) {
+    assert.equal(isReviewBody(body), false, body);
+    assert.deepEqual(parseReview(body), unknown(), body);
+  }
+});
+
+test('isReviewBody() keeps genuine template drift eligible for the block path', () => {
+  const drift = changesBody('格式已经改变，没有条目列表。');
+  assert.equal(isReviewBody(drift), true);
+  assert.deepEqual(parseReview(drift), unknown());
 });
 
 // ---------------------------------------------------------------------------

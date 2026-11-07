@@ -18,6 +18,14 @@
  *                 -> fixes[]/reviewRounds[] append + review_fix_done --> mr_open
  *     unknown  --block('review-parse-failed')--> blocked (no auto-retry)
  *
+ *   recovery (fixing_review with NO in-flight job — retry after a failure,
+ *   host reload, dispose)
+ *     lost review_fix_done      -> retry the action (idempotent ledger replay)
+ *     pending commit record     -> validate worktree+branch+sha, push, append
+ *                                  the ledger once, review_fix_done
+ *     persisted findings exist  -> restart the child (rounds NOT incremented)
+ *     no findings               -> block('review-recovery-unavailable')
+ *
  * Contracts:
  *
  *   - `tick()` is public and testable; `start(timer)` only registers the
@@ -28,15 +36,17 @@
  *     from the bounded `meta['delivery.context:<code>']` record written by the
  *     delivery service: `{sessionId, cwd, gitlabBaseUrl, gitlabProjectPath,
  *     commitType}`. A missing/invalid record only writes the static
- *     `review.error:<code>` message 「缺少交付上下文，请重新交付」 and never
- *     mutates the workflow.
+ *     `review.error:<code>` message 「缺少交付上下文，需人工检查（P4/P5 交接）」 and
+ *     never mutates the workflow.
  *   - No GitLab token (`tokenStore.get()` returns null/throws) means NO request
  *     and NO write at all: the tick is a silent no-op.
- *   - The newest note whose body carries the AI marker AND a `结论:` line is
- *     the only candidate (system notes are skipped). It is deduped by id via
- *     `meta['review.last-note:<code>']`, so the same note never triggers a
- *     second fix round. `parseReview()` is the canonical parser; only an
- *     AI-target note that parses to `unknown` blocks (template drift).
+ *   - The newest note whose OWN top-level lines carry the AI marker AND a
+ *     `结论:` line is the only candidate (`isReviewBody`, system notes skipped;
+ *     a human reply quoting/pasting a note is not a review). It is deduped by
+ *     id via `meta['review.last-note:<code>']`; the changes path writes that
+ *     claim BEFORE the transition and blocks if it cannot, so the same note
+ *     never starts a second round. `parseReview()` is the canonical parser;
+ *     only an AI-target note that parses to `unknown` blocks (template drift).
  *   - `review_requests_changes` increments `mr.rounds` (state machine). A 4th
  *     changes request at `MAX_REVIEW_ROUNDS` (3) blocks with
  *     `review-rounds-exhausted` instead of transitioning. A successful
@@ -67,13 +77,21 @@ import {
   createRepoLock,
 } from './delivery-service.js';
 import { MAX_REVIEW_ROUNDS } from './protocol.js';
-import { parseReview } from './review-parser.js';
+import { isReviewBody, parseReview } from './review-parser.js';
 
 /** `meta` key prefix of a persisted review error (suffix = ticket code). */
 export const REVIEW_ERROR_META_PREFIX = 'review.error:';
 
 /** `meta` key prefix of the last processed AI review note id. */
 export const REVIEW_LAST_NOTE_META_PREFIX = 'review.last-note:';
+
+/**
+ * `meta` key prefix of a review-fix commit that was created but could not be
+ * pushed (or whose host crashed between commit and transition). Recovery pushes
+ * exactly this commit instead of rerunning the child (a clean worktree would
+ * otherwise be misread as `review-fix-no-changes`).
+ */
+export const REVIEW_FIX_COMMIT_META_PREFIX = 'review.fix-commit:';
 
 /** Default poll cadence (60 s). */
 export const DEFAULT_POLL_INTERVAL_MS = 60_000;
@@ -93,8 +111,18 @@ export const REVIEW_CHANGED_FILE_MAX_CHARS = 4_096;
 export const REVIEW_CHILD_ID_MAX_CHARS = 200;
 export const REVIEW_DIFF_STAT_MAX_CHARS = 4_000;
 
+/**
+ * Bounds for the findings persisted to `mr.blockingIssues`/`nonBlockingIssues`
+ * (and passed to the child). The snapshot is re-sent to every client, so one
+ * giant note must never be persisted verbatim; the caps mirror the review-fix
+ * prompt renderer (`blocking` 20 / `nonBlocking` 10 / 600 chars per field).
+ */
+export const REVIEW_BLOCKING_ISSUES_MAX = 20;
+export const REVIEW_NON_BLOCKING_ISSUES_MAX = 10;
+export const REVIEW_ISSUE_FIELD_MAX_CHARS = 600;
+
 /** Static context failures (client-visible via `snapshot.review.errors`). */
-export const REVIEW_CONTEXT_MISSING_MESSAGE = '缺少交付上下文，请重新交付';
+export const REVIEW_CONTEXT_MISSING_MESSAGE = '缺少交付上下文，需人工检查（P4/P5 交接）';
 export const REVIEW_GITLAB_CONFIG_MESSAGE = 'GitLab 配置无效，请重新交付';
 export const REVIEW_WORKSPACE_FAILED_MESSAGE = '无法解析工作区仓库，请稍后重试';
 export const REVIEW_MR_FETCH_FAILED_MESSAGE = '获取 MR 状态失败，请稍后重试';
@@ -108,17 +136,16 @@ export const REVIEW_REASON_MESSAGES = Object.freeze({
   'review-rounds-exhausted': `AI Review 修复已满 ${MAX_REVIEW_ROUNDS} 轮，需人工介入`,
   'review-fix-failed': 'AI Review 修复失败，请检查工作区后重试',
   'review-fix-no-changes': 'AI Review 修复未产生改动，请人工检查',
+  'review-fix-timeout': 'AI Review 修复超时，请稍后重试',
+  'review-fix-unavailable': '无法启动 AI Review 修复子代理，请检查会话与工作区后重试',
+  'review-save-failed': 'Review 记录保存失败，请重试',
+  'review-recovery-unavailable': 'Review 修复恢复条件不足，请人工检查',
+  'review-fix-write-failed': 'Review 修复结果写入失败，请重试',
   'review-merged-manually': 'MR 在 AI Review 通过前被合并，请人工确认',
 });
 
 /** Workflows the poller owns. `mergeable`/`merged` are merge-detection only. */
 const POLLABLE_WORKFLOWS = new Set(['mr_open', 'fixing_review', 'mergeable', 'merged']);
-
-/** The AI note marker (same string the canonical parser requires). */
-const AI_MARKER = 'AI Code Review';
-
-/** Conclusion line marker; both marker and conclusion must be present. */
-const VERDICT_MARKER_RE = /结论[ \t]*[:：]/;
 
 const EMPTY_TICK = Object.freeze({ checked: 0, transitioned: 0 });
 
@@ -306,16 +333,27 @@ export function createReviewService({
       return handleMerged({ code, workflow });
     }
 
-    // --- 2. Newest AI review note -----------------------------------------
-    // Do not start a second fix while one is running for this ticket. An
-    // in-flight job still gets its merge check above.
-    if (workflow === 'fixing_review' && fixJobs.has(code)) {
-      return { transitioned: false };
+    // --- 2. Recover a stranded `fixing_review` ----------------------------
+    // A review-fix job can die (runner failure -> block -> retry, host reload,
+    // dispose) leaving the ticket in `fixing_review` with NO job. The note path
+    // below only accepts `mr_open`, so without this branch the ticket would
+    // spin forever (and a brand-new note could never recover it). Recovery runs
+    // BEFORE note polling: while a round is unfinished a new note must not
+    // re-enter `review_requests_changes` (it would increment rounds twice).
+    if (workflow === 'fixing_review') {
+      if (fixJobs.has(code)) return { transitioned: false };
+      return recoverFixRound({ code, ticket, context });
     }
-    if (workflow !== 'mr_open' && workflow !== 'fixing_review') {
+
+    // `mergeable`/`merged` are merge-detection only. A successful poll with
+    // nothing to do clears a stale transient error instead of keeping it until
+    // an unrelated transition happens.
+    if (workflow !== 'mr_open') {
+      await clearError(code);
       return { transitioned: false };
     }
 
+    // --- 3. Newest AI review note -----------------------------------------
     let notes;
     try {
       notes = await client.listNotes({
@@ -329,8 +367,14 @@ export function createReviewService({
     if (disposed) return { transitioned: false };
 
     const note = pickLatestAiNote(notes);
-    if (note === null) return { transitioned: false };
-    if (sameNoteId(readLastNoteId(code), note.id)) return { transitioned: false };
+    if (note === null) {
+      await clearError(code);
+      return { transitioned: false };
+    }
+    if (sameNoteId(readLastNoteId(code), note.id)) {
+      await clearError(code);
+      return { transitioned: false };
+    }
 
     const parsed = parseReview(typeof note.body === 'string' ? note.body : '');
     if (parsed.verdict === 'pass') {
@@ -414,9 +458,10 @@ export function createReviewService({
 
   /**
    * Apply one `review_requests_changes` round and start its single background
-   * fix job. The repository lock is taken BEFORE the transition: a busy/failed
-   * lock leaves the ticket in `mr_open` (the note stays unprocessed) instead of
-   * stranding it in `fixing_review` with no job.
+   * fix job. The repository lock and the note dedupe claim are taken BEFORE the
+   * transition: a busy lock/refused claim leaves the ticket in `mr_open` (the
+   * note stays retryable) instead of stranding it in `fixing_review` with no
+   * job, and a failed claim can never start the same note twice.
    */
   async function startChangesRound({ code, ticket, note, parsed, context }) {
     const rounds = Number.isSafeInteger(ticket.mr?.rounds) ? ticket.mr.rounds : 0;
@@ -442,10 +487,23 @@ export function createReviewService({
       return { transitioned: false };
     }
 
-    const findings = {
-      blocking: Array.isArray(parsed.blocking) ? parsed.blocking : [],
-      nonBlocking: Array.isArray(parsed.nonBlocking) ? parsed.nonBlocking : [],
-    };
+    const findings = boundFindings(parsed.blocking, parsed.nonBlocking);
+
+    // Persist the dedupe claim BEFORE the round starts. A best-effort claim was
+    // the M2 duplicate-round bug: a failed write left the same note unclaimed,
+    // so the next tick started round 2 for one note. A failed claim now blocks
+    // (and the ticket never enters a round it cannot dedupe).
+    const claimed = await writeLastNote(code, note, 'changes');
+    if (disposed) {
+      repoLock.release(repo, owner);
+      return { transitioned: false };
+    }
+    if (!claimed) {
+      repoLock.release(repo, owner);
+      const blocked = await blockTicket(code, 'review-save-failed', 'mr_open');
+      return { transitioned: blocked };
+    }
+
     const applied = await applyActionSafe(
       code,
       'review_requests_changes',
@@ -466,10 +524,12 @@ export function createReviewService({
       if (applied?.code !== 'stale-workflow') {
         await rememberError(code, writeFailureMessage(applied));
       }
+      // The round never started: release the claim so a later tick retries the
+      // same note. Failing to release fails safe (skip, never duplicate).
+      await forgetLastNote(code);
       return { transitioned: false };
     }
 
-    await writeLastNote(code, note, 'changes');
     await clearError(code);
     if (disposed) {
       repoLock.release(repo, owner);
@@ -491,6 +551,257 @@ export function createReviewService({
       noteId: note.id,
     });
     return { transitioned: true };
+  }
+
+  /**
+   * Recover one `fixing_review` ticket that has NO in-flight review-fix job.
+   * This is the C1 recovery path: `retry` returns a blocked ticket to
+   * `fixing_review`, and a host reload/dispose leaves the same shape, but the
+   * note path only accepts `mr_open`. Order matters:
+   *
+   *   1. The ledger patch already succeeded and `review_fix_done` was lost
+   *      (I2): retry that action idempotently (no duplicate ledger/commit).
+   *   2. A host commit exists but was never pushed (I1): validate it against
+   *      the registered worktree/branch, push it, append the ledger ONCE, then
+   *      finish the transition — no second child run.
+   *   3. Otherwise restart the child from the findings persisted by
+   *      `review_requests_changes` (rounds were already incremented).
+   *   4. No persisted findings: block with a static reason instead of spinning.
+   */
+  async function recoverFixRound({ code, ticket, context }) {
+    const reconciled = await reconcileFixDone({ code, ticket });
+    if (reconciled !== undefined) return reconciled;
+
+    const pushed = await pushRecordedFix({ code, ticket, context });
+    if (pushed !== undefined) return pushed;
+
+    return restartFixJob({ code, ticket, context });
+  }
+
+  /**
+   * Retry a lost `review_fix_done` when the ledger already proves the round
+   * completed: the last `reviewRounds[]` entry is `succeeded` for the current
+   * `mr.rounds`. Reusing a fresh actionId is safe because the transition is
+   * idempotent; `expectedWorkflow` keeps a moved ticket untouched. If the retry
+   * itself fails, block (retryable) instead of leaving the ticket stranded.
+   */
+  async function reconcileFixDone({ code, ticket }) {
+    const rounds = Array.isArray(ticket.reviewRounds) ? ticket.reviewRounds : [];
+    const last = rounds[rounds.length - 1];
+    const mrRounds = Number.isSafeInteger(ticket.mr?.rounds) ? ticket.mr.rounds : 0;
+    if (!isPlainObject(last) || last.status !== 'succeeded' || last.round !== mrRounds) {
+      return undefined;
+    }
+    // The ledger entry must belong to the round that is still claimed as the
+    // last processed note; otherwise fall through to the commit-ledger replay.
+    if (!sameNoteId(readLastNoteId(code), last.noteId)) return undefined;
+
+    const nextMr = { ...(isPlainObject(ticket.mr) ? ticket.mr : {}), state: 'opened' };
+    const applied = await applyActionSafe(
+      code,
+      'review_fix_done',
+      { actor: 'system', mr: nextMr },
+      'fixing_review',
+      'review-reconcile-done',
+    );
+    if (disposed) return { transitioned: false };
+    if (applied?.ok === true) {
+      await clearFixCommitRecord(code);
+      await clearError(code);
+      return { transitioned: true };
+    }
+
+    const blocked = await blockTicket(code, 'review-fix-write-failed', 'fixing_review');
+    return { transitioned: blocked };
+  }
+
+  /**
+   * Push the commit recorded by a failed/unclean previous run (I1). Returns
+   * `undefined` when there is nothing valid to push (stale record discarded), so
+   * the caller can restart the child; a busy repository lock waits for the next
+   * tick. The record is only trusted when it still matches THIS registered
+   * worktree and ITS branch tip — a foreign ref is never pushed.
+   */
+  async function pushRecordedFix({ code, ticket, context }) {
+    const branch = readBranch(ticket);
+    if (branch === null) return undefined;
+    const record = readFixCommitRecord(code, branch);
+    if (record === undefined) return undefined;
+
+    let repo;
+    try {
+      repo = await git.repoRoot(context.cwd);
+    } catch {
+      repo = undefined;
+    }
+    if (typeof repo !== 'string' || repo.trim() === '') {
+      const blocked = await blockTicket(code, 'review-recovery-unavailable', 'fixing_review');
+      return { transitioned: blocked };
+    }
+
+    let probe;
+    try {
+      probe = await git.probeWorktree(repo, branch.worktree, branch.name);
+    } catch {
+      probe = null;
+    }
+    if (disposed) return { transitioned: false };
+    if (!isPlainObject(probe) || probe.ok !== true || probe.state !== 'same') {
+      await clearFixCommitRecord(code);
+      return undefined;
+    }
+
+    let head;
+    try {
+      head = await git.revParse(branch.worktree, branch.name);
+    } catch {
+      head = undefined;
+    }
+    if (disposed) return { transitioned: false };
+    if (typeof head !== 'string' || head !== record.sha) {
+      await clearFixCommitRecord(code);
+      return undefined;
+    }
+
+    const owner = `review:${code}`;
+    if (!repoLock.acquire(repo, owner)) {
+      // Another job owns this repository; retry the recovery next tick.
+      return { transitioned: false };
+    }
+    try {
+      if (disposed) return { transitioned: false };
+      let pushed;
+      try {
+        pushed = await git.pushBranch({
+          root: branch.worktree,
+          remote: 'origin',
+          branch: branch.name,
+        });
+      } catch {
+        pushed = undefined;
+      }
+      if (disposed) return { transitioned: false };
+      if (!isPlainObject(pushed) || pushed.ok !== true) {
+        // Keep the record: the next retry must push this exact commit again.
+        const blocked = await blockTicket(code, 'review-fix-failed', 'fixing_review');
+        return { transitioned: blocked };
+      }
+      return await finishRecordedFix({ code, record });
+    } finally {
+      repoLock.release(repo, owner);
+    }
+  }
+
+  /**
+   * Append the recorded ledger entries (exactly once) and complete the round.
+   * The patch reuses `record.runId` as its idempotency key, so a replay of an
+   * already-applied patch returns the cached result instead of appending twice.
+   */
+  async function finishRecordedFix({ code, record }) {
+    const current = readTicket(code);
+    if (!current.ok || current.ticket.workflow !== 'fixing_review') {
+      await clearFixCommitRecord(code);
+      return { transitioned: false };
+    }
+    const ticket = current.ticket;
+    const fixes = Array.isArray(ticket.fixes) ? ticket.fixes : [];
+    const reviewRounds = Array.isArray(ticket.reviewRounds) ? ticket.reviewRounds : [];
+    const alreadyApplied = reviewRounds.some(
+      (entry) => isPlainObject(entry)
+        && entry.round === record.round
+        && entry.status === 'succeeded',
+    );
+
+    if (!alreadyApplied) {
+      const nextMr = { ...(isPlainObject(ticket.mr) ? ticket.mr : {}), state: 'opened' };
+      let patched;
+      try {
+        patched = await store.patchTicket(
+          code,
+          {
+            fixes: [...fixes, buildFixEntry(record)],
+            reviewRounds: [...reviewRounds, buildRoundEntry(record)],
+            mr: nextMr,
+          },
+          { actionId: record.runId, expectedWorkflow: 'fixing_review' },
+        );
+      } catch {
+        patched = undefined;
+      }
+      if (disposed) return { transitioned: false };
+      if (patched?.ok !== true) {
+        await rememberError(code, writeFailureMessage(patched));
+        return { transitioned: false };
+      }
+    }
+
+    const nextMr = { ...(isPlainObject(ticket.mr) ? ticket.mr : {}), state: 'opened' };
+    const applied = await applyActionSafe(
+      code,
+      'review_fix_done',
+      { actor: 'system', mr: nextMr },
+      'fixing_review',
+      'review-recovered-done',
+    );
+    if (disposed) return { transitioned: false };
+    if (applied?.ok !== true) {
+      // The ledger is written; the next tick reconciles this exact case.
+      await rememberError(code, writeFailureMessage(applied));
+      return { transitioned: false };
+    }
+    await clearFixCommitRecord(code);
+    await clearError(code);
+    return { transitioned: true };
+  }
+
+  /**
+   * Restart a review-fix job from the findings persisted with
+   * `review_requests_changes` (C1). `mr.rounds` was already incremented by the
+   * reducer, so this path never calls that action again, never writes the
+   * last-note claim and never increments the round.
+   */
+  async function restartFixJob({ code, ticket, context }) {
+    const findings = boundFindings(ticket.mr?.blockingIssues, ticket.mr?.nonBlockingIssues);
+    if (findings.blocking.length === 0 && findings.nonBlocking.length === 0) {
+      const blocked = await blockTicket(code, 'review-recovery-unavailable', 'fixing_review');
+      return { transitioned: blocked };
+    }
+
+    let repo;
+    try {
+      repo = await git.repoRoot(context.cwd);
+    } catch {
+      repo = undefined;
+    }
+    if (typeof repo !== 'string' || repo.trim() === '') {
+      const blocked = await blockTicket(code, 'review-recovery-unavailable', 'fixing_review');
+      return { transitioned: blocked };
+    }
+
+    const owner = `review:${code}`;
+    if (!repoLock.acquire(repo, owner)) {
+      // Another job owns this repository; retry the recovery next tick.
+      return { transitioned: false };
+    }
+    if (disposed) {
+      repoLock.release(repo, owner);
+      return { transitioned: false };
+    }
+
+    const round = Number.isSafeInteger(ticket.mr?.rounds) ? ticket.mr.rounds : 0;
+    const lastNoteId = readLastNoteId(code);
+    await clearError(code);
+    startFixJob({
+      code,
+      repo,
+      owner,
+      context,
+      ticket,
+      findings,
+      round,
+      noteId: lastNoteId,
+    });
+    return { transitioned: false };
   }
 
   /**
@@ -577,7 +888,7 @@ export function createReviewService({
       }
       if (entry.cancelled || disposed) return;
       if (!isPlainObject(result) || result.ok !== true) {
-        await failFix(code, 'review-fix-failed', entry);
+        await failFix(code, fixFailureReason(result), entry);
         return;
       }
 
@@ -640,6 +951,67 @@ export function createReviewService({
       }
       const sha = committed.sha;
 
+      // The child succeeded and the host committed. Build the ledger entries
+      // NOW and persist the commit record BEFORE the push: a push/host failure
+      // must be recoverable by pushing THIS commit, never by rerunning the
+      // child (a clean worktree would otherwise look like no-changes).
+      const finishedAt = nowOrIso();
+      const childId = boundChildId(result.childId);
+      const elapsedMs = Number.isFinite(result.elapsedMs)
+        ? Math.max(0, Math.trunc(result.elapsedMs))
+        : undefined;
+      const summary = clipText(result.result?.summary, REVIEW_TEXT_MAX_CHARS);
+      const testResult = clipText(result.result?.testResult, REVIEW_TEXT_MAX_CHARS);
+      const notes = typeof result.result?.notes === 'string'
+        ? clipText(result.result.notes, REVIEW_TEXT_MAX_CHARS)
+        : undefined;
+      const runId = nextActionId('review-fix', code);
+      const fixEntry = {
+        runId,
+        ...(childId === undefined ? {} : { childId }),
+        startedAt,
+        finishedAt,
+        changedFiles,
+        diffStat: clipText(diffStat, REVIEW_DIFF_STAT_MAX_CHARS),
+        diff,
+        summary,
+        testResult,
+        ...(notes === undefined ? {} : { notes }),
+        status: 'succeeded',
+        ...(elapsedMs === undefined ? {} : { elapsedMs }),
+      };
+      const roundEntry = {
+        round: Number.isSafeInteger(round) && round >= 0 ? round : 0,
+        noteId: normalizeNoteId(noteId),
+        verdict: 'changes',
+        startedAt,
+        finishedAt,
+        changedFiles,
+        ...(childId === undefined ? {} : { childId }),
+        status: 'succeeded',
+      };
+      const record = {
+        sha,
+        worktree: branch.worktree,
+        branch: branch.name,
+        round: roundEntry.round,
+        noteId: roundEntry.noteId,
+        startedAt,
+        finishedAt,
+        changedFiles,
+        diffStat: fixEntry.diffStat,
+        diff,
+        summary,
+        testResult,
+        ...(notes === undefined ? {} : { notes }),
+        ...(childId === undefined ? {} : { childId }),
+        ...(elapsedMs === undefined ? {} : { elapsedMs }),
+        runId,
+        status: 'succeeded',
+      };
+      await writeFixCommitRecord(code, record);
+      if (entry.cancelled || disposed) return;
+
       // Second identity gate: the ref we are about to push must resolve to the
       // commit the host just created (never the main worktree / another branch).
       let head;
@@ -670,17 +1042,7 @@ export function createReviewService({
         return;
       }
 
-      await persistFixDone({
-        entry,
-        code,
-        round,
-        noteId,
-        startedAt,
-        result,
-        changedFiles,
-        diffStat,
-        diff,
-      });
+      await persistFixDone({ entry, code, runId, fixEntry, roundEntry });
     } catch (error) {
       notifyLog(log, 'review-fix-job', error);
       if (!entry.cancelled && !disposed) {
@@ -693,19 +1055,11 @@ export function createReviewService({
    * Persist one successful review-fix run through the write queue: append to
    * `fixes[]`, append to `reviewRounds[]`, refresh `mr.state`, then
    * `review_fix_done` (which must NOT increment `mr.rounds` again — the
-   * transition into `fixing_review` already did).
+   * transition into `fixing_review` already did). The patch reuses `runId` as
+   * its idempotency key so a lost action can be reconciled without a second
+   * ledger entry.
    */
-  async function persistFixDone({
-    entry,
-    code,
-    round,
-    noteId,
-    startedAt,
-    result,
-    changedFiles,
-    diffStat,
-    diff,
-  }) {
+  async function persistFixDone({ entry, code, runId, fixEntry, roundEntry }) {
     const current = readTicket(code);
     if (!current.ok) {
       if (!disposed) {
@@ -725,42 +1079,6 @@ export function createReviewService({
     const reviewRounds = Array.isArray(current.ticket.reviewRounds)
       ? current.ticket.reviewRounds
       : [];
-    const finishedAt = nowOrIso();
-    const childId = boundChildId(result.childId);
-    const elapsedMs = Number.isFinite(result.elapsedMs)
-      ? Math.max(0, Math.trunc(result.elapsedMs))
-      : undefined;
-    const summary = clipText(result.result?.summary, REVIEW_TEXT_MAX_CHARS);
-    const testResult = clipText(result.result?.testResult, REVIEW_TEXT_MAX_CHARS);
-    const notes = typeof result.result?.notes === 'string'
-      ? clipText(result.result.notes, REVIEW_TEXT_MAX_CHARS)
-      : undefined;
-    const runId = nextActionId('review-fix', code);
-
-    const fixEntry = {
-      runId,
-      ...(childId === undefined ? {} : { childId }),
-      startedAt,
-      finishedAt,
-      changedFiles,
-      diffStat: clipText(diffStat, REVIEW_DIFF_STAT_MAX_CHARS),
-      diff,
-      summary,
-      testResult,
-      ...(notes === undefined ? {} : { notes }),
-      status: 'succeeded',
-      ...(elapsedMs === undefined ? {} : { elapsedMs }),
-    };
-    const roundEntry = {
-      round: Number.isSafeInteger(round) && round >= 0 ? round : 0,
-      noteId: normalizeNoteId(noteId),
-      verdict: 'changes',
-      startedAt,
-      finishedAt,
-      changedFiles,
-      ...(childId === undefined ? {} : { childId }),
-      status: 'succeeded',
-    };
     const nextMr = {
       ...(isPlainObject(current.ticket.mr) ? current.ticket.mr : {}),
       state: 'opened',
@@ -794,6 +1112,7 @@ export function createReviewService({
       await rememberError(code, writeFailureMessage(applied));
       return;
     }
+    await clearFixCommitRecord(code);
     await clearError(code);
   }
 
@@ -960,22 +1279,109 @@ export function createReviewService({
   }
 
   /**
-   * Record the processed note id. Written only after a successful transition so
-   * a refused transition retries the same note instead of silently dropping it;
-   * the next tick's transition guard keeps that retry from double-incrementing.
+   * Record the processed note id. Returns false when the claim could not be
+   * persisted. The changes path writes this BEFORE `review_requests_changes`
+   * and treats a failure as a hard error: without the claim the same note could
+   * start a second round on a later tick (M2, rounds 1 -> 2).
    */
-  function writeLastNote(code, note, verdict) {
-    if (disposed) return Promise.resolve();
+  async function writeLastNote(code, note, verdict) {
+    if (disposed) return false;
     const record = {
       id: normalizeNoteId(note?.id),
       verdict,
       at: nowOrIso(),
     };
     try {
-      return store.setMeta(REVIEW_LAST_NOTE_META_PREFIX + code, record).catch(() => {});
+      await store.setMeta(REVIEW_LAST_NOTE_META_PREFIX + code, record);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Best-effort release of a note claim written before a refused transition:
+   * the round never started, so the note must stay retryable. A failed release
+   * fails safe (the note is skipped, never run twice).
+   */
+  function forgetLastNote(code) {
+    if (disposed) return Promise.resolve();
+    try {
+      return store.setMeta(REVIEW_LAST_NOTE_META_PREFIX + code, null).catch(() => {});
     } catch {
       return Promise.resolve();
     }
+  }
+
+  /**
+   * Persist the review-fix commit BEFORE the push (I1). The record is bounded
+   * (no token, no raw note body) and carries everything needed to append the
+   * ledger entry without a second child run.
+   */
+  function writeFixCommitRecord(code, record) {
+    if (disposed) return Promise.resolve();
+    try {
+      return store.setMeta(REVIEW_FIX_COMMIT_META_PREFIX + code, record).catch(() => {});
+    } catch {
+      return Promise.resolve();
+    }
+  }
+
+  /** Forget the pending-commit record after the round completed (or is stale). */
+  function clearFixCommitRecord(code) {
+    if (disposed) return Promise.resolve();
+    try {
+      return store.setMeta(REVIEW_FIX_COMMIT_META_PREFIX + code, null).catch(() => {});
+    } catch {
+      return Promise.resolve();
+    }
+  }
+
+  /**
+   * Read and bound the pending-commit record. Only a record staged for THIS
+   * worktree and THIS personal branch is returned; a corrupt/foreign record is
+   * ignored. The caller additionally verifies the branch tip via
+   * `probeWorktree` + `revParse` before pushing anything.
+   */
+  function readFixCommitRecord(code, branch) {
+    let value;
+    try {
+      value = store.getMeta(REVIEW_FIX_COMMIT_META_PREFIX + code);
+    } catch {
+      return undefined;
+    }
+    if (!isPlainObject(value)) return undefined;
+    if (typeof value.sha !== 'string' || !/^[0-9a-f]{40,64}$/i.test(value.sha)) return undefined;
+    if (value.worktree !== branch.worktree || value.branch !== branch.name) return undefined;
+    if (!Number.isSafeInteger(value.round) || value.round < 0) return undefined;
+    if (typeof value.startedAt !== 'string' || value.startedAt === '') return undefined;
+    if (typeof value.finishedAt !== 'string' || value.finishedAt === '') return undefined;
+    if (typeof value.runId !== 'string' || value.runId === '') return undefined;
+    return {
+      sha: value.sha,
+      worktree: branch.worktree,
+      branch: branch.name,
+      round: value.round,
+      noteId: value.noteId === undefined ? 0 : normalizeNoteId(value.noteId),
+      startedAt: value.startedAt,
+      finishedAt: value.finishedAt,
+      changedFiles: boundChangedFiles(value.changedFiles),
+      diffStat: clipText(value.diffStat, REVIEW_DIFF_STAT_MAX_CHARS),
+      diff: clipText(value.diff, REVIEW_DIFF_MAX_CHARS),
+      summary: clipText(value.summary, REVIEW_TEXT_MAX_CHARS),
+      testResult: clipText(value.testResult, REVIEW_TEXT_MAX_CHARS),
+      ...(typeof value.notes === 'string'
+        ? { notes: clipText(value.notes, REVIEW_TEXT_MAX_CHARS) }
+        : {}),
+      ...(typeof value.childId === 'string' && value.childId !== ''
+        ? { childId: value.childId.slice(0, REVIEW_CHILD_ID_MAX_CHARS) }
+        : {}),
+      ...(Number.isFinite(value.elapsedMs)
+        ? { elapsedMs: Math.max(0, Math.trunc(value.elapsedMs)) }
+        : {}),
+      runId: value.runId,
+      status: 'succeeded',
+    };
   }
 
   // -------------------------------------------------------------------------
@@ -1086,9 +1492,11 @@ function isPollable(ticket) {
 
 /**
  * Latest genuine AI review note, or null. "Genuine" = a non-system note whose
- * body carries both the `AI Code Review` marker and a `结论:` line; the parser
- * then decides pass/changes/unknown. Ordering is done here because the GitLab
- * client preserves the upstream order and consumers must not trust it.
+ * OWN top-level lines carry both the `AI Code Review` marker and a `结论:` line
+ * (delegated to the canonical `isReviewBody()` so a human reply that quotes or
+ * pastes a note is never treated as template drift). The parser then decides
+ * pass/changes/unknown. Ordering is done here because the GitLab client
+ * preserves the upstream order and consumers must not trust it.
  */
 export function pickLatestAiNote(notes) {
   if (!Array.isArray(notes)) return null;
@@ -1103,9 +1511,7 @@ export function pickLatestAiNote(notes) {
 function isAiReviewNote(note) {
   if (!isPlainObject(note)) return false;
   if (note.system === true) return false;
-  const body = typeof note.body === 'string' ? note.body : '';
-  if (!body.includes(AI_MARKER)) return false;
-  return VERDICT_MARKER_RE.test(body);
+  return isReviewBody(typeof note.body === 'string' ? note.body : '');
 }
 
 /** Negative when `a` is older, positive when newer (ISO strings, then id). */
@@ -1180,6 +1586,81 @@ function boundChangedFiles(files) {
     .filter((file) => typeof file === 'string' && file !== '')
     .slice(0, REVIEW_CHANGED_FILES_MAX)
     .map((file) => file.slice(0, REVIEW_CHANGED_FILE_MAX_CHARS));
+}
+
+/**
+ * Bound the findings persisted with `review_requests_changes` and handed to the
+ * child. A single giant note must not blow up the snapshot (which every client
+ * receives) nor the prompt data budget; the caps mirror the prompt renderer.
+ */
+function boundFindings(blocking, nonBlocking) {
+  return {
+    blocking: boundIssueList(blocking, REVIEW_BLOCKING_ISSUES_MAX),
+    nonBlocking: boundIssueList(nonBlocking, REVIEW_NON_BLOCKING_ISSUES_MAX),
+  };
+}
+
+function boundIssueList(items, maxItems) {
+  if (!Array.isArray(items) || maxItems <= 0) return [];
+  const result = [];
+  for (const item of items) {
+    if (result.length >= maxItems) break;
+    if (!isPlainObject(item)) continue;
+    result.push({
+      file: clipText(item.file, REVIEW_ISSUE_FIELD_MAX_CHARS),
+      fid: clipText(item.fid, REVIEW_ISSUE_FIELD_MAX_CHARS),
+      level: clipText(item.level, REVIEW_ISSUE_FIELD_MAX_CHARS),
+      gateCategory: clipText(item.gateCategory, REVIEW_ISSUE_FIELD_MAX_CHARS),
+      location: clipText(item.location, REVIEW_ISSUE_FIELD_MAX_CHARS),
+      problem: clipText(item.problem, REVIEW_ISSUE_FIELD_MAX_CHARS),
+      suggestion: clipText(item.suggestion, REVIEW_ISSUE_FIELD_MAX_CHARS),
+    });
+  }
+  return result;
+}
+
+/** Rebuild the `fixes[]` entry recorded by a pending-commit record (I1). */
+function buildFixEntry(record) {
+  return {
+    runId: record.runId,
+    ...(record.childId === undefined ? {} : { childId: record.childId }),
+    startedAt: record.startedAt,
+    finishedAt: record.finishedAt,
+    changedFiles: Array.isArray(record.changedFiles) ? record.changedFiles : [],
+    diffStat: record.diffStat,
+    diff: record.diff,
+    summary: record.summary,
+    testResult: record.testResult,
+    ...(record.notes === undefined ? {} : { notes: record.notes }),
+    status: 'succeeded',
+    ...(record.elapsedMs === undefined ? {} : { elapsedMs: record.elapsedMs }),
+  };
+}
+
+/** Rebuild the `reviewRounds[]` entry recorded by a pending-commit record. */
+function buildRoundEntry(record) {
+  return {
+    round: record.round,
+    noteId: record.noteId,
+    verdict: 'changes',
+    startedAt: record.startedAt,
+    finishedAt: record.finishedAt,
+    changedFiles: Array.isArray(record.changedFiles) ? record.changedFiles : [],
+    ...(record.childId === undefined ? {} : { childId: record.childId }),
+    status: 'succeeded',
+  };
+}
+
+/**
+ * Map the runner's internal failure code to a client-visible static reason.
+ * `analysis-timeout` / `analysis-unavailable` are actionable (timeout vs. a
+ * host/session problem) and must not be flattened into "check your workspace".
+ */
+function fixFailureReason(result) {
+  const code = isPlainObject(result) ? result.code : undefined;
+  if (code === 'analysis-timeout') return 'review-fix-timeout';
+  if (code === 'analysis-unavailable') return 'review-fix-unavailable';
+  return 'review-fix-failed';
 }
 
 /**
