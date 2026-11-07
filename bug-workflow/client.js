@@ -5930,13 +5930,18 @@ window.__ModuleLoader__.load({
               // The polling banner (or the next poll) reports a failed refresh.
             }
           } else {
+            // The platform captcha is single-use: a failed attempt consumed it.
+            // Refresh it automatically so the user only re-types the code.
+            setLoginCaptcha(null);
+            setLoginCode('');
+            void fetchLoginCaptcha();
             setLoginError(platformLoginErrorView(result));
           }
         } finally {
           loginBusyRef.current = false;
           setLoginBusy(false);
         }
-      }, [configured, loginCaptcha, loginCode, loginPassword, loginUsername, polling, postMutation, sessionId]);
+      }, [configured, fetchLoginCaptcha, loginCaptcha, loginCode, loginPassword, loginUsername, polling, postMutation, sessionId]);
 
       // When the settings panel opens for a not-yet-logged-in workspace, fetch
       // the first captcha automatically (one request, retryable via the image).
