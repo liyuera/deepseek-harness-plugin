@@ -1196,6 +1196,111 @@ test('POST /action advances a ticket (start_analysis)', async () => {
   assert.equal(json.ticket.timeline.at(-1).kind, 'start_analysis');
 });
 
+// ---------------------------------------------------------------------------
+// Service-owned demo action guard (P5 Task 5): a raw `/action analysis_done` /
+// `/action fix_done` must not advance a ticket while the real background job is
+// running for that code — otherwise the service's own conditional write turns
+// into `stale-workflow` and the run's ledger is lost.
+// ---------------------------------------------------------------------------
+
+/** Fake store whose `applyAction` succeeds without a state-machine check. */
+function legacyActionStore() {
+  return createFakeStore({
+    applyAction: (code, action) => ({
+      ok: true,
+      ticket: { ...inboxTicket(code), workflow: action === 'analysis_done' ? 'plan_review' : 'fix_done' },
+    }),
+  });
+}
+
+test('POST /action refuses analysis_done while the real analysis job runs for that code', async () => {
+  const store = createFakeStore({ tickets: [{ ...inboxTicket('BUG-1'), workflow: 'analyzing' }] });
+  const analysis = createFakeAnalysis({ status: { running: ['BUG-1'], errors: {} } });
+  const { handlers } = handlersWith({ store, analysis });
+  const { res, json } = await call(handlers.action, {
+    method: 'POST',
+    url: API_PATHS.action,
+    body: actionBody({ action: 'analysis_done', actionId: 'act-guard-analysis' }),
+  });
+
+  assert.equal(res.statusCode, 409);
+  assert.equal(json.ok, false);
+  assert.equal(json.code, 'service-job-running');
+  assert.match(json.message, /AI 任务正在运行/);
+  assert.equal(json.ticket, undefined, 'the refusal must not echo a ticket');
+  assert.equal(store.calls.applyAction.length, 0, 'the guard must run before the store write');
+  assert.equal(analysis.calls.status, 1);
+});
+
+test('POST /action refuses fix_done while the real fix job runs for that code', async () => {
+  const store = createFakeStore({ tickets: [{ ...inboxTicket('BUG-1'), workflow: 'fixing' }] });
+  const fix = createFakeFix({ status: { running: ['BUG-1'], errors: {} } });
+  const { handlers } = handlersWith({ store, fix });
+  const { res, json } = await call(handlers.action, {
+    method: 'POST',
+    url: API_PATHS.action,
+    body: actionBody({ action: 'fix_done', actionId: 'act-guard-fix' }),
+  });
+
+  assert.equal(res.statusCode, 409);
+  assert.equal(json.code, 'service-job-running');
+  assert.equal(store.calls.applyAction.length, 0);
+  assert.equal(fix.calls.status, 1);
+});
+
+test('POST /action keeps the legacy path when another code is running or another action is sent', async () => {
+  const store = legacyActionStore();
+  const analysis = createFakeAnalysis({ status: { running: ['BUG-OTHER'], errors: {} } });
+  const { handlers } = handlersWith({ store, analysis });
+
+  const otherCode = await call(handlers.action, {
+    method: 'POST',
+    url: API_PATHS.action,
+    body: actionBody({ action: 'analysis_done', actionId: 'act-guard-other-code' }),
+  });
+  assert.equal(otherCode.res.statusCode, 200, 'a job for another ticket must not gate this one');
+  assert.equal(otherCode.json.ticket.workflow, 'plan_review');
+  assert.equal(store.calls.applyAction.length, 1);
+
+  // Only the two service-owned demo actions are guarded: `start_analysis`
+  // bypasses nothing (it is the P1 demo entry point, not a service result).
+  const otherAction = await call(handlers.action, {
+    method: 'POST',
+    url: API_PATHS.action,
+    body: actionBody({ action: 'start_analysis', actionId: 'act-guard-other-action' }),
+  });
+  assert.equal(otherAction.res.statusCode, 200);
+  assert.equal(store.calls.applyAction.length, 2);
+  assert.deepEqual(store.calls.applyAction.map((entry) => entry.action), ['analysis_done', 'start_analysis']);
+  assert.equal(analysis.calls.status, 1, 'only the guarded action reads the live service status');
+});
+
+test('POST /action keeps the legacy path when the service is unwired or its status throws', async () => {
+  const throwStatus = () => {
+    throw new Error('service status unavailable');
+  };
+
+  const cases = [
+    { name: 'analysis unwired', deps: { analysis: null }, action: 'analysis_done' },
+    { name: 'fix unwired', deps: { fix: null }, action: 'fix_done' },
+    { name: 'analysis status throws', deps: { analysis: createFakeAnalysis({ status: throwStatus }) }, action: 'analysis_done' },
+    { name: 'fix status throws', deps: { fix: createFakeFix({ status: throwStatus }) }, action: 'fix_done' },
+  ];
+
+  for (const entry of cases) {
+    const store = legacyActionStore();
+    const { handlers } = handlersWith({ store, ...entry.deps });
+    const { res, json } = await call(handlers.action, {
+      method: 'POST',
+      url: API_PATHS.action,
+      body: actionBody({ action: entry.action, actionId: `act-guard-${entry.action}` }),
+    });
+    assert.equal(res.statusCode, 200, `${entry.name} must keep the legacy path`);
+    assert.equal(json.ok, true, entry.name);
+    assert.equal(store.calls.applyAction.length, 1, `${entry.name} must still reach the store`);
+  }
+});
+
 test('POST /action rejects malformed JSON with 400', async () => {
   const { handlers } = handlersWith();
   const { res, json } = await call(handlers.action, {

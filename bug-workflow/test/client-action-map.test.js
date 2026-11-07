@@ -13,12 +13,17 @@
  *   1. `analyzing.analysis_done` must ship a real demo `plan` payload, and the
  *      demo chain must apply each descriptor's payload (not `{}`), so
  *      `approve_plan` keeps a non-empty plan instead of an empty object.
- *   2. `review_requests_changes` declares `maxRounds`, and the extracted rule
- *      disables it at the cap the host refuses with 409 (which blocks the
- *      ticket server-side).
- *   3. The exact action set per workflow state is hardcoded one-way AND
+ *   2. The exact action set per workflow state is hardcoded one-way AND
  *      backwards (host -> board is not asserted per state because the board
  *      intentionally omits `block`, documented P1 omission).
+ *
+ * P5 Task 5 removed the demo write-back actions for the delivery/review flow
+ * (`submit_mr`, `mr_created`, `review_requests_changes`, `review_pass`,
+ * `review_fix_done`, `mr_merged`, `dismiss`): the host services own those
+ * transitions now (delivery job, 60 s review polling, merge detection and
+ * automatic archival). This test asserts they are gone from the board while
+ * the host state machine still accepts them, and that the remaining literal
+ * still passes the host guard for every mapped action.
  */
 
 import test from 'node:test';
@@ -47,14 +52,28 @@ const EXPECTED_ACTIONS = Object.freeze({
   plan_review: ['approve_plan', 'reject_plan'],
   fixing: ['fix_done'],
   fix_done: ['mark_test_passed'],
-  submitting: ['submit_mr', 'mr_created'],
-  mr_open: ['review_requests_changes', 'review_pass'],
-  fixing_review: ['review_fix_done'],
-  mergeable: ['mr_merged'],
-  merged: ['dismiss'],
+  // P5: the delivery/review flow is service-owned. The board renders the real
+  // 「提交并创建 MR」 descriptor (board-only, routed to /api/deliver) and the
+  // review/merge banners instead of demo write-back buttons.
+  submitting: [],
+  mr_open: [],
+  fixing_review: [],
+  mergeable: [],
+  merged: [],
   done: [],
   blocked: ['retry'],
 });
+
+/** P5 demo write-back actions the board must never render again. */
+const REMOVED_P5_ACTIONS = Object.freeze([
+  'submit_mr',
+  'mr_created',
+  'review_requests_changes',
+  'review_pass',
+  'review_fix_done',
+  'mr_merged',
+  'dismiss',
+]);
 
 const DEMO_PATH = Object.freeze([
   'start_analysis',
@@ -62,23 +81,7 @@ const DEMO_PATH = Object.freeze([
   'approve_plan',
   'fix_done',
   'mark_test_passed',
-  'submit_mr',
-  'mr_created',
-  'review_pass',
-  'mr_merged',
-  'dismiss',
 ]);
-
-const DEMO_ISSUE_FIELDS = [
-  'fid',
-  'file',
-  'level',
-  'gateCategory',
-  'location',
-  'problem',
-  'suggestion',
-  'blocking',
-];
 
 /** Fields of `planSchema` in `src/host/domain.js`, in declaration order. */
 const DEMO_PLAN_FIELDS = [
@@ -220,18 +223,14 @@ test('every mapped action passes the real state machine guard', () => {
   }
 });
 
-test('mr_created is offered from submitting and not from mr_open', () => {
-  const submitting = actionsOf(ACTION_BY_STATE, 'submitting');
-  assert.ok(submitting.includes('submit_mr'), 'submitting must still offer submit_mr');
-  assert.ok(submitting.includes('mr_created'), 'submitting must offer mr_created');
-  assert.ok(!actionsOf(ACTION_BY_STATE, 'mr_open').includes('mr_created'), 'mr_open must not offer mr_created');
-});
-
-test('apply() from submitting with mr_created reaches mr_open', () => {
-  const check = canApply(ticketAt('submitting'), 'mr_created');
-  assert.equal(check.ok, true, `mr_created must be legal from submitting: ${check.code} ${check.message}`);
-  const next = apply(ticketAt('submitting'), 'mr_created', {}, AT);
-  assert.equal(next.workflow, 'mr_open');
+test('the P5 demo write-back actions are absent from the board map', () => {
+  const offeredActions = STATES.flatMap((state) => actionsOf(ACTION_BY_STATE, state));
+  for (const action of REMOVED_P5_ACTIONS) {
+    assert.ok(!offeredActions.includes(action), `${action} must not be rendered by the board any more`);
+    // The removal is board-only: the host state machine still owns these
+    // transitions for its services and for legacy clients.
+    assert.ok(ACTIONS.includes(action), `${action} must stay a host action`);
+  }
 });
 
 test('analyzing.analysis_done ships a demo plan payload matching the host plan schema', () => {
@@ -259,7 +258,7 @@ test('analyzing.analysis_done ships a demo plan payload matching the host plan s
   assert.equal(plan.rejectedReason, null);
 });
 
-test('the P1 demo path applies each descriptor payload and reaches done with the real plan', () => {
+test('the remaining demo path applies each descriptor payload and reaches submitting with the real plan', () => {
   const demoDescriptor = descriptorOf(ACTION_BY_STATE, 'analyzing', 'analysis_done');
   const demoPlan = demoDescriptor.payload.plan;
 
@@ -284,7 +283,10 @@ test('the P1 demo path applies each descriptor payload and reaches done with the
     if (action === 'approve_plan') planAfterApprove = ticket.plan;
   }
 
-  assert.equal(ticket.workflow, TERMINAL_STATE, 'the demo chain must reach done');
+  // P5 removed the demo submit_mr/mr_created buttons, so the board-driven demo
+  // chain now stops at `submitting`; the real delivery job takes over there.
+  assert.equal(ticket.workflow, 'submitting', 'the demo chain must stop at submitting (delivery is service-owned)');
+  assert.deepEqual(actionsOf(ACTION_BY_STATE, 'submitting'), [], 'submitting renders no demo write-back button');
 
   assert.ok(planBeforeApprove !== null, 'analysis_done must create a plan on the ticket');
   assert.equal(planBeforeApprove.summary, demoPlan.summary, 'analysis_done must persist the demo plan summary');
@@ -311,29 +313,26 @@ test('the P1 demo path applies each descriptor payload and reaches done with the
   assert.equal(planAfterApprove.rejectedReason, null);
 });
 
-test('review loop actions stay legal from their mapped states', () => {
-  assert.ok(actionsOf(ACTION_BY_STATE, 'mr_open').includes('review_requests_changes'));
+test('the host still owns the review loop the board no longer drives', () => {
+  // Board-only removal, full host support: the review service writes these.
   const changes = apply(ticketAt('mr_open'), 'review_requests_changes', {}, AT);
   assert.equal(changes.workflow, 'fixing_review');
-  assert.ok(actionsOf(ACTION_BY_STATE, 'fixing_review').includes('review_fix_done'));
   const back = apply(changes, 'review_fix_done', {}, AT);
   assert.equal(back.workflow, 'mr_open');
   assert.equal(canApply(ticketAt('mr_open', { mr: { rounds: MAX_REVIEW_ROUNDS } }), 'review_requests_changes').ok, false);
+  const passing = apply(ticketAt('mr_open'), 'review_pass', {}, AT);
+  assert.equal(passing.workflow, 'mergeable');
+  assert.equal(apply(passing, 'mr_merged', {}, AT).workflow, 'merged');
 });
 
-test('review_requests_changes declares the host review-rounds cap', () => {
-  const descriptor = descriptorOf(ACTION_BY_STATE, 'mr_open', 'review_requests_changes');
-  assert.ok(descriptor, 'mr_open must offer review_requests_changes');
-  assert.equal(descriptor.maxRounds, MAX_REVIEW_ROUNDS, 'maxRounds must mirror MAX_REVIEW_ROUNDS from the host protocol');
-});
-
-test('the availability rule disables review_requests_changes at the rounds cap', () => {
-  const descriptor = descriptorOf(ACTION_BY_STATE, 'mr_open', 'review_requests_changes');
-  assert.ok(descriptor, 'mr_open must offer review_requests_changes');
+test('the availability rule still disables a declared rounds cap', () => {
   assert.equal(typeof actionUnavailableHint, 'function');
 
-  const noMr = ticketAt('mr_open');
-  assert.equal(actionUnavailableHint(descriptor, noMr), null, 'a ticket without mr metadata stays available');
+  // The P5 board map no longer carries a maxRounds descriptor (the demo
+  // review_requests_changes button is gone), but the shared rule stays the
+  // contract for any future capped descriptor and is still used by ActionBar.
+  const descriptor = { action: 'review_requests_changes', maxRounds: MAX_REVIEW_ROUNDS };
+  assert.equal(actionUnavailableHint(descriptor, ticketAt('mr_open')), null, 'a ticket without mr metadata stays available');
 
   const belowCap = ticketAt('mr_open', { mr: { rounds: MAX_REVIEW_ROUNDS - 1 } });
   assert.equal(actionUnavailableHint(descriptor, belowCap), null, 'below the cap the button stays available');
@@ -349,9 +348,7 @@ test('the availability rule disables review_requests_changes at the rounds cap',
   assert.equal(hostCheck.code, 'review-rounds-exhausted');
 
   // Only descriptors that declare maxRounds are affected.
-  const passDescriptor = descriptorOf(ACTION_BY_STATE, 'mr_open', 'review_pass');
-  assert.equal(actionUnavailableHint(passDescriptor, atCap), null, 'review_pass must stay available at the cap');
-  assert.equal(canApply(atCap, 'review_pass').ok, true);
+  assert.equal(actionUnavailableHint({ action: 'other' }, atCap), null);
 });
 
 test('ActionBar applies the availability rule and renders the exhausted hint', () => {
@@ -366,27 +363,57 @@ test('ActionBar applies the availability rule and renders the exhausted hint', (
   assert.ok(body.includes("role: 'note'"), 'the hint must be exposed to assistive technology');
 });
 
-test('review_requests_changes demo payload carries the spec issue fields', () => {
-  const descriptor = descriptorOf(ACTION_BY_STATE, 'mr_open', 'review_requests_changes');
-  assert.ok(descriptor, 'mr_open must offer review_requests_changes');
-  const issues = descriptor.payload?.blockingIssues;
-  assert.ok(Array.isArray(issues), 'payload.blockingIssues must be an array');
-  assert.equal(issues.length, 1, 'the P1 demo payload ships exactly one blocking issue');
-  const issue = issues[0];
-  assert.deepEqual(Object.keys(issue).sort(), [...DEMO_ISSUE_FIELDS].sort());
-  assert.equal(issue.fid, 'demo-1');
-  assert.equal(issue.file, 'src/demo.ts');
-  assert.equal(issue.level, '中');
-  assert.equal(issue.gateCategory, '逻辑错误');
-  assert.equal(issue.location, 'src/demo.ts:1-2');
-  assert.equal(issue.problem, 'P1 演示问题');
-  assert.equal(issue.suggestion, '演示建议');
-  assert.equal(issue.blocking, true);
+test('P5 delivery/review panels wire the real routes and keep counters out of live regions', () => {
+  // The board-only delivery descriptor must hit /api/deliver (never /action),
+  // otherwise the host would see a demo submit_mr instead of starting the job.
+  assert.ok(source.includes("deliver: '/bug-workflow/api/deliver'"), 'client API map must expose the delivery route');
+  assert.ok(source.includes("gitlabToken: '/bug-workflow/api/gitlab-token'"), 'client API map must expose the GitLab token route');
+  assert.ok(source.includes("action: 'start_deliver'"), 'the board-only delivery descriptor must exist');
+  assert.ok(source.includes("label: '提交并创建 MR'"), 'the delivery button must keep its product label');
 
-  const applied = apply(ticketAt('mr_open'), 'review_requests_changes', descriptor.payload, AT);
-  // JSON round-trip: values extracted from the vm context have foreign prototypes.
-  assert.equal(JSON.stringify(applied.mr.blockingIssues), JSON.stringify(issues));
-  assert.equal(applied.mr.rounds, 1);
+  const executeStart = source.indexOf('const executeAction = React.useCallback(');
+  const executeEnd = source.indexOf('const requestAction = React.useCallback(', executeStart);
+  assert.ok(executeStart !== -1 && executeEnd > executeStart, 'client.js must declare executeAction before requestAction');
+  const executeBody = source.slice(executeStart, executeEnd);
+  assert.ok(executeBody.includes("descriptor.action === 'start_deliver'"), 'executeAction must recognize start_deliver');
+  assert.ok(
+    executeBody.includes('postMutation(API.deliver, { sessionId, code: ticket.code })'),
+    'start_deliver must POST /api/deliver with {sessionId, code}',
+  );
+
+  // Running timers tick every second; the polite live region must only hold
+  // the start/finish copy, so the counter carries aria-live="off".
+  const deliveryStart = source.indexOf('function DeliveryNotice(');
+  const deliveryEnd = source.indexOf('function ReviewNotice(', deliveryStart);
+  assert.ok(deliveryStart !== -1 && deliveryEnd > deliveryStart, 'client.js must declare DeliveryNotice before ReviewNotice');
+  const deliveryBody = source.slice(deliveryStart, deliveryEnd);
+  assert.ok(deliveryBody.includes("'data-bug-delivery': 'running'"), 'delivery must render a running banner');
+  assert.ok(deliveryBody.includes("'aria-live': 'off'"), 'the delivery elapsed counter must opt out of the live region');
+  assert.ok(deliveryBody.includes('snapshot.delivery') === false, 'delivery must use helpers, not raw snapshot indexing');
+  assert.ok(deliveryBody.includes('deliveryRunningFor(snapshot, ticket.code)'), 'delivery progress must follow snapshot.delivery.running');
+  assert.ok(deliveryBody.includes('deliveryErrorFor(snapshot, ticket.code)'), 'delivery error copy must come from snapshot.delivery.errors');
+
+  const reviewStart = source.indexOf('function ReviewNotice(');
+  const reviewEnd = source.indexOf('function Timeline(', reviewStart);
+  assert.ok(reviewStart !== -1 && reviewEnd > reviewStart, 'client.js must declare ReviewNotice before Timeline');
+  const reviewBody = source.slice(reviewStart, reviewEnd);
+  for (const copy of [
+    'REVIEW_POLL_HINT',
+    'REVIEW_RUNNING_HINT',
+    'REVIEW_NOT_RUNNING_HINT',
+    'REVIEW_MERGEABLE_HINT',
+    'REVIEW_MERGED_HINT',
+    'reviewRunningFor(snapshot, ticket.code)',
+    'reviewErrorFor(snapshot, ticket.code)',
+    "MAX_RENDERED_REVIEW_ISSUES",
+  ]) {
+    assert.ok(reviewBody.includes(copy), `ReviewNotice must render ${copy}`);
+  }
+  assert.ok(reviewBody.includes("'aria-live': 'off'"), 'the review elapsed counter must opt out of the live region');
+
+  // Timeline `patch` events (mr/reviewRounds-only patchTicket writes) must have
+  // a label instead of rendering the raw kind.
+  assert.ok(source.includes("patch: '交付信息已更新'"), 'EVENT_LABELS must map the patch timeline kind');
 });
 
 test('terminal state maps no actions and accepts none', () => {

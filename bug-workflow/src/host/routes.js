@@ -8,7 +8,10 @@
  *                                              analysis, fix, delivery, review, tickets, serverTime }
  *   POST /bug-workflow/api/action          -> { ok, ticket } | { ok:false, code, message, ticket? }
  *                                              action:'create' + payload.code imports that
- *                                              platform task by code (see `importTask`)
+ *                                              platform task by code (see `importTask`).
+ *                                              `analysis_done`/`fix_done` are refused with
+ *                                              409 `service-job-running` while that ticket's
+ *                                              real job is in the service's running set.
  *   POST /bug-workflow/api/analyze         -> { ok, workflow:'analyzing', running }
  *                                              | { ok:false, code, message } (P3 real analysis)
  *   POST /bug-workflow/api/fix             -> { ok, workflow:'fixing', running }
@@ -287,6 +290,16 @@ const DELIVERY_ERROR_STATUS = Object.freeze({
 /** 503 message for a host built without the delivery service. */
 const DELIVERY_UNAVAILABLE_MESSAGE = '交付服务不可用，请稍后重试';
 
+/**
+ * 409 copy for a service-owned demo action (`analysis_done` / `fix_done`) that
+ * arrives while the corresponding real background job is still running for the
+ * same ticket. Accepting it would advance the ticket early and turn the
+ * service's own conditional state write into `stale-workflow`, losing the
+ * ledger entry; the host refuses instead (static code + copy, no detail).
+ */
+const SERVICE_JOB_RUNNING_CODE = 'service-job-running';
+const SERVICE_JOB_RUNNING_MESSAGE = '该工单的 AI 任务正在运行，已拒绝手动推进；请等待任务完成';
+
 /** Explicit allow-list of loopback Host header values (with optional port). */
 const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1']);
 
@@ -537,6 +550,21 @@ export function createHandlers({
       const payload = normalizePayload(input.payload);
       if (!payload.ok) {
         sendError(res, 400, payload.code, payload.message);
+        return;
+      }
+
+      // Service-owned demo actions: `analysis_done`/`fix_done` are transition
+      // names the real background services write themselves. A board/raw POST
+      // while that job is running for the SAME code must be refused before the
+      // store write, otherwise the ticket advances early and the service's
+      // conditional patch/action becomes `stale-workflow` (the run's ledger is
+      // lost). An unwired service (or a status read that fails) keeps the
+      // legacy path: this guard only covers the live race, never a new failure.
+      const serviceDeps = action === 'analysis_done'
+        ? analysisDeps
+        : (action === 'fix_done' ? fixDeps : null);
+      if (serviceDeps !== null && serviceJobRunningFor(serviceDeps, code)) {
+        sendError(res, 409, SERVICE_JOB_RUNNING_CODE, SERVICE_JOB_RUNNING_MESSAGE);
         return;
       }
 
@@ -1286,6 +1314,29 @@ function readServiceStatus(serviceDeps) {
     }
   }
   return { running, errors };
+}
+
+/**
+ * True when `code` is in the service's live `status().running` set.
+ *
+ * Reading the service status is best-effort: an unwired dependency, a service
+ * without `status()`, a throwing `status()` or a malformed result all read as
+ * "not running" so the legacy `/api/action` path stays available (the guard
+ * only ever removes the specific race with a real background job; it must not
+ * turn into a new failure mode for older wiring).
+ */
+function serviceJobRunningFor(serviceDeps, code) {
+  if (serviceDeps === null || serviceDeps === undefined) return false;
+  if (typeof serviceDeps.service?.status !== 'function') return false;
+
+  let status;
+  try {
+    status = serviceDeps.service.status();
+  } catch {
+    return false;
+  }
+  if (!isPlainObject(status) || !Array.isArray(status.running)) return false;
+  return status.running.includes(code);
 }
 
 /** Coerce a sync stat to a non-negative integer; anything else counts as 0. */
