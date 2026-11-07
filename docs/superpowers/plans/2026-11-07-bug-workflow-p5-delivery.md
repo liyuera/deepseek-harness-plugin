@@ -26,13 +26,20 @@
 // git.js 扩展（注入 execFile，返回结构化结果；分支名先过 assertPushableBranch）
 createGit({ execFile }) -> {
   // P4 已导出：repoRoot/refExists/worktreePath/worktreeAdd({created})/status/diffStat/diff/worktreeRemove
-  // 注意：listWorktrees/probeWorktree 只是 git.js 内部闭包，**不是 P4 公开 API**；
-  //       P5 Task 3 必须先把它们从 createGit() 导出（或提供等价公开方法）再使用。
-  assertPushableBranch(name) -> void        // 抛 GitError('protected-branch')；main/dev/feature-*/hotfix-*/release-* 拒绝
-  revParse(repo, ref) -> Promise<string>,
-  commitAll({ root, message }) -> Promise<{ sha }>,   // git add -A && git commit -m；无改动 → { sha:null }
-  pushBranch({ root, remote, branch }) -> Promise<void>, // git push -u <remote> <branch>（禁止 --force）
+  // P5 Task 3 已把 P4 的内部闭包 listWorktrees/probeWorktree 提升为公开 API：
+  listWorktrees(repo) -> Promise<{ok:true, entries:Array<{path, branch}>}>,
+  probeWorktree(repo, path, branch) -> Promise<{ok:true, state:'absent'|'unregistered'|'same'|'different'}>,
+  revParse(repo, ref) -> Promise<string | GitFailure>,
+  commitAll({ root, message }) -> Promise<{ok:true, sha:string|null} | GitFailure>,
+  // git add -A → git diff --cached --quiet（exit 1 = 有暂存改动）→ git commit -m <message>；
+  // 无改动 → { ok:true, sha:null } 且不写空提交；message 始终是单个 argv，绝无 shell
+  pushBranch({ root, remote='origin', branch }) -> Promise<{ok:true, branch, remote} | GitFailure>,
+  // 先 assertPushableBranch（在 spawn 之前），再 git push -u <remote> <branch>；禁止 --force；60s 超时
 }
+// 模块级：assertPushableBranch(name) -> string（规范化后的分支名）
+//   拒绝：main/master/dev/develop、feature-*、hotfix-*、release-*（大小写不敏感，含 refs/heads/ 前缀）
+//   抛 GitError('protected-branch'|'invalid-branch')，message 为静态中文（不复述输入）
+// GitFailure: { ok:false, code:'git-failed'|'git-timeout'|'protected-branch'|'invalid-branch', message, command }
 
 // gitlab.js
 createGitlabClient({ baseUrl, tokenProvider, fetchImpl, timeoutMs = 15000 }) -> {
@@ -53,18 +60,33 @@ export function parseReview(body) -> { verdict:'pass'|'changes'|'unknown', block
 // Issue: { file, fid, level, gateCategory, location, problem, suggestion }；无 summary/noteMeta；隐藏统计段已裁掉
 
 // delivery-service.js
-createDeliveryService({ store, git, gitlab, settings, clock, lock, execCommand })
+// 注入式、纯编排；**不接收已构造的 gitlab client**（Task 2 review M4）：
+// gitlabBaseUrl 是 per-workspace settings，而 createGitlabClient 在构造期绑定 baseUrl，
+// 因此按 workspace 现读 settings 构造，与 index.js 的 platformClientFor 同模式。
+createDeliveryService({
+  store, git, tokenStore,
+  gitlabClientFor: (settings) => gitlabClient,   // 首选；start() 内按当前 settings 调用
+  // gitlab: 预构造 client 仅保留给直接测试；fetchImpl 用于内置 fallback factory
+  clock, lock,                                   // lock: {acquire(repo,owner), release(repo,owner)} 共享仓库单飞
+  execCommand,                                   // (command,{cwd,timeoutMs,signal}) -> {ok,output}
+  commandTimeoutMs = 300000, drainTimeoutMs = 3000, log,
+})
   .start(sessionId, cwd, code) -> { ok:true, running:true } | { ok:false, code, message }
-  .status() -> { running:string[], errors:Record<code,string> }
+  .status() -> { running:string[], errors:Record<code,string> }   // errors 键 = 工单号
   .dispose() -> Promise<void>
-// 流程：校验 submitting + token/settings + branch 元数据 + worktree 存在 → lint/test →
-//        commitAll → push → findOpenMR 复用或 createMergeRequest →
-//        写队列内：submit_mr（intent）→ mr_created(expectedWorkflow:'submitting', mr:MRRecord) → patchTicket(mr)
-// 失败码：not-submitting|missing-gitlab-token|invalid-gitlab-settings|worktree-missing|
-//         delivery-lint-failed|delivery-test-failed|protected-branch|git-failed|push-failed|mr-failed|delivery-busy
+// 流程：校验 submitting + token/settings + branch 元数据 + worktree 存在（同步、零写入）→
+//        lint/test（空命令跳过，时间线记「未配置 lint/test」）→ commitAll → push →
+//        findOpenMR 复用或 createMergeRequest →
+//        写队列内：submit_mr（intent）→ mr_created(expectedWorkflow:'submitting', mr:MRRecord) →
+//                  patchTicket({reviewRounds:[]})（仅当尚无该字段，expectedWorkflow:'mr_open'）
+// 失败码：ticket-not-found|not-submitting|missing-gitlab-token|invalid-gitlab-settings|worktree-missing|
+//         protected-branch|invalid-branch|delivery-lint-failed|delivery-test-failed|delivery-no-changes|
+//         git-failed|push-failed|mr-failed|delivery-busy|delivery-unavailable
+// 步骤失败 → block（静态 reason，expectedWorkflow:'submitting'）+ meta `delivery.error:<工单号>`；
+// 迟到/取消结果只写 meta，绝不回退已推进的工单；绝不触碰 `fix.error:<工单号>`
 
-// review-service.js
-createReviewService({ store, gitlab, git, runner, clock, timer, settings })
+// review-service.js（Task 4；这里同样用 per-workspace factory，避免单个 client 绑定过期 baseUrl）
+createReviewService({ store, git, tokenStore, gitlabClientFor, runner, clock, timer, getSettings })
   .start() / .dispose() / .status() / .tick() -> Promise<{ checked, transitioned }>
 // tick：mr_open/fixing_review 工单 → listNotes → 最新 AI note（去重）→ parse →
 //   pass: review_pass(expectedWorkflow:'mr_open')
@@ -93,7 +115,7 @@ fixes:  [ fixRunSchema … ]                                   // review 修复�
 **路由**：
 - `POST /bug-workflow/api/deliver` body `{sessionId, code}` → 200 `{ok:true, running:true, workflow:'submitting'}`；400/404/409/503/500（409：`not-submitting`、`delivery-busy`、`protected-branch`；503：`missing-gitlab-token`、`delivery-unavailable`）。
 - `POST /bug-workflow/api/gitlab-token` body `{sessionId, token}` → 200 `{ok:true, tokenPresent}`（string 保存、`null` 清除；与平台 token 端点完全同契约：415/413/400/503 守卫一致，token 不回显，未绑定 session 也可配置）；不提供 PUT/DELETE。
-- **snapshot 扩展**：`delivery: { running:string[], errors:Record<code,string> }`（`errors` 的键来自 `delivery.error:<code>` meta，与 `fix.errors` 平行、互不清空）、`gitlab: { tokenPresent:boolean }`（保留既有字段）。
+- **snapshot 扩展**：`delivery: { running:string[], errors:Record<code,string> }`（`errors` 的键 = 工单号，值来自 `delivery.error:<工单号>` meta；与 `fix.errors` 平行、互不清空）、`gitlab: { tokenPresent:boolean }`（保留既有字段）。
 
 ---
 
@@ -125,8 +147,8 @@ fixes:  [ fixRunSchema … ]                                   // review 修复�
   - `assertPushableBranch` 拒绝 main/dev/feature-x/hotfix-x/release-x（含大小写/前缀变体），允许 feat-X-user/hot-X-user/自定义非保护分支；
   - `commitAll`：有改动 → sha 且工作树干净；无改动 → sha null 不写空提交；提交信息含工单号（防注入：消息作为单个 `-m` 参数，不做 shell 拼接）；
   - `pushBranch`：推到本地 bare origin 成功、创建上游；保护分支被拒绝；不传 `--force`；
-  - delivery：`submitting` + 完整配置 → lint/test 执行（注入 execCommand：成功；lint 失败 → block `delivery-lint-failed` 且不 commit/push；test 失败同理）→ commit → push → MR 创建（title=`<source> -> <target>`、description 含工单链接/方案摘要/测试说明）→ 写队列内 `submit_mr`+`mr_created(expectedWorkflow:'submitting')`+`patchTicket(mr)`；已有 open MR → 复用不重复创建；缺 token/settings/worktree/分支 → 静态 409/503/400，零写入；重入单飞（`delivery-busy`）；迟到/取消不回退已提交的 `mr_open`；lint/test 失败的错误 meta 只写 `delivery.error:<code>`（`snapshot.delivery.errors`），断言不写 `fix.error:<code>`。
-- [ ] **Step 2: 实现** git 扩展（先导出 `listWorktrees`/`probeWorktree`；execFile 参数数组，超时 30s；push 前硬校验）、store 字段扩展（mr/reviewRounds 形状校验，写队列内；timeline 按字段映射：`branch`→`worktree`、`fixes`→`fix-run`、其它→`patch`）、delivery-service（步骤化、每步失败静态映射、错误 meta 用 `delivery.error:<code>`、状态写入带 expectedWorkflow）、路由与 index 接线（`deliveryDeps` 未接线 → `/api/deliver` 503 `delivery-unavailable`、snapshot 空形状 `delivery:{running:[],errors:{}}`）。
+  - delivery：`submitting` + 完整配置 → lint/test 执行（注入 execCommand：成功；lint 失败 → block `delivery-lint-failed` 且不 commit/push；test 失败同理）→ commit → push → MR 创建（title=`<source> -> <target>`、description 含工单链接/方案摘要/测试说明）→ 写队列内 `submit_mr`+`mr_created(expectedWorkflow:'submitting')`+`patchTicket({reviewRounds:[]})`（`mr_created` 已持久化 mr；补丁只为初始化 review 轮次账本）；已有 open MR → 复用不重复创建；缺 token/settings/worktree/分支 → 静态 409/503/400，零写入；重入单飞（`delivery-busy`）；迟到/取消不回退已提交的 `mr_open`；lint/test 失败的错误 meta 只写 `delivery.error:<工单号>`（`snapshot.delivery.errors`），断言不写 `fix.error:<工单号>`。
+- [ ] **Step 2: 实现** git 扩展（先导出 `listWorktrees`/`probeWorktree`；execFile 参数数组，超时 30s；push 前硬校验）、store 字段扩展（mr/reviewRounds 形状校验，写队列内；timeline 按字段映射：`branch`→`worktree`、`fixes`→`fix-run`、其它→`patch`）、delivery-service（步骤化、每步失败静态映射、错误 meta 用 `delivery.error:<工单号>`、状态写入带 expectedWorkflow）、路由与 index 接线（`deliveryDeps` 未接线 → `/api/deliver` 503 `delivery-unavailable`、snapshot 空形状 `delivery:{running:[],errors:{}}`；GitLab client 走 `gitlabClientFor(settings)` per-workspace factory，构造期 `invalid-project` → 静态 `invalid-gitlab-settings`，见 Task 2 review M4）。
 - [ ] **Step 3: 验证**：全量 tests 全过；live 只读：snapshot 含 `delivery:{running:[],errors:{}}`、`/api/deliver` 未接线/未知工单/非 submitting 的 503/404/409；不执行真 push。
 - [ ] **Step 4: 提交** `feat(bug-workflow): 提交推送与 MR 创建`.
 

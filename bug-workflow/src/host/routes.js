@@ -12,6 +12,8 @@
  *                                              | { ok:false, code, message } (P3 real analysis)
  *   POST /bug-workflow/api/fix             -> { ok, workflow:'fixing', running }
  *                                              | { ok:false, code, message } (P4 real fix)
+ *   POST /bug-workflow/api/deliver         -> { ok, workflow:'submitting', running }
+ *                                              | { ok:false, code, message } (P5 delivery/MR)
  *   POST /bug-workflow/api/settings        -> { ok, settings }
  *   POST /bug-workflow/api/platform-token  -> { ok, tokenPresent } (token is only written, never read back)
  *   POST /bug-workflow/api/gitlab-token    -> { ok, tokenPresent } (P5 GitLab token, same contract)
@@ -62,6 +64,16 @@
  * host failures 500. The snapshot always carries `fix:{running, errors}` with
  * the same shape as `analysis`.
  *
+ * P5 `/deliver` mapping: a missing ticket is 404; `not-submitting`,
+ * `delivery-busy`, `delivery-no-changes` and `protected-branch` are 409;
+ * missing worktree/settings and invalid branch input are 400;
+ * `missing-gitlab-token` and an unwired service are retryable 503; unexpected
+ * git/push/MR failures are 500. The snapshot always carries
+ * `delivery:{running, errors}` where `errors` is keyed by ticket code and read
+ * from the delivery-specific meta namespace (`delivery.error:<code>`), never
+ * from `fix.error:<code>`. The background job's lint/test/commit/push/MR
+ * failures block the ticket and never surface as a synchronous HTTP error.
+ *
  * Failures are closed over: every handler is wrapped, and no handler lets an
  * exception escape into the HTTP server. The plugin loads without storage; the
  * fallback handlers are the contract for that state.
@@ -80,6 +92,7 @@ export const API_PATHS = Object.freeze({
   action: '/bug-workflow/api/action',
   analyze: '/bug-workflow/api/analyze',
   fix: '/bug-workflow/api/fix',
+  deliver: '/bug-workflow/api/deliver',
   settings: '/bug-workflow/api/settings',
   platformToken: '/bug-workflow/api/platform-token',
   gitlabToken: '/bug-workflow/api/gitlab-token',
@@ -111,6 +124,7 @@ const ROUTE_METHODS = Object.freeze({
   action: 'POST',
   analyze: 'POST',
   fix: 'POST',
+  deliver: 'POST',
   settings: 'POST',
   platformToken: 'POST',
   gitlabToken: 'POST',
@@ -227,6 +241,43 @@ const FIX_ERROR_STATUS = Object.freeze({
 /** 503 message for a host built without the fix service. */
 const FIX_UNAVAILABLE_MESSAGE = '修复服务不可用，请稍后重试';
 
+/**
+ * `POST /deliver` failure code -> HTTP status (P5 plan). A missing ticket is
+ * 404; a ticket that is not `submitting` (manual test not passed), a concurrent
+ * delivery in the same ticket/repository and a no-op commit are 409; missing
+ * branch/worktree metadata and invalid GitLab/branch configuration are 400; a
+ * missing GitLab token or an unwired service is a retryable 503; unexpected
+ * git/push/MR failures are 500. Unknown codes are programming errors -> 500.
+ *
+ * The lint/test/commit/push/MR steps run in the background AFTER the 200, so
+ * their failures block the ticket and appear in `snapshot.delivery.errors`
+ * instead of this mapping; the mapping still covers the codes a future
+ * synchronous validation could return.
+ */
+const DELIVERY_ERROR_STATUS = Object.freeze({
+  'ticket-not-found': 404,
+  'not-found': 404,
+  'not-submitting': 409,
+  'delivery-busy': 409,
+  'delivery-no-changes': 409,
+  'protected-branch': 409,
+  'worktree-missing': 400,
+  'invalid-gitlab-settings': 400,
+  'invalid-branch': 400,
+  'invalid-code': 400,
+  'invalid-input': 400,
+  'unknown-workspace': 400,
+  'missing-gitlab-token': 503,
+  'delivery-unavailable': 503,
+  'git-failed': 500,
+  'push-failed': 500,
+  'mr-failed': 500,
+  internal: 500,
+});
+
+/** 503 message for a host built without the delivery service. */
+const DELIVERY_UNAVAILABLE_MESSAGE = '交付服务不可用，请稍后重试';
+
 /** Explicit allow-list of loopback Host header values (with optional port). */
 const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1']);
 
@@ -259,12 +310,16 @@ const LOOPBACK_REMOTE_ADDRESSES = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1
  *   `createFixService()` result for `POST /fix` and the snapshot `fix` block;
  *   when null `/fix` answers 503 `fix-unavailable` and the snapshot reports
  *   empty fix state
+ * @param {{service: object}|null} [deps.delivery]
+ *   `createDeliveryService()` result for `POST /deliver` and the snapshot
+ *   `delivery` block; when null `/deliver` answers 503 `delivery-unavailable`
+ *   and the snapshot reports empty delivery state
  * @param {() => string} [deps.clock] ISO 8601 server time for snapshots
  * @param {number|null} [deps.domainOpenedAt] domain open timestamp for health
  * @param {number} [deps.bodyTimeoutMs] POST body read deadline (default 10 s)
  * @param {((entry: {event: string, error: unknown}) => void)|null} [deps.log]
  *   optional host logger; receives full errors that are hidden from responses
- * @returns {{health: Function, snapshot: Function, action: Function, analyze: Function, fix: Function, settings: Function, platformToken: Function, gitlabToken: Function, sync: Function}}
+ * @returns {{health: Function, snapshot: Function, action: Function, analyze: Function, fix: Function, deliver: Function, settings: Function, platformToken: Function, gitlabToken: Function, sync: Function}}
  */
 export function createHandlers({
   store,
@@ -275,6 +330,7 @@ export function createHandlers({
   importTask = null,
   analysis = null,
   fix = null,
+  delivery = null,
   clock = defaultClock,
   domainOpenedAt = null,
   bodyTimeoutMs = BODY_TIMEOUT_MS,
@@ -332,6 +388,16 @@ export function createHandlers({
     }
   }
   const fixDeps = fix === undefined ? null : fix;
+  if (delivery !== null && delivery !== undefined) {
+    if (typeof delivery !== 'object'
+      || typeof delivery.service?.start !== 'function'
+      || typeof delivery.service?.status !== 'function') {
+      throw new TypeError(
+        'createHandlers() delivery.service must expose start(sessionId, cwd, code) and status()',
+      );
+    }
+  }
+  const deliveryDeps = delivery === undefined ? null : delivery;
   if (typeof clock !== 'function') {
     throw new TypeError('createHandlers() requires clock to be a function');
   }
@@ -393,6 +459,9 @@ export function createHandlers({
         analysis: readServiceStatus(analysisDeps),
         // P4: fix progress + static per-ticket errors, same shape.
         fix: readServiceStatus(fixDeps),
+        // P5: delivery progress + static per-ticket errors from the
+        // delivery-specific meta namespace (parallel to `fix`, never shared).
+        delivery: readServiceStatus(deliveryDeps),
         tickets: snapshot.tickets,
         serverTime: clock(),
       });
@@ -633,6 +702,80 @@ export function createHandlers({
         status,
         failureCode,
         clipMessage(typeof result?.message === 'string' ? result.message : '修复启动失败'),
+      );
+    }),
+
+    /**
+     * Start the real (P5) delivery for one `submitting` ticket:
+     * `{sessionId, code}`.
+     *
+     * The service runs lint/test, commits, pushes the personal branch and
+     * creates/reuses the GitLab MR in the background; this route answers as
+     * soon as the job is launched (200). All synchronous validations (state,
+     * settings, token, branch/worktree, client factory) happen before the
+     * launch and return the static 400/404/409/503 mapping; the later steps
+     * block the ticket and surface through `snapshot.delivery.errors`.
+     */
+    deliver: safe(async (req, res) => {
+      if (!guard(req, res, ROUTE_METHODS.deliver)) return;
+      if (!guardJsonContentType(req, res)) return;
+      if (!guardOrigin(req, res)) return;
+
+      const body = await readJsonBody(req, bodyTimeoutMs);
+      if (!body.ok) {
+        sendError(res, body.status, body.code, body.message);
+        if (body.destroyRequest === true) destroyRequest(req);
+        return;
+      }
+      const input = body.value;
+
+      const sessionId = normalizeSessionId(input.sessionId);
+      if (sessionId === undefined) {
+        sendError(res, 400, 'missing-session', '缺少有效的 sessionId');
+        return;
+      }
+
+      const code = normalizeCode(input.code);
+      if (code === undefined) {
+        sendError(res, 400, 'invalid-code', '缺少有效的工单编号 code');
+        return;
+      }
+
+      if (deliveryDeps === null) {
+        sendError(res, 503, 'delivery-unavailable', DELIVERY_UNAVAILABLE_MESSAGE);
+        return;
+      }
+
+      // The worktree/branch metadata is resolved against a real repository; an
+      // unbound session would otherwise resolve it relative to the wrong cwd.
+      const resolved = normalizeWorkspace(workspace.resolve(sessionId));
+      if (resolved.path === null) {
+        sendError(res, 400, 'unknown-workspace', '无法确定工作区路径，无法提交 MR');
+        return;
+      }
+
+      const result = await deliveryDeps.service.start(sessionId, resolved.path, code);
+      if (result?.ok === true) {
+        sendJsonSafe(res, 200, {
+          ok: true,
+          workflow: 'submitting',
+          running: result.running === true,
+        });
+        return;
+      }
+
+      const failureCode = typeof result?.code === 'string' ? result.code : 'internal';
+      const status = DELIVERY_ERROR_STATUS[failureCode];
+      if (status === undefined) {
+        notifyLog(log, 'delivery-result', result);
+        sendError(res, 500, 'internal', '交付启动失败');
+        return;
+      }
+      sendError(
+        res,
+        status,
+        failureCode,
+        clipMessage(typeof result?.message === 'string' ? result.message : '交付启动失败'),
       );
     }),
 
@@ -881,6 +1024,7 @@ export function registerUnavailableRoutes(ctx, health = {}) {
     action: unavailableHandler(ROUTE_METHODS.action, health),
     analyze: unavailableHandler(ROUTE_METHODS.analyze, health),
     fix: unavailableHandler(ROUTE_METHODS.fix, health),
+    deliver: unavailableHandler(ROUTE_METHODS.deliver, health),
     settings: unavailableHandler(ROUTE_METHODS.settings, health),
     platformToken: unavailableHandler(ROUTE_METHODS.platformToken, health),
     gitlabToken: unavailableHandler(ROUTE_METHODS.gitlabToken, health),
@@ -1088,10 +1232,11 @@ function emptyDicts() {
 }
 
 /**
- * Snapshot `analysis`/`fix` object. Both services are optional (older wiring, a
- * profile without subagent services, or a failed service construction), so a
- * missing/failing `status()` degrades to empty state and the board keeps
- * rendering. Only static strings persisted by the service are exposed.
+ * Snapshot `analysis`/`fix`/`delivery` object. Every service is optional (older
+ * wiring, a profile without subagent services, or a failed service
+ * construction), so a missing/failing `status()` degrades to empty state and the
+ * board keeps rendering. Only static strings persisted by the service are
+ * exposed.
  */
 function readServiceStatus(serviceDeps) {
   const empty = { running: [], errors: {} };
