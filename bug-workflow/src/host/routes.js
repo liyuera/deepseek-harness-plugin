@@ -186,10 +186,12 @@ const ANALYSIS_UNAVAILABLE_MESSAGE = '分析服务不可用，请稍后重试';
 
 /**
  * `POST /fix` failure code -> HTTP status (P4 plan). A missing ticket is 404; a
- * state-machine refusal and an unapproved plan are 409; an unwired service or a
- * missing runner is a retryable 503. Branch/worktree input errors are 400
- * (fixable by correcting the ticket/settings) and unexpected git/host failures
- * are 500. Unknown codes are programming errors -> 500.
+ * state-machine refusal, an unapproved plan, a concurrent fix in the same
+ * repository (`fix-busy`) and a personal branch already owned by another
+ * worktree (`fix-branch-busy`) are 409; an unwired service or a missing runner
+ * is a retryable 503. Branch/worktree input errors are 400 (fixable by
+ * correcting the ticket/settings) and unexpected git/host failures are 500.
+ * Unknown codes are programming errors -> 500.
  */
 const FIX_ERROR_STATUS = Object.freeze({
   'ticket-not-found': 404,
@@ -197,6 +199,8 @@ const FIX_ERROR_STATUS = Object.freeze({
   'invalid-state': 409,
   'invalid-transition': 409,
   'plan-not-approved': 409,
+  'fix-busy': 409,
+  'fix-branch-busy': 409,
   'worktree-conflict': 409,
   'unknown-workspace': 400,
   'invalid-code': 400,

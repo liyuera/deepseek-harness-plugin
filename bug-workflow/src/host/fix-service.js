@@ -12,30 +12,51 @@
  *
  *   - One fix per ticket: a duplicate `start()` while the in-memory job is
  *     running returns `running:true` without launching a second subagent.
+ *   - One fix per repository (design spec §9: 修复类子代理并发 1（同工作区
+ *     串行）). The repository root is resolved before any preparation and a
+ *     second, different ticket in the same repo is rejected with `fix-busy`
+ *     (HTTP 409) before any state write. The lock is held until the background
+ *     job settles.
  *   - Service-level restart: `fix_done` only accepts `fixing`, and a failed fix
  *     blocks the ticket from `fixing`. `start()` therefore also restarts (a) a
  *     ticket already `fixing` with no in-memory job (crash, unload, previous
- *     host) without a state write, and (b) a ticket blocked with
- *     `blockedFrom:'fixing'` by applying `retry` back to `fixing`. The runner
- *     availability check happens BEFORE that retry write, so a 503 never leaves
- *     a half-restarted ticket; a retry that does not end in `fixing` is a lost
- *     race (`invalid-state`).
+ *     host) without an initial state write, and (b) a ticket blocked with
+ *     `blockedFrom:'fixing'` by applying `retry` back to `fixing`. Git
+ *     preparation (settings, branch derivation, base resolution and
+ *     `worktree add`) happens BEFORE that retry write, so a preparation
+ *     failure leaves the ticket blocked instead of stranding it in `fixing`
+ *     with no job, branch or error; the branch metadata is persisted after a
+ *     successful retry, and a persistence failure rolls the ticket back to
+ *     `blocked`. The runner availability check also happens before every
+ *     write, so a 503 never leaves a half-restarted ticket.
  *   - Only an approved plan can be fixed (`plan-not-approved` otherwise).
  *   - Branches follow the team rule (`deriveBranches`, version from
  *     `platform.versionName ?? version`, family `hot` for type `故障`). The
  *     target base is resolved in this order and recorded as `baseSource`:
  *     `origin/<target>` ('origin'), local `<target>` ('target'), else `HEAD`
- *     ('HEAD', local/demo repositories).
+ *     ('HEAD', local/demo repositories) — all three values are valid contract.
+ *   - A personal branch already recorded by another ticket of the same repo
+ *     (same version/family/user maps to the same branch) is detected before
+ *     `git worktree add`: the start fails with `fix-branch-busy`, a static
+ *     Chinese reason, instead of an opaque git collision. A `fixing` ticket is
+ *     blocked with that reason; a blocked restart keeps its blocked state.
  *   - All git work happens in `<repo>/.dsh-worktrees/<code>` through the
  *     injected git executor; P4 never commits or pushes. A worktree-add
- *     failure is returned to the route and the ticket keeps its workflow.
+ *     failure is returned to the route and the ticket keeps its workflow. If
+ *     git created the branch but failed to register the worktree, the branch
+ *     is left at the base (retries reuse it; the service never deletes a
+ *     branch it cannot prove it created).
  *   - After the runner succeeds, `changedFiles` comes from
  *     `git status --porcelain` (tracked AND untracked `??` entries), while
- *     `diffStat`/`diff` are clipped by the git module. The fixes entry is
- *     written through `store.patchTicket()` with `expectedWorkflow:'fixing'`,
- *     then `fix_done` uses the same conditional write: a late result that lands
- *     after the ticket advanced records only a static meta error and never
- *     regresses the workflow (`stale-workflow`).
+ *     `diffStat`/`diff` are clipped (the persisted diff is a bounded excerpt,
+ *     never the full patch). A successful status read with zero changes does
+ *     NOT advance to `fix_done`: the run is stored as failed (`fix-no-changes`)
+ *     and the ticket is blocked (design spec §7: fixing → fix_done requires
+ *     worktree changes). A failed status read degrades to the runner list.
+ *     The fixes entry is written through `store.patchTicket()` with
+ *     `expectedWorkflow:'fixing'`, then `fix_done` uses the same conditional
+ *     write: a late result that lands after the ticket advanced records only a
+ *     static meta error and never regresses the workflow.
  *   - A runner failure maps to a static block reason + static meta error
  *     (`fix-timeout`/`fix-bad-output`/`no-live-agent`/`fix-failed`). The
  *     `block` write also carries `expectedWorkflow:'fixing'`; on a stale
@@ -43,11 +64,16 @@
  *   - `dispose()` marks every running entry `cancelled` and only then aborts
  *     it. A cancelled job performs NO terminal write: plugin unload is not a
  *     fix failure, so the ticket stays `fixing` with no `fix.error` meta and
- *     the next host load restarts it through the orphan path. The drain is
- *     bounded and idempotent; the host awaits it before closing the domain.
+ *     the next host load restarts it through the orphan path. The cancelled
+ *     flag is re-checked after every await in the finish path (including the
+ *     git collection), so a dispose during post-run collection writes nothing.
+ *     The drain is bounded and idempotent; the host awaits it before closing
+ *     the domain.
  *   - The background job never rejects. Error messages are static Chinese
  *     strings: runner messages/diagnostics/stacks never reach meta or snapshot.
  */
+
+import { sep } from 'node:path';
 
 import { DEFAULT_FIX_TIMEOUT_MS } from './agent-access.js';
 import { BranchError, deriveBranches } from './branch.js';
@@ -64,10 +90,39 @@ export const FIX_REASON_MESSAGES = Object.freeze({
   'fix-bad-output': '修复结果格式不正确，请重试',
   'no-live-agent': '当前没有可用的会话 Agent',
   'fix-failed': '修复子代理执行失败，请重试',
+  // A successful runner result with an empty `git status`: the child reported
+  // a fix but the worktree has no changes (design spec §7 requires changes).
+  'fix-no-changes': '修复未产生任何代码改动，请重试',
+  // Another ticket of this repository already has the same personal branch
+  // checked out (same version/type/user derives the same branch name).
+  'fix-branch-busy': '个人分支已被其它工单的工作树占用，请先清理后再试',
 });
 
-/** A successful result that arrived after the ticket stopped being fixable. */
+/** `start()` refusal when another ticket is already fixing in this repository. */
+export const FIX_BUSY_MESSAGE = '当前工作区已有修复任务在执行，请稍后重试';
+
+/** A result that arrived after the ticket stopped being fixable. */
 export const STALE_FIX_MESSAGE = '修复结果已过期或状态已变化，已丢弃';
+
+/**
+ * A persistence failure that is NOT a stale-workflow race (invalid payload,
+ * closed domain, clock error). Keeping this distinct from the stale copy stops
+ * a lost successful run from looking like a harmless late result.
+ */
+export const SAVE_FAILED_MESSAGE = '修复结果保存失败，请重试（详情见宿主日志）';
+
+/** A blocked restart whose git preparation failed: the ticket was NOT retried. */
+export const FIX_START_FAILED_MESSAGE = '修复启动失败，请检查分支与工作树后重试';
+
+/**
+ * Persisted `diff` excerpt cap. The client never renders the full patch, and
+ * the snapshot is polled every 3 s, so a single run must not store (or ship)
+ * the whole 20 k git-module diff. The plan contract only requires `diffStat`.
+ */
+export const FIX_DIFF_MAX_CHARS = 4_000;
+
+/** Free-text cap for the persisted summary/testResult/notes (schema mirrors it). */
+const FIX_TEXT_MAX_CHARS = 8_000;
 
 /** Runner failure code -> persisted block reason. */
 const RUNNER_CODE_TO_REASON = Object.freeze({
@@ -129,6 +184,8 @@ export function createFixService({
 
   /** code -> { controller, cancelled } for fixes currently running. */
   const running = new Map();
+  /** resolved repo root -> code of the running fix that owns the repository. */
+  const repoLocks = new Map();
   /** Promises of background jobs that have not settled yet (dispose drain). */
   const jobs = new Set();
   /** Codes known to carry a fix error (meta is still the source of truth). */
@@ -166,8 +223,6 @@ export function createFixService({
     const current = found.ticket;
 
     // Duplicate click / concurrent request: never launch a second subagent.
-    // The entry below is reserved before the first await, so two same-tick
-    // requests cannot both pass this check.
     if (running.has(key)) return { ok: true, running: true, workflow: 'fixing' };
 
     // Service-level restart: a failure blocks from `fixing` and `fix_done`
@@ -187,45 +242,70 @@ export function createFixService({
       return failure('fix-unavailable', FIX_REASON_MESSAGES['no-live-agent']);
     }
 
+    // Resolve the repository BEFORE reserving: the per-workspace concurrency
+    // lock is keyed by the real repository (the session cwd can be a
+    // subdirectory), and the single-flight check must be repeated after this
+    // await so two same-tick requests for the same ticket still collapse.
+    const repo = await git.repoRoot(cwd);
+    if (typeof repo !== 'string' || repo.trim() === '') return gitFailure(repo);
+    if (disposed) return failure('fix-unavailable', UNAVAILABLE_MESSAGE);
+    if (running.has(key)) return { ok: true, running: true, workflow: 'fixing' };
+
+    // Design spec §9: one fix subagent per workspace. A different ticket in
+    // the same repository is rejected before any state write (HTTP 409).
+    if (!lockRepo(repo, key)) return failure('fix-busy', FIX_BUSY_MESSAGE);
+
     const entry = reserve(key);
+    let launched = false;
     try {
-      let ticket = current;
-
-      if (blockedRestart) {
-        const retried = await applyRetry(key);
-        if (!retried.ok) {
-          clearRunning(key, entry);
-          return retried.failure;
-        }
-        ticket = retried.ticket;
-        if (disposed) return disposedStart(key, entry);
-      }
-
-      await clearError(key);
-      // Re-check AFTER every await: dispose() may have aborted the reserved
-      // entry while a write was in flight. No job may launch then.
-      if (disposed) return disposedStart(key, entry);
-
-      const prepared = await prepareWorktree(key, ticket, cwd);
+      // Git preparation happens BEFORE the blocked restart's `retry` write:
+      // a failing preparation must leave the ticket in its previous state
+      // instead of stranding it in `fixing` with no job, branch or error.
+      const prepared = await prepareWorktree(key, current, cwd, repo);
       if (!prepared.ok) {
-        clearRunning(key, entry);
+        await reportStartFailure(key, blockedRestart, prepared.failure);
         return prepared.failure;
       }
       if (disposed) return disposedStart(key, entry);
 
+      if (blockedRestart) {
+        const retried = await applyRetry(key);
+        if (!retried.ok) return retried.failure;
+        if (disposed) return disposedStart(key, entry);
+      }
+
+      // The branch metadata is persisted only after the ticket is `fixing`.
+      const branched = await persistBranch(key, prepared);
+      if (!branched.ok) {
+        // A retry that already moved the ticket is rolled back to `blocked`
+        // when its metadata cannot be stored; otherwise the ticket would be
+        // left in `fixing` without a job or an error, which the board cannot
+        // recover from (review I1).
+        if (blockedRestart) await restoreBlockedAfterRetry(key, branched);
+        return branched.failure;
+      }
+      if (disposed) return disposedStart(key, entry);
+
+      await clearError(key);
       launchJob({
         entry,
         key,
+        repo,
         sessionId,
         worktreePath: prepared.worktreePath,
         branch: prepared.branch,
         target: prepared.target,
-        ticket: prepared.ticket,
+        ticket: branched.ticket,
       });
+      launched = true;
       return { ok: true, running: true, workflow: 'fixing' };
     } catch {
-      clearRunning(key, entry);
       return failure('internal', INTERNAL_MESSAGE);
+    } finally {
+      if (!launched) {
+        clearRunning(key, entry);
+        unlockRepo(repo, key);
+      }
     }
   }
 
@@ -257,13 +337,14 @@ export function createFixService({
   }
 
   /**
-   * Settings -> branch names -> repo root -> worktree path -> base -> worktree
-   * -> persisted branch metadata. Every step returns a static failure instead
-   * of throwing; nothing is written until the worktree actually exists. The
-   * branch patch carries `expectedWorkflow:'fixing'` so a ticket that moved on
-   * during the (possibly slow) git work is not overwritten.
+   * Git preparation only: settings -> branch names -> branch ownership ->
+   * worktree path -> base -> `worktree add`. Nothing is persisted here, which
+   * lets `start()` run this BEFORE the blocked restart's `retry` write: a
+   * failure then leaves the ticket in its previous state instead of stranding
+   * it in `fixing` (review I1). `baseSource` is one of 'origin', 'target' or
+   * 'HEAD' and is persisted later by `persistBranch()`.
    */
-  async function prepareWorktree(key, ticket, cwd) {
+  async function prepareWorktree(key, ticket, cwd, repo) {
     let settings;
     try {
       settings = await readSettings(cwd);
@@ -290,10 +371,11 @@ export function createFixService({
       return { ok: false, failure: failure('internal', INTERNAL_MESSAGE) };
     }
 
-    const repo = await git.repoRoot(cwd);
-    if (typeof repo !== 'string' || repo.trim() === '') {
-      return { ok: false, failure: gitFailure(repo) };
-    }
+    // Another ticket of the same version/type/user derives the same personal
+    // branch. Letting `git worktree add` collide would surface as an opaque
+    // `git-failed` 500; fail with a static, actionable reason instead.
+    const collision = await detectBranchCollision(repo, key, branches.personalBranch);
+    if (collision.ok !== true) return { ok: false, failure: collision.failure };
 
     const tree = git.worktreePath({ repo, code: key });
     if (tree?.ok !== true) {
@@ -315,18 +397,38 @@ export function createFixService({
       branch: branches.personalBranch,
       base: base.base,
     });
-    if (added?.ok === false) return { ok: false, failure: gitFailure(added) };
+    if (added?.ok === false) {
+      // If git created the personal branch but failed to register the
+      // worktree, the branch is left at the base. Retries reuse it; the
+      // service never deletes a branch it cannot prove it created (M5).
+      return { ok: false, failure: gitFailure(added) };
+    }
 
+    return {
+      ok: true,
+      worktreePath: tree.path,
+      branch: branches.personalBranch,
+      target: branches.targetBranch,
+      baseSource: base.source,
+    };
+  }
+
+  /**
+   * Persist the personal branch/worktree metadata after the ticket is
+   * `fixing`. The write carries `expectedWorkflow:'fixing'` so a ticket that
+   * moved on during the (possibly slow) git work is not overwritten.
+   */
+  async function persistBranch(key, prepared) {
     let patched;
     try {
       patched = await store.patchTicket(
         key,
         {
           branch: {
-            name: branches.personalBranch,
-            target: branches.targetBranch,
-            baseSource: base.source,
-            worktree: tree.path,
+            name: prepared.branch,
+            target: prepared.target,
+            baseSource: prepared.baseSource,
+            worktree: prepared.worktreePath,
             createdAt: readNow(),
           },
         },
@@ -338,10 +440,15 @@ export function createFixService({
 
     if (patched?.ok !== true) {
       if (patched?.code === 'stale-workflow') {
-        return { ok: false, failure: failure('invalid-state', '工单状态已变化，请刷新后重试') };
+        return {
+          ok: false,
+          storeCode: 'stale-workflow',
+          failure: failure('invalid-state', '工单状态已变化，请刷新后重试'),
+        };
       }
       return {
         ok: false,
+        storeCode: patched?.code,
         failure: failure(
           typeof patched?.code === 'string' ? patched.code : 'internal',
           typeof patched?.message === 'string' ? patched.message : INTERNAL_MESSAGE,
@@ -349,19 +456,104 @@ export function createFixService({
       };
     }
 
-    return {
-      ok: true,
-      ticket: patched.ticket,
-      worktreePath: tree.path,
-      branch: branches.personalBranch,
-      target: branches.targetBranch,
-    };
+    return { ok: true, ticket: patched.ticket };
+  }
+
+  /**
+   * Check whether another ticket of this repository already records the same
+   * personal branch with a live worktree. Best-effort on purpose: a failing
+   * store read or git probe falls through to `git worktree add` (the real
+   * authority) so this guard never becomes a new failure source.
+   */
+  async function detectBranchCollision(repo, key, branchName) {
+    let tickets;
+    try {
+      tickets = store.list();
+    } catch {
+      return { ok: true };
+    }
+    if (!Array.isArray(tickets)) return { ok: true };
+
+    for (const other of tickets) {
+      if (!isPlainObject(other)) continue;
+      const otherKey = normalizeCode(other.code);
+      if (otherKey === undefined || otherKey === key) continue;
+      const branch = other.branch;
+      if (!isPlainObject(branch) || branch.name !== branchName) continue;
+      const worktree = branch.worktree;
+      if (typeof worktree !== 'string' || worktree === '') continue;
+      if (!isInsideRepo(repo, worktree)) continue;
+
+      let status;
+      try {
+        status = await git.status(worktree);
+      } catch {
+        continue;
+      }
+      // A readable status proves the recorded worktree still exists, so the
+      // branch is actually checked out there.
+      if (typeof status === 'string') {
+        return { ok: false, failure: failure('fix-branch-busy', FIX_REASON_MESSAGES['fix-branch-busy']) };
+      }
+    }
+    return { ok: true };
+  }
+
+  /**
+   * Record a static error for a start that failed before launching. A blocked
+   * restart keeps its blocked state (its old reason is still valid) and only
+   * refreshes the meta message. A branch owned by another worktree is a
+   * terminal conflict for this start, so a `fixing` ticket is blocked with the
+   * same static reason.
+   */
+  async function reportStartFailure(key, blockedRestart, startFailure) {
+    const code = startFailure?.code;
+    if (code === 'fix-branch-busy') {
+      if (blockedRestart) await rememberError(key, FIX_REASON_MESSAGES['fix-branch-busy']);
+      else await blockWithReason(key, 'fix-branch-busy');
+      return;
+    }
+    if (blockedRestart) await rememberError(key, startFailureMessage(code));
+  }
+
+  /**
+   * A blocked restart already applied `retry` before the branch metadata write
+   * failed. Put the ticket back to `blocked(fixing)` with a static reason so
+   * the user can retry. A stale-workflow failure means the ticket moved on, so
+   * touching it would be wrong: only the static meta is written.
+   */
+  async function restoreBlockedAfterRetry(key, branched) {
+    if (branched?.storeCode === 'stale-workflow') {
+      await rememberError(key, STALE_FIX_MESSAGE);
+      return;
+    }
+    let blocked;
+    try {
+      blocked = await store.applyAction(
+        key,
+        'block',
+        { reason: 'fix-failed', actor: 'system' },
+        { actionId: nextActionId('fix-restore', key), expectedWorkflow: 'fixing' },
+      );
+    } catch {
+      blocked = undefined;
+    }
+    await rememberError(
+      key,
+      blocked?.ok === true
+        ? FIX_REASON_MESSAGES['fix-failed']
+        : startFailureMessage(branched?.failure?.code),
+    );
   }
 
   /**
    * Resolve the worktree base: `origin/<target>` when it exists, else the local
    * `<target>`, else `HEAD` (documented fallback for local/demo repositories).
-   * The chosen source is recorded in the branch metadata as `baseSource`.
+   * The chosen source is recorded in the branch metadata as `baseSource`, one
+   * of the three contract values `'origin' | 'target' | 'HEAD'`.
+   *
+   * @returns {Promise<{ok:true, base:string, source:'origin'|'target'|'HEAD'}
+   *   | {ok:false, failure:object}>}
    */
   async function resolveBase(repo, target) {
     const remoteRef = `origin/${target}`;
@@ -445,16 +637,17 @@ export function createFixService({
 
   /**
    * Fire-and-forget background job. `run()` never throws, its completion always
-   * releases the running entry, and the promise stays in `jobs` until it
-   * settles so `dispose()` can drain it.
+   * releases the running entry and the repository lock, and the promise stays
+   * in `jobs` until it settles so `dispose()` can drain it.
    */
-  function launchJob({ entry, key, sessionId, worktreePath, branch, target, ticket }) {
+  function launchJob({ entry, key, repo, sessionId, worktreePath, branch, target, ticket }) {
     const job = run({ entry, key, sessionId, worktreePath, branch, target, ticket });
     jobs.add(job);
     void job
       .finally(() => {
         jobs.delete(job);
         clearRunning(key, entry);
+        unlockRepo(repo, key);
       })
       .catch(() => {
         // `run()` contains every failure; belt-and-braces only.
@@ -493,9 +686,9 @@ export function createFixService({
 
     try {
       if (result?.ok === true) {
-        await applyFixResult({ key, worktreePath, startedAt, result });
+        await applyFixResult({ entry, key, worktreePath, startedAt, result });
       } else {
-        await applyFixFailure(key, result?.code);
+        await applyFixFailure(key, result?.code, entry);
       }
     } catch {
       // The store/domain may already be closing (host unload). The outcome
@@ -503,15 +696,38 @@ export function createFixService({
     }
   }
 
-  /** Persist one successful run, then advance the state machine to `fix_done`. */
-  async function applyFixResult({ key, worktreePath, startedAt, result }) {
+  /**
+   * Persist one run, then either advance to `fix_done` (real changes) or block
+   * with `fix-no-changes` (successful status read, empty worktree).
+   */
+  async function applyFixResult({ entry, key, worktreePath, startedAt, result }) {
     const current = readTicket(key);
-    if (!current.ok || current.ticket.workflow !== 'fixing') {
+    if (!current.ok) {
+      // Missing/invalid record vs a store read failure: only the former means
+      // the result is genuinely stale (M3).
+      await rememberError(
+        key,
+        current.reason === 'error' ? SAVE_FAILED_MESSAGE : STALE_FIX_MESSAGE,
+      );
+      return;
+    }
+    if (current.ticket.workflow !== 'fixing') {
       await rememberError(key, STALE_FIX_MESSAGE);
       return;
     }
 
     const collected = await collectChanges(worktreePath, result.result);
+    // A dispose can land while the three git reads await; unload is not a
+    // failure, so no fixes entry / fix_done / block may be written (M1).
+    if (entry.cancelled === true) return;
+
+    // Design spec §7: fixing → fix_done requires worktree changes. A status
+    // read that SUCCEEDED with an empty porcelain output means the child
+    // reported a fix but changed nothing: record a failed run and block.
+    // (A failed status read keeps the old degrade-and-succeed behavior: the
+    // host cannot verify changes then.) Lint/test execution is intentionally
+    // deferred; see the P4 Task 2 fix report.
+    const noChanges = collected.statusOk === true && collected.changedFiles.length === 0;
     const fixes = Array.isArray(current.ticket.fixes) ? current.ticket.fixes : [];
     const patchActionId = nextActionId('fix-patch', key);
     let finishedAt;
@@ -527,13 +743,14 @@ export function createFixService({
         : {}),
       startedAt,
       finishedAt,
-      changedFiles: collected.changedFiles,
-      diffStat: collected.diffStat,
+      changedFiles: collected.changedFiles.slice(0, 2000),
+      diffStat: clipText(collected.diffStat, 4_000),
       diff: collected.diff,
-      summary: result.result.summary,
-      testResult: result.result.testResult,
-      notes: result.result.notes,
-      status: 'succeeded',
+      summary: clipText(result.result?.summary, FIX_TEXT_MAX_CHARS),
+      testResult: clipText(result.result?.testResult, FIX_TEXT_MAX_CHARS),
+      notes: clipText(result.result?.notes, FIX_TEXT_MAX_CHARS),
+      status: noChanges ? 'failed' : 'succeeded',
+      ...(noChanges ? { error: 'fix-no-changes' } : {}),
       ...(Number.isFinite(result.elapsedMs) ? { elapsedMs: result.elapsedMs } : {}),
     };
 
@@ -545,11 +762,19 @@ export function createFixService({
         { actionId: patchActionId, expectedWorkflow: 'fixing' },
       );
     } catch {
-      await rememberError(key, STALE_FIX_MESSAGE);
+      await rememberError(key, SAVE_FAILED_MESSAGE);
       return;
     }
     if (patched?.ok !== true) {
-      await rememberError(key, STALE_FIX_MESSAGE);
+      await rememberError(key, patchFailureMessage(patched));
+      return;
+    }
+    // No terminal write after cancellation (a dispose during the patch write
+    // is rare but must still not advance/block the ticket).
+    if (entry.cancelled === true) return;
+
+    if (noChanges) {
+      await applyFixFailure(key, 'fix-no-changes', entry);
       return;
     }
 
@@ -564,10 +789,11 @@ export function createFixService({
         await clearError(key);
         return;
       }
+      await rememberError(key, patchFailureMessage(applied));
+      return;
     } catch {
-      // Fall through to the static stale error; the workflow is untouched.
+      await rememberError(key, SAVE_FAILED_MESSAGE);
     }
-    await rememberError(key, STALE_FIX_MESSAGE);
   }
 
   /**
@@ -576,11 +802,21 @@ export function createFixService({
    * `expectedWorkflow:'fixing'`: the store re-reads inside its write-queue
    * critical section and refuses (`stale-workflow`) when the ticket already
    * advanced. On a stale refusal only the static meta is written.
+   *
+   * @param {string} key ticket code
+   * @param {string} runnerCode runner failure code or a block reason
+   * @param {{cancelled?: boolean}} [entry] running entry (cancel re-check)
    */
-  async function applyFixFailure(key, runnerCode) {
-    const reason = RUNNER_CODE_TO_REASON[runnerCode] ?? 'fix-failed';
-    const message = FIX_REASON_MESSAGES[reason] ?? FIX_REASON_MESSAGES['fix-failed'];
+  async function applyFixFailure(key, runnerCode, entry) {
+    if (entry?.cancelled === true) return;
+    const reason = RUNNER_CODE_TO_REASON[runnerCode]
+      ?? (Object.hasOwn(FIX_REASON_MESSAGES, runnerCode) ? runnerCode : 'fix-failed');
+    await blockWithReason(key, reason);
+  }
 
+  /** `block` with a static reason (stale refusal still records the meta). */
+  async function blockWithReason(key, reason) {
+    const message = FIX_REASON_MESSAGES[reason] ?? FIX_REASON_MESSAGES['fix-failed'];
     try {
       await store.applyAction(
         key,
@@ -597,9 +833,10 @@ export function createFixService({
   /**
    * Collect the worktree changes. `changedFiles` comes from
    * `git status --porcelain` (tracked changes AND untracked `??` entries; a
-   * `git diff` alone would miss new files). `diffStat`/`diff` are clipped by
-   * the git module. A failing status/diff read falls back to the runner's own
-   * changedFiles and empty diff metadata instead of failing the whole fix.
+   * `git diff` alone would miss new files). `statusOk` distinguishes an empty
+   * worktree from a failed status read: only the former is `fix-no-changes`.
+   * The persisted `diff` is a bounded excerpt (the snapshot is polled often and
+   * the client renders `diffStat`, not the patch).
    */
   async function collectChanges(worktreePath, fixResult) {
     let changedFiles = Array.isArray(fixResult?.changedFiles)
@@ -609,15 +846,16 @@ export function createFixService({
     let diff = '';
 
     const status = await git.status(worktreePath);
-    if (typeof status === 'string') changedFiles = parsePorcelainFiles(status);
+    const statusOk = typeof status === 'string';
+    if (statusOk) changedFiles = parsePorcelainFiles(status);
 
     const stat = await git.diffStat(worktreePath);
     if (typeof stat === 'string') diffStat = stat;
 
     const patch = await git.diff(worktreePath);
-    if (typeof patch === 'string') diff = patch;
+    if (typeof patch === 'string') diff = clipText(patch, FIX_DIFF_MAX_CHARS, '\n…（diff 已截断）');
 
-    return { changedFiles, diffStat, diff };
+    return { changedFiles, diffStat, diff, statusOk };
   }
 
   /** Persist one static error; the in-memory index is a status convenience. */
@@ -656,6 +894,19 @@ export function createFixService({
 
   function clearRunning(key, entry) {
     if (running.get(key) === entry) running.delete(key);
+  }
+
+  /** Try to take the per-repository lock for `key` (1 fix per workspace). */
+  function lockRepo(repo, key) {
+    const owner = repoLocks.get(repo);
+    if (owner !== undefined && owner !== key) return false;
+    repoLocks.set(repo, key);
+    return true;
+  }
+
+  /** Release the repository lock only when `key` still owns it. */
+  function unlockRepo(repo, key) {
+    if (repoLocks.get(repo) === key) repoLocks.delete(repo);
   }
 
   /**
@@ -816,6 +1067,37 @@ function failure(code, message) {
 
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/** True when `candidate` is strictly below `repo` (path separator aware). */
+function isInsideRepo(repo, candidate) {
+  if (typeof repo !== 'string' || typeof candidate !== 'string') return false;
+  const root = repo.endsWith(sep) ? repo.slice(0, -1) : repo;
+  return root !== '' && candidate.startsWith(root + sep);
+}
+
+/** Static message for a failed start that never reached the runner. */
+function startFailureMessage(code) {
+  if (code === 'git-timeout') return FIX_REASON_MESSAGES['fix-timeout'];
+  if (code === 'fix-branch-busy') return FIX_REASON_MESSAGES['fix-branch-busy'];
+  return FIX_START_FAILED_MESSAGE;
+}
+
+/**
+ * Static meta message for a failed store write. Only a real in-queue
+ * `stale-workflow` refusal is "the result is stale"; a schema/domain failure
+ * gets its own copy so a lost successful run is not silently disguised as a
+ * harmless late result (M3).
+ */
+function patchFailureMessage(result) {
+  return result?.code === 'stale-workflow' ? STALE_FIX_MESSAGE : SAVE_FAILED_MESSAGE;
+}
+
+/** Clip a persisted text field; `marker` is appended only when clipped. */
+function clipText(value, max, marker = '…') {
+  const text = typeof value === 'string' ? value : '';
+  if (text.length <= max) return text;
+  return `${text.slice(0, Math.max(0, max - marker.length))}${marker}`;
 }
 
 /**

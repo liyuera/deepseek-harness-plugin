@@ -439,7 +439,9 @@ export function createStore(domain, clock = defaultClock, options = {}) {
    * is the prerequisite of the run.
    *
    * @param {string} rawCode ticket code
-   * @param {{branch?: object|null, fixes?: unknown[]}} patch whitelisted fields
+   * @param {{branch?: object|null, fixes?: object[]}} patch whitelisted fields
+   *   (`fixes` entries are validated by the domain `ticketSchema` at the write
+   *   boundary, i.e. the injected `checkTicket()` validator)
    * @param {{actionId?: string, expectedWorkflow?: string}} [options]
    *   idempotency key and optional in-queue workflow guard (same semantics as
    *   `applyAction()`; a stale guard writes neither the ticket nor the ledger)

@@ -61,10 +61,10 @@ export const PLATFORM_FIELDS = Object.freeze([
 ]);
 
 /**
- * Build the three record schemas from a zod namespace.
+ * Build the record schemas from a zod namespace.
  *
  * @param {{z: object}} deps the zod namespace (`import { z } from 'zod'`)
- * @returns {{platformSchema: object, ticketSchema: object, settingsSchema: object, metaSchema: object}}
+ * @returns {{platformSchema: object, ticketSchema: object, settingsSchema: object, metaSchema: object, fixRunSchema: object}}
  */
 export function buildDomainSchemas({ z } = {}) {
   if (z === null || typeof z !== 'object' || typeof z.looseObject !== 'function') {
@@ -95,6 +95,9 @@ export function buildDomainSchemas({ z } = {}) {
   const branchSchema = z.looseObject({
     name: z.string(),
     target: z.string(),
+    // P4 fix-service records where the worktree base came from. Optional so a
+    // branch written by an earlier host (or a hand-edited row) still loads.
+    baseSource: z.enum(['origin', 'target', 'HEAD']).optional(),
   });
 
   const mrSchema = z.looseObject({
@@ -107,6 +110,34 @@ export function buildDomainSchemas({ z } = {}) {
     blockingIssues: z.array(z.unknown()),
     nonBlockingIssues: z.array(z.unknown()),
     rounds: z.number().int().nonnegative(),
+  });
+
+  /**
+   * One `ticket.fixes[]` entry as written by `fix-service` (P4). This closes
+   * the P4 prerequisite that the array was `z.array(z.unknown())`: the host
+   * now enforces the run metadata it persists and the snapshot re-sends.
+   *
+   * Optionality is deliberately lenient for forward/backward compatibility:
+   * `diff`/`notes`/`childId`/`elapsedMs`/`error` may be absent, and
+   * `looseObject` keeps fields a later P4/P5 run adds. Required fields are the
+   * ones every writer has always produced. Bounds are defensive: the writer
+   * already clips `diff` to 4 000 characters and free text to 8 000, so a
+   * snapshot (polled by the client) can never carry an unbounded patch.
+   */
+  const fixRunSchema = z.looseObject({
+    runId: z.string().min(1).max(200),
+    childId: z.string().max(200).optional(),
+    startedAt: z.string().min(1).max(64),
+    finishedAt: z.string().min(1).max(64),
+    changedFiles: z.array(z.string().max(4096)).max(2000),
+    diffStat: z.string().max(4000),
+    diff: z.string().max(8000).optional(),
+    summary: z.string().max(8000),
+    testResult: z.string().max(8000),
+    notes: z.string().max(8000).optional(),
+    error: z.string().max(200).optional(),
+    status: z.enum(['succeeded', 'failed', 'cancelled']),
+    elapsedMs: z.number().int().nonnegative().optional(),
   });
 
   /**
@@ -156,7 +187,7 @@ export function buildDomainSchemas({ z } = {}) {
     plan: planSchema.nullable(),
     branch: branchSchema.nullable(),
     mr: mrSchema.nullable(),
-    fixes: z.array(z.unknown()),
+    fixes: z.array(fixRunSchema),
     timeline: z.array(timelineEventSchema),
     createdAt: z.string(),
     updatedAt: z.string(),
@@ -187,7 +218,7 @@ export function buildDomainSchemas({ z } = {}) {
     value: z.unknown(),
   });
 
-  return { platformSchema, ticketSchema, settingsSchema, metaSchema };
+  return { platformSchema, ticketSchema, settingsSchema, metaSchema, fixRunSchema };
 }
 
 /**
