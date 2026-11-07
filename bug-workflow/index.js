@@ -11,11 +11,13 @@
  *          -> close the domain from the fiber disposer
  *
  *   GET  /bug-workflow/api/health    -> { ok, domainOpenedAt, tickets }
- *   GET  /bug-workflow/api/snapshot  -> { ok, workspace, settings, platform, dicts, analysis, tickets, serverTime }
+ *   GET  /bug-workflow/api/snapshot  -> { ok, workspace, settings, platform, dicts, analysis, fix, tickets, serverTime }
  *   POST /bug-workflow/api/action    -> { ok, ticket } | { ok:false, code, message, ticket? }
  *                                       (create + payload.code = 按编号从平台导入)
  *   POST /bug-workflow/api/analyze   -> { ok, workflow:'analyzing', running }
  *                                       (P3 real analysis; see below)
+ *   POST /bug-workflow/api/fix       -> { ok, workflow:'fixing', running }
+ *                                       (P4 real fix; see below)
  *   POST /bug-workflow/api/settings  -> { ok, settings }
  *   POST /bug-workflow/api/platform-token -> { ok, tokenPresent }
  *   POST /bug-workflow/api/sync      -> { ok, synced, created, updated, total, filtered, lastSyncAt }
@@ -28,6 +30,14 @@
  * instead of failing the whole plugin. The service is disposed and drained
  * (cancelled jobs are marked so they write no false failure; the drain is
  * bounded) before the storage domain closes; a stuck runner cannot hang unload.
+ *
+ * Fix wiring (P4 Task 2): `createGit()` provides the injected git executor
+ * (default `execFile`), and `createFixService()` owns branch/worktree
+ * preparation plus the write-capable fix subagent. It shares the same runner,
+ * store and clock. Construction is non-fatal (the board still loads, `/fix`
+ * answers 503 and the snapshot reports an empty `fix` block), and teardown
+ * disposes/drains it together with the analysis service before the domain
+ * closes.
  *
  * Sync wiring (P2 Task 4): `createSyncService()` reads the token from
  * `ctx.credentials`, maps platform tasks into the v2 ticket store, and persists
@@ -57,6 +67,8 @@
 import { closeDomain, openDomain, settingsSchema, ticketSchema } from './src/host/domain.js';
 import { createAgentRunner } from './src/host/agent-access.js';
 import { createAnalysisService } from './src/host/analysis-service.js';
+import { createFixService } from './src/host/fix-service.js';
+import { createGit } from './src/host/git.js';
 import { createTokenStore } from './src/host/credentials.js';
 import { createPlatformClient } from './src/host/platform.js';
 import {
@@ -96,8 +108,9 @@ export function apply(ctx) {
   let disposeApi;
   let disposed = false;
   // Created after the store is ready; read by the domain-lifetime disposer so
-  // running analyses are aborted before the storage domain closes.
+  // running analyses/fixes are aborted before the storage domain closes.
   let analysisService;
+  let fixService;
 
   // One runner per fiber. Resolving the optional delegation services lazily via
   // `ctx.get` keeps the plugin loadable in profiles without subagents/agents:
@@ -198,6 +211,25 @@ export function apply(ctx) {
           logWarning(storageCtx, 'bug-workflow: 分析服务初始化失败', error);
         }
 
+        // P4 fix orchestration. Same non-fatal policy: a broken git executor or
+        // service construction leaves `/fix` at 503 and the snapshot `fix`
+        // block empty instead of taking the board/analysis down.
+        let fix = null;
+        try {
+          const git = createGit();
+          fixService = createFixService({
+            store,
+            runner,
+            git,
+            getSettings: (cwd) => store.getSettings(cwd),
+            clock,
+          });
+          fix = { service: fixService };
+        } catch (error) {
+          fixService = undefined;
+          logWarning(storageCtx, 'bug-workflow: 修复服务初始化失败', error);
+        }
+
         // Automatic sync is registered BEFORE the real routes are mounted: if
         // the optional timer service misbehaves, the catch path still owns the
         // fallback route set (never real handlers over a closed domain).
@@ -217,6 +249,7 @@ export function apply(ctx) {
             ? (cwd, code) => sync.importTask(cwd, code)
             : null,
           analysis,
+          fix,
           clock,
           domainOpenedAt: handle.openedAt,
           // Full request errors stay in the host log; only clipped summaries
@@ -227,9 +260,11 @@ export function apply(ctx) {
         if (!mounted) {
           // The fiber was disposed while the domain was opening; no request can
           // reach these handlers any more, so release the domain immediately
-          // instead of leaving a handle behind. Drain any analysis job before
-          // closing the domain so an in-flight job write cannot land on it.
+          // instead of leaving a handle behind. Drain any analysis/fix job
+          // before closing the domain so an in-flight job write cannot land on
+          // it.
           await analysisService?.dispose();
+          await fixService?.dispose();
           await closeDomain(handle);
           return handle;
         }
@@ -241,10 +276,15 @@ export function apply(ctx) {
       } catch (error) {
         // Release a domain that opened but could not be attached to a store (or
         // to routes); otherwise the facility would report `already-open` on
-        // every reload. Abort and drain any analysis job first; it may still
-        // write through the store.
+        // every reload. Abort and drain any analysis/fix job first; it may
+        // still write through the store.
         try {
           await analysisService?.dispose();
+        } catch {
+          // Teardown must continue regardless.
+        }
+        try {
+          await fixService?.dispose();
         } catch {
           // Teardown must continue regardless.
         }
@@ -277,11 +317,17 @@ export function apply(ctx) {
     // a late successful open; `closeDomain` is idempotent.
     storageCtx.effect(
       () => async () => {
-        // Abort and drain running analyses first: their background jobs may
-        // still write through the store, and the domain must not close under a
-        // live job. The drain is bounded, so a stuck runner cannot hang unload.
+        // Abort and drain running analyses/fixes first: their background jobs
+        // may still write through the store, and the domain must not close
+        // under a live job. Both drains are bounded, so a stuck runner cannot
+        // hang unload.
         try {
           await analysisService?.dispose();
+        } catch {
+          // Disposal is best-effort; the domain teardown still has to run.
+        }
+        try {
+          await fixService?.dispose();
         } catch {
           // Disposal is best-effort; the domain teardown still has to run.
         }

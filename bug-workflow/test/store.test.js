@@ -142,11 +142,31 @@ function strictTicket(ticket) {
   if (ticket.plan !== null && !Array.isArray(ticket.plan.changedFiles)) {
     throw new Error('plan.changedFiles 必须是数组');
   }
+  if (ticket.branch !== null && typeof ticket.branch?.name !== 'string') {
+    throw new Error('branch.name 必须是字符串');
+  }
   if (ticket.blockedReason !== null && typeof ticket.blockedReason !== 'string') {
     throw new Error('blockedReason 必须是字符串');
   }
   if (ticket.mr !== null && !Number.isInteger(ticket.mr.rounds)) {
     throw new Error('mr.rounds 必须是整数');
+  }
+  if (!Array.isArray(ticket.fixes)) {
+    throw new Error('fixes 必须是数组');
+  }
+  for (const entry of ticket.fixes) {
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new Error('fixes 元素必须是对象');
+    }
+    if (typeof entry.runId !== 'string' || entry.runId === '') {
+      throw new Error('fixes.runId 必须是非空字符串');
+    }
+    if (!['succeeded', 'failed', 'cancelled'].includes(entry.status)) {
+      throw new Error('fixes.status 非法');
+    }
+    if (!Array.isArray(entry.changedFiles)) {
+      throw new Error('fixes.changedFiles 必须是数组');
+    }
   }
   return cloneJson(ticket);
 }
@@ -925,4 +945,253 @@ test('corrupted ticket records are skipped, counted, and never overwritten', asy
   assert.equal(recreated.ok, false);
   assert.equal(recreated.code, 'invalid-record');
   assert.equal(tickets.get('key-mismatch').code, 'other', 'corrupted record left untouched');
+});
+
+// ---------------------------------------------------------------------------
+// patchTicket() (P4 metadata writes)
+// ---------------------------------------------------------------------------
+
+const BRANCH_METADATA = Object.freeze({
+  name: 'feat-V1.6.1-ly',
+  target: 'feature-V1.6.1',
+  baseSource: 'origin',
+  worktree: '/tmp/repo/.dsh-worktrees/BUG-1',
+  createdAt: T2,
+});
+
+const FIX_ENTRY = Object.freeze({
+  runId: 'run-1',
+  childId: 'child-1',
+  startedAt: T1,
+  finishedAt: T2,
+  changedFiles: ['src/a.js'],
+  diffStat: ' src/a.js | 2 +-',
+  summary: '已修复',
+  testResult: '通过',
+  status: 'succeeded',
+});
+
+test('patchTicket() merges branch metadata, bumps updatedAt and appends one worktree event', async () => {
+  const domain = createFakeDomain();
+  const store = createStore(domain, clockFrom(T1, T2));
+  await store.create({ code: 'BUG-1', title: 'BUG-1' });
+
+  const result = await store.patchTicket(
+    'BUG-1',
+    { branch: cloneJson(BRANCH_METADATA) },
+    { actionId: 'patch-1', expectedWorkflow: 'inbox' },
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.ticket.workflow, 'inbox', 'patchTicket must never change the workflow');
+  assert.deepEqual(result.ticket.branch, BRANCH_METADATA);
+  assert.equal(result.ticket.updatedAt, T2);
+  assert.equal(result.ticket.timeline.length, 2);
+  assert.deepEqual(result.ticket.timeline.at(-1), {
+    at: T2,
+    kind: 'worktree',
+    actor: 'system',
+    message: '已创建个人分支与工作树',
+  });
+
+  const persisted = store.get('BUG-1');
+  assert.deepEqual(persisted.branch, BRANCH_METADATA);
+  assert.equal(persisted.timeline.length, 2);
+
+  // The returned ticket never aliases the stored record.
+  result.ticket.branch.name = 'mutated';
+  assert.equal(store.get('BUG-1').branch.name, BRANCH_METADATA.name);
+});
+
+test('patchTicket() appends a fix-run timeline event for a fixes patch', async () => {
+  const domain = createFakeDomain();
+  const store = createStrictStore(domain, clockFrom(T1, T2));
+  await store.create({ code: 'BUG-1', title: 'BUG-1' });
+  await store.patchTicket('BUG-1', { branch: cloneJson(BRANCH_METADATA) });
+
+  const result = await store.patchTicket(
+    'BUG-1',
+    { fixes: [cloneJson(FIX_ENTRY)] },
+    { expectedWorkflow: 'inbox' },
+  );
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.ticket.branch, BRANCH_METADATA, 'branch metadata must survive');
+  assert.deepEqual(result.ticket.fixes, [FIX_ENTRY]);
+  assert.deepEqual(result.ticket.timeline.at(-1), {
+    at: T2,
+    kind: 'fix-run',
+    actor: 'agent',
+    message: 'AI 修复已执行',
+  });
+  assert.equal(
+    result.ticket.timeline.filter((entry) => entry.kind === 'fix-run').length,
+    1,
+    'exactly one event per patch call',
+  );
+});
+
+test('patchTicket() rejects unknown fields and malformed patches without writing', async () => {
+  const domain = createFakeDomain();
+  const store = createStore(domain, clockFrom(T1, T2, T3));
+  await store.create({ code: 'BUG-1', title: 'BUG-1' });
+
+  const invalid = [
+    undefined,
+    null,
+    [],
+    {},
+    { workflow: 'done' },
+    { plan: {} },
+    { branch: cloneJson(BRANCH_METADATA), workflow: 'done' },
+    { fixes: 'not-an-array' },
+    { branch: 'not-an-object' },
+    { branch: undefined },
+    { fixes: undefined },
+  ];
+
+  for (const [index, patch] of invalid.entries()) {
+    const result = await store.patchTicket('BUG-1', patch, { actionId: `bad-${index}` });
+    assert.equal(result.ok, false, `invalid patch #${index} must fail`);
+    assert.equal(result.code, 'invalid-input', `invalid patch #${index}`);
+    assert.equal(typeof result.message, 'string');
+  }
+
+  const ticket = store.get('BUG-1');
+  assert.equal(ticket.workflow, 'inbox');
+  assert.equal(ticket.branch, null);
+  assert.deepEqual(ticket.fixes, []);
+  assert.equal(ticket.timeline.length, 1, 'no timeline event may be appended');
+  assert.equal(ticket.updatedAt, T1);
+  assert.equal(store.getMeta('action:bad-0'), undefined, 'rejected patches are not memoized');
+});
+
+test('patchTicket() enforces expectedWorkflow inside the write queue without writing', async () => {
+  const domain = createFakeDomain();
+  const store = createStore(domain, clockFrom(T1, T2));
+  await store.create({ code: 'BUG-1', title: 'BUG-1' });
+
+  const stale = await store.patchTicket(
+    'BUG-1',
+    { branch: cloneJson(BRANCH_METADATA) },
+    { actionId: 'stale-1', expectedWorkflow: 'fixing' },
+  );
+  assert.deepEqual(stale.ok, false);
+  assert.equal(stale.code, 'stale-workflow');
+  assert.equal(store.get('BUG-1').branch, null);
+  assert.equal(store.get('BUG-1').timeline.length, 1);
+  assert.equal(store.getMeta('action:stale-1'), undefined, 'a stale guard writes no ledger entry');
+
+  const invalidExpected = await store.patchTicket(
+    'BUG-1',
+    { branch: cloneJson(BRANCH_METADATA) },
+    { expectedWorkflow: '   ' },
+  );
+  assert.equal(invalidExpected.code, 'invalid-input');
+
+  const matching = await store.patchTicket(
+    'BUG-1',
+    { branch: cloneJson(BRANCH_METADATA) },
+    { expectedWorkflow: 'inbox' },
+  );
+  assert.equal(matching.ok, true);
+});
+
+test('patchTicket() replays a successful actionId and rejects reuse for another ticket', async () => {
+  const domain = createFakeDomain();
+  const store = createStore(domain, clockFrom(T1, T2));
+  await store.create({ code: 'BUG-1', title: 'BUG-1' });
+  await store.create({ code: 'BUG-2', title: 'BUG-2' });
+
+  const first = await store.patchTicket(
+    'BUG-1',
+    { branch: cloneJson(BRANCH_METADATA) },
+    { actionId: 'patch-1' },
+  );
+  assert.equal(first.ok, true);
+
+  // A retry with a different patch body still replays the first result and
+  // appends nothing: the actionId is the idempotency key.
+  const replay = await store.patchTicket(
+    'BUG-1',
+    { fixes: [cloneJson(FIX_ENTRY)] },
+    { actionId: 'patch-1' },
+  );
+  assert.deepEqual(replay, first);
+  assert.equal(store.get('BUG-1').timeline.length, 2);
+  assert.deepEqual(store.get('BUG-1').fixes, []);
+  assert.notEqual(store.getMeta('action:patch-1'), undefined, 'the action result is persisted');
+
+  const reused = await store.patchTicket(
+    'BUG-2',
+    { branch: cloneJson(BRANCH_METADATA) },
+    { actionId: 'patch-1' },
+  );
+  assert.equal(reused.ok, false);
+  assert.equal(reused.code, 'action-id-reused');
+  assert.equal(store.get('BUG-2').branch, null);
+});
+
+test('patchTicket() refuses a schema-invalid patch and leaves state untouched', async () => {
+  const domain = createFakeDomain();
+  const store = createStrictStore(domain, clockFrom(T1, T2, T3));
+  await store.create({ code: 'BUG-1', title: 'BUG-1' });
+
+  const result = await store.patchTicket(
+    'BUG-1',
+    { branch: { worktree: '/tmp/repo/.dsh-worktrees/BUG-1' } },
+    { actionId: 'invalid-1' },
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'invalid-payload');
+  const ticket = store.get('BUG-1');
+  assert.equal(ticket.branch, null);
+  assert.equal(ticket.timeline.length, 1);
+  assert.equal(ticket.updatedAt, T1);
+  assert.equal(store.getMeta('action:invalid-1'), undefined);
+});
+
+test('patchTicket() rejects a malformed fix-run entry and accepts a valid one', async () => {
+  const domain = createFakeDomain();
+  const store = createStrictStore(domain, clockFrom(T1, T2, T3));
+  await store.create({ code: 'BUG-1', title: 'BUG-1' });
+
+  const malformed = { ...cloneJson(FIX_ENTRY), status: 'ok' };
+  const rejected = await store.patchTicket(
+    'BUG-1',
+    { fixes: [malformed] },
+    { actionId: 'bad-fix' },
+  );
+
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.code, 'invalid-payload');
+  const untouched = store.get('BUG-1');
+  assert.deepEqual(untouched.fixes, []);
+  assert.equal(untouched.timeline.length, 1, 'a rejected entry must not append a timeline event');
+  assert.equal(store.getMeta('action:bad-fix'), undefined, 'rejected patches are not memoized');
+
+  const accepted = await store.patchTicket(
+    'BUG-1',
+    { fixes: [cloneJson(FIX_ENTRY)] },
+    { actionId: 'good-fix' },
+  );
+  assert.equal(accepted.ok, true);
+  assert.deepEqual(accepted.ticket.fixes, [FIX_ENTRY]);
+  assert.equal(accepted.ticket.timeline.at(-1).kind, 'fix-run');
+});
+
+test('patchTicket() reports unknown tickets and invalid codes without throwing', async () => {
+  const domain = createFakeDomain();
+  const store = createStore(domain);
+
+  const missing = await store.patchTicket('NOPE-1', { branch: {} });
+  assert.equal(missing.ok, false);
+  assert.equal(missing.code, 'not-found');
+
+  for (const code of ['', '   ', undefined, null, 42]) {
+    const invalid = await store.patchTicket(code, { branch: {} });
+    assert.equal(invalid.ok, false, String(code));
+    assert.equal(invalid.code, 'invalid-input', String(code));
+  }
 });

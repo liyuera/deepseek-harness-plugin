@@ -243,6 +243,79 @@ check('invalid source rejected', () => {
   }
 });
 
+check('fix run entry accepted', () => {
+  const entry = {
+    runId: 'fix-patch-BUG-V1-2026-11-07T00:00:00.000Z',
+    childId: 'child-1',
+    startedAt: '2026-11-07T00:00:00.000Z',
+    finishedAt: '2026-11-07T00:01:00.000Z',
+    changedFiles: ['src/a.js', 'src/new file.js'],
+    diffStat: ' 2 files changed, 3 insertions(+)',
+    diff: 'diff --git a/src/a.js b/src/a.js\n+fixed',
+    summary: '已修复事件绑定',
+    testResult: 'node --test：通过',
+    notes: '',
+    status: 'succeeded',
+    elapsedMs: 60000,
+  };
+  const parsed = ticketSchema.parse(v1Ticket({ workflow: 'fix_done', fixes: [entry] }));
+  assert.deepEqual(parsed.fixes, [entry]);
+});
+
+check('malformed fix run entry rejected', () => {
+  const entry = {
+    runId: 'run-1',
+    startedAt: '2026-11-07T00:00:00.000Z',
+    finishedAt: '2026-11-07T00:01:00.000Z',
+    changedFiles: ['src/a.js'],
+    diffStat: ' 1 file changed',
+    summary: '已修复',
+    testResult: '',
+    status: 'succeeded',
+  };
+  const malformed = [
+    { ...entry, runId: 42 },
+    { ...entry, runId: '' },
+    { ...entry, changedFiles: 'src/a.js' },
+    { ...entry, changedFiles: [42] },
+    { ...entry, status: 'ok' },
+    { ...entry, finishedAt: null },
+    { ...entry, elapsedMs: -1 },
+    { ...entry, diff: 42 },
+  ];
+  for (const candidate of malformed) {
+    const result = ticketSchema.safeParse(v1Ticket({ fixes: [candidate] }));
+    assert.equal(result.success, false, `malformed entry accepted: ${JSON.stringify(candidate)}`);
+  }
+});
+
+check('branch worktree metadata accepted and bounded', () => {
+  const branch = {
+    name: 'feat-V1.0.0-ly',
+    target: 'feature-V1.0.0',
+    baseSource: 'origin',
+    worktree: '/repo/.dsh-worktrees/BUG-V1',
+    createdAt: '2026-11-07T00:00:00.000Z',
+  };
+  const parsed = ticketSchema.parse(v1Ticket({ branch }));
+  assert.deepEqual(parsed.branch, branch);
+
+  const malformed = [
+    { ...branch, worktree: 42 },
+    { ...branch, worktree: 'x'.repeat(4097) },
+    { ...branch, createdAt: 42 },
+    { ...branch, createdAt: 'x'.repeat(65) },
+  ];
+  for (const candidate of malformed) {
+    const result = ticketSchema.safeParse(v1Ticket({ branch: candidate }));
+    assert.equal(
+      result.success,
+      false,
+      `malformed branch metadata accepted: ${JSON.stringify(candidate).slice(0, 120)}`,
+    );
+  }
+});
+
 check('settings defaults platformBaseUrl/writebackStatus', () => {
   const parsed = settingsSchema.parse({});
   assert.equal(parsed.platformBaseUrl, 'https://ecard.htwisdom.cn');

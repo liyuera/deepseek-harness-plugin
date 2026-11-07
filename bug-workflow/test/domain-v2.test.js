@@ -286,8 +286,11 @@ test('domain v2 verifier passes with the installed DSH runtime', (t) => {
     'PASS invalid platform.taskId rejected',
     'PASS invalid platform.syncedAt rejected',
     'PASS invalid source rejected',
+    'PASS fix run entry accepted',
+    'PASS malformed fix run entry rejected',
+    'PASS branch worktree metadata accepted and bounded',
     'PASS settings defaults platformBaseUrl/writebackStatus',
-    'PASS domain v2 contract (10 checks)',
+    'PASS domain v2 contract (13 checks)',
   ]) {
     assert.equal(output.includes(expected), true, `missing verifier output: ${expected}\n${output}`);
   }

@@ -80,6 +80,13 @@ export const MAX_ACTION_RESULTS = 500;
 /** Meta key holding the mapped platform dictionaries (Task 4). */
 export const PLATFORM_DICTS_KEY = 'platform.dicts';
 
+/**
+ * Ticket fields `patchTicket()` is allowed to change. P4 only needs the git
+ * branch/worktree metadata and the fix-run ledger; every workflow transition
+ * still goes through `applyAction()`/the state machine.
+ */
+export const PATCHABLE_TICKET_FIELDS = Object.freeze(['branch', 'fixes']);
+
 /** Dictionary groups exposed by `/snapshot`; every group is always an array. */
 export const DICT_GROUPS = Object.freeze(['status', 'type', 'priority']);
 
@@ -409,6 +416,131 @@ export function createStore(domain, clock = defaultClock, options = {}) {
     return result;
   }
 
+  /**
+   * Patch whitelisted metadata fields of an existing ticket (P4).
+   *
+   * `fix-service` owns the ticket lifecycle, but `branch`/`fixes` are not a
+   * state transition: they are git worktree metadata and the fix-run ledger.
+   * This method is the only supported way to persist them, so they still pass
+   * the write queue and the domain schema. Everything else (workflow, plan,
+   * blocked fields, ...) must go through `applyAction()`.
+   *
+   * Queued as a whole: the actionId replay check, ticket read, expected
+   * workflow guard, merge and put are one critical section. Unknown fields are
+   * rejected before any state is read, `checkTicket()` validates the merged
+   * record BEFORE the put (a schema-invalid patch leaves the stored ticket and
+   * the action ledger untouched), `updatedAt` is bumped and exactly one static
+   * timeline event is appended:
+   *
+   *   branch present -> kind `worktree`, actor `system`
+   *   fixes present  -> kind `fix-run`,  actor `agent`
+   *
+   * When both are present the call is still one event; `branch` wins because it
+   * is the prerequisite of the run.
+   *
+   * @param {string} rawCode ticket code
+   * @param {{branch?: object|null, fixes?: object[]}} patch whitelisted fields
+   *   (`fixes` entries are validated by the domain `ticketSchema` at the write
+   *   boundary, i.e. the injected `checkTicket()` validator)
+   * @param {{actionId?: string, expectedWorkflow?: string}} [options]
+   *   idempotency key and optional in-queue workflow guard (same semantics as
+   *   `applyAction()`; a stale guard writes neither the ticket nor the ledger)
+   * @returns {Promise<{ok:true, ticket:object} | {ok:false, code:string, message:string}>}
+   */
+  function patchTicket(rawCode, patch, options = {}) {
+    return withWrite(() => patchTicketUnlocked(rawCode, patch, options));
+  }
+
+  async function patchTicketUnlocked(rawCode, patch, options = {}) {
+    const code = normalizeCode(rawCode);
+    if (code === undefined) return failure('invalid-input', '工单编号不能为空');
+
+    let actionId;
+    if (options !== undefined && options !== null && options.actionId !== undefined) {
+      actionId = normalizeActionId(options.actionId);
+      if (actionId === undefined) {
+        return failure('invalid-input', 'actionId 必须是非空字符串');
+      }
+      const cached = readActionResult(metaTable, actionId, code, 'patch');
+      if (cached !== undefined) {
+        if (cached.reused === true) {
+          return failure(
+            'action-id-reused',
+            `actionId ${actionId} 已用于工单 ${String(cached.code)} 的动作 ${String(cached.action)}`,
+          );
+        }
+        return cached.result;
+      }
+    }
+
+    let expectedWorkflow;
+    if (options !== undefined && options !== null && options.expectedWorkflow !== undefined) {
+      expectedWorkflow = normalizeCode(options.expectedWorkflow);
+      if (expectedWorkflow === undefined) {
+        return failure('invalid-input', 'expectedWorkflow 必须是非空字符串');
+      }
+    }
+
+    if (!isPlainObject(patch)) return failure('invalid-input', 'patch 必须是普通对象');
+    const fields = Object.keys(patch);
+    if (fields.length === 0) return failure('invalid-input', 'patch 至少包含一个字段');
+    for (const field of fields) {
+      // Checking every key (not just the known ones) makes an attempt to patch
+      // `workflow`/`plan` an explicit error instead of a silent no-op.
+      if (!PATCHABLE_TICKET_FIELDS.includes(field)) {
+        return failure('invalid-input', 'patchTicket 只允许修改 branch 与 fixes');
+      }
+      if (patch[field] === undefined) {
+        return failure('invalid-input', 'patch 字段不能为 undefined');
+      }
+    }
+    if (patch.fixes !== undefined && !Array.isArray(patch.fixes)) {
+      return failure('invalid-input', 'fixes 必须是数组');
+    }
+    if (patch.branch !== undefined && patch.branch !== null && !isPlainObject(patch.branch)) {
+      return failure('invalid-input', 'branch 必须是普通对象或 null');
+    }
+
+    const found = readTicket(code);
+    if (!found.ok) {
+      return found.reason === 'invalid'
+        ? failure('invalid-record', `工单 ${code} 的存储记录损坏，请人工检查`)
+        : failure('not-found', `工单 ${code} 不存在`);
+    }
+
+    if (expectedWorkflow !== undefined && found.ticket.workflow !== expectedWorkflow) {
+      return failure(
+        'stale-workflow',
+        `工单 ${code} 已不在 ${expectedWorkflow} 状态（当前 ${found.ticket.workflow}）`,
+      );
+    }
+
+    const at = readNow(clock);
+    const next = cloneTicket(found.ticket);
+    for (const field of fields) next[field] = structuredClone(patch[field]);
+    next.updatedAt = at;
+    const hasBranch = Object.prototype.hasOwnProperty.call(patch, 'branch');
+    next.timeline = [
+      ...(Array.isArray(next.timeline) ? next.timeline : []),
+      {
+        at,
+        kind: hasBranch ? 'worktree' : 'fix-run',
+        actor: hasBranch ? 'system' : 'agent',
+        message: hasBranch ? '已创建个人分支与工作树' : 'AI 修复已执行',
+      },
+    ];
+
+    const checked = checkTicket(next);
+    if (!checked.ok) return checked;
+
+    await tickets.put(code, checked.ticket);
+    const result = { ok: true, ticket: cloneTicket(checked.ticket) };
+    if (actionId !== undefined) {
+      await rememberActionResult(actionId, code, 'patch', result);
+    }
+    return result;
+  }
+
   async function rememberActionResult(actionId, code, action, result) {
     const key = ACTION_KEY_PREFIX + actionId;
     const at = parseTicketTimestamp(result.ticket) ?? Date.now();
@@ -633,6 +765,7 @@ export function createStore(domain, clock = defaultClock, options = {}) {
     snapshot,
     create,
     applyAction,
+    patchTicket,
     getSettings,
     putSettings,
     upsertPlatformRecords,

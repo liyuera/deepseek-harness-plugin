@@ -52,6 +52,22 @@
  *     `snapshot.analysis.errors[code]` / `blockedReason` are rendered as static
  *     copy only for analysis-related blocks (never on tickets that already moved
  *     on, where a stale persisted error may survive).
+ *   - P4 real fix: `start_fix` is a board-only descriptor (never in
+ *     `ACTION_BY_STATE`) rendered by the detail view's `FixNotice`. It POSTs
+ *     `/bug-workflow/api/fix` (`{sessionId, code}`) for the approved-plan
+ *     start, the orphaned-`fixing` restart and the blocked-from-fixing retry
+ *     (the host restarts/retries through the same route; no `/action retry`).
+ *     A 200 only means "accepted": the `AI 修复中…` timer is shown only while
+ *     `snapshot.fix.running` contains the code. Otherwise the panel offers
+ *     「开始修复」/「重新修复」; a fix-related block renders the static
+ *     `FIX_REASON_LABELS` copy and the host detail from
+ *     `snapshot.fix.errors[code]` (preferred over an older `blockedReason`).
+ *     The demo `fix_done` button is hidden for every `fixing` ticket because
+ *     the host advances it itself after the real run. `FixCard` renders the
+ *     host's run shape (`startedAt`/`finishedAt`/`status`/`changedFiles`/
+ *     `diffStat`/`summary`/`error`/`elapsedMs`, legacy `at`/`evidence`
+ *     tolerated) and `MrCard` shows the branch base (`baseSource`) and
+ *     worktree when the host recorded them.
  *   - status/type filters prefer the platform dictionaries in `snapshot.dicts`
  *     (label = `value`, stable key = `key`, optional colour dot) and fall back
  *     to the values observed on tickets. Rows carry a 平台/手动 source badge.
@@ -84,6 +100,7 @@ window.__ModuleLoader__.load({
       snapshot: '/bug-workflow/api/snapshot',
       action: '/bug-workflow/api/action',
       analyze: '/bug-workflow/api/analyze',
+      fix: '/bug-workflow/api/fix',
       settings: '/bug-workflow/api/settings',
       platformToken: '/bug-workflow/api/platform-token',
       sync: '/bug-workflow/api/sync',
@@ -142,6 +159,10 @@ window.__ModuleLoader__.load({
       dismiss: '完成移除',
       retry: '解除阻塞',
       blocked: '阻塞',
+      // P4 Task 2 store.patchTicket writes these two for a real fix
+      // (branch/worktree metadata and the finished run).
+      worktree: '创建分支/工作树',
+      'fix-run': 'AI 修复执行',
     });
 
     const ACTOR_LABELS = Object.freeze({ user: '用户', agent: '代理', system: '系统' });
@@ -420,6 +441,127 @@ window.__ModuleLoader__.load({
     /** Persisted block reason -> static client copy (never a prototype value). */
     function analysisReasonLabel(reason) {
       return ownAnalysisValue(ANALYSIS_REASON_LABELS, reason);
+    }
+
+    // ---------------------------------------------------------------------
+    // P4 real fix (POST /api/fix + snapshot.fix feedback)
+    // ---------------------------------------------------------------------
+
+    /**
+     * Static copy for the fix failure reasons persisted by the host
+     * (`FIX_REASON_MESSAGES` in `src/host/fix-service.js`). A blocked ticket
+     * only keeps the reason code, so the board attaches the Chinese hint.
+     */
+    const FIX_REASON_LABELS = Object.freeze(Object.assign(Object.create(null), {
+      'fix-timeout': '修复超时，请重试',
+      'fix-bad-output': '修复结果格式不正确，请重试',
+      'fix-failed': '修复子代理执行失败，请重试',
+      'fix-no-changes': '修复未产生任何代码改动，请重试',
+      'fix-branch-busy': '个人分支已被其它工单的工作树占用，请先清理后再试',
+      'no-live-agent': '当前没有可用的会话 Agent',
+    }));
+
+    /** Live progress copy (elapsed time is appended from the local timer). */
+    const FIX_RUNNING_HINT = 'AI 修复中…（最长约 15 分钟，可继续其他操作）';
+
+    /** Shown when a `fixing` ticket has no running host job. */
+    const FIX_INTERRUPTED_HINT = '上次修复已中断，可重新修复';
+
+    /** The normal approved-but-not-started state of a `fixing` ticket. */
+    const FIX_READY_HINT = '方案已通过，可开始 AI 修复';
+
+    /**
+     * Board-only descriptors for starting a fix. Neither is part of
+     * `ACTION_BY_STATE` (that literal is the state-machine contract checked by
+     * `test/client-action-map.test.js`); the detail view adds one contextually.
+     * Both go to `POST /api/fix` — the host uses the same route for an approved
+     * plan, an orphaned `fixing` restart and a blocked-from-fixing retry, so
+     * the client never sends a separate `/action retry` first.
+     */
+    const FIX_START_DESCRIPTOR = Object.freeze({
+      action: 'start_fix',
+      label: '开始修复',
+      confirm: '确认开始 AI 修复？（修复最长约 15 分钟，可继续做其他操作）',
+      tone: 'primary',
+    });
+
+    const FIX_RETRY_DESCRIPTOR = Object.freeze({
+      action: 'start_fix',
+      label: '重新修复',
+      confirm: '确认重新开始 AI 修复？（修复最长约 15 分钟，可继续做其他操作）',
+      tone: 'primary',
+    });
+
+    /** Newest `fixes` entries rendered by the history card (host appends one per run). */
+    const MAX_RENDERED_FIXES = 10;
+
+    /**
+     * `POST /api/fix` failure code -> actionable Chinese hint. Mirrors the
+     * route's `FIX_ERROR_STATUS` map; the status fallback covers a host that
+     * returns a code this board does not know yet.
+     */
+    const FIX_ERROR_HINTS = Object.freeze(Object.assign(Object.create(null), {
+      'ticket-not-found': '工单不存在',
+      'not-found': '工单不存在',
+      'invalid-state': '当前状态不能修复，请刷新',
+      'invalid-transition': '当前状态不能修复，请刷新',
+      'plan-not-approved': '方案尚未通过审核，无法开始修复',
+      'fix-busy': '当前工作区已有修复任务在执行，请稍后重试',
+      'fix-branch-busy': '个人分支已被其它工单的工作树占用，请先清理后再试',
+      'worktree-conflict': '工作树已存在，请先清理后再试',
+      'fix-unavailable': '修复服务不可用，请稍后重试',
+      'analysis-unavailable': '修复服务不可用，请稍后重试',
+      'git-timeout': '修复准备超时，请稍后重试',
+      'git-failed': '修复准备失败，请检查分支与工作树',
+      'unknown-workspace': '工单编号/工作区无效',
+      'invalid-code': '工单编号/工作区无效',
+      'invalid-input': '工单编号/工作区无效',
+      'invalid-payload': '工单编号/工作区无效',
+      'invalid-branch': '分支配置无效，请检查版本与个人分支后缀',
+      'invalid-branch-user': '个人分支后缀无效，请检查设置',
+      'invalid-family': '分支类型无效，请检查工单类型',
+      'invalid-version': '工单版本无效，无法推导分支',
+      'invalid-worktree-path': '工作树路径无效',
+      'no-live-agent': '当前没有可用的会话 Agent',
+      'missing-session': '缺少会话上下文，无法修复',
+    }));
+
+    /** Product-status fallback for `POST /api/fix` (400/404/409/500/503). */
+    const FIX_STATUS_HINTS = Object.freeze(Object.assign(Object.create(null), {
+      400: '工单编号/工作区或分支配置无效',
+      404: '工单不存在',
+      409: '当前状态不能修复，请刷新',
+      500: '修复启动失败，请稍后重试',
+      503: '修复服务不可用，请稍后重试',
+    }));
+
+    /** `branch.baseSource` -> short Chinese description (host writes 3 values). */
+    const BASE_SOURCE_LABELS = Object.freeze(Object.assign(Object.create(null), {
+      origin: '远端目标分支',
+      target: '本地目标分支',
+      HEAD: '当前 HEAD',
+    }));
+
+    /**
+     * Own-property lookup for the fix copy maps, same guard as
+     * `ownAnalysisValue`: reason codes are untrusted strings and a plain object
+     * index would resolve `__proto__`/`constructor` to a non-copy value.
+     */
+    function ownFixValue(map, key) {
+      if (typeof key !== 'string' && typeof key !== 'number') return undefined;
+      return Object.hasOwn(map, key) ? map[key] : undefined;
+    }
+
+    /** Persisted fix block reason -> static client copy (never a raw code). */
+    function fixReasonLabel(reason) {
+      return ownFixValue(FIX_REASON_LABELS, reason);
+    }
+
+    /** `branch.baseSource` display copy; unknown values are shown clipped. */
+    function branchBaseSourceLabel(value) {
+      if (typeof value !== 'string' || value === '') return '';
+      const mapped = ownFixValue(BASE_SOURCE_LABELS, value);
+      return mapped === undefined ? clip(value, 80) : mapped;
     }
 
     // ---------------------------------------------------------------------
@@ -860,6 +1002,35 @@ window.__ModuleLoader__.load({
       return typeof message === 'string' && message !== '' ? message : null;
     }
 
+    /** Snapshot `fix.running` lookup; a missing block means "not running". */
+    function fixRunningFor(snapshot, code) {
+      if (typeof code !== 'string' || code === '') return false;
+      if (snapshot === null || typeof snapshot !== 'object') return false;
+      const fix = snapshot.fix;
+      if (fix === null || typeof fix !== 'object' || !Array.isArray(fix.running)) return false;
+      return fix.running.includes(code);
+    }
+
+    /**
+     * The persisted static fix error for one code, or `null`.
+     *
+     * Staleness rule (same as `analysisErrorFor`): `fix.error:<code>` is only
+     * cleared by a later successful fix start, so a ticket that already moved
+     * on may still carry an old error. Callers must only render it for the two
+     * live conditions in `FixNotice` — a fix-related blocked ticket, or
+     * `fixing` with no running job.
+     */
+    function fixErrorFor(snapshot, code) {
+      if (typeof code !== 'string' || code === '') return null;
+      if (snapshot === null || typeof snapshot !== 'object') return null;
+      const fix = snapshot.fix;
+      if (fix === null || typeof fix !== 'object') return null;
+      const errors = fix.errors;
+      if (errors === null || typeof errors !== 'object' || Array.isArray(errors)) return null;
+      const message = errors[code];
+      return typeof message === 'string' && message !== '' ? message : null;
+    }
+
     /**
      * True when a `blocked` ticket was blocked by the analysis flow. The host
      * only blocks an analysis failure from `analyzing` (the cleanup write is
@@ -885,13 +1056,63 @@ window.__ModuleLoader__.load({
       return '分析失败，可重新分析';
     }
 
-    /** Blocked-reason display text: mapped analysis copy, raw code otherwise. */
+    /**
+     * True when a `blocked` ticket was blocked by the fix flow.
+     *
+     * `blockedFrom:'fixing'` is the host contract (every fix failure blocks
+     * with `expectedWorkflow:'fixing'`), and — exactly like `isAnalysisBlock` —
+     * it is the ONLY signal. `blockedReason` must never decide this: a
+     * `reject_plan` block persists the user's free-text rejection reason
+     * verbatim (`state-machine.js`), so a plan-review ticket rejected with
+     * e.g. `fix-一下再提交` would otherwise look like a fix block, hide the
+     * generic 「重试」 (the only exit from a plan-review block) and offer
+     * 「重新修复」 that the host refuses with 409 invalid-state. The host stays
+     * the authority for the actual restart. `snapshot.fix.errors` never decides
+     * this on its own (only rendered once the ticket qualifies), so a ticket
+     * that moved on cannot show stale fix error copy.
+     */
+    function isFixBlock(ticket) {
+      if (ticket === null || typeof ticket !== 'object' || ticket.workflow !== 'blocked') return false;
+      return ticket.blockedFrom === 'fixing';
+    }
+
+    /**
+     * True when the branch/worktree metadata the host persists at the start of
+     * a run (`persistBranch` in `fix-service.js`) is present. A cancelled or
+     * host-unloaded job writes neither a `fixes` entry nor `fix.error`, so this
+     * is the only persisted marker that "a run was started" — used to pick the
+     * interrupted copy instead of the normal ready copy.
+     */
+    function fixRunStarted(ticket) {
+      if (ticket === null || typeof ticket !== 'object') return false;
+      const branch = ticket.branch;
+      return branch !== null && typeof branch === 'object'
+        && typeof branch.worktree === 'string' && branch.worktree.trim() !== '';
+    }
+
+    /**
+     * Static failure copy for a blocked fix. The host writes the newest start
+     * failure to `snapshot.fix.errors[code]`; a blocked-restart preparation
+     * failure deliberately keeps the old `blockedReason`, so the snapshot
+     * detail wins over the persisted reason. Neither is a raw code.
+     */
+    function fixFailureText(ticket, serverError) {
+      if (typeof serverError === 'string' && serverError !== '') return clip(serverError, 300);
+      const reason = ticket !== null && typeof ticket === 'object' && typeof ticket.blockedReason === 'string'
+        ? ticket.blockedReason
+        : '';
+      const mapped = fixReasonLabel(reason);
+      if (mapped !== undefined) return mapped;
+      return '修复失败，可重新修复';
+    }
+
+    /** Blocked-reason display text: mapped analysis/fix copy, raw code otherwise. */
     function blockedReasonText(ticket) {
       const reason = ticket !== null && typeof ticket === 'object' && typeof ticket.blockedReason === 'string'
         ? ticket.blockedReason
         : '';
       if (reason === '') return '未记录';
-      return analysisReasonLabel(reason) ?? clip(reason, 300);
+      return analysisReasonLabel(reason) ?? fixReasonLabel(reason) ?? clip(reason, 300);
     }
 
     function safeHttpUrl(value) {
@@ -1014,6 +1235,26 @@ window.__ModuleLoader__.load({
       return { running, errors };
     }
 
+    /**
+     * Snapshot `fix` block: `{running: string[], errors: {[code]: string}}`.
+     * Same defensive normalization as `analysis` (the host always sends it,
+     * empty when the fix service is not wired, but a partial/older response
+     * must not crash the board or leak non-string entries into render).
+     */
+    function normalizeFix(raw) {
+      const value = raw !== null && typeof raw === 'object' ? raw : {};
+      const running = Array.isArray(value.running)
+        ? value.running.filter((code) => typeof code === 'string' && code !== '')
+        : [];
+      const errors = {};
+      if (value.errors !== null && typeof value.errors === 'object' && !Array.isArray(value.errors)) {
+        for (const [code, message] of Object.entries(value.errors)) {
+          if (typeof message === 'string' && message !== '') errors[code] = message;
+        }
+      }
+      return { running, errors };
+    }
+
     function normalizeSnapshot(payload) {
       const value = payload && typeof payload === 'object' ? payload : {};
       const workspace = value.workspace && typeof value.workspace === 'object' ? value.workspace : {};
@@ -1033,6 +1274,9 @@ window.__ModuleLoader__.load({
         // P3 analysis progress/errors (empty shape when the host has no
         // analysis service, e.g. a profile without subagent services).
         analysis: normalizeAnalysis(value.analysis),
+        // P4 fix progress/errors, normalized exactly like `analysis` so a
+        // partial host response cannot crash the board.
+        fix: normalizeFix(value.fix),
         // Task 4 guarantees all three groups; normalize anyway so a partial
         // host response can never make the filter crash.
         dicts: {
@@ -1217,6 +1461,36 @@ window.__ModuleLoader__.load({
         ...view,
         title: '分析启动失败',
         message: hint === null ? view.message : hint,
+      };
+    }
+
+    /**
+     * `POST /api/fix` failure copy: 404 missing ticket, 409 stale state /
+     * unapproved plan / repository or branch busy, 503 service unavailable,
+     * 400 invalid code or branch configuration, 500 unexpected git/host
+     * failure. The hint replaces the host message so the banner always tells
+     * the user what to do; the server code/status stay for diagnosis.
+     *
+     * One exception: the host also returns code `fix-unavailable` with a
+     * cause-specific static message (`FIX_REASON_MESSAGES['no-live-agent']`
+     * when the session has no live agent) while the route's generic
+     * `fix-unavailable` copy means "service not wired". Keep that refined
+     * message instead of masking it with the cause-neutral hint the host would
+     * otherwise repeat; the generic copy still covers the plain 503.
+     */
+    function fixErrorView(result) {
+      const view = toErrorView(result);
+      const hint = ownFixValue(FIX_ERROR_HINTS, view.code)
+        ?? (view.status === null ? undefined : ownFixValue(FIX_STATUS_HINTS, view.status))
+        ?? null;
+      const generic503 = ownFixValue(FIX_STATUS_HINTS, 503);
+      const refined = view.code === 'fix-unavailable'
+        && view.message !== ''
+        && view.message !== generic503;
+      return {
+        ...view,
+        title: '修复启动失败',
+        message: refined ? view.message : (hint === null ? view.message : hint),
       };
     }
 
@@ -2802,15 +3076,63 @@ window.__ModuleLoader__.load({
       return h(Card, { title: '方案', aside: value && typeof value.generatedAt === 'string' ? `生成于 ${formatTime(value.generatedAt)}` : undefined }, ...body);
     }
 
+    /** `fixes[].status` -> display label + badge tone (the host writes 3 values). */
+    function fixStatusLabel(status) {
+      if (status === 'succeeded') return { label: '成功', tone: 'success' };
+      if (status === 'failed') return { label: '失败', tone: 'danger' };
+      if (status === 'cancelled') return { label: '已取消', tone: 'neutral' };
+      return null;
+    }
+
+    /** Non-negative `elapsedMs` -> elapsed copy, or null when absent/invalid. */
+    function formatRunElapsed(value) {
+      if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return null;
+      return formatElapsed(Math.round(value / 1000));
+    }
+
+    /**
+     * Fix history card. The host writes one entry per real run:
+     * `{runId, startedAt, finishedAt, status, changedFiles, diffStat, summary,
+     * testResult, error?, elapsedMs?, diff?, notes?}`. Legacy P1 demo entries
+     * only carry `at`/`evidence`; those fields are read only when the new one
+     * is absent, so old records still render without fabricating new data.
+     * `testResult` is surfaced by `TestCard`; this card renders what changed.
+     */
     function FixCard({ fixes }) {
       const list = Array.isArray(fixes) ? fixes.filter((fix) => fix && typeof fix === 'object') : [];
       if (list.length === 0) {
         return h(Card, { title: '修复记录' }, h('p', { style: emptyTextStyle }, '暂无修复记录。'));
       }
-      const ordered = list.slice().reverse();
-      return h(Card, { title: '修复记录', aside: `${list.length} 次` }, ...ordered.map((fix, index) => {
-        const files = Array.isArray(fix.changedFiles) ? fix.changedFiles : [];
+      // The host appends one entry per finished run (each may carry up to
+      // 2 000 changed files), so render only the newest runs; the aside still
+      // reports the full count.
+      const visible = list.slice(-MAX_RENDERED_FIXES);
+      const ordered = visible.slice().reverse();
+      return h(Card, {
+        title: '修复记录',
+        aside: list.length > visible.length
+          ? `${list.length} 次（显示最近 ${MAX_RENDERED_FIXES} 次）`
+          : `${list.length} 次`,
+      }, ...ordered.map((fix, index) => {
+        const files = Array.isArray(fix.changedFiles)
+          ? fix.changedFiles.filter((file) => textOf(file) !== '')
+          : [];
+        // Legacy P1 demo entries only; the host no longer writes `evidence`.
         const evidence = Array.isArray(fix.evidence) ? fix.evidence : [];
+        const status = fixStatusLabel(fix.status);
+        const startedAt = typeof fix.startedAt === 'string' ? fix.startedAt : null;
+        const finishedAt = typeof fix.finishedAt === 'string' ? fix.finishedAt : null;
+        const legacyAt = typeof fix.at === 'string' ? fix.at : null;
+        const timeText = startedAt !== null
+          ? `开始 ${formatTime(startedAt)}`
+          : (legacyAt !== null ? `修复于 ${formatTime(legacyAt)}` : `第 ${list.length - index} 次`);
+        const elapsed = formatRunElapsed(fix.elapsedMs);
+        const diffStat = typeof fix.diffStat === 'string' && fix.diffStat.trim() !== '' ? fix.diffStat : null;
+        // The host persists a reason CODE in `error` (e.g. `fix-no-changes`),
+        // never a message: map it through the same copy table as the blocked
+        // banner and only clip an unknown string.
+        const rawError = typeof fix.error === 'string' && fix.error.trim() !== '' ? fix.error : null;
+        const errorText = rawError === null ? null : (fixReasonLabel(rawError) ?? clip(rawError, 300));
         return h('div', {
           key: `fix-${index}`,
           style: {
@@ -2822,13 +3144,28 @@ window.__ModuleLoader__.load({
             minWidth: 0,
           },
         },
-          h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap', fontSize: 11, lineHeight: '16px', color: C.textTertiary } },
-            h('span', null, typeof fix.at === 'string' ? formatTime(fix.at) : `第 ${list.length - index} 次`),
-            fix.diffStat === undefined ? null : h('span', null, `改动：${clip(fix.diffStat, 160)}`),
-            fix.testResult === undefined ? null : h('span', { style: { color: C.textSecondary } }, `测试：${clip(fix.testResult, 160)}`)),
-          files.length === 0
+          h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', fontSize: 11, lineHeight: '16px', color: C.textTertiary } },
+            status === null ? null : h(Badge, { label: status.label, tone: status.tone }),
+            h('span', { title: fullTime(startedAt) ?? fullTime(legacyAt) }, timeText),
+            finishedAt === null ? null : h('span', { title: fullTime(finishedAt) }, `完成 ${formatTime(finishedAt)}`),
+            elapsed === null ? null : h('span', null, `耗时 ${elapsed}`),
+            diffStat === null ? null : h('span', null, `改动：${clip(diffStat, 160)}`)),
+          h(TextField, { label: '摘要', value: fix.summary }),
+          errorText === null
             ? null
-            : h('div', { style: { ...fieldValueStyle, fontSize: 12 } }, `文件：${files.map((file) => clip(file, 160)).join('、')}`),
+            : h('div', {
+              style: {
+                fontSize: 12,
+                lineHeight: '18px',
+                color: C.error,
+                wordBreak: 'break-word',
+                overflowWrap: 'anywhere',
+              },
+            }, `错误：${errorText}`),
+          h(ListField, {
+            label: files.length === 0 ? '改动文件' : `改动文件（${files.length}）`,
+            values: files,
+          }),
           evidence.length === 0
             ? null
             : h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, fontSize: 11, lineHeight: '16px' } },
@@ -2852,16 +3189,23 @@ window.__ModuleLoader__.load({
     function TestCard({ fixes, workflow }) {
       const list = Array.isArray(fixes) ? fixes.filter((fix) => fix && typeof fix === 'object') : [];
       const latest = list.length === 0 ? null : list[list.length - 1];
-      const testResult = latest === null ? undefined : latest.testResult;
+      // The host writes `testResult` on every run entry; only a non-empty
+      // string is rendered (legacy entries may omit it).
+      const testResult = latest !== null && typeof latest.testResult === 'string' && latest.testResult.trim() !== ''
+        ? latest.testResult
+        : undefined;
+      // `evidence` is no longer written by the host: render it only when a
+      // legacy P1 demo entry still carries it.
       const evidence = latest === null || !Array.isArray(latest.evidence) ? [] : latest.evidence;
+      const latestStatus = latest === null ? null : fixStatusLabel(latest.status);
       const statusText = workflow === 'fix_done'
         ? '待人工测试：完成测试后点击「标记测试通过」。'
         : (workflow === 'fixing'
           ? '修复进行中，暂无人工测试记录。'
           : (list.length === 0 ? '暂无测试记录。' : '最近一次修复的测试结果如下。'));
-      return h(Card, { title: '测试与证据' },
+      return h(Card, { title: '测试与证据', aside: latestStatus === null ? undefined : latestStatus.label },
         h('p', { style: emptyTextStyle }, statusText),
-        testResult === undefined || testResult === null
+        testResult === undefined
           ? null
           : h(TextField, { label: '测试结果', value: testResult }),
         evidence.length === 0
@@ -2881,6 +3225,12 @@ window.__ModuleLoader__.load({
       const target = mr !== null && typeof mr.targetBranch === 'string'
         ? mr.targetBranch
         : (branch !== null && typeof branch.target === 'string' ? branch.target : '—');
+      const baseSource = branch === null || typeof branch.baseSource !== 'string'
+        ? ''
+        : branchBaseSourceLabel(branch.baseSource);
+      const worktree = branch === null || typeof branch.worktree !== 'string' || branch.worktree.trim() === ''
+        ? null
+        : branch.worktree;
       const url = mr === null ? null : safeHttpUrl(mr.url);
       const iid = mr === null ? null : textOf(mr.iid);
       return h(Card, { title: 'MR 与分支', aside: iid === null || iid === '' ? undefined : `!${iid}` },
@@ -2888,6 +3238,22 @@ window.__ModuleLoader__.load({
           h('div', { style: fieldLabelStyle }, '分支'),
           h('div', { style: { ...fieldValueStyle, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace', fontSize: 11.5 } },
             `${source} → ${target}`)),
+        baseSource === ''
+          ? null
+          : h('div', { style: { fontSize: 11.5, lineHeight: '18px', color: C.textSecondary } },
+            `基线：${baseSource}`),
+        worktree === null
+          ? null
+          : h('div', { style: { display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 } },
+            h('div', { style: fieldLabelStyle }, '工作树'),
+            h('div', {
+              style: {
+                ...fieldValueStyle,
+                fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+                fontSize: 11.5,
+                wordBreak: 'break-all',
+              },
+            }, worktree)),
         mr === null
           ? null
           : h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '4px 12px', fontSize: 11.5, lineHeight: '18px', color: C.textSecondary } },
@@ -3003,7 +3369,9 @@ window.__ModuleLoader__.load({
         h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary } },
           isAnalysisBlock(ticket)
             ? '这是 AI 分析失败导致的阻塞：点击「重新分析」会解除阻塞并重新开始分析。'
-            : '处理完成后可点击「重试」回到阻塞前状态。'));
+            : (isFixBlock(ticket)
+              ? '这是 AI 修复失败导致的阻塞：点击「重新修复」会自动解除阻塞并重新开始修复。'
+              : '处理完成后可点击「重试」回到阻塞前状态。')));
     }
 
     /**
@@ -3131,18 +3499,187 @@ window.__ModuleLoader__.load({
             '重新分析会自动解除该阻塞并重新开始，最长约 10 分钟。')));
     }
 
+    /**
+     * P4 fix status/failure panel for the detail view.
+     *
+     * Three mutually exclusive renderings, all driven by the polled snapshot:
+     *   - `fixing` + `fix.running` has the code: live progress copy plus a
+     *     local elapsed timer (the caller hides the demo `fix_done` button for
+     *     every `fixing` ticket; the host advances the ticket itself once the
+     *     real run succeeds);
+     *   - `fixing` without a running job: the normal approved-but-not-started
+     *     state (「开始修复」 when the host has not persisted branch/worktree
+     *     metadata yet) or an interrupted run (「重新修复」 once it has); both
+     *     re-POST `/api/fix`, which the host uses to restart orphans;
+     *   - a fix-related `blocked` ticket: the newest static failure copy from
+     *     `snapshot.fix.errors[code]` (falling back to `blockedReason`) plus
+     *     the same 「重新修复」 button (the host retries blocked-from-fixing and
+     *     clears the block itself).
+     *
+     * The persisted `fix.error:<code>` is deliberately NOT rendered for any
+     * other workflow: it may survive on a ticket that already moved on.
+     */
+    function FixNotice({ ticket, snapshot, busyAction, locked, onAction }) {
+      const isFixing = ticket.workflow === 'fixing';
+      const running = isFixing && fixRunningFor(snapshot, ticket.code);
+      const elapsed = useElapsedSeconds(running, ticket.code);
+      const block = isFixBlock(ticket);
+      if (!isFixing && !block) return null;
+
+      const fixes = Array.isArray(ticket.fixes) ? ticket.fixes.filter((fix) => fix && typeof fix === 'object') : [];
+      const approved = ticket.plan !== null && typeof ticket.plan === 'object'
+        && typeof ticket.plan.approvedAt === 'string' && ticket.plan.approvedAt !== '';
+      const serverError = fixErrorFor(snapshot, ticket.code);
+
+      const busy = busyAction === FIX_START_DESCRIPTOR.action;
+      const disabled = busy || locked === true;
+      // A normal first start is an approved plan whose run has never written
+      // its branch metadata (and has no run/error); everything else
+      // (interrupted, blocked) is a restart/retry. The branch marker is the
+      // only persisted trace of a cancelled/disposed run, which writes neither
+      // `fixes` nor `fix.error` — without it an orphan looked "ready".
+      const started = isFixing && fixRunStarted(ticket);
+      const ready = isFixing && fixes.length === 0 && serverError === null && approved && !started;
+      const descriptor = ready ? FIX_START_DESCRIPTOR : FIX_RETRY_DESCRIPTOR;
+      const start = h('button', {
+        key: 'fix-start',
+        type: 'button',
+        disabled,
+        'aria-busy': busy || undefined,
+        title: locked === true ? UNBOUND_WORKSPACE_HINT : descriptor.confirm,
+        onClick: () => {
+          if (disabled) return;
+          if (typeof onAction === 'function') onAction(descriptor);
+        },
+        style: primaryButtonStyle(disabled),
+      }, busy ? '处理中…' : descriptor.label);
+
+      if (isFixing && running) {
+        return h('div', {
+          role: 'status',
+          'aria-live': 'polite',
+          'data-bug-fix': 'running',
+          style: {
+            border: `0.5px solid ${TONES.info.border}`,
+            background: TONES.info.background,
+            borderRadius: 8,
+            padding: '8px 10px',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 3,
+            minWidth: 0,
+          },
+        },
+          h('div', { style: { fontSize: 12, fontWeight: 600, color: TONES.info.color, lineHeight: '18px' } },
+            FIX_RUNNING_HINT),
+          // The elapsed counter updates every second; keep it out of the
+          // polite live region so screen readers announce the fix start and
+          // completion, not one message per tick.
+          h('div', {
+            'aria-live': 'off',
+            style: { fontSize: 11, lineHeight: '16px', color: C.textSecondary },
+          }, `已运行 ${formatElapsed(elapsed)}`),
+          h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary } },
+            '修复在后台进行，可继续做其他操作；完成后工单会进入「待人工测试」。'));
+      }
+
+      if (isFixing) {
+        if (!approved) {
+          // Every host path into `fixing` (approve_plan) sets plan.approvedAt;
+          // without it /api/fix refuses with 409 plan-not-approved, so the
+          // board does not offer a button that is guaranteed to be rejected.
+          return h('div', {
+            role: 'status',
+            'data-bug-fix': 'not-approved',
+            style: {
+              border: `0.5px solid ${TONES.warn.border}`,
+              background: TONES.warn.background,
+              borderRadius: 8,
+              padding: '8px 10px',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 4,
+              minWidth: 0,
+            },
+          },
+            h('div', { style: { fontSize: 12, fontWeight: 600, color: TONES.warn.color, lineHeight: '18px' } },
+              '方案尚未通过审核，无法开始 AI 修复'),
+            h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary } },
+              '请先回到「方案待审」通过方案（或刷新看板确认最新状态）后再开始修复。'));
+        }
+        return h('div', {
+          role: 'status',
+          'data-bug-fix': ready ? 'ready' : 'interrupted',
+          style: {
+            border: `0.5px solid ${TONES.warn.border}`,
+            background: TONES.warn.background,
+            borderRadius: 8,
+            padding: '8px 10px',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 4,
+            minWidth: 0,
+          },
+        },
+          h('div', { style: { fontSize: 12, fontWeight: 600, color: TONES.warn.color, lineHeight: '18px' } },
+            ready ? FIX_READY_HINT : FIX_INTERRUPTED_HINT),
+          serverError === null
+            ? null
+            : h('div', {
+              style: { fontSize: 11, lineHeight: '16px', color: C.textSecondary, wordBreak: 'break-word' },
+            }, `宿主记录：${clip(serverError, 300)}`),
+          h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary } },
+            ready
+              ? '修复会在工作区创建独立的工作树，最长约 15 分钟；期间可继续其他操作。'
+              : '重新修复会从当前状态继续（宿主会重启中断的修复任务）。'),
+          h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' } }, start));
+      }
+
+      // `block` is true: static failure copy plus the restart button.
+      const reason = typeof ticket.blockedReason === 'string' ? ticket.blockedReason : '';
+      const persisted = fixReasonLabel(reason);
+      return h('div', {
+        role: 'alert',
+        'data-bug-fix': 'blocked',
+        style: {
+          border: `0.5px solid ${TONES.danger.border}`,
+          background: TONES.danger.background,
+          borderRadius: 8,
+          padding: '8px 10px',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 4,
+          minWidth: 0,
+        },
+      },
+        h('div', { style: { fontSize: 12, fontWeight: 600, color: C.error, lineHeight: '18px' } }, 'AI 修复未完成'),
+        h('div', { style: { ...fieldValueStyle, fontSize: 12 } }, fixFailureText(ticket, serverError)),
+        persisted === undefined || serverError === null || persisted === serverError
+          ? null
+          : h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textSecondary, wordBreak: 'break-word' } },
+            `工单记录：${persisted}`),
+        h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center', paddingTop: 2 } },
+          start,
+          h('span', { style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary } },
+            '重新修复会自动解除该阻塞并重新开始，最长约 15 分钟。')));
+    }
+
     function TicketDetail({ ticket, snapshot, busyAction, locked, onAction, onBack }) {
       // UI-only filters (the action-map literal and its contract test stay
       // untouched): the demo 「分析完成」 button is hidden for EVERY `analyzing`
       // ticket — running or interrupted — because that transition belongs to
-      // the real analysis job. P4 must remove the demo action from the map
-      // itself. The generic 「重试」 is replaced by the analysis restart button
-      // for a ticket blocked by the analysis flow.
+      // the real analysis job. P4 hides the demo 「修复完成」 button for EVERY
+      // `fixing` ticket for the same reason: the host advances the ticket
+      // itself after a real fix. The generic 「重试」 is replaced by the
+      // analysis/fix restart button for a ticket blocked by that flow.
       const analysisRunning = ticket.workflow === 'analyzing' && analysisRunningFor(snapshot, ticket.code);
       const analysisBlock = isAnalysisBlock(ticket);
+      const fixBlock = isFixBlock(ticket);
       const actions = (ACTION_BY_STATE[ticket.workflow] ?? []).filter((descriptor) => {
         if (ticket.workflow === 'analyzing' && descriptor.action === 'analysis_done') return false;
+        if (ticket.workflow === 'fixing' && descriptor.action === 'fix_done') return false;
         if (analysisBlock && descriptor.action === 'retry') return false;
+        if (fixBlock && descriptor.action === 'retry') return false;
         return true;
       });
       const planReview = ticket.workflow === 'plan_review';
@@ -3175,7 +3712,11 @@ window.__ModuleLoader__.load({
             }, typeof ticket.title === 'string' && ticket.title.trim() !== '' ? ticket.title : '（无标题）')),
           h(Badge, { label: workflowLabel(ticket.workflow), tone: workflowTone(ticket.workflow) })),
         h(AnalysisNotice, { ticket, snapshot, busyAction, locked, onAction }),
-        h(BlockedNotice, { ticket }),
+        h(FixNotice, { ticket, snapshot, busyAction, locked, onAction }),
+        // FixNotice already reports the blocked-fix cause and the restart
+        // action (role="alert"); the generic blocked banner would repeat the
+        // same reason. Keep it for every other block (analysis, plan review…).
+        fixBlock ? null : h(BlockedNotice, { ticket }),
         planReview ? null : actionBar,
         h(FieldsBlock, { ticket, snapshot }),
         h(PlatformCard, { ticket }),
@@ -3653,14 +4194,15 @@ window.__ModuleLoader__.load({
         if (!descriptor || !ticket || busyRef.current || typeof ticket.code !== 'string') return;
         if (sessionId === null || configured !== true) return;
 
-        // P3: `start_analysis` (from `inbox`) and the board-only 「重新分析」
-        // descriptor both go to the real analysis route. The host handles the
-        // inbox start, the orphaned-`analyzing` restart and the
-        // blocked-from-analyzing auto-retry, so the client never sends a
-        // separate `/action retry` first.
+        // P3/P4: `start_analysis` and the board-only `start_fix` descriptors
+        // bypass `/action` and go to their real routes. The host handles the
+        // approved start, the orphaned-`analyzing`/`fixing` restart and the
+        // blocked-from-analysis/fix retry through those routes, so the client
+        // never sends a separate `/action retry` first.
         const isAnalyze = descriptor.action === 'start_analysis';
+        const isFix = descriptor.action === 'start_fix';
         let payload = {};
-        if (!isAnalyze) {
+        if (!isAnalyze && !isFix) {
           payload = descriptor.payload === undefined || descriptor.payload === null ? {} : descriptor.payload;
           if (descriptor.input === 'reason') {
             const trimmed = typeof reason === 'string' ? reason.trim() : '';
@@ -3675,15 +4217,20 @@ window.__ModuleLoader__.load({
         setFlash(null);
 
         try {
-          const result = isAnalyze
-            ? await postMutation(API.analyze, { sessionId, code: ticket.code })
-            : await postMutation(API.action, {
+          let result;
+          if (isAnalyze) {
+            result = await postMutation(API.analyze, { sessionId, code: ticket.code });
+          } else if (isFix) {
+            result = await postMutation(API.fix, { sessionId, code: ticket.code });
+          } else {
+            result = await postMutation(API.action, {
               sessionId,
               actionId: createActionId(),
               code: ticket.code,
               action: descriptor.action,
               payload,
             });
+          }
           if (result.aborted === true) return;
 
           if (result.ok) {
@@ -3693,6 +4240,11 @@ window.__ModuleLoader__.load({
               // blocks moments later, so progress is never claimed here: the
               // refreshed snapshot's `analysis.running` is the only signal.
               setFlash(`工单 ${ticket.code} 分析请求已受理，正在刷新…`);
+            } else if (isFix) {
+              // Same contract for a fix: 200 means the host accepted the
+              // start, not that the work is done. Progress comes only from
+              // `snapshot.fix.running` / the ticket's workflow.
+              setFlash(`工单 ${ticket.code} 修复请求已受理，正在刷新…`);
             } else {
               const next = result.data && typeof result.data === 'object' ? result.data.ticket : null;
               const nextWorkflow = next && typeof next.workflow === 'string' ? next.workflow : null;
@@ -3700,13 +4252,17 @@ window.__ModuleLoader__.load({
                 ? `工单 ${ticket.code} 操作成功`
                 : `工单 ${ticket.code} 已更新：${workflowLabel(nextWorkflow)}`);
             }
+          } else if (isAnalyze) {
+            setActionError(analyzeErrorView(result));
+          } else if (isFix) {
+            setActionError(fixErrorView(result));
           } else {
-            setActionError(isAnalyze ? analyzeErrorView(result) : toErrorView(result));
+            setActionError(toErrorView(result));
           }
 
           // Refresh after success and after a rejected action: a 409 may have
           // changed the ticket server-side (e.g. review rounds -> blocked), and
-          // the analysis progress/errors only exist in the snapshot.
+          // the analysis/fix progress and errors only exist in the snapshot.
           try {
             await polling.refresh();
           } catch {

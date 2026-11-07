@@ -2,5 +2,8 @@ node_modules/
 *.tsbuildinfo
 
 .superpowers/
+.claude/
+.idea/
 .tmp/
 bug-workflow/.tmp/
+.dsh-worktrees/
