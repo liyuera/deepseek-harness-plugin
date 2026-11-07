@@ -229,7 +229,7 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 
 1. 能访问星瞰河山一体化平台（`https://ecard.htwisdom.cn/HT_TEAM/…`），并拥有可登录的平台账号。
 2. **主路径：看板内登录**（P6 已实现）。打开看板 → 右上「设置」→「平台连接」，输入**平台账号 / 密码 / 图形验证码**（验证码图片由宿主实时向平台请求，点图可换一张）→「登录平台」。
-   - 宿主用 `POST /api/htwisdom-auth/oauth/token`（`grant_type=captcha`，密码按平台前端规则 **MD5** 后发送）完成登录，成功后把 `access-token` 写入 `ctx.credentials`；
+   - 宿主先读取平台**公开**的 `GET /api/htwisdom-system/system/open-api/system-config?tenantId=000000` 拿到应用级 OAuth 客户端（`clientId/clientSecret`，与前端 `Authorization: Basic` 同源，不包含用户密码），再调 `POST /api/htwisdom-auth/oauth/token`（**form-urlencoded** 体、`grant_type=captcha`、密码按平台前端规则 **MD5** 后发送）完成登录，成功后把 `access-token` 写入 `ctx.credentials`；
    - **密码只用于这一次登录请求**：不保存、不写日志、不回显；账号名可记住（浏览器 localStorage），密码永不记住；
    - 登录失败会给出静态原因（验证码错误/账号密码错误/网络/超时）。
 3. **降级路径：手动粘贴 token**（登录接口不可用时）。在平台页面 Console 读取：
@@ -421,6 +421,7 @@ P2 **未对真实平台执行**同步/导入（无真实 token，用户不在场
 - 路由只接受**本机回环**连接（`socket.remoteAddress` 校验 + `Host` 文本白名单，DNS rebinding 不可绕过）。
 - POST 必须 `Content-Type: application/json`（跨站表单 `text/plain` 先 415）；带浏览器 `Origin` 时必须与请求 Host 同源，否则 403。
 - 请求体上限 64 KiB、读取超时 10 s；错误响应只带裁剪后的 message，完整错误进宿主日志。
+- 平台登录的应用级 OAuth 客户端（`clientId/clientSecret`）来自平台公开 bootstrap 配置，**只用于登录请求的 Basic 头、不落库**；登录密码在宿主内存中 MD5 后用于一次请求，不落库、不写日志、不回显。
 - 平台 token 只走 `ctx.credentials`；请求头 `Htwisdom-Auth` 是唯一出口，`credentials:'omit'`、`redirect:'error'`（不跟随重定向，避免 token 被带到别的源）；错误 message 为静态模板，不插值 token/上游正文。
 - GitLab token 同样只走 `ctx.credentials`（ref `BUG_WORKFLOW_GITLAB_TOKEN`）；唯一的出口是 `PRIVATE-TOKEN` header，`redirect:'error'`、15s 超时、响应体 1 MiB 上限；错误静态化，不打印 token/URL 上游正文/堆栈。
 - **git 只经 `execFile('git', argv)`**：工单号、分支名先在 `branch.js`/`git.worktreePath` 校验，永不拼接 shell；工作树路径固定在 `<repo>/.dsh-worktrees/<code>`。P5 只 `git add -A` / `git diff --cached --quiet` / `git commit -m <单参数>` / `git push -u origin <个人分支>`；push 前 `assertPushableBranch` 硬校验受保护分支，**命令 argv 里没有 `--force`/force-with-lease**；目标分支族在 delivery 启动前硬校验（`main`/`dev`/`release-*` 等拒绝）。git 命令超时 30s（push 60s），失败静态化。

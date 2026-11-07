@@ -158,6 +158,35 @@ function requireBaseUrl(input) {
 }
 
 /**
+ * The OAuth client pair is publicly readable from the platform's login
+ * bootstrap endpoint (the same values the frontend puts in `Authorization:
+ * Basic`). They are application-level credentials, not the user's password;
+ * they are re-fetched per login attempt and never persisted by this module.
+ *
+ * @param {string} baseUrl normalized base URL (trailing slash)
+ * @returns {Promise<{clientId: string, clientSecret: string, defaultTenant: string|null}>}
+ */
+async function readOauthClient(baseUrl, requestJsonFn) {
+  const { body } = await requestJsonFn(
+    `${baseUrl}api/htwisdom-system/system/open-api/system-config?tenantId=${encodeURIComponent(DEFAULT_TENANT_ID)}`,
+    { method: 'GET', headers: { Accept: 'application/json' } },
+    'login',
+  );
+  const data = isPlainObject(body.data) ? body.data : {};
+  const envelopeCode = typeof body.code === 'number' ? body.code : NaN;
+  const clientId = typeof data.clientId === 'string' ? data.clientId.trim() : '';
+  const clientSecret = typeof data.clientSecret === 'string' ? data.clientSecret.trim() : '';
+  if (envelopeCode !== 200 || clientId === '' || clientSecret === ''
+    || clientId.length > MAX_USERNAME_CHARS || clientSecret.length > MAX_PASSWORD_CHARS) {
+    throw new PlatformLoginError('login-bad-response', MESSAGE.loginBadResponse);
+  }
+  const defaultTenant = typeof data.defaultTenant === 'string' && /^[0-9A-Za-z_-]{1,64}$/.test(data.defaultTenant)
+    ? data.defaultTenant
+    : null;
+  return { clientId, clientSecret, defaultTenant };
+}
+
+/**
  * Create the login service.
  *
  * @param {{fetchImpl?: Function, timeoutMs?: number}} [options]
@@ -254,6 +283,7 @@ export function createPlatformLogin(options = {}) {
       );
     }
 
+
     let body;
     try {
       body = JSON.parse(text);
@@ -330,30 +360,45 @@ export function createPlatformLogin(options = {}) {
     const tenantId = normalizeTenant(input.tenantId);
     if (tenantId === undefined) throw new PlatformLoginError('invalid-input', MESSAGE.invalidTenant);
 
+    // The public login bootstrap config carries the OAuth client pair the
+    // frontend embeds in every request as `Authorization: Basic ...`. The login
+    // endpoint silences a request without it (HTTP 200, empty body), so the pair
+    // MUST be fetched before the token POST.
+    const client = await readOauthClient(baseUrl, requestJson);
+    const basic = Buffer.from(`${client.clientId}:${client.clientSecret}`, 'utf8').toString('base64');
+
+    const resolvedTenant = input.tenantId === undefined || input.tenantId === null || input.tenantId === ''
+      ? (client.defaultTenant !== null ? client.defaultTenant : tenantId)
+      : tenantId;
+    // The platform parses the token request from a querystring body; JSON is
+    // ignored and answered with "Missing grant type".
+    const form = new URLSearchParams({
+      type: 'account',
+      scope: 'all',
+      grant_type: 'captcha',
+      deptId: '',
+      roleId: '',
+      tenantId: resolvedTenant,
+      username,
+      password: hashPassword(password),
+      code,
+    }).toString();
+
     const { body, status } = await requestJson(
       `${baseUrl}api/htwisdom-auth/oauth/token`,
       {
         method: 'POST',
         headers: {
           Accept: 'application/json',
-          'Content-Type': 'application/json',
-          'Tenant-Id': tenantId,
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: `Basic ${basic}`,
+          'Tenant-Id': resolvedTenant,
           'Captcha-key': captchaKey,
           'Captcha-code': code,
           'Dept-Id': '',
           'Role-Id': '',
         },
-        body: JSON.stringify({
-          type: 'account',
-          scope: 'all',
-          grant_type: 'captcha',
-          deptId: '',
-          roleId: '',
-          tenantId,
-          username,
-          password: hashPassword(password),
-          code,
-        }),
+        body: form,
       },
       'login',
     );
