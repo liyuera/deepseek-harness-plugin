@@ -8,7 +8,7 @@
  * DOM is touched outside React.
  *
  * Data flow:
- *   - `usePolling(snapshotUrl, 3000)` reads `GET /bug-workflow/api/snapshot`
+ *   - `usePolling(snapshotUrl, POLL_INTERVAL_MS)` reads `GET /bug-workflow/api/snapshot`
  *     and ignores stale/aborted responses; unmount stops the timer.
  *   - every write goes through `POST /bug-workflow/api/action` with
  *     `Content-Type: application/json`, a fresh idempotency `actionId`, and a
@@ -100,7 +100,7 @@ window.__ModuleLoader__.load({
     const h = React.createElement;
     const ID = '@liyuera/dsh-bug-workflow';
     /** Visible build tag so the running UI can be verified after a reload. */
-    const CLIENT_BUILD = 'p6-login.2026-11-08.4';
+    const CLIENT_BUILD = 'p6-login.2026-11-08.5';
 
     /** Snapshot/action endpoints (same origin as the Harness Web page). */
     const API = Object.freeze({
@@ -118,7 +118,11 @@ window.__ModuleLoader__.load({
     });
 
     /** Poll cadence in milliseconds (P1 contract: every 3 s). */
-    const POLL_INTERVAL_MS = 3000;
+    /** Board auto-refresh cadence (manual 刷新 stays immediate). */
+    const POLL_INTERVAL_MS = 180000;
+    const POLL_INTERVAL_LABEL = POLL_INTERVAL_MS >= 60000 && POLL_INTERVAL_MS % 60000 === 0
+      ? `${POLL_INTERVAL_MS / 60000} 分钟`
+      : `${POLL_INTERVAL_MS / 1000} 秒`;
 
     /** Workflow state -> Chinese label. */
     const WORKFLOW_LABELS = Object.freeze({
@@ -3556,7 +3560,7 @@ window.__ModuleLoader__.load({
           ? '正在读取本工作区看板…'
           : (path === null
             ? '该会话没有工作区目录，看板仍显示本机全部工单'
-            : (refreshing ? '刷新中…' : `Bug 工作流 · 每 ${POLL_INTERVAL_MS / 1000} 秒自动刷新`)));
+            : (refreshing ? '刷新中…' : `Bug 工作流 · 每 ${POLL_INTERVAL_LABEL}自动刷新`)));
       const hasFilters = filters.status.length > 0 || filters.type.length > 0;
       const disabled = busy !== null;
       const syncingNow = syncing === true;
