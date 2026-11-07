@@ -5,7 +5,7 @@
  *
  *   GET  /bug-workflow/api/health          -> { ok, domainOpenedAt, tickets }
  *   GET  /bug-workflow/api/snapshot        -> { ok, workspace, settings, platform, gitlab, dicts,
- *                                              analysis, fix, delivery, tickets, serverTime }
+ *                                              analysis, fix, delivery, review, tickets, serverTime }
  *   POST /bug-workflow/api/action          -> { ok, ticket } | { ok:false, code, message, ticket? }
  *                                              action:'create' + payload.code imports that
  *                                              platform task by code (see `importTask`)
@@ -75,6 +75,12 @@
  * from the delivery-specific meta namespace (`delivery.error:<code>`), never
  * from `fix.error:<code>`. The background job's lint/test/commit/push/MR
  * failures block the ticket and never surface as a synchronous HTTP error.
+ *
+ * P5 AI Review polling is timer-driven by `createReviewService()` and exposes
+ * no HTTP route: the snapshot always carries `review:{running, errors}` (empty
+ * when the service is not wired or failed to construct), with `errors` keyed by
+ * ticket code and read from `review.error:<code>`. Polling/fix/merge failures
+ * are visible only through that block.
  *
  * Failures are closed over: every handler is wrapped, and no handler lets an
  * exception escape into the HTTP server. The plugin loads without storage; the
@@ -317,6 +323,10 @@ const LOOPBACK_REMOTE_ADDRESSES = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1
  *   `createDeliveryService()` result for `POST /deliver` and the snapshot
  *   `delivery` block; when null `/deliver` answers 503 `delivery-unavailable`
  *   and the snapshot reports empty delivery state
+ * @param {{service: object}|null} [deps.review]
+ *   `createReviewService()` result for the snapshot `review` block. Review is
+ *   timer-driven and exposes NO HTTP route, so only `status()` is required;
+ *   when null the snapshot reports empty review state
  * @param {() => string} [deps.clock] ISO 8601 server time for snapshots
  * @param {number|null} [deps.domainOpenedAt] domain open timestamp for health
  * @param {number} [deps.bodyTimeoutMs] POST body read deadline (default 10 s)
@@ -334,6 +344,7 @@ export function createHandlers({
   analysis = null,
   fix = null,
   delivery = null,
+  review = null,
   clock = defaultClock,
   domainOpenedAt = null,
   bodyTimeoutMs = BODY_TIMEOUT_MS,
@@ -401,6 +412,14 @@ export function createHandlers({
     }
   }
   const deliveryDeps = delivery === undefined ? null : delivery;
+  if (review !== null && review !== undefined) {
+    if (typeof review !== 'object' || typeof review.service?.status !== 'function') {
+      throw new TypeError(
+        'createHandlers() review.service must expose status()',
+      );
+    }
+  }
+  const reviewDeps = review === undefined ? null : review;
   if (typeof clock !== 'function') {
     throw new TypeError('createHandlers() requires clock to be a function');
   }
@@ -465,6 +484,9 @@ export function createHandlers({
         // P5: delivery progress + static per-ticket errors from the
         // delivery-specific meta namespace (parallel to `fix`, never shared).
         delivery: readServiceStatus(deliveryDeps),
+        // P5: review polling/merge-detection progress + static per-ticket
+        // errors (`review.error:<code>`). Timer-driven: no HTTP route.
+        review: readServiceStatus(reviewDeps),
         tickets: snapshot.tickets,
         serverTime: clock(),
       });
@@ -1235,11 +1257,11 @@ function emptyDicts() {
 }
 
 /**
- * Snapshot `analysis`/`fix`/`delivery` object. Every service is optional (older
- * wiring, a profile without subagent services, or a failed service
- * construction), so a missing/failing `status()` degrades to empty state and the
- * board keeps rendering. Only static strings persisted by the service are
- * exposed.
+ * Snapshot `analysis`/`fix`/`delivery`/`review` object. Every service is
+ * optional (older wiring, a profile without subagent services, or a failed
+ * service construction), so a missing/failing `status()` degrades to empty
+ * state and the board keeps rendering. Only static strings persisted by the
+ * service are exposed.
  */
 function readServiceStatus(serviceDeps) {
   const empty = { running: [], errors: {} };

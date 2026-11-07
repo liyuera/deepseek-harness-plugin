@@ -82,6 +82,12 @@
  *     written. The error namespace is delivery-specific and NEVER touches
  *     `fix.error:<code>` (the P4 fix service owns that key and clears it on its
  *     next start).
+ *   - A successful delivery persists `meta['delivery.context:<code>']` with
+ *     `{sessionId, cwd, gitlabBaseUrl, gitlabProjectPath, commitType}` (bounded
+ *     scalars only, never the token). The timer-driven review service has no
+ *     session/workspace of its own, so this record is what lets it rebuild the
+ *     MR client and run the review-fix subagent. A later successful delivery
+ *     overwrites it.
  *   - `dispose()` marks running jobs cancelled and aborts them; a cancelled
  *     job performs no block/error/meta write. The drain is bounded.
  *   - Hard boundary: this module never merges, closes, approves, resolves,
@@ -102,6 +108,24 @@ export const DELIVERY_ERROR_META_PREFIX = 'delivery.error:';
 
 /** `meta` key prefix of the commit staged for a retryable delivery. */
 export const DELIVERY_COMMIT_META_PREFIX = 'delivery.commit:';
+
+/**
+ * `meta` key prefix of the review context persisted after a successful
+ * delivery (suffix = ticket code). The 60 s review poller is timer-driven and
+ * has no live session/workspace, so the delivery service records the minimum
+ * the review service needs to rebuild its per-workspace GitLab client:
+ *
+ *   { sessionId, cwd, gitlabBaseUrl, gitlabProjectPath, commitType }
+ *
+ * Only these five bounded scalar fields are ever written — credentials/tokens
+ * are read from the token store and NEVER copied into `meta`.
+ */
+export const DELIVERY_CONTEXT_META_PREFIX = 'delivery.context:';
+
+/** Bounds for the persisted review context (defensive, snapshot-safe). */
+export const DELIVERY_CONTEXT_PATH_MAX_CHARS = 4_096;
+export const DELIVERY_CONTEXT_FIELD_MAX_CHARS = 2_048;
+export const DELIVERY_CONTEXT_COMMIT_TYPE_MAX_CHARS = 64;
 
 /** Upper bound for one configured lint/test command (5 minutes). */
 export const DEFAULT_COMMAND_TIMEOUT_MS = 300_000;
@@ -573,6 +597,8 @@ export function createDeliveryService({
       settings,
       branch,
       client,
+      sessionId,
+      cwd,
     });
     jobs.add(job);
     void job
@@ -592,7 +618,7 @@ export function createDeliveryService({
    * One background delivery. Never rejects, never writes after cancellation,
    * and releases the running/lock slots through the caller's `finally`.
    */
-  async function runDelivery({ entry, key, ticket, settings, branch, client }) {
+  async function runDelivery({ entry, key, ticket, settings, branch, client, sessionId, cwd }) {
     let checks;
     try {
       const lint = await runCheck(settings.lintCommand, entry, branch.worktree);
@@ -699,7 +725,7 @@ export function createDeliveryService({
       }
       if (entry.cancelled) return;
 
-      await persistDelivered({ key, branch, mr, checks, sha });
+      await persistDelivered({ key, branch, mr, checks, sha, settings, sessionId, cwd });
     } catch (error) {
       notifyLog(log, 'delivery-job', error);
       if (entry.cancelled) return;
@@ -762,7 +788,7 @@ export function createDeliveryService({
    * initialization. Every write is conditional on the expected workflow, so a
    * late result cannot regress a ticket that moved on.
    */
-  async function persistDelivered({ key, branch, mr, checks, sha }) {
+  async function persistDelivered({ key, branch, mr, checks, sha, settings, sessionId, cwd }) {
     const submitMessage = buildSkippedCheckMessage(checks);
     let submitted;
     try {
@@ -828,6 +854,13 @@ export function createDeliveryService({
         // turn a successful delivery into a visible error.
       }
     }
+
+    // Persist the review context AFTER the MR is durably on the ticket: the
+    // timer-driven review service has no session/workspace, so this is the only
+    // way it can rebuild the per-workspace GitLab client. Only bounded scalar
+    // fields are copied; the token stays in credentials. A meta write failure
+    // must not turn a successful delivery into a visible error.
+    await rememberContext(key, { sessionId, cwd, settings });
 
     notifyLog(log, 'delivery-done', { code: key, sha, iid: mr.iid ?? null, url: mr.url ?? null });
     await clearError(key);
@@ -942,6 +975,22 @@ export function createDeliveryService({
   }
 
   /**
+   * Persist the review context for a delivered ticket (overwrites a previous
+   * delivery's context). Validation is defensive: a direct `start()` caller
+   * may pass a malformed session/cwd, and a partial context would make the
+   * review poller fail later. Best effort — the delivery already succeeded.
+   */
+  function rememberContext(key, { sessionId, cwd, settings }) {
+    const context = buildDeliveryContext({ sessionId, cwd, settings });
+    if (context === undefined) return Promise.resolve();
+    try {
+      return store.setMeta(DELIVERY_CONTEXT_META_PREFIX + key, context).catch(() => {});
+    } catch {
+      return Promise.resolve();
+    }
+  }
+
+  /**
    * Read the commit recorded by a previous attempt, but only when it was
    * staged for THIS worktree and THIS personal branch. A corrupt/foreign
    * record is ignored (falls back to `delivery-no-changes`).
@@ -1014,6 +1063,53 @@ export function buildCommitMessage(settings, code, ticket) {
     : 'fix';
   const summary = resolveSummary(ticket);
   return `${type}: 【jira单号】：${code}，【开发内容】：${summary}`;
+}
+
+/**
+ * Build the bounded review context persisted after a successful delivery.
+ *
+ * Only the five fields the review poller needs are copied — never the token,
+ * never arbitrary settings. Returns `undefined` when a required field is
+ * missing/over-long so a partial context can never be written.
+ *
+ * @param {{sessionId?: unknown, cwd?: unknown, settings?: unknown}} input
+ * @returns {{sessionId: string, cwd: string, gitlabBaseUrl: string,
+ *   gitlabProjectPath: string, commitType: string} | undefined}
+ */
+export function buildDeliveryContext(input = {}) {
+  const source = isPlainObject(input) ? input : {};
+  const settings = isPlainObject(source.settings) ? source.settings : {};
+  const sessionId = boundedText(source.sessionId, DELIVERY_CONTEXT_FIELD_MAX_CHARS);
+  const cwd = boundedText(source.cwd, DELIVERY_CONTEXT_PATH_MAX_CHARS);
+  const gitlabBaseUrl = boundedText(
+    settings.gitlabBaseUrl,
+    DELIVERY_CONTEXT_FIELD_MAX_CHARS,
+  );
+  const gitlabProjectPath = boundedText(
+    settings.gitlabProjectPath,
+    DELIVERY_CONTEXT_FIELD_MAX_CHARS,
+  );
+  if (
+    sessionId === undefined
+    || cwd === undefined
+    || gitlabBaseUrl === undefined
+    || gitlabProjectPath === undefined
+  ) {
+    return undefined;
+  }
+  const commitType = boundedText(
+    settings.commitType,
+    DELIVERY_CONTEXT_COMMIT_TYPE_MAX_CHARS,
+  ) ?? 'fix';
+  return { sessionId, cwd, gitlabBaseUrl, gitlabProjectPath, commitType };
+}
+
+/** Non-empty trimmed string with a code-unit cap, else undefined. */
+function boundedText(value, max) {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (trimmed === '' || trimmed.length > max) return undefined;
+  return trimmed;
 }
 
 /**

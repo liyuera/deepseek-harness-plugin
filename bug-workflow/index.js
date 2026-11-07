@@ -11,7 +11,7 @@
  *          -> close the domain from the fiber disposer
  *
  *   GET  /bug-workflow/api/health    -> { ok, domainOpenedAt, tickets }
- *   GET  /bug-workflow/api/snapshot  -> { ok, workspace, settings, platform, gitlab, dicts, analysis, fix, delivery, tickets, serverTime }
+ *   GET  /bug-workflow/api/snapshot  -> { ok, workspace, settings, platform, gitlab, dicts, analysis, fix, delivery, review, tickets, serverTime }
  *   POST /bug-workflow/api/action    -> { ok, ticket } | { ok:false, code, message, ticket? }
  *                                       (create + payload.code = 按编号从平台导入)
  *   POST /bug-workflow/api/analyze   -> { ok, workflow:'analyzing', running }
@@ -53,6 +53,18 @@
  * reports an empty `delivery` block), and teardown disposes/drains delivery
  * alongside analysis/fix before the domain closes.
  *
+ * Review wiring (P5 Task 4b): `createReviewService()` owns the 60 s AI Review
+ * poll, the review-fix job and merge/auto-archive. It is timer-driven (no HTTP
+ * route): `readTimer(storageCtx)` is read optionally, and an absent timer only
+ * disables polling (logged), never the board. It consumes the
+ * `delivery.context:<code>` meta written by delivery (the timer has no live
+ * session/workspace), reads the newest AI note, and shares the ONE
+ * `createRepoLock()` instance with delivery (`review:<code>` vs
+ * `delivery:<code>`), so git-writing jobs on one repository serialize.
+ * Construction is non-fatal (the snapshot `review` block stays empty), and
+ * teardown disposes/drains review BEFORE analysis/fix/delivery and before the
+ * domain closes.
+ *
  * Sync wiring (P2 Task 4): `createSyncService()` reads the token from
  * `ctx.credentials`, maps platform tasks into the v2 ticket store, and persists
  * the dictionaries/last-sync status in `meta`. `ctx.interval(600_000)` runs it
@@ -91,6 +103,7 @@ import { createGit } from './src/host/git.js';
 import { createGitlabClient } from './src/host/gitlab.js';
 import { createTokenStore, GITLAB_TOKEN_REF } from './src/host/credentials.js';
 import { createPlatformClient } from './src/host/platform.js';
+import { createReviewService } from './src/host/review-service.js';
 import {
   registerRoutes,
   registerUnavailableRoutes,
@@ -132,6 +145,7 @@ export function apply(ctx) {
   let analysisService;
   let fixService;
   let deliveryService;
+  let reviewService;
 
   // One runner per fiber. Resolving the optional delegation services lazily via
   // `ctx.get` keeps the plugin loadable in profiles without subagents/agents:
@@ -270,21 +284,23 @@ export function apply(ctx) {
           logWarning(storageCtx, 'bug-workflow: 修复服务初始化失败', error);
         }
 
-        // P5 delivery orchestration. The GitLab client is built per workspace
-        // from the CURRENT settings (`gitlabBaseUrl` is per-workspace and the
-        // client binds it at construction); the factory is called inside the
-        // service's `start()`, which maps construction errors to a static
-        // `invalid-gitlab-settings` instead of failing the plugin load.
+        // P5 delivery/review shared wiring. The GitLab client is built per
+        // workspace from the CURRENT settings (`gitlabBaseUrl` is per-workspace
+        // and the client binds it at construction); the factory is called inside
+        // the services, which map construction errors to static failures
+        // instead of failing the plugin load.
+        const gitlabClientFor = (settings) => createGitlabClient({
+          baseUrl: settings.gitlabBaseUrl,
+          tokenProvider: () => gitlabTokenStore.get(),
+        });
+        // One repository single-flight lock shared by delivery and the review
+        // fix job: owner `delivery:<code>` vs `review:<code>` on the same repo
+        // are mutually exclusive, so two git-writing jobs can never overlap.
+        const repoLock = createRepoLock();
+
         let delivery = null;
         try {
           if (gitExecutor === null) throw new Error('git executor unavailable');
-          const gitlabClientFor = (settings) => createGitlabClient({
-            baseUrl: settings.gitlabBaseUrl,
-            tokenProvider: () => gitlabTokenStore.get(),
-          });
-          // One lock instance for the P5 services (delivery now; the review
-          // service can share the same repository single-flight later).
-          const repoLock = createRepoLock();
           deliveryService = createDeliveryService({
             store,
             git: gitExecutor,
@@ -298,6 +314,48 @@ export function apply(ctx) {
         } catch (error) {
           deliveryService = undefined;
           logWarning(storageCtx, 'bug-workflow: 交付服务初始化失败', error);
+        }
+
+        // P5 AI Review polling + review-fix + merge/auto-archive. Timer-driven
+        // (no HTTP route), constructed non-fatally: a broken construction leaves
+        // the snapshot `review` block empty and the timer off, while delivery/
+        // fix/analysis keep working. `readTimer()` is optional — an absent timer
+        // service disables polling only (never the board).
+        try {
+          if (gitExecutor === null) throw new Error('git executor unavailable');
+          reviewService = createReviewService({
+            store,
+            git: gitExecutor,
+            runner,
+            tokenStore: gitlabTokenStore,
+            gitlabClientFor,
+            clock,
+            lock: repoLock,
+            getSettings: (cwd) => store.getSettings(cwd),
+            log: (entry) => logWarning(
+              storageCtx,
+              `bug-workflow: Review ${entry?.event ?? 'tick'} 失败`,
+              entry?.error,
+            ),
+          });
+        } catch (error) {
+          reviewService = undefined;
+          logWarning(storageCtx, 'bug-workflow: Review 服务初始化失败', error);
+        }
+        let review = reviewService === undefined ? null : { service: reviewService };
+        if (review !== null) {
+          const timer = readTimer(storageCtx);
+          if (timer === null) {
+            logWarning(storageCtx, 'bug-workflow: timer service unavailable, review polling disabled');
+          } else {
+            try {
+              reviewService.start(timer);
+            } catch (error) {
+              // A broken timer service only disables polling; the snapshot
+              // `review` block (status/errors) still works.
+              logWarning(storageCtx, 'bug-workflow: Review 轮询启动失败', error);
+            }
+          }
         }
 
         // Automatic sync is registered BEFORE the real routes are mounted: if
@@ -322,6 +380,7 @@ export function apply(ctx) {
           analysis,
           fix,
           delivery,
+          review,
           clock,
           domainOpenedAt: handle.openedAt,
           // Full request errors stay in the host log; only clipped summaries
@@ -332,9 +391,11 @@ export function apply(ctx) {
         if (!mounted) {
           // The fiber was disposed while the domain was opening; no request can
           // reach these handlers any more, so release the domain immediately
-          // instead of leaving a handle behind. Drain any analysis/fix/delivery
-          // job before closing the domain so an in-flight job write cannot land
-          // on it.
+          // instead of leaving a handle behind. Drain any review/analysis/fix/
+          // delivery job before closing the domain so an in-flight job write
+          // cannot land on it (the review poller uses the same repo lock as
+          // delivery, so it is stopped first).
+          await reviewService?.dispose();
           await analysisService?.dispose();
           await fixService?.dispose();
           await deliveryService?.dispose();
@@ -349,8 +410,13 @@ export function apply(ctx) {
       } catch (error) {
         // Release a domain that opened but could not be attached to a store (or
         // to routes); otherwise the facility would report `already-open` on
-        // every reload. Abort and drain any analysis/fix/delivery job first; it
-        // may still write through the store.
+        // every reload. Abort and drain any review/analysis/fix/delivery job
+        // first; it may still write through the store.
+        try {
+          await reviewService?.dispose();
+        } catch {
+          // Teardown must continue regardless.
+        }
         try {
           await analysisService?.dispose();
         } catch {
@@ -395,10 +461,16 @@ export function apply(ctx) {
     // a late successful open; `closeDomain` is idempotent.
     storageCtx.effect(
       () => async () => {
-        // Abort and drain running analyses/fixes/deliveries first: their
-        // background jobs may still write through the store, and the domain
-        // must not close under a live job. Every drain is bounded, so a stuck
-        // runner/command cannot hang unload.
+        // Abort and drain running services first: their background jobs may
+        // still write through the store, and the domain must not close under a
+        // live job. The review poller is stopped first (it shares the repo lock
+        // with delivery). Every drain is bounded, so a stuck runner/command
+        // cannot hang unload.
+        try {
+          await reviewService?.dispose();
+        } catch {
+          // Disposal is best-effort; the domain teardown still has to run.
+        }
         try {
           await analysisService?.dispose();
         } catch {
