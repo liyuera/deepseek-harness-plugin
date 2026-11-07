@@ -159,6 +159,10 @@ window.__ModuleLoader__.load({
       dismiss: '完成移除',
       retry: '解除阻塞',
       blocked: '阻塞',
+      // P4 Task 2 store.patchTicket writes these two for a real fix
+      // (branch/worktree metadata and the finished run).
+      worktree: '创建分支/工作树',
+      'fix-run': 'AI 修复执行',
     });
 
     const ACTOR_LABELS = Object.freeze({ user: '用户', agent: '代理', system: '系统' });
@@ -487,6 +491,9 @@ window.__ModuleLoader__.load({
       confirm: '确认重新开始 AI 修复？（修复最长约 15 分钟，可继续做其他操作）',
       tone: 'primary',
     });
+
+    /** Newest `fixes` entries rendered by the history card (host appends one per run). */
+    const MAX_RENDERED_FIXES = 10;
 
     /**
      * `POST /api/fix` failure code -> actionable Chinese hint. Mirrors the
@@ -1053,17 +1060,34 @@ window.__ModuleLoader__.load({
      * True when a `blocked` ticket was blocked by the fix flow.
      *
      * `blockedFrom:'fixing'` is the host contract (every fix failure blocks
-     * with `expectedWorkflow:'fixing'`). A legacy/partial record may only keep
-     * a `fix-*` reason, so that is accepted as a second signal; the host stays
-     * the authority and answers 409 with the static "refresh" hint if the
-     * ticket is no longer fixable. `snapshot.fix.errors` never decides this on
-     * its own (only rendered once the ticket qualifies), so a ticket that moved
-     * on cannot show stale fix error copy.
+     * with `expectedWorkflow:'fixing'`), and — exactly like `isAnalysisBlock` —
+     * it is the ONLY signal. `blockedReason` must never decide this: a
+     * `reject_plan` block persists the user's free-text rejection reason
+     * verbatim (`state-machine.js`), so a plan-review ticket rejected with
+     * e.g. `fix-一下再提交` would otherwise look like a fix block, hide the
+     * generic 「重试」 (the only exit from a plan-review block) and offer
+     * 「重新修复」 that the host refuses with 409 invalid-state. The host stays
+     * the authority for the actual restart. `snapshot.fix.errors` never decides
+     * this on its own (only rendered once the ticket qualifies), so a ticket
+     * that moved on cannot show stale fix error copy.
      */
     function isFixBlock(ticket) {
       if (ticket === null || typeof ticket !== 'object' || ticket.workflow !== 'blocked') return false;
-      if (ticket.blockedFrom === 'fixing') return true;
-      return typeof ticket.blockedReason === 'string' && ticket.blockedReason.startsWith('fix-');
+      return ticket.blockedFrom === 'fixing';
+    }
+
+    /**
+     * True when the branch/worktree metadata the host persists at the start of
+     * a run (`persistBranch` in `fix-service.js`) is present. A cancelled or
+     * host-unloaded job writes neither a `fixes` entry nor `fix.error`, so this
+     * is the only persisted marker that "a run was started" — used to pick the
+     * interrupted copy instead of the normal ready copy.
+     */
+    function fixRunStarted(ticket) {
+      if (ticket === null || typeof ticket !== 'object') return false;
+      const branch = ticket.branch;
+      return branch !== null && typeof branch === 'object'
+        && typeof branch.worktree === 'string' && branch.worktree.trim() !== '';
     }
 
     /**
@@ -1446,16 +1470,27 @@ window.__ModuleLoader__.load({
      * 400 invalid code or branch configuration, 500 unexpected git/host
      * failure. The hint replaces the host message so the banner always tells
      * the user what to do; the server code/status stay for diagnosis.
+     *
+     * One exception: the host also returns code `fix-unavailable` with a
+     * cause-specific static message (`FIX_REASON_MESSAGES['no-live-agent']`
+     * when the session has no live agent) while the route's generic
+     * `fix-unavailable` copy means "service not wired". Keep that refined
+     * message instead of masking it with the cause-neutral hint the host would
+     * otherwise repeat; the generic copy still covers the plain 503.
      */
     function fixErrorView(result) {
       const view = toErrorView(result);
       const hint = ownFixValue(FIX_ERROR_HINTS, view.code)
         ?? (view.status === null ? undefined : ownFixValue(FIX_STATUS_HINTS, view.status))
         ?? null;
+      const generic503 = ownFixValue(FIX_STATUS_HINTS, 503);
+      const refined = view.code === 'fix-unavailable'
+        && view.message !== ''
+        && view.message !== generic503;
       return {
         ...view,
         title: '修复启动失败',
-        message: hint === null ? view.message : hint,
+        message: refined ? view.message : (hint === null ? view.message : hint),
       };
     }
 
@@ -3068,8 +3103,17 @@ window.__ModuleLoader__.load({
       if (list.length === 0) {
         return h(Card, { title: '修复记录' }, h('p', { style: emptyTextStyle }, '暂无修复记录。'));
       }
-      const ordered = list.slice().reverse();
-      return h(Card, { title: '修复记录', aside: `${list.length} 次` }, ...ordered.map((fix, index) => {
+      // The host appends one entry per finished run (each may carry up to
+      // 2 000 changed files), so render only the newest runs; the aside still
+      // reports the full count.
+      const visible = list.slice(-MAX_RENDERED_FIXES);
+      const ordered = visible.slice().reverse();
+      return h(Card, {
+        title: '修复记录',
+        aside: list.length > visible.length
+          ? `${list.length} 次（显示最近 ${MAX_RENDERED_FIXES} 次）`
+          : `${list.length} 次`,
+      }, ...ordered.map((fix, index) => {
         const files = Array.isArray(fix.changedFiles)
           ? fix.changedFiles.filter((file) => textOf(file) !== '')
           : [];
@@ -3084,7 +3128,11 @@ window.__ModuleLoader__.load({
           : (legacyAt !== null ? `修复于 ${formatTime(legacyAt)}` : `第 ${list.length - index} 次`);
         const elapsed = formatRunElapsed(fix.elapsedMs);
         const diffStat = typeof fix.diffStat === 'string' && fix.diffStat.trim() !== '' ? fix.diffStat : null;
-        const error = typeof fix.error === 'string' && fix.error.trim() !== '' ? fix.error : null;
+        // The host persists a reason CODE in `error` (e.g. `fix-no-changes`),
+        // never a message: map it through the same copy table as the blocked
+        // banner and only clip an unknown string.
+        const rawError = typeof fix.error === 'string' && fix.error.trim() !== '' ? fix.error : null;
+        const errorText = rawError === null ? null : (fixReasonLabel(rawError) ?? clip(rawError, 300));
         return h('div', {
           key: `fix-${index}`,
           style: {
@@ -3103,7 +3151,7 @@ window.__ModuleLoader__.load({
             elapsed === null ? null : h('span', null, `耗时 ${elapsed}`),
             diffStat === null ? null : h('span', null, `改动：${clip(diffStat, 160)}`)),
           h(TextField, { label: '摘要', value: fix.summary }),
-          error === null
+          errorText === null
             ? null
             : h('div', {
               style: {
@@ -3113,7 +3161,7 @@ window.__ModuleLoader__.load({
                 wordBreak: 'break-word',
                 overflowWrap: 'anywhere',
               },
-            }, `错误：${clip(error, 300)}`),
+            }, `错误：${errorText}`),
           h(ListField, {
             label: files.length === 0 ? '改动文件' : `改动文件（${files.length}）`,
             values: files,
@@ -3460,8 +3508,9 @@ window.__ModuleLoader__.load({
      *     every `fixing` ticket; the host advances the ticket itself once the
      *     real run succeeds);
      *   - `fixing` without a running job: the normal approved-but-not-started
-     *     state (「开始修复」) or an interrupted run (「重新修复」); both re-POST
-     *     `/api/fix`, which the host uses to restart orphans;
+     *     state (「开始修复」 when the host has not persisted branch/worktree
+     *     metadata yet) or an interrupted run (「重新修复」 once it has); both
+     *     re-POST `/api/fix`, which the host uses to restart orphans;
      *   - a fix-related `blocked` ticket: the newest static failure copy from
      *     `snapshot.fix.errors[code]` (falling back to `blockedReason`) plus
      *     the same 「重新修复」 button (the host retries blocked-from-fixing and
@@ -3484,9 +3533,13 @@ window.__ModuleLoader__.load({
 
       const busy = busyAction === FIX_START_DESCRIPTOR.action;
       const disabled = busy || locked === true;
-      // A normal first start is an approved plan with no run and no host error;
-      // everything else (interrupted, blocked) is a restart/retry.
-      const ready = isFixing && fixes.length === 0 && serverError === null && approved;
+      // A normal first start is an approved plan whose run has never written
+      // its branch metadata (and has no run/error); everything else
+      // (interrupted, blocked) is a restart/retry. The branch marker is the
+      // only persisted trace of a cancelled/disposed run, which writes neither
+      // `fixes` nor `fix.error` — without it an orphan looked "ready".
+      const started = isFixing && fixRunStarted(ticket);
+      const ready = isFixing && fixes.length === 0 && serverError === null && approved && !started;
       const descriptor = ready ? FIX_START_DESCRIPTOR : FIX_RETRY_DESCRIPTOR;
       const start = h('button', {
         key: 'fix-start',
@@ -3660,7 +3713,10 @@ window.__ModuleLoader__.load({
           h(Badge, { label: workflowLabel(ticket.workflow), tone: workflowTone(ticket.workflow) })),
         h(AnalysisNotice, { ticket, snapshot, busyAction, locked, onAction }),
         h(FixNotice, { ticket, snapshot, busyAction, locked, onAction }),
-        h(BlockedNotice, { ticket }),
+        // FixNotice already reports the blocked-fix cause and the restart
+        // action (role="alert"); the generic blocked banner would repeat the
+        // same reason. Keep it for every other block (analysis, plan review…).
+        fixBlock ? null : h(BlockedNotice, { ticket }),
         planReview ? null : actionBar,
         h(FieldsBlock, { ticket, snapshot }),
         h(PlatformCard, { ticket }),

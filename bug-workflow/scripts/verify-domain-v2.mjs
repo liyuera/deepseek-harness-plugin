@@ -289,6 +289,33 @@ check('malformed fix run entry rejected', () => {
   }
 });
 
+check('branch worktree metadata accepted and bounded', () => {
+  const branch = {
+    name: 'feat-V1.0.0-ly',
+    target: 'feature-V1.0.0',
+    baseSource: 'origin',
+    worktree: '/repo/.dsh-worktrees/BUG-V1',
+    createdAt: '2026-11-07T00:00:00.000Z',
+  };
+  const parsed = ticketSchema.parse(v1Ticket({ branch }));
+  assert.deepEqual(parsed.branch, branch);
+
+  const malformed = [
+    { ...branch, worktree: 42 },
+    { ...branch, worktree: 'x'.repeat(4097) },
+    { ...branch, createdAt: 42 },
+    { ...branch, createdAt: 'x'.repeat(65) },
+  ];
+  for (const candidate of malformed) {
+    const result = ticketSchema.safeParse(v1Ticket({ branch: candidate }));
+    assert.equal(
+      result.success,
+      false,
+      `malformed branch metadata accepted: ${JSON.stringify(candidate).slice(0, 120)}`,
+    );
+  }
+});
+
 check('settings defaults platformBaseUrl/writebackStatus', () => {
   const parsed = settingsSchema.parse({});
   assert.equal(parsed.platformBaseUrl, 'https://ecard.htwisdom.cn');

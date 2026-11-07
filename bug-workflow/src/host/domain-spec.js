@@ -98,6 +98,11 @@ export function buildDomainSchemas({ z } = {}) {
     // P4 fix-service records where the worktree base came from. Optional so a
     // branch written by an earlier host (or a hand-edited row) still loads.
     baseSource: z.enum(['origin', 'target', 'HEAD']).optional(),
+    // P4 fix-service persists the run's worktree path and start timestamp on
+    // the branch; the client's MR card renders `worktree`. Declared (bounded)
+    // here so tightening this object later cannot silently drop them.
+    worktree: z.string().max(4096).optional(),
+    createdAt: z.string().max(64).optional(),
   });
 
   const mrSchema = z.looseObject({
