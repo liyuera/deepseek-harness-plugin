@@ -255,7 +255,11 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 
 ### 3. 同步语义
 
-- 取数：`GET /user-auth-info` 拿当前用户 id → 分页 `GET /task?refHandlerPersonId=<id>&size=100&descs=createdTime`（上限 1000 条 / 12 页）→ `GET /dict/business/dictionary`（状态/类型/优先级三组）。**上游 `getDicts()` 失败**发生在任何工单 upsert 之前，会中止整次同步、工单不变；但 **`store.setDicts()` 在工单 upsert 之后执行**：若这次存储写失败，同步返回 `internal`（`lastSyncAt` 不写、`lastSyncError` 记录），而工单可能已更新、筛选字典仍是旧的——存在这个部分成功窗口，不是「整次同步原子回滚」。
+- 取数：`GET /user-auth-info` 拿当前用户 id → **两路分页**：
+  - 我负责的：`GET /task?refHandlerPersonId=<id>&size=100&descs=createdTime`
+  - 我参与的（含他人负责、我作为参与人的缺陷/需求）：`GET /task?participantId=<id>&…`
+  两路结果按 `taskCode` 去重合并（各上限 1000 条 / 12 页）→ `GET /dict/business/dictionary`（状态/类型/优先级三组）。
+- 「我的工单」= 我负责 ∪ 我参与。只查 handler 会漏掉挂在我名下但负责人是别人的工单（实测：`YGFNXDJRFWDJSYJJYY-632` 负责人李伟、参与人李昱）。**上游 `getDicts()` 失败**发生在任何工单 upsert 之前，会中止整次同步、工单不变；但 **`store.setDicts()` 在工单 upsert 之后执行**：若这次存储写失败，同步返回 `internal`（`lastSyncAt` 不写、`lastSyncError` 记录），而工单可能已更新、筛选字典仍是旧的——存在这个部分成功窗口，不是「整次同步原子回滚」。
 - 过滤：`platformProjectCode` 非空时只 upsert 前缀匹配的工单，其余计入 `filtered`；空则全部。
 - 合并：已存在的工单只更新标题/类型/状态/优先级/版本/负责人/URL/平台快照/`updatedAt`，**保留** `workflow`、`blocked*`、`plan`、`branch`、`mr`、`fixes`、`timeline`、`createdAt`；新工单从 `inbox` 开始、`source:'platform'`。
 - 元数据：`meta['platform.lastSyncAt']`、`meta['platform.lastSyncError']`、`meta['platform.dicts']`；成功同步会清空 `lastSyncError`。

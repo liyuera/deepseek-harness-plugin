@@ -383,8 +383,15 @@ export function createSyncService(deps = {}) {
     const assigneeId = normalizeId(user.data?.id);
     if (assigneeId === undefined) return failRecorded('platform-bad-response');
 
-    const listed = await listAllTasks(client, assigneeId);
-    if (!listed.ok) return listed;
+    // "My tickets" = handled by me + participated by me. The platform list
+    // endpoint returns a bug handled by someone else when the user is only a
+    // participant (e.g. 632 缺陷 handler 李伟, participant 李昱), so both views
+    // are fetched and merged (deduped by taskCode).
+    const handled = await listAllTasks(client, assigneeId, 'handler');
+    if (!handled.ok) return handled;
+    const participated = await listAllTasks(client, assigneeId, 'participant');
+    if (!participated.ok) return participated;
+    const listed = { ok: true, records: mergeTaskRecords(handled.records, participated.records) };
 
     const dicts = await client.getDicts();
     if (!dicts?.ok) return failUpstream(dicts);
@@ -435,28 +442,63 @@ export function createSyncService(deps = {}) {
       synced: mapped.length,
       created: counts.created,
       updated: counts.updated,
-      total: listed.total,
+      total: listed.records.length,
       filtered,
       lastSyncAt: now,
     };
   }
 
   /**
+   * Merge the handled/participated lists, keeping the first record per
+   * `taskCode` (records without a code cannot key a ticket and are skipped by
+   * the caller anyway; they are kept distinct here).
+   *
+   * @param {object[]} handled records from `listMyTasks`
+   * @param {object[]} participated records from `listParticipantTasks`
+   * @returns {object[]}
+   */
+  function mergeTaskRecords(handled, participated) {
+    const merged = [];
+    const seen = new Set();
+    for (const record of [...handled, ...participated]) {
+      const code = textValue(record?.taskCode);
+      if (code === undefined) {
+        // No code: keep it (the mapping step drops it) without dedupe keys.
+        merged.push(record);
+        continue;
+      }
+      if (seen.has(code)) continue;
+      seen.add(code);
+      merged.push(record);
+    }
+    return merged;
+  }
+
+  /**
    * Page through `listMyTasks` until the reported total, an empty page, or the
    * hard cap. The loop is bounded three ways so a lying `total` cannot hang it.
    */
-  async function listAllTasks(client, assigneeId) {
-    const records = [];
-    let total = 0;
-    let page = 1;
-
-    while (page <= SYNC_MAX_PAGES) {
-      const result = await client.listMyTasks({
+  async function listAllTasks(client, assigneeId, mode = 'handler') {
+    const request = mode === 'participant'
+      ? (page) => client.listParticipantTasks({
+        participantId: assigneeId,
+        page,
+        size: SYNC_PAGE_SIZE,
+        descs: SYNC_SORT,
+      })
+      : (page) => client.listMyTasks({
         assigneeId,
         page,
         size: SYNC_PAGE_SIZE,
         descs: SYNC_SORT,
       });
+
+    const records = [];
+    let total = 0;
+    let page = 1;
+
+    while (page <= SYNC_MAX_PAGES) {
+      const result = await request(page);
       if (!result?.ok) return failUpstream(result);
 
       const data = isPlainObject(result.data) ? result.data : {};

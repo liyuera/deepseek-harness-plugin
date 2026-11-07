@@ -7,7 +7,7 @@
  * the sync engine and the live E2E can be exercised without a real token:
  *
  *   GET  /api/htwisdom-system/user-auth-info
- *   GET  /api/htwisdom-team/task?current&size&refHandlerPersonId&taskStatusList…
+ *   GET  /api/htwisdom-team/task?current&size&refHandlerPersonId|participantId&taskStatusList…
  *   GET  /api/htwisdom-team/task/detailByTaskCode/<code>
  *   GET  /api/htwisdom-system/dict/business/dictionary?codes=a,b,c
  *   GET  /api/htwisdom-team/remark/list?refTaskCode=<code>&remarkType=001_TASK
@@ -441,6 +441,7 @@ function listTasks(tasks, searchParams) {
   const current = positiveInt(searchParams.get('current')) ?? 1;
   const size = positiveInt(searchParams.get('size')) ?? 10;
   const handlerId = searchParams.get('refHandlerPersonId');
+  const participantId = searchParams.get('participantId');
   const statuses = searchParams.getAll('taskStatusList').filter((item) => item !== '');
   const projectId = searchParams.get('refProjectId');
   const keyword = searchParams.get('keyword');
@@ -448,6 +449,13 @@ function listTasks(tasks, searchParams) {
 
   let filtered = tasks.filter((task) => {
     if (handlerId !== null && String(task.refHandlePersonId) !== handlerId) return false;
+    if (participantId !== null) {
+      const people = [
+        ...(Array.isArray(task.participantList) ? task.participantList : []),
+        ...(Array.isArray(task.participants) ? task.participants : []),
+      ].map((person) => String(person?.userId ?? person?.id ?? person?.userId ?? ''));
+      if (!people.includes(participantId)) return false;
+    }
     if (statuses.length > 0 && !statuses.includes(task.taskStatus)) return false;
     if (projectId !== null && String(task.refProjectId) !== projectId) return false;
     if (keyword !== null && keyword !== '') {

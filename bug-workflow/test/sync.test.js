@@ -159,13 +159,15 @@ function strictTicket(ticket) {
  */
 function createFakePlatform({
   tasks = [],
+  participantTasks = [],
   baseUrl = BASE_URL,
   getUser,
   listMyTasks,
+  listParticipantTasks,
   getTask,
   getDicts,
 } = {}) {
-  const calls = { user: 0, list: [], task: [], dicts: 0 };
+  const calls = { user: 0, list: [], participantList: [], task: [], dicts: 0 };
   const client = {
     baseUrl,
     async getUser() {
@@ -184,6 +186,22 @@ function createFakePlatform({
         data: {
           records: tasks.slice(start, start + size),
           total: String(tasks.length),
+          size: String(size),
+          current: String(page),
+        },
+      };
+    },
+    async listParticipantTasks(input = {}) {
+      calls.participantList.push(cloneJson(input));
+      if (typeof listParticipantTasks === 'function') return listParticipantTasks(input, calls);
+      const page = input.page ?? 1;
+      const size = input.size ?? 20;
+      const start = (page - 1) * size;
+      return {
+        ok: true,
+        data: {
+          records: participantTasks.slice(start, start + size),
+          total: String(participantTasks.length),
           size: String(size),
           current: String(page),
         },
@@ -222,6 +240,7 @@ function createSetup(options = {}) {
   const tasks = options.tasks ?? cloneJson(TASK_FIXTURE);
   const fake = createFakePlatform({
     tasks,
+    participantTasks: options.participantTasks ?? [],
     baseUrl: options.baseUrl ?? BASE_URL,
     ...(options.platform ?? {}),
   });
@@ -354,6 +373,68 @@ test('first run creates platform tickets with mapped display fields and snapshot
     `${PROJECT_CODE}-648`,
   ]);
   assert.equal(store.get('HTSMART-12'), undefined);
+});
+
+test('participant-only tasks are merged with handled tasks and deduped by taskCode', async () => {
+  // A bug handled by someone else but with the current user as participant
+  // (live example: 632 handled by 李伟, participant 李昱) only appears in the
+  // participantId view. Duplicates across both lists must collapse to one row.
+  const participantOnly = {
+    ...syntheticTask(2),
+    taskCode: `${PROJECT_CODE}-632`,
+    taskName: '精准承保-仅测试环境上传图片后有接口报错',
+    taskTypeName: '缺陷',
+  };
+  const duplicateOfHandled = { ...syntheticTask(3), taskCode: `${PROJECT_CODE}-647` };
+  const { store, sync, fake } = createSetup({
+    participantTasks: [participantOnly, duplicateOfHandled],
+  });
+
+  const result = await sync.run(CWD);
+
+  assert.deepEqual(result, {
+    ok: true,
+    synced: 3,
+    created: 3,
+    updated: 0,
+    total: 4,
+    filtered: 1,
+    lastSyncAt: T1,
+  });
+  assert.deepEqual(fake.calls.participantList, [
+    { participantId: '10086', page: 1, size: 100, descs: 'createdTime' },
+  ]);
+  const participantTicket = store.get(`${PROJECT_CODE}-632`);
+  assert.equal(participantTicket.source, 'platform');
+  assert.equal(participantTicket.workflow, 'inbox');
+  assert.equal(participantTicket.title, participantOnly.taskName);
+  // The duplicate did not create a second row and did not touch the handled one.
+  assert.equal(store.list().filter((ticket) => ticket.code === `${PROJECT_CODE}-647`).length, 1);
+});
+
+test('a participant-list failure aborts the sync before writing tickets', async () => {
+  const { store, sync } = createSetup({
+    platform: {
+      listParticipantTasks: () => ({
+        ok: false,
+        code: 'platform-http',
+        status: 200,
+        upstreamCode: 500,
+        message: '平台请求失败',
+      }),
+    },
+  });
+
+  const result = await sync.run(CWD);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'platform-http');
+  assert.equal(store.list().length, 0);
+  assert.deepEqual(await sync.status(), {
+    tokenPresent: true,
+    lastSyncAt: null,
+    lastSyncError: '平台请求失败，请稍后重试',
+  });
 });
 
 test('run() stores mapped dictionaries in meta and reports them via status()', async () => {

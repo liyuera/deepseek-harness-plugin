@@ -330,21 +330,22 @@ export function createPlatformClient(options = {}) {
   }
 
   /**
-   * GET the paginated "my tasks" list. `assigneeId` must be the platform user
-   * id from `getUser()` (the query parameter is `refHandlerPersonId`, note the
-   * extra `r` compared with the record field `refHandlePersonId`).
+   * Shared paginated task-list request: both "handled by me" and "participated
+   * by me" use `GET /task` with a different user-id query parameter.
    *
-   * @param {{page?: number, size?: number, assigneeId?: string|number,
-   *   descs?: string, taskStatusList?: string|string[]}} [input]
+   * @param {object} input raw `list*Tasks` input
+   * @param {string} idField query parameter carrying the user id
+   * @param {string} methodName used in the error copy
+   * @returns {Promise<Result>}
    */
-  async function listMyTasks(input = {}) {
+  async function listTasksBy(input, idField, methodName) {
     if (!isPlainObject(input)) {
       return failure('invalid-request', MESSAGE.invalidRequest);
     }
 
-    const assigneeId = normalizeId(input.assigneeId);
-    if (assigneeId === undefined) {
-      return failure('invalid-request', 'listMyTasks 需要 assigneeId（先调用 getUser 获取用户 id）');
+    const userId = normalizeId(input.userId ?? input.assigneeId ?? input.participantId);
+    if (userId === undefined) {
+      return failure('invalid-request', `${methodName} 需要 userId（先调用 getUser 获取用户 id）`);
     }
 
     const page = positiveInteger(input.page) ?? (input.page === undefined ? 1 : undefined);
@@ -361,7 +362,7 @@ export function createPlatformClient(options = {}) {
     const query = {
       current: page,
       size,
-      refHandlerPersonId: assigneeId,
+      [idField]: userId,
     };
     if (typeof input.descs === 'string' && input.descs.trim() !== '') query.descs = input.descs.trim();
     if (statuses.length > 0) query.taskStatusList = statuses;
@@ -372,6 +373,31 @@ export function createPlatformClient(options = {}) {
       return failure('platform-bad-response', MESSAGE.badResponse);
     }
     return { ok: true, data: result.data };
+  }
+
+  /**
+   * GET the paginated "my tasks" list. `assigneeId` must be the platform user
+   * id from `getUser()` (the query parameter is `refHandlerPersonId`, note the
+   * extra `r` compared with the record field `refHandlePersonId`).
+   *
+   * @param {{page?: number, size?: number, assigneeId?: string|number,
+   *   descs?: string, taskStatusList?: string|string[]}} [input]
+   */
+  function listMyTasks(input = {}) {
+    return listTasksBy(input, 'refHandlerPersonId', 'listMyTasks');
+  }
+
+  /**
+   * GET the paginated "participated tasks" list. The platform's task list also
+   * returns issues where the user is only a participant (e.g. a bug handled by
+   * someone else but with the user attached); `GET /task?participantId=<id>`
+   * is that view, and the two lists are merged by the sync engine.
+   *
+   * @param {{page?: number, size?: number, participantId?: string|number,
+   *   descs?: string, taskStatusList?: string|string[]}} [input]
+   */
+  function listParticipantTasks(input = {}) {
+    return listTasksBy(input, 'participantId', 'listParticipantTasks');
   }
 
   /** GET `detailByTaskCode/<code>` → `data` (the full task record). */
@@ -430,7 +456,7 @@ export function createPlatformClient(options = {}) {
     });
   }
 
-  return { baseUrl, getUser, listMyTasks, getTask, getDicts, getRemarks, listFiles };
+  return { baseUrl, getUser, listMyTasks, listParticipantTasks, getTask, getDicts, getRemarks, listFiles };
 }
 
 // ---------------------------------------------------------------------------

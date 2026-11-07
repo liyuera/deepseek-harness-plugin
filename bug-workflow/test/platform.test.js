@@ -271,6 +271,33 @@ test('pagination, taskStatusList filtering and listMyTasks validation', async ()
   });
 });
 
+test('listParticipantTasks queries by participantId and validates its input', async () => {
+  await withMock(async (mock) => {
+    const client = createPlatformClient({ baseUrl: mock.url, token: TOKEN });
+
+    const page = await client.listParticipantTasks({ participantId: 10086, page: 1, size: 10 });
+    assert.equal(page.ok, true);
+    // Every fixture task lists user 10086 in participantList (handler or
+    // participant), which is exactly the platform's participantId view.
+    assert.equal(page.data.total, '3');
+    const request = mock.requests.at(-1);
+    assert.equal(request.query.participantId, '10086');
+    assert.equal(request.query.current, '1');
+    assert.equal(request.query.size, '10');
+    assert.equal('refHandlerPersonId' in request.query, false);
+    const stranger = await client.listParticipantTasks({ participantId: 99999, page: 1, size: 10 });
+    assert.equal(stranger.ok, true);
+    assert.equal(stranger.data.total, '0');
+
+    const missing = await client.listParticipantTasks({ page: 1, size: 10 });
+    assert.equal(missing.ok, false);
+    assert.equal(missing.code, 'invalid-request');
+    const before = mock.requests.length;
+    await client.listParticipantTasks({ participantId: 10086, page: 0, size: 10 });
+    assert.equal(mock.requests.length, before);
+  });
+});
+
 test('remarks decode percent-encoding and keep malformed content raw', async () => {
   await withMock(async (mock) => {
     const client = createPlatformClient({ baseUrl: mock.url, token: TOKEN });
