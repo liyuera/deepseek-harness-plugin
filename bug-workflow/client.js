@@ -100,7 +100,7 @@ window.__ModuleLoader__.load({
     const h = React.createElement;
     const ID = '@liyuera/dsh-bug-workflow';
     /** Visible build tag so the running UI can be verified after a reload. */
-    const CLIENT_BUILD = 'p6-login.2026-11-08.1';
+    const CLIENT_BUILD = 'p6-login.2026-11-08.2';
 
     /** Snapshot/action endpoints (same origin as the Harness Web page). */
     const API = Object.freeze({
@@ -5907,6 +5907,7 @@ window.__ModuleLoader__.load({
         loginBusyRef.current = true;
         setLoginBusy(true);
         setLoginError(null);
+        let refreshCaptchaAfter = false;
         try {
           const result = await postMutation(API.platformLogin, {
             sessionId,
@@ -5933,15 +5934,19 @@ window.__ModuleLoader__.load({
             }
           } else {
             // The platform captcha is single-use: a failed attempt consumed it.
-            // Refresh it automatically so the user only re-types the code.
+            // Refresh it AFTER the busy gate is released (fetchLoginCaptcha
+            // itself refuses to run while a mutation is in flight).
             setLoginCaptcha(null);
             setLoginCode('');
-            void fetchLoginCaptcha();
             setLoginError(platformLoginErrorView(result));
+            refreshCaptchaAfter = true;
           }
         } finally {
           loginBusyRef.current = false;
           setLoginBusy(false);
+          if (refreshCaptchaAfter) {
+            void fetchLoginCaptcha();
+          }
         }
       }, [configured, fetchLoginCaptcha, loginCaptcha, loginCode, loginPassword, loginUsername, polling, postMutation, sessionId]);
 
