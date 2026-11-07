@@ -11,7 +11,7 @@
  *          -> close the domain from the fiber disposer
  *
  *   GET  /bug-workflow/api/health    -> { ok, domainOpenedAt, tickets }
- *   GET  /bug-workflow/api/snapshot  -> { ok, workspace, settings, platform, dicts, analysis, fix, tickets, serverTime }
+ *   GET  /bug-workflow/api/snapshot  -> { ok, workspace, settings, platform, gitlab, dicts, analysis, fix, tickets, serverTime }
  *   POST /bug-workflow/api/action    -> { ok, ticket } | { ok:false, code, message, ticket? }
  *                                       (create + payload.code = 按编号从平台导入)
  *   POST /bug-workflow/api/analyze   -> { ok, workflow:'analyzing', running }
@@ -20,6 +20,7 @@
  *                                       (P4 real fix; see below)
  *   POST /bug-workflow/api/settings  -> { ok, settings }
  *   POST /bug-workflow/api/platform-token -> { ok, tokenPresent }
+ *   POST /bug-workflow/api/gitlab-token   -> { ok, tokenPresent } (P5 GitLab token)
  *   POST /bug-workflow/api/sync      -> { ok, synced, created, updated, total, filtered, lastSyncAt }
  *
  * Analysis wiring (P3 Task 2): one `createAgentRunner()` per fiber resolves the
@@ -69,7 +70,7 @@ import { createAgentRunner } from './src/host/agent-access.js';
 import { createAnalysisService } from './src/host/analysis-service.js';
 import { createFixService } from './src/host/fix-service.js';
 import { createGit } from './src/host/git.js';
-import { createTokenStore } from './src/host/credentials.js';
+import { createTokenStore, GITLAB_TOKEN_REF } from './src/host/credentials.js';
 import { createPlatformClient } from './src/host/platform.js';
 import {
   registerRoutes,
@@ -180,6 +181,13 @@ export function apply(ctx) {
         // storage routes must not depend on a service the board can live
         // without. Absent credentials -> tokenPresent:false + 503 on writes.
         const tokenStore = createTokenStore(readCredentials(storageCtx));
+        // P5: the GitLab token is a second, independent reference over the same
+        // optional credentials service. The token value never leaves it; the
+        // routes only read presence for the snapshot.
+        const gitlabTokenStore = createTokenStore(
+          readCredentials(storageCtx),
+          { ref: GITLAB_TOKEN_REF },
+        );
 
         // Sync engine: token from credentials, platform client over the
         // workspace's `platformBaseUrl`. `createPlatformClient` throws for an
@@ -241,6 +249,7 @@ export function apply(ctx) {
           store,
           workspace,
           tokenStore,
+          gitlabTokenStore,
           sync,
           // By-code import shares the sync service's token/settings/platform
           // client wiring. Guarding the method keeps an older/sync-less build

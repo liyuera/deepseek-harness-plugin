@@ -58,7 +58,7 @@ createDeliveryService({ store, git, gitlab, settings, clock, lock, execCommand }
 //        commitAll → push → findOpenMR 复用或 createMergeRequest →
 //        写队列内：submit_mr（intent）→ mr_created(expectedWorkflow:'submitting', mr:MRRecord) → patchTicket(mr)
 // 失败码：not-submitting|missing-gitlab-token|invalid-gitlab-settings|worktree-missing|
-//         delivery-lint-failed|delivery-test-failed|git-failed|push-failed|mr-failed|delivery-busy
+//         delivery-lint-failed|delivery-test-failed|protected-branch|git-failed|push-failed|mr-failed|delivery-busy
 
 // review-service.js
 createReviewService({ store, gitlab, git, runner, clock, timer, settings })
@@ -89,18 +89,18 @@ fixes:  [ fixRunSchema … ]                                   // review 修复�
 
 **路由**：
 - `POST /bug-workflow/api/deliver` body `{sessionId, code}` → 200 `{ok:true, running:true, workflow:'submitting'}`；400/404/409/503/500（409：`not-submitting`、`delivery-busy`、`protected-branch`；503：`missing-gitlab-token`、`delivery-unavailable`）。
-- `PUT /bug-workflow/api/gitlab-token` body `{sessionId, token}` → 200 `{ok:true}`（保存进 credentials）；`DELETE` → 清除；语义复用平台 token 端点（415/413/400 守卫一致）。
+- `POST /bug-workflow/api/gitlab-token` body `{sessionId, token}` → 200 `{ok:true, tokenPresent}`（string 保存、`null` 清除；与平台 token 端点完全同契约：415/413/400/503 守卫一致，token 不回显，未绑定 session 也可配置）；不提供 PUT/DELETE。
 - **snapshot 扩展**：`delivery: { running:string[], errors:Record<code,string> }`（`errors` 的键来自 `delivery.error:<code>` meta，与 `fix.errors` 平行、互不清空）、`gitlab: { tokenPresent:boolean }`（保留既有字段）。
 
 ---
 
 ### Task 1: GitLab 设置/凭证 + review-parser 迁移
 
-**Files:** Modify `bug-workflow/src/host/store.js`（`DEFAULT_SETTINGS.gitlabBaseUrl`）、`src/host/credentials.js`（`GITLAB_TOKEN_REF = 'BUG_WORKFLOW_GITLAB_TOKEN'`，导出名字与校验复用平台 token 逻辑）、`src/host/routes.js`（`/api/gitlab-token` PUT/DELETE、snapshot `gitlab.tokenPresent`、JSDoc/错误映射）、`bug-workflow/index.js` 无改动（token 存储走既有 deps）；new `src/host/review-parser.js`（迁移 `scripts/review-parser.mjs` 主体，导出 `parseReview` 及现有辅助），`scripts/review-parser.mjs` 改为薄复导出；Test `test/credentials.test.js`、`test/routes.test.js`、`test/domain-v2.test.js`（settings 默认值）、新增 `test/review-parser.test.js`（把现在脚本测试改为导入 canonical；脚本级 smoke 保留）。
+**Files:** Modify `bug-workflow/src/host/store.js`（`DEFAULT_SETTINGS.gitlabBaseUrl='https://git.htwisdom.cn'`）、`src/host/credentials.js`（`GITLAB_TOKEN_REF = 'BUG_WORKFLOW_GITLAB_TOKEN'`；`createTokenStore(credentials, { ref })` 泛化，单参调用仍默认 `PLATFORM_TOKEN_REF`）、`src/host/routes.js`（`POST /api/gitlab-token`（string 保存/`null` 清除，与平台 token 同契约）、新增 deps `gitlabTokenStore`、snapshot `gitlab.tokenPresent`、API_PATHS/ROUTE_METHODS/registerUnavailableRoutes/JSDoc）、`bug-workflow/index.js`（构造 `createTokenStore(credentials, { ref: GITLAB_TOKEN_REF })` 并传入 routes；dispose 顺序不变——**必须接线**，当前 routes 只收到单 ref 的 `tokenStore`）；new `src/host/review-parser.js`（迁移 `scripts/review-parser.mjs` 主体，无 `node:` 依赖、无 CLI 副作用，导出 `parseReview`），`scripts/review-parser.mjs` 改为薄复导出（保留自测 harness 与 fixtures；`scripts/probe-gitlab.mjs` 经 shim 导入不变）；Test `test/credentials.test.js`、`test/routes.test.js`、`test/domain-v2.test.js`（settings 默认值 + 旧行缺键）、`scripts/verify-domain-v2.mjs`、新增 `test/review-parser.test.js`（canonical 导入覆盖全部分支 + shim/脚本自测 smoke）。client 的 GitLab 设置/token UI 在 Task 5，不在 Task 1。
 
-- [ ] **Step 1: 失败测试**：settings 默认 `gitlabBaseUrl='https://git.htwisdom.cn'` 且旧行缺键读为默认；GitLab token 保存/清除/缺失三种 snapshot 状态；PUT 非字符串/超长/空 → 400，未绑定工作区 → 409，415/413 守卫复用；`parseReview` 经 canonical 导入的全部分支与迁移前一致（pass/changes/unknown、门禁分类、隐藏段裁剪、AI 标记过滤）。
-- [ ] **Step 2: 实现**：`DEFAULT_SETTINGS` 加键（domain settingsSchema 由 DEFAULT_SETTINGS 生成，looseObject 兼容旧行，无需升 domain）；`credentials.js` 增加 GitLab ref（保存/读取/清除，token 仅内存 + credentials，不落 store）；routes 增加端点与 snapshot 字段（复用 `guard/guardJsonContentType/guardOrigin/readJsonBody` 与静态错误文案）；迁移 parser：canonical 新文件 + script 复导出 + 所有 import 改 canonical。
-- [ ] **Step 3: 验证**：全量 tests 全过；`node --check`；live 只读：reinstall 后 health 200、snapshot 含 `gitlab.tokenPresent:false`、PUT/DELETE 走 415/400/200 路径（不真存 token，或存占位后清）。
+- [ ] **Step 1: 失败测试**：settings 默认 `gitlabBaseUrl='https://git.htwisdom.cn'` 且旧行缺键读为默认；GitLab token 保存/清除/缺失三种 snapshot 状态；POST 非字符串/超长/空 → 400，缺失 session → 400（未绑定 session 仍可配置，token 是 profile-global），415/413/403/405 守卫复用，凭据不可用 → 503；`parseReview` 经 canonical 导入的全部分支与迁移前一致（pass/changes/unknown、门禁分类、隐藏段裁剪、AI 标记过滤）。
+- [ ] **Step 2: 实现**：`DEFAULT_SETTINGS` 加键（domain settingsSchema 由 DEFAULT_SETTINGS 生成，looseObject 兼容旧行，无需升 domain）；`credentials.js` 增加 GitLab ref 与 option（保存/读取/清除，token 仅内存 + credentials，不落 store）；routes 增加端点与 snapshot 字段（复用 `guard/guardJsonContentType/guardOrigin/readJsonBody` 与静态错误文案，平台 token 行为不变）；迁移 parser：canonical 新文件 + script 复导出 + 所有 import 改 canonical。
+- [ ] **Step 3: 验证**：全量 tests 全过；`node --check`；live 只读：reinstall 后 health 200、snapshot 含 `gitlab.tokenPresent:false`、GET `/api/gitlab-token` → 405 / 非 JSON → 415 / 缺 session → 400（不写真实 token）。
 - [ ] **Step 4: 提交** `feat(bug-workflow): GitLab 设置与凭证`.
 
 ### Task 2: GitLab 客户端 + loopback mock

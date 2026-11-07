@@ -105,6 +105,10 @@ const SYNCED_TICKET_FIELDS = Object.freeze([
 export const DEFAULT_SETTINGS = Object.freeze({
   platformBaseUrl: 'https://ecard.htwisdom.cn',
   platformProjectCode: '',
+  // P5 GitLab API root. Added without a domain bump: the settings schema is a
+  // looseObject built from this object, so an older row without the key reads
+  // the default here and on open.
+  gitlabBaseUrl: 'https://git.htwisdom.cn',
   gitlabProjectPath: '',
   branchUser: 'ly',
   gitlabReviewer: '',

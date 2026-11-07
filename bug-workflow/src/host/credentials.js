@@ -1,22 +1,29 @@
 /**
- * Platform-token storage for the Bug workflow plugin.
+ * Host token storage for the Bug workflow plugin.
  *
- * The token is a secret: it only ever travels between this module and the DSH
+ * One implementation backs both credentials: the platform sync token (P2) and
+ * the GitLab API token (P5). They differ only by credential reference, so
+ * `createTokenStore(credentials, { ref })` keeps the get/set/clear/present and
+ * validation rules identical for both.
+ *
+ * A token is a secret: it only ever travels between this module and the DSH
  * `ctx.credentials` service. Nothing here logs, formats, or returns the value
- * to an HTTP client — `get()` is host-internal (the sync engine calls it), and
- * `present()` answers the snapshot's `tokenPresent` flag without reading it.
+ * to an HTTP client — `get()` is host-internal (the sync/delivery/review
+ * services call it), and `present()` answers the snapshot's `tokenPresent` flag
+ * without reading it.
  *
- * ## Credential key
+ * ## Credential keys
  *
- * The P2 plan names the credential `bug-workflow.platform-token`. That string
- * is not addressable in either half of the credentials seam: a `CredentialRef`
- * must match `^[A-Za-z_][A-Za-z0-9_]*$` (environment-variable shape) and a
- * `CredentialKey` is `<scope>/<id>` with lowercase-hyphenated segments. Storing
- * the dotted form in the provider-managed file would be rejected when
- * `dsh-credentials-local` re-reads the document (and would make the provider
- * fail its next boot), so this module uses the reference-shaped key
- * `BUG_WORKFLOW_PLATFORM_TOKEN` — the smallest legal mapping of the planned
- * name and the same shape a platform API key would take.
+ * The P2 plan names the platform credential `bug-workflow.platform-token`. That
+ * string is not addressable in either half of the credentials seam: a
+ * `CredentialRef` must match `^[A-Za-z_][A-Za-z0-9_]*$` (environment-variable
+ * shape) and a `CredentialKey` is `<scope>/<id>` with lowercase-hyphenated
+ * segments. Storing the dotted form in the provider-managed file would be
+ * rejected when `dsh-credentials-local` re-reads the document (and would make
+ * the provider fail its next boot), so this module uses the reference-shaped
+ * key `BUG_WORKFLOW_PLATFORM_TOKEN` — the smallest legal mapping of the planned
+ * name and the same shape a platform API key would take. P5 adds the GitLab
+ * reference `BUG_WORKFLOW_GITLAB_TOKEN` following the same rule.
  *
  * ## Error contract
  *
@@ -36,14 +43,20 @@
  * credentials is not.
  */
 
-/** Reference name used in the DSH credential store (environment-variable shape). */
+/** Reference name of the platform sync token (environment-variable shape). */
 export const PLATFORM_TOKEN_REF = 'BUG_WORKFLOW_PLATFORM_TOKEN';
+
+/** Reference name of the GitLab API token (P5, environment-variable shape). */
+export const GITLAB_TOKEN_REF = 'BUG_WORKFLOW_GITLAB_TOKEN';
 
 /** Maximum accepted token length in characters (8192). */
 export const MAX_TOKEN_LENGTH = 8192;
 
 /** Methods the credential service must expose for the reference half. */
 const REQUIRED_METHODS = Object.freeze(['set', 'resolve', 'describe', 'unset']);
+
+/** Reference keys are environment-variable shaped (the seam's contract). */
+const REF_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /**
  * Structured token-store failure. `code` is stable; callers branch on it and
@@ -62,23 +75,30 @@ export class TokenStoreError extends Error {
 }
 
 /**
- * Build the platform-token store over a `ctx.credentials` service.
+ * Build a token store over a `ctx.credentials` service for one reference.
  *
  * The service is captured once. Pass `undefined` when the service is not
  * available: the plugin still loads, `present()` stays false, and writes fail
- * with `credentials-unavailable` (the route maps that to HTTP 503).
+ * with `credentials-unavailable` (the routes map that to HTTP 503).
+ *
+ * `options.ref` selects the credential reference and defaults to
+ * `PLATFORM_TOKEN_REF`, so every single-argument call made before P5 keeps the
+ * exact platform-token behaviour. The two stores are independent even when
+ * they share one credentials service.
  *
  * @param {object|undefined|null} credentials `ctx.credentials` service
+ * @param {{ref?: string}|undefined|null} [options]
  * @returns {{get: () => Promise<string|null>, set: (token: string) => Promise<void>, clear: () => Promise<void>, present: () => Promise<boolean>}}
  */
-export function createTokenStore(credentials) {
+export function createTokenStore(credentials, options = {}) {
   const service = normalizeCredentials(credentials);
+  const ref = normalizeRef(options);
 
   async function get() {
     if (service === null) throw unavailable();
     let resolved;
     try {
-      resolved = await service.resolve(PLATFORM_TOKEN_REF);
+      resolved = await service.resolve(ref);
     } catch {
       // The provider's message may quote internals; never forward it.
       throw unavailable();
@@ -93,7 +113,7 @@ export function createTokenStore(credentials) {
     const value = normalizeToken(token);
     if (service === null) throw unavailable();
     try {
-      await service.set(PLATFORM_TOKEN_REF, value);
+      await service.set(ref, value);
     } catch {
       // Same rule as get(): no provider detail, and certainly no token.
       throw unavailable();
@@ -103,7 +123,7 @@ export function createTokenStore(credentials) {
   async function clear() {
     if (service === null) throw unavailable();
     try {
-      await service.unset(PLATFORM_TOKEN_REF);
+      await service.unset(ref);
     } catch {
       throw unavailable();
     }
@@ -112,7 +132,7 @@ export function createTokenStore(credentials) {
   async function present() {
     if (service === null) return false;
     try {
-      const info = await service.describe(PLATFORM_TOKEN_REF);
+      const info = await service.describe(ref);
       return info !== null && typeof info === 'object' && info.configured === true;
     } catch {
       return false;
@@ -152,6 +172,25 @@ function normalizeCredentials(credentials) {
   return credentials;
 }
 
+/**
+ * Resolve the credential reference. Missing options keep the pre-P5 platform
+ * default; a malformed ref is a programming error (the credentials seam only
+ * accepts environment-variable shaped references) and is rejected loudly
+ * rather than silently writing to the wrong credential.
+ */
+function normalizeRef(options) {
+  if (options === undefined || options === null) return PLATFORM_TOKEN_REF;
+  if (typeof options !== 'object') {
+    throw new TypeError('createTokenStore() options must be an object');
+  }
+  const ref = options.ref;
+  if (ref === undefined) return PLATFORM_TOKEN_REF;
+  if (typeof ref !== 'string' || !REF_RE.test(ref)) {
+    throw new TypeError('createTokenStore() ref must be an environment-variable-shaped reference');
+  }
+  return ref;
+}
+
 function unavailable() {
-  return new TokenStoreError('credentials-unavailable', '凭据服务不可用，无法读写平台 token');
+  return new TokenStoreError('credentials-unavailable', '凭据服务不可用，无法读写 token');
 }

@@ -25,7 +25,7 @@ import {
   registerUnavailableRoutes,
 } from '../src/host/routes.js';
 import { createAnalysisService } from '../src/host/analysis-service.js';
-import { PLATFORM_TOKEN_REF, createTokenStore } from '../src/host/credentials.js';
+import { GITLAB_TOKEN_REF, MAX_TOKEN_LENGTH, PLATFORM_TOKEN_REF, createTokenStore } from '../src/host/credentials.js';
 import { DEFAULT_SETTINGS, createStore } from '../src/host/store.js';
 import { MAX_REVIEW_ROUNDS, initialTicket } from '../src/host/state-machine.js';
 import { resolveWorkspace } from '../src/host/workspace.js';
@@ -429,6 +429,14 @@ function platformTokenBody(overrides = {}) {
   });
 }
 
+function gitlabTokenBody(overrides = {}) {
+  return JSON.stringify({
+    sessionId: SESSION_ID,
+    token: 'p5-dummy-gitlab-token',
+    ...overrides,
+  });
+}
+
 function syncBody(overrides = {}) {
   return JSON.stringify({
     sessionId: SESSION_ID,
@@ -576,6 +584,7 @@ function handlersWith({
   store = createFakeStore(),
   workspace = createWorkspace(),
   tokenStore = createTokenStore(createFakeCredentials()),
+  gitlabTokenStore = createTokenStore(createFakeCredentials(), { ref: GITLAB_TOKEN_REF }),
   sync,
   importTask,
   analysis,
@@ -600,6 +609,7 @@ function handlersWith({
     store,
     workspace,
     tokenStore,
+    gitlabTokenStore,
     sync: syncService,
     importTask: importTaskFn,
     analysis: analysisDeps,
@@ -608,6 +618,7 @@ function handlersWith({
       store,
       workspace,
       tokenStore,
+      gitlabTokenStore,
       sync: syncService,
       importTask: importTaskFn,
       analysis: analysisDeps,
@@ -715,6 +726,7 @@ test('GET /snapshot composes workspace, settings, tickets and serverTime', async
     workspace: { path: WORKSPACE, configured: true },
     settings: DEFAULT_SETTINGS,
     platform: { tokenPresent: false, lastSyncAt: null, lastSyncError: null },
+    gitlab: { tokenPresent: false },
     dicts: { status: [], type: [], priority: [] },
     analysis: { running: [], errors: {} },
     fix: { running: [], errors: {} },
@@ -751,6 +763,54 @@ test('GET /snapshot keeps tokenPresent false when credentials is unavailable', a
     lastSyncError: null,
   });
   assert.deepEqual(json.dicts, { status: [], type: [], priority: [] });
+});
+
+test('GET /snapshot reports gitlab.tokenPresent independently of the platform token', async () => {
+  const credentials = createFakeCredentials({ [GITLAB_TOKEN_REF]: 'p5-dummy-gitlab-token' });
+  const gitlabTokenStore = createTokenStore(credentials, { ref: GITLAB_TOKEN_REF });
+  const { handlers } = handlersWith({ gitlabTokenStore });
+  const { res, json } = await call(handlers.snapshot, { url: snapshotUrl() });
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(json.gitlab, { tokenPresent: true });
+  // A GitLab credential never leaks into (or lights up) the platform block.
+  assert.deepEqual(json.platform, {
+    tokenPresent: false,
+    lastSyncAt: null,
+    lastSyncError: null,
+  });
+  assert.equal(JSON.stringify(json).includes('p5-dummy-gitlab-token'), false);
+  // Presence is a status read: the snapshot never resolves the value.
+  assert.deepEqual(credentials.calls.resolve, []);
+});
+
+test('GET /snapshot degrades gitlab.tokenPresent to false when unwired or failing', async () => {
+  const unwired = await call(handlersWith({ gitlabTokenStore: null }).handlers.snapshot, {
+    url: snapshotUrl(),
+  });
+  assert.equal(unwired.res.statusCode, 200);
+  assert.deepEqual(unwired.json.gitlab, { tokenPresent: false });
+
+  const unavailable = await call(
+    handlersWith({
+      gitlabTokenStore: createTokenStore(undefined, { ref: GITLAB_TOKEN_REF }),
+    }).handlers.snapshot,
+    { url: snapshotUrl() },
+  );
+  assert.equal(unavailable.res.statusCode, 200);
+  assert.deepEqual(unavailable.json.gitlab, { tokenPresent: false });
+
+  const failing = {
+    async get() { return null; },
+    async set() {},
+    async clear() {},
+    async present() { throw new Error('credentials boom'); },
+  };
+  const failed = await call(handlersWith({ gitlabTokenStore: failing }).handlers.snapshot, {
+    url: snapshotUrl(),
+  });
+  assert.equal(failed.res.statusCode, 200);
+  assert.deepEqual(failed.json.gitlab, { tokenPresent: false });
 });
 
 test('GET /snapshot reports sync status and mapped dictionaries', async () => {
@@ -2057,6 +2117,215 @@ test('POST /platform-token maps an unexpected token-store failure to 500 interna
 });
 
 // ---------------------------------------------------------------------------
+// GitLab token
+// ---------------------------------------------------------------------------
+
+test('POST /gitlab-token writes the string into the GitLab credential and answers only tokenPresent', async () => {
+  const credentials = createFakeCredentials({ [PLATFORM_TOKEN_REF]: 'p2-dummy-token' });
+  const tokenStore = createTokenStore(credentials);
+  const gitlabTokenStore = createTokenStore(credentials, { ref: GITLAB_TOKEN_REF });
+  const store = createFakeStore();
+  const { handlers } = handlersWith({ store, tokenStore, gitlabTokenStore });
+  const { res, json } = await call(handlers.gitlabToken, {
+    method: 'POST',
+    url: API_PATHS.gitlabToken,
+    body: gitlabTokenBody(),
+  });
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(json, { ok: true, tokenPresent: true });
+  assert.deepEqual(credentials.calls.set, [
+    { ref: GITLAB_TOKEN_REF, value: 'p5-dummy-gitlab-token' },
+  ]);
+  assert.equal(credentials.values.get(GITLAB_TOKEN_REF), 'p5-dummy-gitlab-token');
+  // The platform credential is untouched, the ticket/settings stores are not
+  // involved, and the response never echoes the token.
+  assert.equal(credentials.values.get(PLATFORM_TOKEN_REF), 'p2-dummy-token');
+  assert.equal(store.calls.applyAction.length, 0);
+  assert.equal(store.calls.putSettings.length, 0);
+  assert.equal(JSON.stringify(json).includes('p5-dummy-gitlab-token'), false);
+});
+
+test('POST /gitlab-token with token:null clears only the GitLab credential', async () => {
+  const credentials = createFakeCredentials({
+    [PLATFORM_TOKEN_REF]: 'p2-dummy-token',
+    [GITLAB_TOKEN_REF]: 'p5-dummy-gitlab-token',
+  });
+  const tokenStore = createTokenStore(credentials);
+  const gitlabTokenStore = createTokenStore(credentials, { ref: GITLAB_TOKEN_REF });
+  const { handlers } = handlersWith({ tokenStore, gitlabTokenStore });
+  const { res, json } = await call(handlers.gitlabToken, {
+    method: 'POST',
+    url: API_PATHS.gitlabToken,
+    body: gitlabTokenBody({ token: null }),
+  });
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(json, { ok: true, tokenPresent: false });
+  assert.deepEqual(credentials.calls.unset, [GITLAB_TOKEN_REF]);
+  assert.equal(credentials.values.has(GITLAB_TOKEN_REF), false);
+  assert.equal(credentials.values.get(PLATFORM_TOKEN_REF), 'p2-dummy-token');
+  assert.equal(JSON.stringify(json).includes('p5-dummy-gitlab-token'), false);
+});
+
+test('the GitLab token routes never change the platform token', async () => {
+  const credentials = createFakeCredentials();
+  const tokenStore = createTokenStore(credentials);
+  const gitlabTokenStore = createTokenStore(credentials, { ref: GITLAB_TOKEN_REF });
+  const { handlers } = handlersWith({ tokenStore, gitlabTokenStore });
+
+  const platformSaved = await call(handlers.platformToken, {
+    method: 'POST',
+    url: API_PATHS.platformToken,
+    body: platformTokenBody(),
+  });
+  assert.deepEqual(platformSaved.json, { ok: true, tokenPresent: true });
+
+  await call(handlers.gitlabToken, {
+    method: 'POST',
+    url: API_PATHS.gitlabToken,
+    body: gitlabTokenBody(),
+  });
+  const cleared = await call(handlers.gitlabToken, {
+    method: 'POST',
+    url: API_PATHS.gitlabToken,
+    body: gitlabTokenBody({ token: null }),
+  });
+  assert.deepEqual(cleared.json, { ok: true, tokenPresent: false });
+
+  const snapshot = await call(handlers.snapshot, { url: snapshotUrl() });
+  assert.deepEqual(snapshot.json.platform, {
+    tokenPresent: true,
+    lastSyncAt: null,
+    lastSyncError: null,
+  });
+  assert.deepEqual(snapshot.json.gitlab, { tokenPresent: false });
+});
+
+test('POST /gitlab-token rejects a missing, non-string, empty or oversized token with 400', async () => {
+  for (const [label, token] of [
+    ['missing', undefined],
+    ['number', 42],
+    ['object', { token: 'x' }],
+    ['array', ['x']],
+    ['empty', ''],
+    ['blank', '   '],
+    ['oversized', 'x'.repeat(MAX_TOKEN_LENGTH + 1)],
+  ]) {
+    const credentials = createFakeCredentials();
+    const gitlabTokenStore = createTokenStore(credentials, { ref: GITLAB_TOKEN_REF });
+    const { handlers } = handlersWith({ gitlabTokenStore });
+    const parsed = JSON.parse(gitlabTokenBody());
+    if (token === undefined) delete parsed.token;
+    else parsed.token = token;
+    const { res, json } = await call(handlers.gitlabToken, {
+      method: 'POST',
+      url: API_PATHS.gitlabToken,
+      body: JSON.stringify(parsed),
+    });
+
+    assert.equal(res.statusCode, 400, label);
+    assert.equal(json.ok, false, label);
+    assert.equal(json.code, 'invalid-token', label);
+    assert.equal(credentials.calls.set.length, 0, label);
+  }
+});
+
+test('POST /gitlab-token requires a sessionId', async () => {
+  const credentials = createFakeCredentials();
+  const gitlabTokenStore = createTokenStore(credentials, { ref: GITLAB_TOKEN_REF });
+  const { handlers } = handlersWith({ gitlabTokenStore });
+  const { res, json } = await call(handlers.gitlabToken, {
+    method: 'POST',
+    url: API_PATHS.gitlabToken,
+    body: gitlabTokenBody({ sessionId: undefined }),
+  });
+
+  assert.equal(res.statusCode, 400);
+  assert.equal(json.code, 'missing-session');
+  assert.equal(credentials.calls.set.length, 0);
+});
+
+test('POST /gitlab-token accepts an unbound session (the token is profile-global)', async () => {
+  const credentials = createFakeCredentials();
+  const gitlabTokenStore = createTokenStore(credentials, { ref: GITLAB_TOKEN_REF });
+  const { handlers } = handlersWith({ gitlabTokenStore });
+  const { res, json } = await call(handlers.gitlabToken, {
+    method: 'POST',
+    url: API_PATHS.gitlabToken,
+    body: gitlabTokenBody({ sessionId: UNBOUND_SESSION_ID }),
+  });
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(json, { ok: true, tokenPresent: true });
+  assert.equal(credentials.values.get(GITLAB_TOKEN_REF), 'p5-dummy-gitlab-token');
+});
+
+test('POST /gitlab-token answers 503 credentials-unavailable when credentials is absent', async () => {
+  for (const gitlabTokenStore of [
+    null,
+    createTokenStore(undefined, { ref: GITLAB_TOKEN_REF }),
+  ]) {
+    const { handlers } = handlersWith({ gitlabTokenStore });
+    for (const token of ['p5-dummy-gitlab-token', null]) {
+      const { res, json } = await call(handlers.gitlabToken, {
+        method: 'POST',
+        url: API_PATHS.gitlabToken,
+        body: gitlabTokenBody({ token }),
+      });
+      assert.equal(res.statusCode, 503, String(token));
+      assert.equal(json.code, 'credentials-unavailable', String(token));
+      assert.equal(JSON.stringify(json).includes('p5-dummy-gitlab-token'), false);
+    }
+  }
+});
+
+test('POST /gitlab-token maps an unexpected token-store failure to 500 internal', async () => {
+  const gitlabTokenStore = {
+    async get() { return null; },
+    async set() { throw new Error('disk full'); },
+    async clear() {},
+    async present() { return false; },
+  };
+  const { handlers } = handlersWith({ gitlabTokenStore });
+  const { res, json } = await call(handlers.gitlabToken, {
+    method: 'POST',
+    url: API_PATHS.gitlabToken,
+    body: gitlabTokenBody(),
+  });
+
+  assert.equal(res.statusCode, 500);
+  assert.equal(json.code, 'internal');
+});
+
+test('POST /gitlab-token rejects a body over 64 KiB with 413', async () => {
+  const { handlers } = handlersWith();
+  const oversized = JSON.stringify({
+    sessionId: SESSION_ID,
+    token: 'x'.repeat(MAX_BODY_BYTES),
+  });
+  assert.ok(Buffer.byteLength(oversized) > MAX_BODY_BYTES);
+
+  const declared = await call(handlers.gitlabToken, {
+    method: 'POST',
+    url: API_PATHS.gitlabToken,
+    body: oversized,
+  });
+  assert.equal(declared.res.statusCode, 413);
+  assert.equal(declared.json.code, 'payload-too-large');
+
+  // Chunked requests carry no content-length: the cap must still apply.
+  const chunked = await call(handlers.gitlabToken, {
+    method: 'POST',
+    url: API_PATHS.gitlabToken,
+    body: oversized,
+    contentLength: false,
+  });
+  assert.equal(chunked.res.statusCode, 413);
+  assert.equal(chunked.json.code, 'payload-too-large');
+});
+
+// ---------------------------------------------------------------------------
 // Host / method guards
 // ---------------------------------------------------------------------------
 
@@ -2069,6 +2338,7 @@ test('every route rejects a non-loopback Host with 403', async () => {
     ['analyze', 'POST', API_PATHS.analyze, analyzeBody()],
     ['settings', 'POST', API_PATHS.settings, settingsBody()],
     ['platformToken', 'POST', API_PATHS.platformToken, platformTokenBody()],
+    ['gitlabToken', 'POST', API_PATHS.gitlabToken, gitlabTokenBody()],
     ['sync', 'POST', API_PATHS.sync, syncBody()],
   ];
   for (const [name, method, url, body] of cases) {
@@ -2121,6 +2391,7 @@ test('every route rejects the wrong HTTP method with 405 and an Allow header', a
     ['fix', 'GET', API_PATHS.fix, 'POST'],
     ['settings', 'GET', API_PATHS.settings, 'POST'],
     ['platformToken', 'GET', API_PATHS.platformToken, 'POST'],
+    ['gitlabToken', 'GET', API_PATHS.gitlabToken, 'POST'],
     ['sync', 'GET', API_PATHS.sync, 'POST'],
   ];
   for (const [name, method, url, allow] of cases) {
@@ -2141,6 +2412,7 @@ const POST_ROUTES = [
   ['fix', API_PATHS.fix, () => fixBody()],
   ['settings', API_PATHS.settings, () => settingsBody()],
   ['platformToken', API_PATHS.platformToken, () => platformTokenBody()],
+  ['gitlabToken', API_PATHS.gitlabToken, () => gitlabTokenBody()],
   ['sync', API_PATHS.sync, () => syncBody()],
 ];
 
@@ -2258,6 +2530,7 @@ test('every route rejects a non-loopback remote address with 403', async () => {
     ['fix', 'POST', API_PATHS.fix, () => fixBody()],
     ['settings', 'POST', API_PATHS.settings, () => settingsBody()],
     ['platformToken', 'POST', API_PATHS.platformToken, () => platformTokenBody()],
+    ['gitlabToken', 'POST', API_PATHS.gitlabToken, () => gitlabTokenBody()],
     ['sync', 'POST', API_PATHS.sync, () => syncBody()],
   ];
   for (const [name, method, url, body] of cases) {
@@ -2387,6 +2660,13 @@ test('registerUnavailableRoutes() keeps health 500/503 and all data routes 503 u
   });
   assert.equal(platformToken.res.statusCode, 503);
   assert.equal(platformToken.json.code, 'storage-unavailable');
+
+  const gitlabToken = await callRegistered(webServer, API_PATHS.gitlabToken, {
+    method: 'POST',
+    body: gitlabTokenBody(),
+  });
+  assert.equal(gitlabToken.res.statusCode, 503);
+  assert.equal(gitlabToken.json.code, 'storage-unavailable');
 
   const sync = await callRegistered(webServer, API_PATHS.sync, {
     method: 'POST',

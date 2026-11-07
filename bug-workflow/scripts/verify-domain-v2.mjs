@@ -316,14 +316,39 @@ check('branch worktree metadata accepted and bounded', () => {
   }
 });
 
-check('settings defaults platformBaseUrl/writebackStatus', () => {
+check('settings defaults platformBaseUrl/gitlabBaseUrl/writebackStatus', () => {
   const parsed = settingsSchema.parse({});
   assert.equal(parsed.platformBaseUrl, 'https://ecard.htwisdom.cn');
+  assert.equal(parsed.gitlabBaseUrl, 'https://git.htwisdom.cn');
   assert.equal(parsed.writebackStatus, false);
 
   const enabled = settingsSchema.parse({ writebackStatus: true });
   assert.equal(enabled.writebackStatus, true);
   assert.equal(enabled.platformBaseUrl, 'https://ecard.htwisdom.cn');
+  assert.equal(enabled.gitlabBaseUrl, 'https://git.htwisdom.cn');
+});
+
+check('settings legacy row without gitlabBaseUrl defaults it', () => {
+  // A record written by P1-P4 has no gitlabBaseUrl key. `looseObject` plus the
+  // schema default must fill it instead of failing the domain open.
+  const legacy = {
+    platformBaseUrl: 'https://ecard.htwisdom.cn',
+    platformProjectCode: '',
+    gitlabProjectPath: 'group/project',
+    branchUser: 'ly',
+    gitlabReviewer: '',
+    commitType: 'fix',
+    lintCommand: '',
+    testCommand: '',
+    devCommand: '',
+    previewUrl: '',
+    writebackStatus: false,
+  };
+  assert.equal(Object.hasOwn(legacy, 'gitlabBaseUrl'), false);
+  const parsed = settingsSchema.parse(legacy);
+  assert.equal(parsed.gitlabBaseUrl, 'https://git.htwisdom.cn');
+  assert.equal(parsed.gitlabProjectPath, 'group/project');
+  assert.equal(parsed.branchUser, 'ly');
 });
 
 // ---------------------------------------------------------------------------

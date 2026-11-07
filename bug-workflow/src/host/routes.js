@@ -4,7 +4,7 @@
  * Routes (all exact, all JSON, all same-origin/loopback only):
  *
  *   GET  /bug-workflow/api/health          -> { ok, domainOpenedAt, tickets }
- *   GET  /bug-workflow/api/snapshot        -> { ok, workspace, settings, platform, dicts, tickets, serverTime }
+ *   GET  /bug-workflow/api/snapshot        -> { ok, workspace, settings, platform, gitlab, dicts, tickets, serverTime }
  *   POST /bug-workflow/api/action          -> { ok, ticket } | { ok:false, code, message, ticket? }
  *                                              action:'create' + payload.code imports that
  *                                              platform task by code (see `importTask`)
@@ -14,6 +14,7 @@
  *                                              | { ok:false, code, message } (P4 real fix)
  *   POST /bug-workflow/api/settings        -> { ok, settings }
  *   POST /bug-workflow/api/platform-token  -> { ok, tokenPresent } (token is only written, never read back)
+ *   POST /bug-workflow/api/gitlab-token    -> { ok, tokenPresent } (P5 GitLab token, same contract)
  *   POST /bug-workflow/api/sync            -> { ok, synced, created, updated, total, filtered, lastSyncAt }
  *                                              | { ok:false, code, message }
  *
@@ -81,6 +82,7 @@ export const API_PATHS = Object.freeze({
   fix: '/bug-workflow/api/fix',
   settings: '/bug-workflow/api/settings',
   platformToken: '/bug-workflow/api/platform-token',
+  gitlabToken: '/bug-workflow/api/gitlab-token',
   sync: '/bug-workflow/api/sync',
 });
 
@@ -96,6 +98,9 @@ const MAX_ERROR_MESSAGE_CHARS = 300;
 /** 503 message for an absent/failed credential service (never mentions a token). */
 const CREDENTIALS_UNAVAILABLE_MESSAGE = '凭据服务不可用，暂时无法保存平台 token';
 
+/** 503 message for the GitLab token (same contract, token-free). */
+const GITLAB_CREDENTIALS_UNAVAILABLE_MESSAGE = '凭据服务不可用，暂时无法保存 GitLab token';
+
 /** A rejected action name is echoed back truncated to this many characters. */
 const MAX_ACTION_NAME_CHARS = 64;
 
@@ -108,6 +113,7 @@ const ROUTE_METHODS = Object.freeze({
   fix: 'POST',
   settings: 'POST',
   platformToken: 'POST',
+  gitlabToken: 'POST',
   sync: 'POST',
 });
 
@@ -238,6 +244,9 @@ const LOOPBACK_REMOTE_ADDRESSES = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1
  * @param {{resolve: (sessionId: string) => {path: string|null, configured: boolean}}} deps.workspace
  * @param {object|null} [deps.tokenStore] `createTokenStore()` result; when null
  *   the snapshot reports `tokenPresent:false` and the token route answers 503
+ * @param {object|null} [deps.gitlabTokenStore] `createTokenStore(..., {ref})`
+ *   result for the P5 GitLab token; when null the snapshot reports
+ *   `gitlab.tokenPresent:false` and `/gitlab-token` answers 503
  * @param {object|null} [deps.sync] `createSyncService()` result; when null the
  *   sync route answers 503 and the snapshot falls back to token presence only
  * @param {((cwd: string|null, code: string) => Promise<object>)|null} [deps.importTask]
@@ -255,12 +264,13 @@ const LOOPBACK_REMOTE_ADDRESSES = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1
  * @param {number} [deps.bodyTimeoutMs] POST body read deadline (default 10 s)
  * @param {((entry: {event: string, error: unknown}) => void)|null} [deps.log]
  *   optional host logger; receives full errors that are hidden from responses
- * @returns {{health: Function, snapshot: Function, action: Function, analyze: Function, fix: Function, settings: Function, platformToken: Function, sync: Function}}
+ * @returns {{health: Function, snapshot: Function, action: Function, analyze: Function, fix: Function, settings: Function, platformToken: Function, gitlabToken: Function, sync: Function}}
  */
 export function createHandlers({
   store,
   workspace,
   tokenStore = null,
+  gitlabTokenStore = null,
   sync = null,
   importTask = null,
   analysis = null,
@@ -282,6 +292,14 @@ export function createHandlers({
     }
   }
   const tokenStoreSafe = tokenStore === undefined ? null : tokenStore;
+  if (gitlabTokenStore !== null && gitlabTokenStore !== undefined) {
+    for (const method of ['get', 'set', 'clear', 'present']) {
+      if (typeof gitlabTokenStore[method] !== 'function') {
+        throw new TypeError(`createHandlers() gitlabTokenStore.${method} must be a function`);
+      }
+    }
+  }
+  const gitlabTokenStoreSafe = gitlabTokenStore === undefined ? null : gitlabTokenStore;
   if (sync !== null && sync !== undefined) {
     for (const method of ['run', 'status']) {
       if (typeof sync[method] !== 'function') {
@@ -366,6 +384,9 @@ export function createHandlers({
         // Task 4: platform status + dictionaries. Both readers degrade to
         // safe defaults so a failing sync/meta read cannot take down the board.
         platform: await readPlatformStatus(syncService, tokenStoreSafe),
+        // P5: GitLab token presence only. The value never leaves credentials,
+        // and a missing/failing store reads as false.
+        gitlab: { tokenPresent: await readTokenPresent(gitlabTokenStoreSafe) },
         dicts: readDicts(store),
         // P3: analysis progress + static per-ticket errors. Absent wiring
         // reports empty state instead of an undefined key.
@@ -726,59 +747,90 @@ export function createHandlers({
      * rejected, matching the action route's validation. The board still gates
      * the UI on a bound workspace.
      */
-    platformToken: safe(async (req, res) => {
-      if (!guard(req, res, ROUTE_METHODS.platformToken)) return;
-      if (!guardJsonContentType(req, res)) return;
-      if (!guardOrigin(req, res)) return;
+    platformToken: safe(writeTokenRoute(
+      ROUTE_METHODS.platformToken,
+      tokenStoreSafe,
+      CREDENTIALS_UNAVAILABLE_MESSAGE,
+      bodyTimeoutMs,
+    )),
 
-      const body = await readJsonBody(req, bodyTimeoutMs);
-      if (!body.ok) {
-        sendError(res, body.status, body.code, body.message);
-        if (body.destroyRequest === true) destroyRequest(req);
+    /**
+     * Write or clear the GitLab token (P5). Exactly the platform-token contract:
+     * `{sessionId, token}` with a string stored and `null` cleared; only
+     * `{ok, tokenPresent}` is echoed. The two credentials are independent refs,
+     * so this route never reads or changes the platform token.
+     */
+    gitlabToken: safe(writeTokenRoute(
+      ROUTE_METHODS.gitlabToken,
+      gitlabTokenStoreSafe,
+      GITLAB_CREDENTIALS_UNAVAILABLE_MESSAGE,
+      bodyTimeoutMs,
+    )),
+  };
+}
+
+/**
+ * Shared implementation of the platform/GitLab token write routes: same
+ * transport guards, JSON body contract, session check and static error mapping.
+ * `store` is the already-validated token store for that credential ref; `null`
+ * means the credentials service is unavailable (503).
+ *
+ * The response only ever carries `{ok, tokenPresent}`: the value is never read
+ * back, so it cannot be echoed.
+ */
+function writeTokenRoute(method, store, unavailableMessage, bodyTimeoutMs) {
+  return async (req, res) => {
+    if (!guard(req, res, method)) return;
+    if (!guardJsonContentType(req, res)) return;
+    if (!guardOrigin(req, res)) return;
+
+    const body = await readJsonBody(req, bodyTimeoutMs);
+    if (!body.ok) {
+      sendError(res, body.status, body.code, body.message);
+      if (body.destroyRequest === true) destroyRequest(req);
+      return;
+    }
+    const input = body.value;
+
+    const sessionId = normalizeSessionId(input.sessionId);
+    if (sessionId === undefined) {
+      sendError(res, 400, 'missing-session', '缺少有效的 sessionId');
+      return;
+    }
+
+    if (store === null) {
+      sendError(res, 503, 'credentials-unavailable', unavailableMessage);
+      return;
+    }
+
+    const clear = input.token === null;
+    if (!clear && typeof input.token !== 'string') {
+      sendError(res, 400, 'invalid-token', 'token 必须是非空字符串，或传 null 清除');
+      return;
+    }
+
+    try {
+      if (clear) {
+        await store.clear();
+        sendJsonSafe(res, 200, { ok: true, tokenPresent: false });
         return;
       }
-      const input = body.value;
-
-      const sessionId = normalizeSessionId(input.sessionId);
-      if (sessionId === undefined) {
-        sendError(res, 400, 'missing-session', '缺少有效的 sessionId');
+      await store.set(input.token);
+      // Deliberately optimistic: a successful write means the token is now
+      // present; reading it back is not needed (and must not leave the store).
+      sendJsonSafe(res, 200, { ok: true, tokenPresent: true });
+    } catch (error) {
+      const code = typeof error?.code === 'string' ? error.code : undefined;
+      if (code === 'invalid-token') {
+        sendError(res, 400, 'invalid-token', clipMessage(errorMessage(error)));
         return;
       }
-
-      if (tokenStoreSafe === null) {
-        sendError(res, 503, 'credentials-unavailable', CREDENTIALS_UNAVAILABLE_MESSAGE);
+      if (code === 'credentials-unavailable') {
+        sendError(res, 503, 'credentials-unavailable', unavailableMessage);
         return;
       }
-
-      const clear = input.token === null;
-      if (!clear && typeof input.token !== 'string') {
-        sendError(res, 400, 'invalid-token', 'token 必须是非空字符串，或传 null 清除');
-        return;
-      }
-
-      try {
-        if (clear) {
-          await tokenStoreSafe.clear();
-          sendJsonSafe(res, 200, { ok: true, tokenPresent: false });
-          return;
-        }
-        await tokenStoreSafe.set(input.token);
-        // Deliberately optimistic: a successful write means the token is now
-        // present; reading it back is not needed (and must not leave the store).
-        sendJsonSafe(res, 200, { ok: true, tokenPresent: true });
-      } catch (error) {
-        const code = typeof error?.code === 'string' ? error.code : undefined;
-        if (code === 'invalid-token') {
-          sendError(res, 400, 'invalid-token', clipMessage(errorMessage(error)));
-          return;
-        }
-        if (code === 'credentials-unavailable') {
-          sendError(res, 503, 'credentials-unavailable', CREDENTIALS_UNAVAILABLE_MESSAGE);
-          return;
-        }
-        throw error;
-      }
-    }),
+      throw error;
+    }
   };
 }
 
@@ -831,6 +883,7 @@ export function registerUnavailableRoutes(ctx, health = {}) {
     fix: unavailableHandler(ROUTE_METHODS.fix, health),
     settings: unavailableHandler(ROUTE_METHODS.settings, health),
     platformToken: unavailableHandler(ROUTE_METHODS.platformToken, health),
+    gitlabToken: unavailableHandler(ROUTE_METHODS.gitlabToken, health),
     sync: unavailableHandler(ROUTE_METHODS.sync, health),
   };
   return registerHandlers(webServer, handlers);

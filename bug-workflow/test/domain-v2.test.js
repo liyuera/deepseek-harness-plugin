@@ -289,8 +289,9 @@ test('domain v2 verifier passes with the installed DSH runtime', (t) => {
     'PASS fix run entry accepted',
     'PASS malformed fix run entry rejected',
     'PASS branch worktree metadata accepted and bounded',
-    'PASS settings defaults platformBaseUrl/writebackStatus',
-    'PASS domain v2 contract (13 checks)',
+    'PASS settings defaults platformBaseUrl/gitlabBaseUrl/writebackStatus',
+    'PASS settings legacy row without gitlabBaseUrl defaults it',
+    'PASS domain v2 contract (14 checks)',
   ]) {
     assert.equal(output.includes(expected), true, `missing verifier output: ${expected}\n${output}`);
   }
