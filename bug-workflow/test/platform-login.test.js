@@ -331,18 +331,25 @@ test('login()/captcha() map network failures and timeouts to static codes', asyn
   );
 });
 
-test('login() never echoes the upstream body or credentials on failure', async (t) => {
+test('login() surfaces a sanitized upstream message but never credentials/tokens', async (t) => {
   const mock = await startMock(defaultHandler({
-    tokenHandler: (res) => json(res, 200, { code: 500, success: false, msg: `boom ${SECRET_PASSWORD} token-abc` }),
+    tokenHandler: (res) => json(res, 200, {
+      code: 500,
+      success: false,
+      msg: `boom ${SECRET_PASSWORD} ${'a'.repeat(48)}`,
+    }),
   }));
   t.after(() => mock.close());
   await assert.rejects(
     () => createPlatformLogin().login({ baseUrl: mock.baseUrl, username: 'u', password: SECRET_PASSWORD, code: 'c', captchaKey: 'k' }),
     (error) => {
       assert.equal(error.code, 'login-failed');
+      // The platform's own copy is useful for support, but secrets/long
+      // token-like blobs are redacted and the text is clipped.
       assert.equal(error.message.includes(SECRET_PASSWORD), false);
-      assert.equal(error.message.includes('token-abc'), false);
-      assert.equal(error.message.includes('boom'), false);
+      assert.equal(error.message.includes('a'.repeat(48)), false);
+      assert.equal(error.message.includes('boom'), true);
+      assert.ok(error.message.length <= 120);
       return true;
     },
   );

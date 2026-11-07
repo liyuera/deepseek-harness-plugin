@@ -194,6 +194,28 @@ async function readOauthClient(baseUrl, requestJsonFn) {
 }
 
 /**
+ * Redact secrets and token-like blobs from an upstream error message before it
+ * is shown to the user (the platform's own login copy is useful, but a token or
+ * echoed credential must never reach the board).
+ *
+ * @param {string} message raw upstream `msg`
+ * @param {string[]} secrets values that must never be echoed
+ * @returns {string} clipped, redacted copy ('' when nothing safe is left)
+ */
+export function safeUpstreamDetail(message, secrets = []) {
+  if (typeof message !== 'string' || message === '') return '';
+  let text = message;
+  for (const secret of secrets) {
+    if (typeof secret === 'string' && secret.length > 0) {
+      text = text.split(secret).join('***');
+    }
+  }
+  text = text.replace(/[A-Za-z0-9+/=_-]{32,}/g, '…');
+  text = text.replace(/[\r\n\t]+/g, ' ').trim();
+  return text.length > 80 ? `${text.slice(0, 79)}…` : text;
+}
+
+/**
  * Create the login service.
  *
  * @param {{fetchImpl?: Function, timeoutMs?: number}} [options]
@@ -430,7 +452,12 @@ export function createPlatformLogin(options = {}) {
       if (/密码|账号|用户|password|username|bad credentials|invalid_grant|unauthorized/i.test(upstreamMsg)) {
         throw new PlatformLoginError('invalid-credentials', MESSAGE.invalidCredentials, status);
       }
-      throw new PlatformLoginError('login-failed', MESSAGE.loginFailed, status);
+      const detail = safeUpstreamDetail(upstreamMsg, [password, username]);
+      throw new PlatformLoginError(
+        'login-failed',
+        detail === '' ? MESSAGE.loginFailed : `${MESSAGE.loginFailed}（平台：${detail}）`,
+        status,
+      );
     }
 
     const data = isPlainObject(body.data) ? body.data : {};
