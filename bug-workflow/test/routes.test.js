@@ -579,6 +579,25 @@ function createFakeDelivery({ start, status } = {}) {
   };
 }
 
+/**
+ * Fake review service (P5 Task 4b). Review is timer-driven and exposes NO HTTP
+ * route, so the snapshot only consumes `status()`.
+ */
+function createFakeReview({ status } = {}) {
+  const calls = { status: 0 };
+  return {
+    calls,
+    service: {
+      status() {
+        calls.status += 1;
+        if (typeof status === 'function') return status();
+        if (status !== undefined) return clone(status);
+        return { running: [], errors: {} };
+      },
+    },
+  };
+}
+
 /** Fake credentials service used by the token-store integration. */
 function createFakeCredentials(initial = {}) {
   const values = new Map(Object.entries(initial));
@@ -623,6 +642,7 @@ function handlersWith({
   analysis,
   fix,
   delivery,
+  review,
   clock = () => SERVER_TIME,
   domainOpenedAt = OPENED_AT,
 } = {}) {
@@ -641,6 +661,8 @@ function handlersWith({
   const fixDeps = fix === undefined ? createFakeFix() : fix;
   // Same convention for the P5 delivery service.
   const deliveryDeps = delivery === undefined ? createFakeDelivery() : delivery;
+  // And for the P5 timer-driven review service (snapshot only, no route).
+  const reviewDeps = review === undefined ? createFakeReview() : review;
   return {
     store,
     workspace,
@@ -651,6 +673,7 @@ function handlersWith({
     analysis: analysisDeps,
     fix: fixDeps,
     delivery: deliveryDeps,
+    review: reviewDeps,
     handlers: createHandlers({
       store,
       workspace,
@@ -661,6 +684,7 @@ function handlersWith({
       analysis: analysisDeps,
       fix: fixDeps,
       delivery: deliveryDeps,
+      review: reviewDeps,
       clock,
       domainOpenedAt,
     }),
@@ -769,6 +793,7 @@ test('GET /snapshot composes workspace, settings, tickets and serverTime', async
     analysis: { running: [], errors: {} },
     fix: { running: [], errors: {} },
     delivery: { running: [], errors: {} },
+    review: { running: [], errors: {} },
     tickets: [ticket],
     serverTime: SERVER_TIME,
   });
@@ -1069,6 +1094,46 @@ test('GET /snapshot sanitizes malformed delivery status fields', async () => {
     running: ['BUG-2'],
     errors: { 'BUG-1': '交付失败' },
   });
+});
+
+test('GET /snapshot reports the review running set and review-specific errors', async () => {
+  const review = createFakeReview({
+    status: {
+      running: ['BUG-7'],
+      errors: { 'BUG-2': 'AI Review 结论解析失败，请人工检查 MR 评论' },
+    },
+  });
+  const { handlers } = handlersWith({ review });
+  const { res, json } = await call(handlers.snapshot, { url: snapshotUrl() });
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(json.review, {
+    running: ['BUG-7'],
+    errors: { 'BUG-2': 'AI Review 结论解析失败，请人工检查 MR 评论' },
+  });
+  assert.equal(review.calls.status, 1);
+  // Review errors are their own namespace; delivery/fix stay empty.
+  assert.deepEqual(json.delivery, { running: [], errors: {} });
+  assert.deepEqual(json.fix, { running: [], errors: {} });
+});
+
+test('GET /snapshot degrades review to empty when unwired or failing', async () => {
+  const unwired = await call(handlersWith({ review: null }).handlers.snapshot, {
+    url: snapshotUrl(),
+  });
+  assert.equal(unwired.res.statusCode, 200);
+  assert.deepEqual(unwired.json.review, { running: [], errors: {} });
+
+  const failing = createFakeReview({
+    status: () => {
+      throw new Error('review status unavailable');
+    },
+  });
+  const { res, json } = await call(handlersWith({ review: failing }).handlers.snapshot, {
+    url: snapshotUrl(),
+  });
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(json.review, { running: [], errors: {} });
 });
 
 test('GET /snapshot returns an unbound workspace for an unknown live session', async () => {

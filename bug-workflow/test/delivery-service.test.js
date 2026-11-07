@@ -34,6 +34,7 @@ import test from 'node:test';
 
 import {
   DELIVERY_COMMIT_META_PREFIX,
+  DELIVERY_CONTEXT_META_PREFIX,
   DELIVERY_ERROR_META_PREFIX,
   DELIVERY_REASON_MESSAGES,
   DELIVERY_STALE_MESSAGE,
@@ -592,6 +593,23 @@ test('start() runs lint/test, commits locally, pushes and creates the MR end-to-
   // Success clears the delivery error (meta value null), never creates one.
   assert.equal(h.store.getMeta(`${DELIVERY_ERROR_META_PREFIX}${CODE}`), null);
   assert.equal(h.store.getMeta(`fix.error:${CODE}`), undefined);
+
+  // 7. The review context is persisted for the timer-driven review service:
+  // exactly the session/workspace/GitLab settings it needs to rebuild its
+  // client, and NEVER the GitLab token.
+  const context = h.store.getMeta(`${DELIVERY_CONTEXT_META_PREFIX}${CODE}`);
+  assert.deepEqual(context, {
+    sessionId: SESSION_ID,
+    cwd: h.fixture.repo,
+    gitlabBaseUrl: h.mock.url,
+    gitlabProjectPath: PROJECT,
+    commitType: 'fix',
+  });
+  assert.deepEqual(
+    Object.keys(context).sort(),
+    ['commitType', 'cwd', 'gitlabBaseUrl', 'gitlabProjectPath', 'sessionId'],
+  );
+  assert.equal(JSON.stringify(context).includes(TOKEN), false);
 });
 
 test('an existing open MR is reused and no second MR is created', async (t) => {
