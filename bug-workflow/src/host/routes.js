@@ -10,6 +10,8 @@
  *                                              platform task by code (see `importTask`)
  *   POST /bug-workflow/api/analyze         -> { ok, workflow:'analyzing', running }
  *                                              | { ok:false, code, message } (P3 real analysis)
+ *   POST /bug-workflow/api/fix             -> { ok, workflow:'fixing', running }
+ *                                              | { ok:false, code, message } (P4 real fix)
  *   POST /bug-workflow/api/settings        -> { ok, settings }
  *   POST /bug-workflow/api/platform-token  -> { ok, tokenPresent } (token is only written, never read back)
  *   POST /bug-workflow/api/sync            -> { ok, synced, created, updated, total, filtered, lastSyncAt }
@@ -54,6 +56,11 @@
  * analysis service is not wired) so the client never special-cases a missing
  * key.
  *
+ * P4 `/fix` mapping: `ticket-not-found` 404, `invalid-state`/`plan-not-approved`
+ * 409, `fix-unavailable` 503, branch/worktree input errors 400, unexpected
+ * host failures 500. The snapshot always carries `fix:{running, errors}` with
+ * the same shape as `analysis`.
+ *
  * Failures are closed over: every handler is wrapped, and no handler lets an
  * exception escape into the HTTP server. The plugin loads without storage; the
  * fallback handlers are the contract for that state.
@@ -71,6 +78,7 @@ export const API_PATHS = Object.freeze({
   snapshot: '/bug-workflow/api/snapshot',
   action: '/bug-workflow/api/action',
   analyze: '/bug-workflow/api/analyze',
+  fix: '/bug-workflow/api/fix',
   settings: '/bug-workflow/api/settings',
   platformToken: '/bug-workflow/api/platform-token',
   sync: '/bug-workflow/api/sync',
@@ -97,6 +105,7 @@ const ROUTE_METHODS = Object.freeze({
   snapshot: 'GET',
   action: 'POST',
   analyze: 'POST',
+  fix: 'POST',
   settings: 'POST',
   platformToken: 'POST',
   sync: 'POST',
@@ -175,6 +184,39 @@ const ANALYSIS_ERROR_STATUS = Object.freeze({
 /** 503 message for a host built without the analysis service (older wiring). */
 const ANALYSIS_UNAVAILABLE_MESSAGE = '分析服务不可用，请稍后重试';
 
+/**
+ * `POST /fix` failure code -> HTTP status (P4 plan). A missing ticket is 404; a
+ * state-machine refusal and an unapproved plan are 409; an unwired service or a
+ * missing runner is a retryable 503. Branch/worktree input errors are 400
+ * (fixable by correcting the ticket/settings) and unexpected git/host failures
+ * are 500. Unknown codes are programming errors -> 500.
+ */
+const FIX_ERROR_STATUS = Object.freeze({
+  'ticket-not-found': 404,
+  'not-found': 404,
+  'invalid-state': 409,
+  'invalid-transition': 409,
+  'plan-not-approved': 409,
+  'worktree-conflict': 409,
+  'unknown-workspace': 400,
+  'invalid-code': 400,
+  'invalid-input': 400,
+  'invalid-payload': 400,
+  'invalid-branch': 400,
+  'invalid-branch-user': 400,
+  'invalid-family': 400,
+  'invalid-version': 400,
+  'invalid-worktree-path': 400,
+  'fix-unavailable': 503,
+  'analysis-unavailable': 503,
+  'git-timeout': 503,
+  'git-failed': 500,
+  internal: 500,
+});
+
+/** 503 message for a host built without the fix service. */
+const FIX_UNAVAILABLE_MESSAGE = '修复服务不可用，请稍后重试';
+
 /** Explicit allow-list of loopback Host header values (with optional port). */
 const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1']);
 
@@ -185,7 +227,7 @@ const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1']);
 const LOOPBACK_REMOTE_ADDRESSES = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
 
 /**
- * Build the seven route handlers over an already-open store.
+ * Build the route handlers over an already-open store.
  *
  * @param {object} deps
  * @param {object} deps.store `createStore()` result (or an equivalent double)
@@ -200,12 +242,16 @@ const LOOPBACK_REMOTE_ADDRESSES = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1
  *   `createAnalysisService()` result for `POST /analyze` and the snapshot
  *   `analysis` block; when null `/analyze` answers 503 `analysis-unavailable`
  *   and the snapshot reports empty analysis state
+ * @param {{service: object}|null} [deps.fix]
+ *   `createFixService()` result for `POST /fix` and the snapshot `fix` block;
+ *   when null `/fix` answers 503 `fix-unavailable` and the snapshot reports
+ *   empty fix state
  * @param {() => string} [deps.clock] ISO 8601 server time for snapshots
  * @param {number|null} [deps.domainOpenedAt] domain open timestamp for health
  * @param {number} [deps.bodyTimeoutMs] POST body read deadline (default 10 s)
  * @param {((entry: {event: string, error: unknown}) => void)|null} [deps.log]
  *   optional host logger; receives full errors that are hidden from responses
- * @returns {{health: Function, snapshot: Function, action: Function, analyze: Function, settings: Function, platformToken: Function, sync: Function}}
+ * @returns {{health: Function, snapshot: Function, action: Function, analyze: Function, fix: Function, settings: Function, platformToken: Function, sync: Function}}
  */
 export function createHandlers({
   store,
@@ -214,6 +260,7 @@ export function createHandlers({
   sync = null,
   importTask = null,
   analysis = null,
+  fix = null,
   clock = defaultClock,
   domainOpenedAt = null,
   bodyTimeoutMs = BODY_TIMEOUT_MS,
@@ -253,6 +300,16 @@ export function createHandlers({
     }
   }
   const analysisDeps = analysis === undefined ? null : analysis;
+  if (fix !== null && fix !== undefined) {
+    if (typeof fix !== 'object'
+      || typeof fix.service?.start !== 'function'
+      || typeof fix.service?.status !== 'function') {
+      throw new TypeError(
+        'createHandlers() fix.service must expose start(sessionId, cwd, code) and status()',
+      );
+    }
+  }
+  const fixDeps = fix === undefined ? null : fix;
   if (typeof clock !== 'function') {
     throw new TypeError('createHandlers() requires clock to be a function');
   }
@@ -308,7 +365,9 @@ export function createHandlers({
         dicts: readDicts(store),
         // P3: analysis progress + static per-ticket errors. Absent wiring
         // reports empty state instead of an undefined key.
-        analysis: readAnalysisStatus(analysisDeps),
+        analysis: readServiceStatus(analysisDeps),
+        // P4: fix progress + static per-ticket errors, same shape.
+        fix: readServiceStatus(fixDeps),
         tickets: snapshot.tickets,
         serverTime: clock(),
       });
@@ -475,6 +534,80 @@ export function createHandlers({
         status,
         failureCode,
         clipMessage(typeof result?.message === 'string' ? result.message : '分析启动失败'),
+      );
+    }),
+
+    /**
+     * Start the real (P4) fix for one approved ticket: `{sessionId, code}`.
+     *
+     * The service prepares the worktree/branch and persists the branch
+     * metadata, then runs the write-capable subagent in the background; this
+     * route answers as soon as the job is launched. A duplicate click while the
+     * job runs is a 200 with `running:true` (no second subagent), and the
+     * service restarts a crash-orphaned `fixing` ticket or a ticket blocked
+     * from `fixing` (the latter after an availability check). Only an unwired
+     * fix service or an unavailable runner is a retryable 503.
+     */
+    fix: safe(async (req, res) => {
+      if (!guard(req, res, ROUTE_METHODS.fix)) return;
+      if (!guardJsonContentType(req, res)) return;
+      if (!guardOrigin(req, res)) return;
+
+      const body = await readJsonBody(req, bodyTimeoutMs);
+      if (!body.ok) {
+        sendError(res, body.status, body.code, body.message);
+        if (body.destroyRequest === true) destroyRequest(req);
+        return;
+      }
+      const input = body.value;
+
+      const sessionId = normalizeSessionId(input.sessionId);
+      if (sessionId === undefined) {
+        sendError(res, 400, 'missing-session', '缺少有效的 sessionId');
+        return;
+      }
+
+      const code = normalizeCode(input.code);
+      if (code === undefined) {
+        sendError(res, 400, 'invalid-code', '缺少有效的工单编号 code');
+        return;
+      }
+
+      if (fixDeps === null) {
+        sendError(res, 503, 'fix-unavailable', FIX_UNAVAILABLE_MESSAGE);
+        return;
+      }
+
+      // The child must work in a real repository; an unbound session would
+      // otherwise resolve a worktree relative to the wrong directory.
+      const resolved = normalizeWorkspace(workspace.resolve(sessionId));
+      if (resolved.path === null) {
+        sendError(res, 400, 'unknown-workspace', '无法确定工作区路径，无法开始修复');
+        return;
+      }
+
+      const result = await fixDeps.service.start(sessionId, resolved.path, code);
+      if (result?.ok === true) {
+        sendJsonSafe(res, 200, {
+          ok: true,
+          workflow: 'fixing',
+          running: result.running === true,
+        });
+        return;
+      }
+
+      const failureCode = typeof result?.code === 'string' ? result.code : 'internal';
+      const status = FIX_ERROR_STATUS[failureCode];
+      if (status === undefined) {
+        notifyLog(log, 'fix-result', result);
+        sendError(res, 500, 'internal', '修复启动失败');
+        return;
+      }
+      sendError(
+        res,
+        status,
+        failureCode,
+        clipMessage(typeof result?.message === 'string' ? result.message : '修复启动失败'),
       );
     }),
 
@@ -646,7 +779,7 @@ export function createHandlers({
 }
 
 /**
- * Register the seven real routes on `ctx.webServer` and return a disposer.
+ * Register the real routes on `ctx.webServer` and return a disposer.
  *
  * The caller must have opened the domain and built the store already. Register
  * this only after disposing `registerUnavailableRoutes()`: duplicate exact paths
@@ -654,7 +787,7 @@ export function createHandlers({
  *
  * @param {object} ctx Cordis context carrying `webServer`
  * @param {object} deps same deps as {@link createHandlers}
- * @returns {() => void} idempotent disposer removing all seven routes
+ * @returns {() => void} idempotent disposer removing all registered routes
  */
 export function registerRoutes(ctx, deps) {
   const webServer = getWebServer(ctx);
@@ -674,7 +807,7 @@ export function registerRoutes(ctx, deps) {
  *
  * @param {object} ctx Cordis context carrying `webServer`
  * @param {{status?: string, stage?: string, error?: string}} [health] shared health state
- * @returns {() => void} idempotent disposer removing all seven routes
+ * @returns {() => void} idempotent disposer removing all registered routes
  */
 export function registerUnavailableRoutes(ctx, health = {}) {
   const webServer = getWebServer(ctx);
@@ -691,6 +824,7 @@ export function registerUnavailableRoutes(ctx, health = {}) {
     snapshot: unavailableHandler(ROUTE_METHODS.snapshot, health),
     action: unavailableHandler(ROUTE_METHODS.action, health),
     analyze: unavailableHandler(ROUTE_METHODS.analyze, health),
+    fix: unavailableHandler(ROUTE_METHODS.fix, health),
     settings: unavailableHandler(ROUTE_METHODS.settings, health),
     platformToken: unavailableHandler(ROUTE_METHODS.platformToken, health),
     sync: unavailableHandler(ROUTE_METHODS.sync, health),
@@ -897,19 +1031,19 @@ function emptyDicts() {
 }
 
 /**
- * Snapshot `analysis` object. The analysis service is optional (older wiring, a
+ * Snapshot `analysis`/`fix` object. Both services are optional (older wiring, a
  * profile without subagent services, or a failed service construction), so a
  * missing/failing `status()` degrades to empty state and the board keeps
  * rendering. Only static strings persisted by the service are exposed.
  */
-function readAnalysisStatus(analysis) {
+function readServiceStatus(serviceDeps) {
   const empty = { running: [], errors: {} };
-  if (analysis === null || analysis === undefined) return empty;
-  if (typeof analysis.service?.status !== 'function') return empty;
+  if (serviceDeps === null || serviceDeps === undefined) return empty;
+  if (typeof serviceDeps.service?.status !== 'function') return empty;
 
   let status;
   try {
-    status = analysis.service.status();
+    status = serviceDeps.service.status();
   } catch {
     return empty;
   }
