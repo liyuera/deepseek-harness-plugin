@@ -52,10 +52,19 @@
  *     changes request at `MAX_REVIEW_ROUNDS` (3) blocks with
  *     `review-rounds-exhausted` instead of transitioning. A successful
  *     `review_fix_done` must NOT increment rounds a second time.
- *   - The review-fix job requires the stored worktree to be a REGISTERED
- *     worktree of the ticket repository checked out on `branch.name`
- *     (`git.probeWorktree === 'same'`). Otherwise it blocks
- *     `review-fix-failed` before any git write. On success the host (not the
+ *   - The review-fix job applies the SAME hard identity gate as delivery before
+ *     the child starts or any git write happens: the stored worktree must
+ *     resolve STRICTLY inside the resolved repository (`isPathInsideRepo`, so
+ *     the main worktree/repository root and any `..` escape are refused),
+ *     `branch.name` must pass `git.assertPushableBranch` (protected branches
+ *     and ref-like names are refused) and, when `mr.sourceBranch` is a
+ *     non-empty string, it must equal `branch.name`. It must additionally be a
+ *     REGISTERED worktree of the ticket repository checked out on `branch.name`
+ *     (`git.probeWorktree === 'same'`). Any failure blocks `review-fix-failed`
+ *     before the child runs or before `git add -A`, so a tampered/legacy ticket
+ *     can never commit the main worktree. The recovery/push paths
+ *     (`pushRecordedFix`/`finishRecordedFix`/`restartFixJob`) apply the same
+ *     gate before replaying a recorded commit. On success the host (not the
  *     child) runs `git add -A`/commit/revParse/push; a clean worktree blocks
  *     `review-fix-no-changes`.
  *   - A pending-commit record is bound to the round and note that produced it:
@@ -82,7 +91,9 @@ import {
   DELIVERY_CONTEXT_META_PREFIX,
   buildCommitMessage,
   createRepoLock,
+  isPathInsideRepo,
 } from './delivery-service.js';
+import { assertPushableBranch } from './git.js';
 import { MAX_REVIEW_ROUNDS } from './protocol.js';
 import { isReviewBody, parseReview } from './review-parser.js';
 
@@ -672,6 +683,16 @@ export function createReviewService({
       return { transitioned: blocked };
     }
 
+    // Same hard identity gate as the live run (P5 final review I1): a record
+    // whose worktree/branch is not safe to push is discarded, never pushed.
+    const refusal = await fixBranchRefusal(repo, branch, ticket);
+    if (disposed) return { transitioned: false };
+    if (refusal !== undefined) {
+      await clearFixCommitRecord(code);
+      const blocked = await blockTicket(code, refusal, 'fixing_review');
+      return { transitioned: blocked };
+    }
+
     let probe;
     try {
       probe = await git.probeWorktree(repo, branch.worktree, branch.name);
@@ -719,7 +740,7 @@ export function createReviewService({
         const blocked = await blockTicket(code, 'review-fix-failed', 'fixing_review');
         return { transitioned: blocked };
       }
-      return await finishRecordedFix({ code, record });
+      return await finishRecordedFix({ code, record, repo });
     } finally {
       repoLock.release(repo, owner);
     }
@@ -731,8 +752,13 @@ export function createReviewService({
    * already-applied patch returns the cached result instead of appending twice.
    * The record must still belong to the CURRENT round/note (N1): a mismatch
    * drops it and returns `undefined` so the caller restarts this round.
+   *
+   * The caller already applied the hard worktree/branch identity gate before
+   * the push; it is re-applied here against the freshly read ticket as a
+   * defense-in-depth check (P5 final review I1). A refused branch drops the
+   * record and blocks instead of completing a round for a foreign worktree.
    */
-  async function finishRecordedFix({ code, record }) {
+  async function finishRecordedFix({ code, record, repo }) {
     const current = readTicket(code);
     if (!current.ok || current.ticket.workflow !== 'fixing_review') {
       await clearFixCommitRecord(code);
@@ -746,6 +772,21 @@ export function createReviewService({
     if (record.round !== mrRounds || !sameNoteId(record.noteId, readLastNoteId(code))) {
       await clearFixCommitRecord(code);
       return undefined;
+    }
+    // Same hard identity gate as `pushRecordedFix` (the ticket may have been
+    // rewritten between the push and this write).
+    const branch = readBranch(ticket);
+    if (branch === null) {
+      await clearFixCommitRecord(code);
+      const blocked = await blockTicket(code, 'review-fix-failed', 'fixing_review');
+      return { transitioned: blocked };
+    }
+    const refusal = await fixBranchRefusal(repo, branch, ticket);
+    if (disposed) return { transitioned: false };
+    if (refusal !== undefined) {
+      await clearFixCommitRecord(code);
+      const blocked = await blockTicket(code, refusal, 'fixing_review');
+      return { transitioned: blocked };
     }
     const fixes = Array.isArray(ticket.fixes) ? ticket.fixes : [];
     const reviewRounds = Array.isArray(ticket.reviewRounds) ? ticket.reviewRounds : [];
@@ -826,6 +867,18 @@ export function createReviewService({
       return { transitioned: blocked };
     }
 
+    // The restart runs the same host commit path, so the same hard identity
+    // gate applies BEFORE the lock/child is taken (P5 final review I1).
+    const branch = readBranch(ticket);
+    if (branch !== null) {
+      const refusal = await fixBranchRefusal(repo, branch, ticket);
+      if (disposed) return { transitioned: false };
+      if (refusal !== undefined) {
+        const blocked = await blockTicket(code, refusal, 'fixing_review');
+        return { transitioned: blocked };
+      }
+    }
+
     const owner = `review:${code}`;
     if (!repoLock.acquire(repo, owner)) {
       // Another job owns this repository; retry the recovery next tick.
@@ -888,6 +941,46 @@ export function createReviewService({
   }
 
   /**
+   * Hard worktree/branch identity gate shared by every review-fix path that
+   * may write the ticket worktree or push a recorded commit (P5 final review
+   * I1). The persisted `branch` metadata is untrusted:
+   *
+   *   1. `branch.name` must pass `assertPushableBranch` (protected integration
+   *      branches and ref-like names are refused) BEFORE `git add -A`;
+   *   2. when the ticket carries a non-empty `mr.sourceBranch`, it must equal
+   *      `branch.name` (the fix must belong to the reviewed MR);
+   *   3. the worktree must resolve STRICTLY inside the resolved repository
+   *      (realpath both sides), so the repository root/main worktree or a
+   *      `..`/symlink escape is never written.
+   *
+   * Returns the static block reason on refusal (`review-fix-failed`, the same
+   * reason the client already renders) or `undefined` when the branch is
+   * safe to use.
+   */
+  async function fixBranchRefusal(repo, branch, ticket) {
+    try {
+      assertPushableBranch(branch.name);
+    } catch {
+      return 'review-fix-failed';
+    }
+    const sourceBranch = ticket.mr?.sourceBranch;
+    if (
+      typeof sourceBranch === 'string'
+      && sourceBranch.trim() !== ''
+      && sourceBranch !== branch.name
+    ) {
+      return 'review-fix-failed';
+    }
+    let inside = false;
+    try {
+      inside = await isPathInsideRepo(repo, branch.worktree);
+    } catch {
+      inside = false;
+    }
+    return inside ? undefined : 'review-fix-failed';
+  }
+
+  /**
    * One background review-fix run: probe the registered worktree, run the
    * write-capable child, verify changes, commit/push from the HOST, then append
    * the ledger entries and advance. Never rejects; cancelled/disposed runs
@@ -899,6 +992,17 @@ export function createReviewService({
       const branch = readBranch(ticket);
       if (branch === null) {
         await failFix(code, 'review-fix-failed', entry);
+        return;
+      }
+
+      // The stored path/name are metadata, not proof: a main-worktree path, a
+      // protected branch or a foreign MR source must block BEFORE the child or
+      // any `git add -A`. This mirrors delivery's `isInsideRepo` +
+      // `assertPushableBranch` gate (P5 final review I1).
+      const refusal = await fixBranchRefusal(repo, branch, ticket);
+      if (entry.cancelled || disposed) return;
+      if (refusal !== undefined) {
+        await failFix(code, refusal, entry);
         return;
       }
 

@@ -553,12 +553,10 @@ export function createDeliveryService({
     }
     // `git rev-parse --show-toplevel` returns a real path; the stored worktree
     // may go through a symlinked tmp/workspace root (e.g. macOS /var ->
-    // /private/var), so compare real paths instead of raw strings.
-    const [repoReal, worktreeReal] = await Promise.all([
-      realpathOrSelf(repo),
-      realpathOrSelf(branch.worktree),
-    ]);
-    if (!isInsideRepo(repoReal, worktreeReal)) {
+    // /private/var), so compare real paths instead of raw strings. The helper
+    // is shared with the review service, which must apply the same hard gate
+    // before it commits a review fix.
+    if (!(await isPathInsideRepo(repo, branch.worktree))) {
       return failure('worktree-missing', DELIVERY_START_MESSAGES['worktree-missing']);
     }
 
@@ -1218,6 +1216,30 @@ async function realpathOrSelf(path) {
   } catch {
     return path;
   }
+}
+
+/**
+ * True when `candidate` resolves to a path STRICTLY below `repo`.
+ *
+ * Both sides are realpathed first, so a symlinked tmp/workspace root (macOS
+ * `/var` -> `/private/var`) or a `..` segment cannot smuggle the main worktree
+ * past the check. The repository root itself is NOT inside the repository: the
+ * root is the main worktree, and both delivery and review-fix must refuse to
+ * stage/commit there. Shared with `review-service.js` as its hard worktree
+ * identity gate (P5 final review I1).
+ *
+ * @param {unknown} repo resolved repository root
+ * @param {unknown} candidate stored worktree path (untrusted metadata)
+ * @returns {Promise<boolean>}
+ */
+export async function isPathInsideRepo(repo, candidate) {
+  if (typeof repo !== 'string' || typeof candidate !== 'string') return false;
+  if (repo.trim() === '' || candidate.trim() === '') return false;
+  const [repoReal, candidateReal] = await Promise.all([
+    realpathOrSelf(repo),
+    realpathOrSelf(candidate),
+  ]);
+  return isInsideRepo(repoReal, candidateReal);
 }
 
 /** Both GitLab settings are required; whitespace-only counts as unset. */

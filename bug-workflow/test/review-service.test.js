@@ -24,7 +24,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import {
   appendFileSync,
@@ -36,6 +36,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { promisify } from 'node:util';
 
 import { buildReviewFixPrompt } from '../src/host/agent-access.js';
 import {
@@ -167,8 +168,34 @@ function gitSync(cwd, args) {
 }
 
 /**
+ * Real git executor that records every `git -C <dir> <cmd>` call. The I1 gate
+ * tests use it to prove that NO add/commit/push was ever attempted, not merely
+ * that the visible HEAD happened to stay the same.
+ */
+function createRecordingGit() {
+  const calls = [];
+  const git = createGit({
+    execFile: (file, args, options) => {
+      calls.push({ file, args: [...args] });
+      return promisify(execFile)(file, args, options);
+    },
+  });
+  return { git, calls };
+}
+
+/** `git add`/`commit`/`push` invocations captured by `createRecordingGit()`. */
+function gitWriteCalls(calls) {
+  return calls.filter((call) => call.file === 'git'
+    && call.args[0] === '-C'
+    && (call.args[2] === 'add' || call.args[2] === 'commit' || call.args[2] === 'push'));
+}
+
+/**
  * Build a real repository with one commit on `main`, a `feature-V1` target,
  * a linked worktree on the personal branch, and a local bare `origin`.
+ * `options.mainWorktree` checks the personal branch out in the MAIN worktree
+ * instead (a shape where `probeWorktree(repo, repo, branch)` is `'same'`, so
+ * only the strict-descendant gate can keep a host commit off the main tree).
  */
 function createRepoFixture(options = {}) {
   const branchName = typeof options.branchName === 'string' ? options.branchName : BRANCH.name;
@@ -192,8 +219,12 @@ function createRepoFixture(options = {}) {
   gitSync(repo, ['remote', 'add', 'origin', origin]);
 
   const worktree = join(repo, '.dsh-worktrees', CODE);
-  mkdirSync(join(repo, '.dsh-worktrees'), { recursive: true });
-  gitSync(repo, ['worktree', 'add', '-b', branchName, '--', worktree, 'main']);
+  if (options.mainWorktree === true) {
+    gitSync(repo, ['checkout', '-q', '-b', branchName]);
+  } else {
+    mkdirSync(join(repo, '.dsh-worktrees'), { recursive: true });
+    gitSync(repo, ['worktree', 'add', '-b', branchName, '--', worktree, 'main']);
+  }
 
   return {
     root,
@@ -1371,6 +1402,262 @@ test('an unregistered/unrelated worktree blocks review-fix-failed before any git
   assert.equal(h.runner.calls.length, 0);
   assert.equal(gitSync(h.fixture.worktree, ['rev-parse', 'HEAD']), branchHeadBefore);
   assert.equal(bareHasBranch(h.fixture.origin, BRANCH.name), false);
+});
+
+test('a main-worktree branch is refused before the runner, commit and push (I1)', async (t) => {
+  const recording = createRecordingGit();
+  const h = await createHarness(t, {
+    git: recording.git,
+    notes: [note(300, CHANGES_BODY, '2026-11-07T04:00:10.000Z')],
+  });
+  // Persisted metadata is untrusted: a tampered/legacy ticket can point the
+  // review fix at the repository root on the protected `main` branch.
+  const ticket = h.store.get(CODE);
+  ticket.branch = { ...ticket.branch, name: 'main', worktree: h.fixture.repo };
+  ticket.mr = { ...ticket.mr, sourceBranch: 'main' };
+  await h.domain.table('tickets').put(CODE, ticket);
+
+  const mainHeadBefore = gitSync(h.fixture.repo, ['rev-parse', 'HEAD']);
+  const mainStatusBefore = gitSync(h.fixture.repo, ['status', '--porcelain']);
+  const worktreeHeadBefore = gitSync(h.fixture.worktree, ['rev-parse', 'HEAD']);
+
+  const result = await h.service.tick();
+  assert.equal(result.transitioned, 1);
+  await waitForIdle(h.service);
+
+  const after = h.store.get(CODE);
+  assert.equal(after.workflow, 'blocked');
+  assert.equal(after.blockedFrom, 'fixing_review');
+  assert.equal(after.blockedReason, 'review-fix-failed');
+  // No child, no `git add -A`/commit/push, no ledger entry, no pending record.
+  assert.equal(h.runner.calls.length, 0);
+  assert.deepEqual(gitWriteCalls(recording.calls), []);
+  assert.equal(after.fixes.length, 0);
+  assert.equal(after.reviewRounds.length, 0);
+  assert.equal(h.store.getMeta(REVIEW_FIX_COMMIT_META_PREFIX + CODE), null);
+  // The main worktree is completely untouched (HEAD and index/working tree).
+  assert.equal(gitSync(h.fixture.repo, ['rev-parse', 'HEAD']), mainHeadBefore);
+  assert.equal(gitSync(h.fixture.repo, ['status', '--porcelain']), mainStatusBefore);
+  assert.equal(gitSync(h.fixture.worktree, ['rev-parse', 'HEAD']), worktreeHeadBefore);
+  assert.equal(bareHasBranch(h.fixture.origin, 'main'), false);
+  assert.equal(
+    h.store.getMeta(REVIEW_ERROR_META_PREFIX + CODE),
+    REVIEW_REASON_MESSAGES['review-fix-failed'],
+  );
+});
+
+test('the repository root is refused even when it is checked out on the personal branch (I1)', async (t) => {
+  // This is the exact shape the old gate missed: no linked worktree exists and
+  // the MAIN worktree is checked out on the pushable personal branch, so
+  // `probeWorktree(root, root, branch)` reports 'same'. Only the strict
+  // "inside the repository, not the root" gate keeps the host commit off main.
+  const recording = createRecordingGit();
+  const fixture = createRepoFixture({ mainWorktree: true });
+  const h = await createHarness(t, {
+    fixture,
+    git: recording.git,
+    notes: [note(304, CHANGES_BODY, '2026-11-07T04:00:10.000Z')],
+  });
+  const ticket = h.store.get(CODE);
+  ticket.branch = { ...ticket.branch, worktree: h.fixture.repo };
+  await h.domain.table('tickets').put(CODE, ticket);
+  const probe = await h.git.probeWorktree(h.fixture.repo, h.fixture.repo, BRANCH.name);
+  assert.equal(probe.state, 'same');
+  const mainHeadBefore = gitSync(h.fixture.repo, ['rev-parse', 'HEAD']);
+
+  await h.service.tick();
+  await waitForIdle(h.service);
+
+  const after = h.store.get(CODE);
+  assert.equal(after.workflow, 'blocked');
+  assert.equal(after.blockedFrom, 'fixing_review');
+  assert.equal(after.blockedReason, 'review-fix-failed');
+  assert.equal(h.runner.calls.length, 0);
+  assert.deepEqual(gitWriteCalls(recording.calls), []);
+  assert.equal(gitSync(h.fixture.repo, ['rev-parse', 'HEAD']), mainHeadBefore);
+  assert.equal(gitSync(h.fixture.repo, ['status', '--porcelain']), '');
+  assert.equal(bareHasBranch(h.fixture.origin, BRANCH.name), false);
+});
+
+test('a worktree outside the repository (incl. a .. escape) is refused before the runner', async (t) => {
+  const cases = [
+    ['absolute-outside', (h) => join(h.fixture.root, 'outside-wt')],
+    ['dotdot-escape', (h) => join(h.fixture.repo, '..', 'outside-wt')],
+  ];
+  for (const [label, outsidePath] of cases) {
+    const recording = createRecordingGit();
+    const h = await createHarness(t, {
+      git: recording.git,
+      notes: [note(301, CHANGES_BODY, '2026-11-07T04:00:10.000Z')],
+    });
+    const outside = outsidePath(h);
+    mkdirSync(outside, { recursive: true });
+    const ticket = h.store.get(CODE);
+    ticket.branch = { ...ticket.branch, worktree: outside };
+    await h.domain.table('tickets').put(CODE, ticket);
+    const mainHeadBefore = gitSync(h.fixture.repo, ['rev-parse', 'HEAD']);
+    const worktreeHeadBefore = gitSync(h.fixture.worktree, ['rev-parse', 'HEAD']);
+
+    await h.service.tick();
+    await waitForIdle(h.service);
+
+    const after = h.store.get(CODE);
+    assert.equal(after.workflow, 'blocked', label);
+    assert.equal(after.blockedFrom, 'fixing_review', label);
+    assert.equal(after.blockedReason, 'review-fix-failed', label);
+    assert.equal(h.runner.calls.length, 0, label);
+    assert.deepEqual(gitWriteCalls(recording.calls), [], label);
+    assert.equal(gitSync(h.fixture.repo, ['rev-parse', 'HEAD']), mainHeadBefore, label);
+    assert.equal(gitSync(h.fixture.worktree, ['rev-parse', 'HEAD']), worktreeHeadBefore, label);
+    assert.equal(bareHasBranch(h.fixture.origin, BRANCH.name), false, label);
+  }
+});
+
+test('protected branch names are refused before the runner even with a registered worktree', async (t) => {
+  for (const branchName of ['main', 'release-x']) {
+    const h = await createHarness(t, {
+      notes: [note(302, CHANGES_BODY, '2026-11-07T04:00:10.000Z')],
+    });
+    const ticket = h.store.get(CODE);
+    ticket.branch = { ...ticket.branch, name: branchName };
+    ticket.mr = { ...ticket.mr, sourceBranch: branchName };
+    await h.domain.table('tickets').put(CODE, ticket);
+    const mainHeadBefore = gitSync(h.fixture.repo, ['rev-parse', 'HEAD']);
+    const worktreeHeadBefore = gitSync(h.fixture.worktree, ['rev-parse', 'HEAD']);
+
+    await h.service.tick();
+    await waitForIdle(h.service);
+
+    const after = h.store.get(CODE);
+    assert.equal(after.workflow, 'blocked', branchName);
+    assert.equal(after.blockedFrom, 'fixing_review', branchName);
+    assert.equal(after.blockedReason, 'review-fix-failed', branchName);
+    assert.equal(h.runner.calls.length, 0, branchName);
+    assert.equal(gitSync(h.fixture.repo, ['rev-parse', 'HEAD']), mainHeadBefore, branchName);
+    assert.equal(gitSync(h.fixture.worktree, ['rev-parse', 'HEAD']), worktreeHeadBefore, branchName);
+    assert.equal(bareHasBranch(h.fixture.origin, branchName), false, branchName);
+  }
+});
+
+test('a branch that is not the reviewed MR source branch is refused before the runner', async (t) => {
+  const h = await createHarness(t, {
+    notes: [note(303, CHANGES_BODY, '2026-11-07T04:00:10.000Z')],
+  });
+  // `feat-V1-other` is pushable and the worktree is inside the repository, but
+  // the reviewed MR belongs to `feat-V1-ly`: the fix must not target another ref.
+  const ticket = h.store.get(CODE);
+  ticket.branch = { ...ticket.branch, name: 'feat-V1-other' };
+  await h.domain.table('tickets').put(CODE, ticket);
+  const mainHeadBefore = gitSync(h.fixture.repo, ['rev-parse', 'HEAD']);
+  const worktreeHeadBefore = gitSync(h.fixture.worktree, ['rev-parse', 'HEAD']);
+
+  await h.service.tick();
+  await waitForIdle(h.service);
+
+  const after = h.store.get(CODE);
+  assert.equal(after.workflow, 'blocked');
+  assert.equal(after.blockedFrom, 'fixing_review');
+  assert.equal(after.blockedReason, 'review-fix-failed');
+  assert.equal(h.runner.calls.length, 0);
+  assert.equal(gitSync(h.fixture.repo, ['rev-parse', 'HEAD']), mainHeadBefore);
+  assert.equal(gitSync(h.fixture.worktree, ['rev-parse', 'HEAD']), worktreeHeadBefore);
+  assert.equal(bareHasBranch(h.fixture.origin, 'feat-V1-other'), false);
+});
+
+test('a pending-commit record with a protected branch or foreign worktree is discarded, never pushed (I1)', async (t) => {
+  const blocking = parseReview(CHANGES_BODY).blocking;
+
+  // Case 1: a record for the protected `main` branch on the main worktree.
+  {
+    const recording = createRecordingGit();
+    const h = await createHarness(t, {
+      git: recording.git,
+      workflow: 'fixing_review',
+      rounds: 1,
+      mr: {
+        ...MR,
+        rounds: 1,
+        verdict: 'changes',
+        blockingIssues: blocking,
+        nonBlockingIssues: [],
+      },
+      lastNoteId: 60,
+    });
+    const ticket = h.store.get(CODE);
+    ticket.branch = { ...ticket.branch, name: 'main', worktree: h.fixture.repo };
+    ticket.mr = { ...ticket.mr, sourceBranch: 'main' };
+    await h.domain.table('tickets').put(CODE, ticket);
+    const mainHeadBefore = gitSync(h.fixture.repo, ['rev-parse', 'HEAD']);
+    await h.store.setMeta(REVIEW_FIX_COMMIT_META_PREFIX + CODE, fixCommitRecord({
+      sha: mainHeadBefore,
+      worktree: h.fixture.repo,
+      branch: 'main',
+      round: 1,
+      noteId: 60,
+    }));
+
+    const result = await h.service.tick();
+    assert.equal(result.transitioned, 1);
+    await waitForIdle(h.service);
+
+    const after = h.store.get(CODE);
+    assert.equal(after.workflow, 'blocked');
+    assert.equal(after.blockedFrom, 'fixing_review');
+    assert.equal(after.blockedReason, 'review-fix-failed');
+    assert.equal(h.runner.calls.length, 0);
+    assert.deepEqual(gitWriteCalls(recording.calls), []);
+    assert.equal(h.store.getMeta(REVIEW_FIX_COMMIT_META_PREFIX + CODE), null);
+    assert.equal(gitSync(h.fixture.repo, ['rev-parse', 'HEAD']), mainHeadBefore);
+    assert.equal(bareHasBranch(h.fixture.origin, 'main'), false);
+    assert.equal(
+      h.store.getMeta(REVIEW_ERROR_META_PREFIX + CODE),
+      REVIEW_REASON_MESSAGES['review-fix-failed'],
+    );
+  }
+
+  // Case 2: a record whose worktree is outside the resolved repository.
+  {
+    const recording = createRecordingGit();
+    const h = await createHarness(t, {
+      git: recording.git,
+      workflow: 'fixing_review',
+      rounds: 1,
+      mr: {
+        ...MR,
+        rounds: 1,
+        verdict: 'changes',
+        blockingIssues: blocking,
+        nonBlockingIssues: [],
+      },
+      lastNoteId: 61,
+    });
+    const outside = join(h.fixture.root, 'foreign-wt');
+    mkdirSync(outside, { recursive: true });
+    const ticket = h.store.get(CODE);
+    ticket.branch = { ...ticket.branch, worktree: outside };
+    await h.domain.table('tickets').put(CODE, ticket);
+    const worktreeHeadBefore = gitSync(h.fixture.worktree, ['rev-parse', 'HEAD']);
+    await h.store.setMeta(REVIEW_FIX_COMMIT_META_PREFIX + CODE, fixCommitRecord({
+      sha: 'b'.repeat(40),
+      worktree: outside,
+      round: 1,
+      noteId: 61,
+    }));
+
+    const result = await h.service.tick();
+    assert.equal(result.transitioned, 1);
+    await waitForIdle(h.service);
+
+    const after = h.store.get(CODE);
+    assert.equal(after.workflow, 'blocked');
+    assert.equal(after.blockedFrom, 'fixing_review');
+    assert.equal(after.blockedReason, 'review-fix-failed');
+    assert.equal(h.runner.calls.length, 0);
+    assert.deepEqual(gitWriteCalls(recording.calls), []);
+    assert.equal(h.store.getMeta(REVIEW_FIX_COMMIT_META_PREFIX + CODE), null);
+    assert.equal(gitSync(h.fixture.worktree, ['rev-parse', 'HEAD']), worktreeHeadBefore);
+    assert.equal(bareHasBranch(h.fixture.origin, BRANCH.name), false);
+  }
 });
 
 test('runner failure codes map to distinct static review-fix reasons', async (t) => {

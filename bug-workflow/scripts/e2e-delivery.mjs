@@ -26,7 +26,10 @@
  *       refused by `assertPushableBranch`/`pushBranch`/delivery before any
  *       commit/push;
  *   (f) hidden-stat blocks and non-AI / other-bot / system notes never reach the
- *       review-fix child input or its prompt.
+ *       review-fix child input or its prompt;
+ *   (g) a tampered review ticket whose worktree is the repository root on `main`
+ *       is refused by the host worktree/branch gate: no child, no commit/push,
+ *       the main worktree stays untouched (P5 final review I1).
  *
  * Output: one PASS line per verified step with the key values (commit sha,
  * MR title/payload, rounds, changedFiles, workflow transitions), a summary, and
@@ -68,6 +71,7 @@ import {
   REVIEW_ERROR_META_PREFIX,
   REVIEW_FIX_COMMIT_META_PREFIX,
   REVIEW_LAST_NOTE_META_PREFIX,
+  REVIEW_REASON_MESSAGES,
   createReviewService,
 } from '../src/host/review-service.js';
 import { createStore } from '../src/host/store.js';
@@ -1403,6 +1407,62 @@ async function runTamperedRecordBoundary() {
 }
 
 // ---------------------------------------------------------------------------
+// (g) a main-worktree review ticket is refused before the child/commit/push
+// ---------------------------------------------------------------------------
+
+async function runMainWorktreeBoundary() {
+  section('boundary (g): main-worktree review-fix refused');
+
+  const code = 'BUG-MAIN-WT';
+  const h = await createHarness({
+    code,
+    branchName: 'feat-V1.2.0-mainwt',
+    notes: [gitlabNote(4001, CHANGES_BODY, '2026-11-07T04:00:10.000Z')],
+    seedContext: true,
+  });
+
+  // Persisted branch metadata is untrusted: simulate a tampered/legacy ticket
+  // that points the review fix at the repository root (the MAIN worktree) on
+  // the protected `main` branch.
+  let ticket = h.store.get(code);
+  ticket.branch = { ...ticket.branch, name: 'main', worktree: h.fixture.repo };
+  ticket.mr = { ...ticket.mr, sourceBranch: 'main' };
+  await h.domain.table('tickets').put(code, ticket);
+
+  const mainHeadBefore = gitSync(h.fixture.repo, ['rev-parse', 'HEAD']);
+  const mainStatusBefore = gitSync(h.fixture.repo, ['status', '--porcelain']);
+
+  const tick = await h.review.tick();
+  assert.equal(tick.transitioned, 1); // the changes round still transitions...
+  await waitForIdle(h.review, 'main-worktree refusal');
+
+  ticket = h.store.get(code);
+  assert.equal(ticket.workflow, 'blocked');
+  assert.equal(ticket.blockedFrom, 'fixing_review');
+  assert.equal(ticket.blockedReason, 'review-fix-failed');
+  assert.equal(ticket.fixes.length, 0);
+  assert.equal(ticket.reviewRounds.length, 0);
+  // ...but the hard worktree/branch gate refuses before the child and git write.
+  assert.equal(h.runner.calls.length, 0);
+  const gitWrites = h.gitCalls.filter((call) => call.args[0] === '-C'
+    && (call.args[2] === 'add' || call.args[2] === 'commit' || call.args[2] === 'push'));
+  assert.deepEqual(gitWrites, []);
+  assert.equal(gitSync(h.fixture.repo, ['rev-parse', 'HEAD']), mainHeadBefore);
+  assert.equal(gitSync(h.fixture.repo, ['status', '--porcelain']), mainStatusBefore);
+  assert.equal(h.store.getMeta(REVIEW_FIX_COMMIT_META_PREFIX + code), null);
+  assert.equal(bareHasBranch(h.fixture.origin, 'main'), false);
+  assert.equal(
+    h.store.getMeta(REVIEW_ERROR_META_PREFIX + code),
+    REVIEW_REASON_MESSAGES['review-fix-failed'],
+  );
+  pass(
+    'main-worktree ticket refused before child/commit/push',
+    `branch=main worktree=repo-root runnerCalls=${h.runner.calls.length} gitWrites=0 mainAdvanced=false reason=review-fix-failed`,
+  );
+  await h.close();
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -1415,6 +1475,7 @@ async function main() {
   await runStaleRecordBoundary();
   await runClaimBoundary();
   await runTamperedRecordBoundary();
+  await runMainWorktreeBoundary();
 
   section('summary');
   console.log(`PASS ${summary.pass} / FAIL ${summary.fail}`);
