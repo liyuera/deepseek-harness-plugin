@@ -31,19 +31,8 @@
  */
 
 import { createHash } from 'node:crypto';
-import { appendFileSync } from 'node:fs';
 
 import { normalizeBaseUrl } from './platform.js';
-
-// TEMPORARY login diagnostics: envelope shape only (keys/status/code/msg),
-// never credentials, token or request body. Removed after live calibration.
-function debugCapture(entry) {
-  try {
-    appendFileSync('/tmp/bug-workflow-login-debug.log', `${JSON.stringify(entry)}\n`);
-  } catch {
-    // Diagnostics must never affect the login path.
-  }
-}
 
 /** Login request budget (the platform is on the intranet). */
 export const DEFAULT_LOGIN_TIMEOUT_MS = 15_000;
