@@ -99,6 +99,8 @@ window.__ModuleLoader__.load({
     const React = require('react');
     const h = React.createElement;
     const ID = '@liyuera/dsh-bug-workflow';
+    /** Visible build tag so the running UI can be verified after a reload. */
+    const CLIENT_BUILD = 'p6-login.2026-11-08.1';
 
     /** Snapshot/action endpoints (same origin as the Harness Web page). */
     const API = Object.freeze({
@@ -3490,7 +3492,7 @@ window.__ModuleLoader__.load({
                 style: { color: TONES.warn.color },
               }, '有未保存的修改')
               : h('span', null, '无未保存修改'),
-            h('span', { style: { marginLeft: 'auto' } }, 'Esc 关闭')),
+            h('span', { style: { marginLeft: 'auto' } }, `Esc 关闭 · 界面 ${CLIENT_BUILD}`)),
           h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 6 } },
             h('button', {
               type: 'button',

@@ -19,6 +19,7 @@ import test from 'node:test';
 
 import {
   API_PATHS,
+  HOST_BUILD,
   MAX_BODY_BYTES,
   createHandlers,
   registerRoutes,
@@ -765,7 +766,7 @@ test('GET /health returns ok, domainOpenedAt and the live ticket count', async (
   assert.equal(res.statusCode, 200);
   assert.equal(res.headers['content-type'], 'application/json; charset=utf-8');
   assert.equal(res.headers['cache-control'], 'no-store');
-  assert.deepEqual(json, { ok: true, domainOpenedAt: OPENED_AT, tickets: 1 });
+  assert.deepEqual(json, { ok: true, domainOpenedAt: OPENED_AT, tickets: 1, build: HOST_BUILD });
 });
 
 test('health rejects every non-GET method with 405', async () => {
@@ -3139,7 +3140,7 @@ test('registerRoutes() mounts every API route and returns a disposer', async () 
   assert.deepEqual([...webServer.routes.keys()], Object.values(API_PATHS));
   const { res, json } = await callRegistered(webServer, API_PATHS.health);
   assert.equal(res.statusCode, 200);
-  assert.deepEqual(json, { ok: true, domainOpenedAt: OPENED_AT, tickets: 0 });
+  assert.deepEqual(json, { ok: true, domainOpenedAt: OPENED_AT, tickets: 0, build: HOST_BUILD });
 
   dispose();
   assert.equal(webServer.routes.size, 0);
