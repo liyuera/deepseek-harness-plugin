@@ -81,15 +81,14 @@ function useMemo(fn, deps) {
   return ctx.slots[index].value;
 }
 
-function useCallback(fn) {
+function useCallback(fn, deps) {
   const ctx = currentContext;
   const index = ctx.index;
   ctx.index += 1;
-  // Real React returns the previous callback while deps are unchanged. The
-  // preview shim keeps the first one: stable identities keep the polling
-  // effect from re-running (and resetting its data) on every pass.
-  if (ctx.slots[index] === undefined) {
-    ctx.slots[index] = { kind: 'callback', value: fn };
+  // Mirror React: keep the previous identity while deps are shallow-equal.
+  const previous = ctx.slots[index];
+  if (previous === undefined || previous.kind !== 'callback' || !sameDeps(previous.deps, deps)) {
+    ctx.slots[index] = { kind: 'callback', deps, value: fn };
   }
   return ctx.slots[index].value;
 }
@@ -531,6 +530,21 @@ function findButtonByLabel(node, match) {
   return null;
 }
 
+function findButtonByText(node, text) {
+  if (node === null || node === undefined || typeof node !== 'object') return null;
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const found = findButtonByText(item, text);
+      if (found !== null) return found;
+    }
+    return null;
+  }
+  if (node.kind !== 'element') return null;
+  const children = Array.isArray(node.children) ? node.children : [node.children];
+  if (node.type === 'button' && children.some((child) => typeof child === 'string' && child.includes(text))) return node;
+  return findButtonByText(node.children, text);
+}
+
 if (MODE === 'settings') {
   const button = findButtonByLabel(tree, '设置');
   if (button === null) {
@@ -552,6 +566,24 @@ if (DETAIL) {
   await flush();
   tree = await render();
 }
+if (DETAIL && process.argv[5] === 'confirm') {
+  // Render the inline action Popconfirm: click the first action button with a
+  // fake anchor rect so the bubble positions itself like it does in the app.
+  const target = findButtonByText(tree, '开始分析') ?? findButtonByText(tree, '通过方案') ?? findButtonByText(tree, '重新分析');
+  if (target !== null && typeof target.props.onClick === 'function') {
+    target.props.onClick({
+      currentTarget: {
+        getBoundingClientRect: () => ({ left: 40, right: 140, top: 300, bottom: 324, width: 100, height: 24 }),
+      },
+    });
+    await flush();
+    tree = await render();
+  } else {
+    console.error('preview: no action button found for the confirm bubble');
+    process.exit(7);
+  }
+}
+
 const body = serialize(tree);
 const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>Bug 看板 · 真实渲染预览</title>
 <style>

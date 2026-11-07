@@ -12,10 +12,10 @@
  *     and ignores stale/aborted responses; unmount stops the timer.
  *   - every write goes through `POST /bug-workflow/api/action` with
  *     `Content-Type: application/json`, a fresh idempotency `actionId`, and a
- *     confirmation. `window.confirm` is used when available; when it is absent
- *     the board renders its own confirm panel instead of silently proceeding.
- *     `reject_plan` always uses the inline reason input (Electron disables the
- *     platform prompt API). Every mutation is gated on the snapshot's
+ *     confirmation. The confirmation is an in-board anchored Popconfirm bubble
+ *     (`ActionPopConfirm`), never the platform's native dialog; `reject_plan`
+ *     adds the inline reason input to the same bubble. Every mutation is gated
+ *     on the snapshot's
  *     `workspace.configured === true`. A rejected action (409/415/403/500) shows
  *     a retryable banner with the server `code` and `message`; nothing throws out
  *     of the slot.
@@ -100,7 +100,7 @@ window.__ModuleLoader__.load({
     const h = React.createElement;
     const ID = '@liyuera/dsh-bug-workflow';
     /** Visible build tag so the running UI can be verified after a reload. */
-    const CLIENT_BUILD = 'p6-login.2026-11-08.8';
+    const CLIENT_BUILD = 'p6-login.2026-11-08.9';
 
     /** Snapshot/action endpoints (same origin as the Harness Web page). */
     const API = Object.freeze({
@@ -2036,22 +2036,6 @@ window.__ModuleLoader__.load({
       return `P1-${stamp}-${salt}`;
     }
 
-    /**
-     * Three-state confirmation: `true`/`false` from the platform dialog, or
-     * `null` when no usable `window.confirm` exists (Electron/embedded webview).
-     * Callers must treat `null` as "render the in-component confirm" — never as
-     * an automatic yes.
-     */
-    function confirmDialog(message) {
-      try {
-        if (typeof window === 'undefined' || window === null) return null;
-        if (typeof window.confirm !== 'function') return null;
-        return window.confirm(message) === true;
-      } catch {
-        return null;
-      }
-    }
-
     function snapshotUrlFor(sessionId) {
       if (typeof sessionId !== 'string' || sessionId === '') return null;
       return `${API.snapshot}?sessionId=${encodeURIComponent(sessionId)}`;
@@ -2502,55 +2486,100 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * In-component fallback for the platform prompt dialog and for a missing
-     * `window.confirm`.
-     * `mode:'reason'` renders a reason input (Enter submits, Esc cancels); empty
-     * input is normalized to the documented default by the caller.
+     * Small confirmation bubble anchored under the clicked action button (the
+     * board's Popconfirm). Replaces the platform `window.confirm` dialog, which
+     * looked foreign inside the board. `mode:'reason'` adds the reject reason
+     * input; Esc or an outside click cancels.
+     *
+     * @param {object|null} request `{mode, descriptor, rect}`; null hides it
+     * @param {boolean} busy disables both buttons while the action runs
+     * @param {() => void} onCancel dismiss
+     * @param {(reason?: string) => void} onConfirm run the action
      */
-    function ActionDialog({ request, busy, onCancel, onConfirm }) {
+    function ActionPopConfirm({ request, busy, onCancel, onConfirm }) {
+      const bubbleRef = React.useRef(null);
+      const inputRef = React.useRef(null);
       const isReason = request !== null && request.mode === 'reason';
       const [reason, setReason] = React.useState('');
-      const inputRef = React.useRef(null);
+
+      React.useEffect(() => {
+        if (request === null) return undefined;
+        if (typeof document === 'undefined' || document === null) return undefined;
+        setReason('');
+        const onKeyDown = (event) => {
+          if (event.key === 'Escape') {
+            event.preventDefault();
+            onCancel();
+          }
+        };
+        const onPointerDown = (event) => {
+          const bubble = bubbleRef.current;
+          if (bubble !== null && typeof bubble.contains === 'function' && bubble.contains(event.target)) return;
+          onCancel();
+        };
+        document.addEventListener('keydown', onKeyDown);
+        document.addEventListener('mousedown', onPointerDown, true);
+        return () => {
+          document.removeEventListener('keydown', onKeyDown);
+          document.removeEventListener('mousedown', onPointerDown, true);
+        };
+      }, [request, onCancel]);
 
       React.useEffect(() => {
         if (!isReason) return;
         try {
           if (inputRef.current !== null && typeof inputRef.current.focus === 'function') inputRef.current.focus();
         } catch {
-          // Focus is best-effort; the dialog still works.
+          // Focus is best-effort; the bubble still works.
         }
-      }, [isReason]);
+      }, [isReason, request]);
 
-      const submit = () => {
-        if (busy === true) return;
-        onConfirm(isReason ? reason : undefined);
-      };
+      if (request === null) return null;
+      const rect = request.rect;
+      const width = 280;
+      const viewportWidth = typeof window !== 'undefined' && typeof window.innerWidth === 'number' ? window.innerWidth : 1024;
+      let left = rect === null || rect === undefined ? Math.max(12, (viewportWidth - width) / 2) : rect.left;
+      left = Math.max(12, Math.min(left, viewportWidth - width - 12));
+      const top = rect === null || rect === undefined ? 80 : Math.max(12, rect.bottom + 6);
 
-      return h('form', {
-        'data-bug-board-dialog': isReason ? 'reason' : 'confirm',
-        onSubmit: (event) => {
-          event.preventDefault();
-          submit();
-        },
-        onKeyDown: (event) => {
-          if (event.key !== 'Escape') return;
-          event.preventDefault();
-          onCancel();
-        },
+      return h('div', {
+        ref: bubbleRef,
+        role: 'dialog',
+        'aria-modal': 'false',
+        'aria-label': '确认操作',
+        'data-bug-popconfirm': request.kind === 'create-demo' ? 'create-demo' : 'action',
         style: {
+          position: 'fixed',
+          left: `${Math.round(left)}px`,
+          top: `${Math.round(top)}px`,
+          width: `${width}px`,
+          maxWidth: 'calc(100vw - 24px)',
+          zIndex: 2147483000,
           display: 'flex',
           flexDirection: 'column',
-          gap: 7,
-          padding: '9px 12px',
-          borderBottom: `0.5px solid ${C.border}`,
-          background: C.surfaceAlt,
-          flex: '0 0 auto',
-          minWidth: 0,
+          gap: 8,
+          padding: '10px 12px',
+          borderRadius: 10,
+          border: `0.5px solid ${C.borderStrong}`,
+          background: C.surface,
+          boxShadow: '0 8px 24px rgba(15, 23, 42, 0.18), 0 2px 6px rgba(15, 23, 42, 0.12)',
+          boxSizing: 'border-box',
+        },
+        onSubmit: (event) => {
+          event.preventDefault();
+          if (busy === true) return;
+          onConfirm(isReason ? reason : undefined);
+        },
+        onKeyDown: (event) => {
+          if (event.key !== 'Enter' || isReason !== true) return;
+          event.preventDefault();
+          if (busy === true) return;
+          onConfirm(reason);
         },
       },
         h('div', {
           style: { fontSize: 12, lineHeight: '18px', color: C.text, fontWeight: 600, wordBreak: 'break-word' },
-        }, textOf(request === null ? undefined : request.descriptor.confirm, '确认执行该动作？')),
+        }, textOf(request.descriptor.confirm, '确认执行该动作？')),
         isReason
           ? h('input', {
             ref: inputRef,
@@ -2564,7 +2593,7 @@ window.__ModuleLoader__.load({
               font: 'inherit',
               fontSize: 12,
               lineHeight: '18px',
-              padding: '3px 8px',
+              padding: '4px 8px',
               borderRadius: 6,
               border: `0.5px solid ${C.borderStrong}`,
               background: 'transparent',
@@ -2582,10 +2611,14 @@ window.__ModuleLoader__.load({
             style: smallButtonStyle(busy === true),
           }, '取消'),
           h('button', {
-            type: 'submit',
+            type: 'button',
+            onClick: () => {
+              if (busy === true) return;
+              onConfirm(isReason ? reason : undefined);
+            },
             disabled: busy === true,
             style: primaryButtonStyle(busy === true),
-          }, busy === true ? '处理中…' : (isReason ? '确认驳回' : '确认'))));
+          }, busy === true ? '处理中…' : (isReason ? '确认驳回' : '确定'))));
     }
 
     /** One workspace-settings row: label, one-line help, input, inline error. */
@@ -3651,7 +3684,7 @@ window.__ModuleLoader__.load({
           }, '设置'),
           h('button', {
             type: 'button',
-            onClick: onCreateDemo,
+            onClick: (event) => onCreateDemo(event),
             disabled: disabled || !writable,
             title: '创建一张演示工单（验收/联调用）',
             style: smallButtonStyle(disabled || !writable),
@@ -3788,8 +3821,8 @@ window.__ModuleLoader__.load({
           disabled: itemDisabled,
           'aria-busy': busy || undefined,
           'aria-disabled': isLocked || unavailable !== null ? true : undefined,
-          onClick: () => {
-            if (typeof onAction === 'function') onAction(descriptor);
+          onClick: (event) => {
+            if (typeof onAction === 'function') onAction(descriptor, event);
           },
           style: actionButtonStyle(descriptor.tone, itemDisabled),
           title: isLocked
@@ -5063,9 +5096,9 @@ window.__ModuleLoader__.load({
         disabled: retryDisabled,
         'aria-busy': busy || undefined,
         title: locked === true ? UNBOUND_WORKSPACE_HINT : ANALYSIS_RETRY_DESCRIPTOR.confirm,
-        onClick: () => {
+        onClick: (event) => {
           if (retryDisabled) return;
-          if (typeof onAction === 'function') onAction(ANALYSIS_RETRY_DESCRIPTOR);
+          if (typeof onAction === 'function') onAction(ANALYSIS_RETRY_DESCRIPTOR, event);
         },
         style: primaryButtonStyle(retryDisabled),
       }, busy ? '处理中…' : ANALYSIS_RETRY_DESCRIPTOR.label);
@@ -5202,9 +5235,9 @@ window.__ModuleLoader__.load({
         disabled,
         'aria-busy': busy || undefined,
         title: locked === true ? UNBOUND_WORKSPACE_HINT : descriptor.confirm,
-        onClick: () => {
+        onClick: (event) => {
           if (disabled) return;
-          if (typeof onAction === 'function') onAction(descriptor);
+          if (typeof onAction === 'function') onAction(descriptor, event);
         },
         style: primaryButtonStyle(disabled),
       }, busy ? '处理中…' : descriptor.label);
@@ -5425,7 +5458,7 @@ window.__ModuleLoader__.load({
         actionLabel
           ? h('button', {
             type: 'button',
-            onClick: onAction,
+            onClick: (event) => onAction(event),
             disabled: busy === true,
             style: primaryButtonStyle(busy === true),
           }, textOf(actionLabel))
@@ -6180,22 +6213,31 @@ window.__ModuleLoader__.load({
         }
       }, [configured, polling, postMutation, sessionId]);
 
-      const requestAction = React.useCallback((descriptor, ticket) => {
+      /** Map a click target to the popconfirm's anchor rectangle. */
+      const anchorRectFromEvent = React.useCallback((event) => {
+        try {
+          const target = event !== null && event !== undefined && typeof event === 'object' ? event.currentTarget : null;
+          if (target === null || target === undefined || typeof target.getBoundingClientRect !== 'function') return null;
+          const rect = target.getBoundingClientRect();
+          if (rect === null || typeof rect !== 'object') return null;
+          return { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom, width: rect.width };
+        } catch {
+          return null;
+        }
+      }, []);
+
+      const requestAction = React.useCallback((descriptor, ticket, event) => {
         if (!descriptor || !ticket || busyRef.current) return;
         if (sessionId === null || configured !== true) return;
-
-        if (descriptor.input === 'reason') {
-          setPendingRequest({ kind: 'action', mode: 'reason', descriptor, ticket });
-          return;
-        }
-        const answer = confirmDialog(textOf(descriptor.confirm, '确认执行该动作？'));
-        if (answer === null) {
-          setPendingRequest({ kind: 'action', mode: 'confirm', descriptor, ticket });
-          return;
-        }
-        if (answer === false) return;
-        executeAction(descriptor, ticket);
-      }, [configured, executeAction, sessionId]);
+        setActionError(null);
+        setPendingRequest({
+          kind: 'action',
+          mode: descriptor.input === 'reason' ? 'reason' : 'confirm',
+          descriptor,
+          ticket,
+          rect: anchorRectFromEvent(event),
+        });
+      }, [anchorRectFromEvent, configured, sessionId]);
 
       const createDemoTicket = React.useCallback(async () => {
         if (busyRef.current || sessionId === null || configured !== true) return;
@@ -6236,21 +6278,15 @@ window.__ModuleLoader__.load({
         }
       }, [configured, polling, postMutation, sessionId]);
 
-      const requestCreateDemo = React.useCallback(() => {
+      const requestCreateDemo = React.useCallback((event) => {
         if (busyRef.current || sessionId === null || configured !== true) return;
-        const message = '创建一张 P1 演示工单？';
-        const answer = confirmDialog(message);
-        if (answer === null) {
-          setPendingRequest({
-            kind: 'create-demo',
-            mode: 'confirm',
-            descriptor: { action: 'create', label: '添加演示工单', confirm: message },
-          });
-          return;
-        }
-        if (answer === false) return;
-        createDemoTicket();
-      }, [configured, createDemoTicket, sessionId]);
+        setPendingRequest({
+          kind: 'create-demo',
+          mode: 'confirm',
+          descriptor: { action: 'create', label: '添加演示工单', confirm: '创建一张 P1 演示工单？' },
+          rect: anchorRectFromEvent(event),
+        });
+      }, [anchorRectFromEvent, configured, sessionId]);
 
       /**
        * Import one platform ticket by code through the existing `create`
@@ -6595,7 +6631,7 @@ window.__ModuleLoader__.load({
           }, flash),
         pendingRequest === null
           ? null
-          : h(ActionDialog, {
+          : h(ActionPopConfirm, {
             key: `${pendingRequest.kind}:${pendingRequest.ticket === undefined ? 'new' : pendingRequest.ticket.code}:${pendingRequest.descriptor.action}`,
             request: pendingRequest,
             busy: busyAction !== null,
@@ -6630,7 +6666,7 @@ window.__ModuleLoader__.load({
               snapshot,
               busyAction,
               locked: !canWrite,
-              onAction: (descriptor) => requestAction(descriptor, selectedTicket),
+              onAction: (descriptor, event) => requestAction(descriptor, selectedTicket, event),
               onBack: () => setSelectedCode(null),
             })),
           settingsOpen === true

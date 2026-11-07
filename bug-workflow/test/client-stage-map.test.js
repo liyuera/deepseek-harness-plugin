@@ -134,3 +134,16 @@ test('lane board keeps its responsive + step-bar source guards', () => {
   assert.ok(!/api\.(post|get)\(/.test(lanesSource), 'lane board must not issue requests');
   assert.ok(!/executeAction|requestAction/.test(lanesSource), 'lane board must not dispatch actions');
 });
+
+test('destructive actions use the in-board Popconfirm, never a native dialog', () => {
+  const source = readFileSync(CLIENT_URL, 'utf8');
+  assert.ok(source.includes('function ActionPopConfirm'), 'the anchored confirm bubble must exist');
+  assert.ok(source.includes("'data-bug-popconfirm'"), 'the bubble must expose a verification marker');
+  assert.ok(source.includes('anchorRectFromEvent'), 'the bubble must anchor to the clicked button');
+  // Native platform dialogs look foreign in the embedded board: no call sites.
+  assert.equal(/window\.confirm\s*\(/.test(source), false, 'window.confirm() must not be called');
+  assert.equal(/function confirmDialog\s*\(/.test(source), false, 'the native confirm wrapper must be gone');
+  // Confirm flows still run through the single host-guarded action path.
+  assert.ok(source.includes('confirmPendingAction'));
+  assert.ok(source.includes('executeAction(request.descriptor, request.ticket, reason)'));
+});
