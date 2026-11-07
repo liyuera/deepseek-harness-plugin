@@ -97,6 +97,7 @@
 import { closeDomain, openDomain, settingsSchema, ticketSchema } from './src/host/domain.js';
 import { createAgentRunner } from './src/host/agent-access.js';
 import { createAnalysisService } from './src/host/analysis-service.js';
+import { createAttachmentService } from './src/host/attachments.js';
 import {
   createDeliveryService,
   createRepoLock,
@@ -234,16 +235,27 @@ export function apply(ctx) {
         // workspace's `platformBaseUrl`. `createPlatformClient` throws for an
         // invalid baseUrl; the sync service catches that (invalid config) and
         // never lets it reach the routes/timer.
+        const platformClientFor = (settings, token) => createPlatformClient({
+          baseUrl: settings.platformBaseUrl,
+          token,
+        });
         const sync = createSyncService({
           store,
           tokenStore,
           getSettings: (cwd) => store.getSettings(cwd),
-          platformClientFor: (settings, token) => createPlatformClient({
-            baseUrl: settings.platformBaseUrl,
-            token,
-          }),
+          platformClientFor,
           clock,
         });
+
+        // P6 evidence downloads: description screenshots + image attachments
+        // are fetched before analysis so the child can read them with
+        // `read_image`. Non-fatal: a broken downloader only degrades the prompt.
+        let attachments = null;
+        try {
+          attachments = createAttachmentService({ store, tokenStore, platformClientFor, clock });
+        } catch (error) {
+          logWarning(storageCtx, 'bug-workflow: 附件下载服务初始化失败', error);
+        }
 
         // P3 analysis orchestration. A construction failure must not take the
         // board down: the routes stay mounted, `/analyze` answers 503, and the
@@ -253,7 +265,7 @@ export function apply(ctx) {
           // The 10-minute analysis budget is a code-level default in
           // analysis-service.js; P3 exposes no host setting for it. Pass
           // `{ timeoutMs }` here to change it.
-          analysisService = createAnalysisService({ store, runner, clock });
+          analysisService = createAnalysisService({ store, runner, clock, attachments });
           analysis = { service: analysisService };
         } catch (error) {
           analysisService = undefined;

@@ -143,6 +143,7 @@ function setup({
   runner = createFakeRunner(),
   timeoutMs = 5_000,
   drainTimeoutMs,
+  attachments,
 } = {}) {
   const domain = createFakeDomain();
   const store = createStore(domain, () => T1);
@@ -152,8 +153,9 @@ function setup({
     clock: createServiceClock(),
     timeoutMs,
     ...(drainTimeoutMs === undefined ? {} : { drainTimeoutMs }),
+    ...(attachments === undefined ? {} : { attachments }),
   });
-  return { domain, store, service, runner };
+  return { domain, store, service, runner, attachments };
 }
 
 async function createTicket(store, code = 'BUG-1') {
@@ -238,6 +240,58 @@ test('start() moves inbox -> analyzing and applies the plan when the runner succ
 
   assert.deepEqual(service.status(), { running: [], errors: {} });
   assert.equal(store.getMeta(ANALYSIS_ERROR_META_PREFIX + 'BUG-1'), undefined);
+});
+
+test('platform images are downloaded before the child runs and passed as local evidence paths', async () => {
+  const attachments = {
+    prepared: [],
+    cleaned: [],
+    async prepare(cwd, code) {
+      this.prepared.push([cwd, code]);
+      return {
+        ok: true,
+        dir: '/tmp/bug-workflow-attachments/BUG-1',
+        images: [{ name: 'shot.png', path: '/tmp/bug-workflow-attachments/BUG-1/01-shot.png', bytes: 1024 }],
+        files: [],
+      };
+    },
+    async cleanup(dir) {
+      this.cleaned.push(dir);
+    },
+  };
+  const { store, service, runner } = setup({ attachments });
+  await createTicket(store);
+
+  await service.start(SESSION_ID, CWD, 'BUG-1');
+  await waitForIdle(service);
+
+  assert.deepEqual(attachments.prepared, [[CWD, 'BUG-1']]);
+  assert.equal(runner.calls.length, 1);
+  assert.deepEqual(runner.calls[0].ticket.analysisAttachments.images, [
+    { name: 'shot.png', path: '/tmp/bug-workflow-attachments/BUG-1/01-shot.png', bytes: 1024 },
+  ]);
+  // Evidence is transient: the directory is cleaned after the analysis.
+  assert.deepEqual(attachments.cleaned, ['/tmp/bug-workflow-attachments/BUG-1']);
+  // The ticket itself is not mutated with the evidence.
+  assert.equal(store.get('BUG-1').analysisAttachments, undefined);
+});
+
+test('a failing attachment downloader degrades to the text-only prompt', async () => {
+  const attachments = {
+    async prepare() {
+      throw new Error('download exploded');
+    },
+    async cleanup() {},
+  };
+  const { store, service, runner } = setup({ attachments });
+  await createTicket(store);
+
+  await service.start(SESSION_ID, CWD, 'BUG-1');
+  await waitForIdle(service);
+
+  assert.equal(runner.calls.length, 1);
+  assert.equal(runner.calls[0].ticket.analysisAttachments, undefined);
+  assert.equal(store.get('BUG-1').workflow, 'plan_review');
 });
 
 test('a duplicate start while running does not launch a second runner call', async () => {

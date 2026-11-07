@@ -771,6 +771,33 @@ test('buildAnalysisPrompt() renders ticket fields, workspace, read-only rules an
   assert.equal(typeof buildAnalysisPrompt(null), 'string');
 });
 
+test('buildAnalysisPrompt() hands downloaded platform evidence to read_image', () => {
+  const ticket = {
+    ...TICKET,
+    analysisAttachments: {
+      images: [
+        { name: 'shot.png', path: '/tmp/workspace/.dsh-attachments/BUG-1/01-shot.png', bytes: 2048 },
+      ],
+      files: [{ name: '日志.txt', bytes: 10, type: 'txt' }],
+    },
+  };
+  const prompt = buildAnalysisPrompt(ticket, '/tmp/workspace');
+  const block = extractTicketDataBlock(prompt);
+
+  assert.ok(block.body.includes('图片证据：shot.png'), 'image evidence must be inside the data block');
+  assert.ok(block.body.includes('/tmp/workspace/.dsh-attachments/BUG-1/01-shot.png'));
+  assert.ok(block.body.includes('附件：日志.txt'));
+  assert.ok(block.body.includes('read_image'), 'the child must be told to open the images');
+  // Scope wording still says outside-workspace paths are off limits.
+  assert.ok(prompt.includes('不得读取工作区之外的路径'));
+
+  // Without evidence there is no evidence section (the scope rule keeps the
+  // read_image exception wording even when unused).
+  const plain = buildAnalysisPrompt(TICKET, '/tmp/workspace');
+  assert.equal(plain.includes('图片证据：'), false);
+  assert.equal(plain.includes('本地路径：'), false);
+});
+
 test('buildAnalysisPrompt() wraps title/description in a nonce-delimited data block', () => {
   const prompt = buildAnalysisPrompt(TICKET, '/tmp/workspace');
   assert.ok(

@@ -112,9 +112,15 @@ export function createAnalysisService({
   clock = defaultClock,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   drainTimeoutMs = DEFAULT_DRAIN_TIMEOUT_MS,
+  attachments = null,
 } = {}) {
   assertStore(store);
   assertRunner(runner);
+  if (attachments !== null && attachments !== undefined
+    && (typeof attachments !== 'object' || typeof attachments.prepare !== 'function')) {
+    throw new TypeError('createAnalysisService() attachments must expose prepare()');
+  }
+  const attachmentService = attachments ?? null;
   const readNow = normalizeClock(clock);
   const analysisTimeoutMs = positiveNumber(timeoutMs) ?? DEFAULT_TIMEOUT_MS;
   const disposeTimeoutMs = positiveNumber(drainTimeoutMs) ?? DEFAULT_DRAIN_TIMEOUT_MS;
@@ -390,16 +396,45 @@ export function createAnalysisService({
 
   async function run({ entry, key, sessionId, cwd, ticket }) {
     let result;
+    // Platform screenshots/attachments: download them to the workspace before
+    // spawning so the child can open the images with `read_image`. Best-effort:
+    // any failure degrades to the text-only prompt and never blocks analysis.
+    let promptTicket = ticket;
+    let evidenceDir;
     try {
+      if (attachmentService !== null) {
+        let evidence = null;
+        try {
+          evidence = await attachmentService.prepare(cwd, key);
+        } catch {
+          evidence = null;
+        }
+        const hasEvidence = evidence !== null && evidence.ok === true
+          && ((Array.isArray(evidence.images) && evidence.images.length > 0)
+            || (Array.isArray(evidence.files) && evidence.files.length > 0));
+        if (hasEvidence) {
+          promptTicket = { ...ticket, analysisAttachments: evidence };
+          if (typeof evidence.dir === 'string' && evidence.dir !== '') evidenceDir = evidence.dir;
+        }
+      }
       result = await runner.runAnalysis({
         sessionId,
         cwd,
-        ticket,
+        ticket: promptTicket,
         signal: entry.controller.signal,
         timeoutMs: analysisTimeoutMs,
       });
     } catch {
       result = { ok: false, code: 'analysis-failed' };
+    } finally {
+      if (evidenceDir !== undefined && attachmentService !== null
+        && typeof attachmentService.cleanup === 'function') {
+        try {
+          await attachmentService.cleanup(evidenceDir);
+        } catch {
+          // Transient evidence directory: a failed cleanup is not fatal.
+        }
+      }
     }
 
     // Teardown cancelled this analysis: unload/app quit is not a failure. Do

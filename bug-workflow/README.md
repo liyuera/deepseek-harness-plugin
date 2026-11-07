@@ -435,6 +435,17 @@ P2 **未对真实平台执行**同步/导入（无真实 token，用户不在场
 - 看板路由本身**没有鉴权**：信任边界是「同机同用户」，任何本机进程都能调这些接口，这是设计取舍，不是遗漏。
 - 工单是 profile 全局的；平台/GitLab token 是 profile 全局的；设置里的 `platformBaseUrl`/`platformProjectCode`/`gitlabBaseUrl`/`gitlabProjectPath` 不是秘密。
 
+## P6 · AI 分析证据（描述截图 / 附件）
+
+平台工单的关键信息经常只在**截图**里（实测 `YGFNXDJRFWDJSYJJYY-632` 的描述就是一张 png）。同步会把描述转成纯文本（图片记作 `[图片]`），因此分析前由宿主补齐证据：
+
+- 分析启动时 `attachments.js` 用平台 token + 工作区设置调用详情接口，解析描述富文本里的 `<img>`（相对路径按 `platformBaseUrl` 解析）；
+- 描述图片为**公开 OSS**（实测不带 `Htwisdom-Auth` 才是 200，带 token 会 400），所以图片下载不带 token；`/api/` 附件 URL 才带 token 重试一次；
+- 下载到 `<workspace>/.dsh-attachments/<工单号>/`：最多 6 张图、单张 8 MiB、总计 24 MiB、15s 超时；附件清单（最多 20 个）以文件名/大小/类型进入 prompt；
+- 分析 prompt 的「TICKET_DATA」数据块内列出本地图片路径，并明确要求子代理用 `read_image` 读取后再分析（仅该目录例外，其余工作区外路径仍禁止）；
+- 分析结束后删除该目录；下载失败只降级为纯文本分析，不会阻塞；
+- 限制：非图片附件只列文件名（不解析内容）；只有子代理模型支持视觉时才能真正"看懂"截图。
+
 ## 已知限制
 
 **P5 重点（用户验收时优先看）**
