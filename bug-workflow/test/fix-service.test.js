@@ -431,6 +431,36 @@ test('start() falls back to HEAD and uses the hot family for failure tickets', a
   assert.equal(ticket.branch.target, 'hotfix-V1.6.1');
 });
 
+test('start() records the freshly resolved base when git creates a new worktree', async () => {
+  const { store, git, service } = setup({
+    gitOptions: { refs: { 'origin/feature-V1.6.1': true } },
+  });
+  await seedFixing(store);
+  // Metadata from a worktree that no longer exists: `created:true` means the
+  // content starts at the freshly resolved base, so the record must be
+  // refreshed instead of inheriting the old baseline/timestamp (I1 fallback).
+  const staleCreatedAt = '2026-11-01T00:00:00.000Z';
+  await store.patchTicket('BUG-1', {
+    branch: {
+      name: 'feat-V1.6.1-ly',
+      target: 'feature-V1.6.1',
+      baseSource: 'target',
+      worktree: WORKTREE,
+      createdAt: staleCreatedAt,
+    },
+  });
+
+  await service.start(SESSION_ID, CWD, 'BUG-1');
+  await waitForIdle(service);
+
+  assert.equal(git.calls.worktreeAdd[0].base, 'origin/feature-V1.6.1');
+  const ticket = store.get('BUG-1');
+  assert.equal(ticket.branch.baseSource, 'origin');
+  assert.notEqual(ticket.branch.createdAt, staleCreatedAt);
+  assert.equal(ticket.branch.name, 'feat-V1.6.1-ly');
+  assert.equal(ticket.branch.worktree, WORKTREE);
+});
+
 test('start() prefers platform.versionName over the ticket version', async () => {
   const { domain, store, git, service } = setup();
   await seedFixing(store);
@@ -685,6 +715,40 @@ test('start() restarts a ticket blocked from fixing via retry, then runs the fix
   assert.equal(ticket.workflow, 'fix_done');
   assert.equal(ticket.fixes.length, 1);
   assert.deepEqual(service.status(), { running: [], errors: {} });
+});
+
+test('a blocked(fixing) restart reusing the worktree preserves baseSource and createdAt', async () => {
+  const { store, git, service } = setup({
+    gitOptions: {
+      refs: { 'origin/feature-V1.6.1': true },
+      worktreeAddResult: { created: false },
+      status: ' M src/a.js\n',
+    },
+  });
+  await seedBlockedFromFixing(store);
+  // First attempt fell back to HEAD; `origin/feature-V1.6.1` appeared later.
+  const branchMetadata = {
+    name: 'feat-V1.6.1-ly',
+    target: 'feature-V1.6.1',
+    baseSource: 'HEAD',
+    worktree: WORKTREE,
+    createdAt: '2026-11-06T00:00:00.000Z',
+  };
+  await store.patchTicket('BUG-1', { branch: branchMetadata });
+
+  const result = await service.start(SESSION_ID, CWD, 'BUG-1');
+  assert.deepEqual(result, { ok: true, running: true, workflow: 'fixing' });
+  await waitForIdle(service);
+
+  // The base is re-resolved to origin for the call, but the reused worktree
+  // still sits on the HEAD base recorded by the first attempt (I1).
+  assert.equal(git.calls.worktreeAdd[0].base, 'origin/feature-V1.6.1');
+  const ticket = store.get('BUG-1');
+  assert.equal(ticket.branch.baseSource, 'HEAD');
+  assert.equal(ticket.branch.createdAt, branchMetadata.createdAt);
+  assert.equal(ticket.branch.name, branchMetadata.name);
+  assert.equal(ticket.branch.target, branchMetadata.target);
+  assert.equal(ticket.branch.worktree, branchMetadata.worktree);
 });
 
 test('a blocked restart checks runner availability before the retry write', async () => {

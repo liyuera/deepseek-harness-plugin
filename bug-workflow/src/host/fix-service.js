@@ -35,6 +35,12 @@
  *     target base is resolved in this order and recorded as `baseSource`:
  *     `origin/<target>` ('origin'), local `<target>` ('target'), else `HEAD`
  *     ('HEAD', local/demo repositories) — all three values are valid contract.
+ *     When `git worktree add` REUSES an already registered worktree
+ *     (`created:false`) the worktree still sits on the base chosen by the
+ *     earlier attempt, so the recorded `baseSource`/`createdAt` are preserved
+ *     instead of being overwritten with the freshly resolved base; a new
+ *     worktree (or old metadata pointing at another branch/path) records the
+ *     fresh resolution.
  *   - A personal branch already recorded by another ticket of the same repo
  *     (same version/family/user maps to the same branch) is detected before
  *     `git worktree add`: the start fails with `fix-branch-busy`, a static
@@ -290,7 +296,7 @@ export function createFixService({
       }
 
       // The branch metadata is persisted only after the ticket is `fixing`.
-      const branched = await persistBranch(key, prepared);
+      const branched = await persistBranch(key, prepared, current);
       if (!branched.ok) {
         // A retry that already moved the ticket is rolled back to `blocked`
         // when its metadata cannot be stored; otherwise the ticket would be
@@ -428,6 +434,11 @@ export function createFixService({
       branch: branches.personalBranch,
       target: branches.targetBranch,
       baseSource: base.source,
+      // `git worktree add` reuses an already registered worktree at `path`
+      // (`{created:false}`); its content then still sits on the base chosen by
+      // the earlier attempt, NOT on the base just resolved. The caller must
+      // not overwrite the recorded baseline in that case (review I1).
+      created: added?.created === true,
     };
   }
 
@@ -435,8 +446,23 @@ export function createFixService({
    * Persist the personal branch/worktree metadata after the ticket is
    * `fixing`. The write carries `expectedWorkflow:'fixing'` so a ticket that
    * moved on during the (possibly slow) git work is not overwritten.
+   *
+   * When the worktree is REUSED (`prepared.created:false`) the existing branch
+   * metadata already describes where that worktree actually sits, so its
+   * `baseSource`/`createdAt` are preserved: re-resolving `origin/<target>`
+   * after an integration branch appeared would otherwise record a baseline the
+   * worktree was never created from. A new worktree (or metadata pointing at a
+   * different branch/path, e.g. an externally removed then re-added worktree)
+   * records the freshly resolved base and timestamp.
    */
-  async function persistBranch(key, prepared) {
+  async function persistBranch(key, prepared, ticket) {
+    const existing = isPlainObject(ticket?.branch) ? ticket.branch : {};
+    const reused = prepared.created !== true;
+    const sameTarget = existing.name === prepared.branch
+      && existing.worktree === prepared.worktreePath;
+    const keepBase = reused && sameTarget && typeof existing.baseSource === 'string';
+    const keepCreatedAt = reused && sameTarget && typeof existing.createdAt === 'string';
+
     let patched;
     try {
       patched = await store.patchTicket(
@@ -445,9 +471,9 @@ export function createFixService({
           branch: {
             name: prepared.branch,
             target: prepared.target,
-            baseSource: prepared.baseSource,
+            baseSource: keepBase ? existing.baseSource : prepared.baseSource,
             worktree: prepared.worktreePath,
-            createdAt: readNow(),
+            createdAt: keepCreatedAt ? existing.createdAt : readNow(),
           },
         },
         { actionId: nextActionId('fix-branch', key), expectedWorkflow: 'fixing' },
