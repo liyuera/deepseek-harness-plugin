@@ -151,6 +151,23 @@ function strictTicket(ticket) {
   if (ticket.mr !== null && !Number.isInteger(ticket.mr.rounds)) {
     throw new Error('mr.rounds 必须是整数');
   }
+  if (!Array.isArray(ticket.fixes)) {
+    throw new Error('fixes 必须是数组');
+  }
+  for (const entry of ticket.fixes) {
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new Error('fixes 元素必须是对象');
+    }
+    if (typeof entry.runId !== 'string' || entry.runId === '') {
+      throw new Error('fixes.runId 必须是非空字符串');
+    }
+    if (!['succeeded', 'failed', 'cancelled'].includes(entry.status)) {
+      throw new Error('fixes.status 非法');
+    }
+    if (!Array.isArray(entry.changedFiles)) {
+      throw new Error('fixes.changedFiles 必须是数组');
+    }
+  }
   return cloneJson(ticket);
 }
 
@@ -1133,6 +1150,35 @@ test('patchTicket() refuses a schema-invalid patch and leaves state untouched', 
   assert.equal(ticket.timeline.length, 1);
   assert.equal(ticket.updatedAt, T1);
   assert.equal(store.getMeta('action:invalid-1'), undefined);
+});
+
+test('patchTicket() rejects a malformed fix-run entry and accepts a valid one', async () => {
+  const domain = createFakeDomain();
+  const store = createStrictStore(domain, clockFrom(T1, T2, T3));
+  await store.create({ code: 'BUG-1', title: 'BUG-1' });
+
+  const malformed = { ...cloneJson(FIX_ENTRY), status: 'ok' };
+  const rejected = await store.patchTicket(
+    'BUG-1',
+    { fixes: [malformed] },
+    { actionId: 'bad-fix' },
+  );
+
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.code, 'invalid-payload');
+  const untouched = store.get('BUG-1');
+  assert.deepEqual(untouched.fixes, []);
+  assert.equal(untouched.timeline.length, 1, 'a rejected entry must not append a timeline event');
+  assert.equal(store.getMeta('action:bad-fix'), undefined, 'rejected patches are not memoized');
+
+  const accepted = await store.patchTicket(
+    'BUG-1',
+    { fixes: [cloneJson(FIX_ENTRY)] },
+    { actionId: 'good-fix' },
+  );
+  assert.equal(accepted.ok, true);
+  assert.deepEqual(accepted.ticket.fixes, [FIX_ENTRY]);
+  assert.equal(accepted.ticket.timeline.at(-1).kind, 'fix-run');
 });
 
 test('patchTicket() reports unknown tickets and invalid codes without throwing', async () => {

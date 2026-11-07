@@ -538,7 +538,8 @@ function createFakeFix({ start, status } = {}) {
   };
 }
 
-/** Fake credentials service used by the token-store integration. */function createFakeCredentials(initial = {}) {
+/** Fake credentials service used by the token-store integration. */
+function createFakeCredentials(initial = {}) {
   const values = new Map(Object.entries(initial));
   const calls = { set: [], resolve: [], describe: [], unset: [] };
   return {
@@ -1620,6 +1621,8 @@ test('POST /fix maps service failures to 400/404/409/503/500', async () => {
     ['invalid-version', 400],
     ['invalid-worktree-path', 400],
     ['worktree-conflict', 409],
+    ['fix-busy', 409],
+    ['fix-branch-busy', 409],
     ['fix-unavailable', 503],
     ['git-timeout', 503],
     ['git-failed', 500],
@@ -2115,6 +2118,7 @@ test('every route rejects the wrong HTTP method with 405 and an Allow header', a
     ['snapshot', 'POST', API_PATHS.snapshot, 'GET'],
     ['action', 'GET', API_PATHS.action, 'POST'],
     ['analyze', 'GET', API_PATHS.analyze, 'POST'],
+    ['fix', 'GET', API_PATHS.fix, 'POST'],
     ['settings', 'GET', API_PATHS.settings, 'POST'],
     ['platformToken', 'GET', API_PATHS.platformToken, 'POST'],
     ['sync', 'GET', API_PATHS.sync, 'POST'],

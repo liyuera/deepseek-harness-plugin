@@ -11,15 +11,21 @@
  * base resolution, worktree creation/persistence, success -> fixes entry +
  * fix_done, failure -> blocked + static meta, cancelled -> no terminal write,
  * blocked(fixing) restart + availability, orphan fixing restart, duplicate
- * single-flight, late results, and dispose drain.
+ * single-flight, late results, and dispose drain. The review-fix block at the
+ * end covers I1 (restart ordering/rollback), I3 (zero-change guard), I4
+ * (per-repo lock + branch-in-use), M1 (cancel during collection), M2 (diff
+ * cap) and M3 (non-stale save-failure copy).
  */
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  FIX_BUSY_MESSAGE,
+  FIX_DIFF_MAX_CHARS,
   FIX_ERROR_META_PREFIX,
   FIX_REASON_MESSAGES,
+  SAVE_FAILED_MESSAGE,
   STALE_FIX_MESSAGE,
   createFixService,
 } from '../src/host/fix-service.js';
@@ -158,6 +164,8 @@ function createFakeGit(options = {}) {
     },
     async status(root) {
       calls.status.push(root);
+      // A function lets a test gate the post-run collection (cancel window).
+      if (typeof options.statusResult === 'function') return options.statusResult(root);
       if (options.statusResult !== undefined) return options.statusResult;
       return options.status ?? '';
     },
@@ -434,7 +442,7 @@ test('start() prefers platform.versionName over the ticket version', async () =>
 });
 
 test('start() reuses an orphaned fixing ticket without a state write', async () => {
-  const { store, service } = setup();
+  const { store, service } = setup({ gitOptions: { status: ' M src/a.js\n' } });
   await seedFixing(store);
   const before = store.get('BUG-1');
   const kindsBefore = before.timeline.map((entry) => entry.kind);
@@ -510,7 +518,10 @@ test('start() returns invalid-version before creating a worktree when the versio
 
 test('a duplicate start while running does not launch a second runner call', async () => {
   const pending = deferred();
-  const { store, runner, service } = setup({ runnerOptions: { run: () => pending.promise } });
+  const { store, runner, service } = setup({
+    gitOptions: { status: ' M src/a.js\n' },
+    runnerOptions: { run: () => pending.promise },
+  });
   await seedFixing(store);
 
   const first = service.start(SESSION_ID, CWD, 'BUG-1');
@@ -629,7 +640,7 @@ test('a late success after the ticket moved on writes no fixes and no fix_done',
 // ---------------------------------------------------------------------------
 
 test('start() restarts a ticket blocked from fixing via retry, then runs the fix', async () => {
-  const { store, service } = setup();
+  const { store, service } = setup({ gitOptions: { status: ' M src/a.js\n' } });
   await seedBlockedFromFixing(store);
 
   const result = await service.start(SESSION_ID, CWD, 'BUG-1');
@@ -792,7 +803,7 @@ test('a fix cancelled before the job settles re-runs through the orphan path on 
   assert.equal(store.get('BUG-1').workflow, 'fixing');
 
   // A new host instance sees `fixing` with no in-memory job and restarts it.
-  const second = setup({ domain, store });
+  const second = setup({ domain, store, gitOptions: { status: ' M src/a.js\n' } });
   const result = await second.service.start(SESSION_ID, CWD, 'BUG-1');
   assert.equal(result.ok, true);
   await waitForIdle(second.service);
@@ -829,4 +840,228 @@ test('changedFiles parses porcelain renames, quoted paths and falls back when st
   assert.equal(ticket.workflow, 'fix_done', 'a status read failure must not fail the whole fix');
   assert.deepEqual(ticket.fixes[0].changedFiles, SUCCESS_RESULT.result.changedFiles);
   assert.equal(ticket.fixes[0].diffStat, '');
+});
+
+// ---------------------------------------------------------------------------
+// P4 Task 2 review fixes: I1 restart ordering, I3 zero changes, I4 concurrency,
+// M1 cancel re-check, M2 diff cap, M3 failure labelling
+// ---------------------------------------------------------------------------
+
+test('a blocked(fixing) restart keeps the ticket blocked when worktree preparation fails', async () => {
+  const { store, git, runner, service } = setup({
+    gitOptions: {
+      worktreeAddResult: { ok: false, code: 'git-timeout', message: 'git 命令执行超时' },
+    },
+  });
+  await seedBlockedFromFixing(store);
+  const branchMetadata = {
+    name: 'feat-V1.6.1-ly',
+    target: 'feature-V1.6.1',
+    baseSource: 'origin',
+    worktree: WORKTREE,
+    createdAt: STORE_TIME,
+  };
+  await store.patchTicket('BUG-1', { branch: branchMetadata });
+  const before = store.get('BUG-1');
+
+  const result = await service.start(SESSION_ID, CWD, 'BUG-1');
+
+  assert.deepEqual(result, {
+    ok: false,
+    code: 'git-timeout',
+    message: 'git 命令执行超时',
+  });
+  const after = store.get('BUG-1');
+  assert.equal(after.workflow, 'blocked', 'a failed preparation must not strand the ticket in fixing');
+  assert.equal(after.blockedFrom, 'fixing');
+  assert.equal(after.blockedReason, before.blockedReason);
+  assert.deepEqual(after.branch, branchMetadata, 'branch metadata must not degrade');
+  assert.deepEqual(after.timeline, before.timeline, 'no retry/timeline write may happen');
+  assert.equal(runner.calls.length, 0);
+  assert.equal(store.getMeta(FIX_ERROR_META_PREFIX + 'BUG-1'), FIX_REASON_MESSAGES['fix-timeout']);
+  assert.deepEqual(service.status(), {
+    running: [],
+    errors: { 'BUG-1': FIX_REASON_MESSAGES['fix-timeout'] },
+  });
+  assert.deepEqual(git.calls.worktreeAdd, [{
+    repo: REPO,
+    path: WORKTREE,
+    branch: 'feat-V1.6.1-ly',
+    base: 'HEAD',
+  }]);
+});
+
+test('a blocked restart whose branch metadata cannot be persisted falls back to blocked', async () => {
+  const { store, service } = setup({ gitOptions: { status: ' M src/a.js\n' } });
+  await seedBlockedFromFixing(store);
+  const originalPatch = store.patchTicket.bind(store);
+  store.patchTicket = async (code, patch, options) => {
+    if (patch !== null && typeof patch === 'object' && patch.branch !== undefined) {
+      return { ok: false, code: 'invalid-payload', message: '工单数据未通过校验' };
+    }
+    return originalPatch(code, patch, options);
+  };
+
+  const result = await service.start(SESSION_ID, CWD, 'BUG-1');
+
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'invalid-payload');
+  const ticket = store.get('BUG-1');
+  assert.equal(ticket.workflow, 'blocked', 'the retry must be rolled back');
+  assert.equal(ticket.blockedFrom, 'fixing');
+  assert.equal(ticket.blockedReason, 'fix-failed');
+  assert.equal(store.getMeta(FIX_ERROR_META_PREFIX + 'BUG-1'), FIX_REASON_MESSAGES['fix-failed']);
+  assert.deepEqual(service.status().running, []);
+});
+
+test('a successful runner result with an empty worktree blocks with fix-no-changes instead of fix_done', async () => {
+  const { store, service } = setup({ gitOptions: { status: '' } });
+  await seedFixing(store);
+
+  const started = await service.start(SESSION_ID, CWD, 'BUG-1');
+  assert.deepEqual(started, { ok: true, running: true, workflow: 'fixing' });
+  await waitForIdle(service);
+
+  const ticket = store.get('BUG-1');
+  assert.equal(ticket.workflow, 'blocked');
+  assert.equal(ticket.blockedFrom, 'fixing');
+  assert.equal(ticket.blockedReason, 'fix-no-changes');
+  assert.equal(ticket.timeline.some((entry) => entry.kind === 'fix_done'), false);
+  assert.equal(ticket.fixes.length, 1);
+  assert.equal(ticket.fixes[0].status, 'failed');
+  assert.equal(ticket.fixes[0].error, 'fix-no-changes');
+  assert.deepEqual(ticket.fixes[0].changedFiles, []);
+  assert.equal(ticket.branch.name, 'feat-V1.6.1-ly');
+  assert.equal(store.getMeta(FIX_ERROR_META_PREFIX + 'BUG-1'), FIX_REASON_MESSAGES['fix-no-changes']);
+});
+
+test('a second ticket in the same repository is rejected with fix-busy while a fix runs', async () => {
+  const pending = deferred();
+  const { store, runner, service } = setup({
+    gitOptions: { status: ' M src/a.js\n' },
+    runnerOptions: { run: () => pending.promise },
+  });
+  await seedFixing(store, { code: 'BUG-1', version: 'V1.6.1' });
+  await seedFixing(store, { code: 'BUG-2', version: 'V1.7.0' });
+
+  const first = await service.start(SESSION_ID, CWD, 'BUG-1');
+  assert.equal(first.ok, true);
+
+  // Same-ticket single-flight is unchanged (200 running, no second runner).
+  const duplicate = await service.start(SESSION_ID, CWD, 'BUG-1');
+  assert.deepEqual(duplicate, { ok: true, running: true, workflow: 'fixing' });
+
+  const busy = await service.start(SESSION_ID, CWD, 'BUG-2');
+  assert.deepEqual(busy, { ok: false, code: 'fix-busy', message: FIX_BUSY_MESSAGE });
+  assert.equal(runner.calls.length, 1);
+  assert.equal(store.get('BUG-2').workflow, 'fixing');
+  assert.equal(store.get('BUG-2').branch, null, 'a busy refusal writes nothing');
+
+  pending.resolve(cloneJson(SUCCESS_RESULT));
+  await waitForIdle(service);
+
+  const second = await service.start(SESSION_ID, CWD, 'BUG-2');
+  assert.equal(second.ok, true, 'the repository lock is released when the first job settles');
+  await waitForIdle(service);
+  assert.equal(store.get('BUG-2').workflow, 'fix_done');
+});
+
+test('a personal branch already checked out by another ticket fails with fix-branch-busy', async () => {
+  const { store, git, runner, service } = setup({ gitOptions: { status: ' M src/a.js\n' } });
+  await seedFixing(store, { code: 'BUG-1' });
+  await seedFixing(store, { code: 'BUG-2' });
+  await store.patchTicket('BUG-2', {
+    branch: {
+      name: 'feat-V1.6.1-ly',
+      target: 'feature-V1.6.1',
+      baseSource: 'origin',
+      worktree: `${REPO}/.dsh-worktrees/BUG-2`,
+      createdAt: STORE_TIME,
+    },
+  });
+
+  const result = await service.start(SESSION_ID, CWD, 'BUG-1');
+
+  assert.deepEqual(result, {
+    ok: false,
+    code: 'fix-branch-busy',
+    message: FIX_REASON_MESSAGES['fix-branch-busy'],
+  });
+  assert.deepEqual(git.calls.worktreeAdd, [], 'git must not be allowed to collide');
+  assert.deepEqual(git.calls.status, [`${REPO}/.dsh-worktrees/BUG-2`]);
+  assert.equal(runner.calls.length, 0);
+  const ticket = store.get('BUG-1');
+  assert.equal(ticket.workflow, 'blocked');
+  assert.equal(ticket.blockedFrom, 'fixing');
+  assert.equal(ticket.blockedReason, 'fix-branch-busy');
+  assert.equal(ticket.branch, null);
+  assert.equal(store.getMeta(FIX_ERROR_META_PREFIX + 'BUG-1'), FIX_REASON_MESSAGES['fix-branch-busy']);
+});
+
+test('a dispose during post-run git collection performs no state write', async () => {
+  const gate = deferred();
+  const { store, git, service } = setup({
+    gitOptions: { statusResult: () => gate.promise },
+  });
+  await seedFixing(store);
+
+  await service.start(SESSION_ID, CWD, 'BUG-1');
+  for (let index = 0; index < 200 && git.calls.status.length === 0; index += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(git.calls.status.length, 1, 'the runner finished and git status is awaited');
+
+  const disposePromise = service.dispose();
+  gate.resolve(' M src/a.js\n');
+  await disposePromise;
+  await waitForIdle(service);
+
+  const ticket = store.get('BUG-1');
+  assert.equal(ticket.workflow, 'fixing');
+  assert.deepEqual(ticket.fixes, []);
+  assert.equal(ticket.timeline.some((entry) => entry.kind === 'fix_done'), false);
+  assert.equal(ticket.timeline.some((entry) => entry.kind === 'blocked'), false);
+  assert.equal(store.getMeta(FIX_ERROR_META_PREFIX + 'BUG-1'), undefined);
+  assert.deepEqual(service.status(), { running: [], errors: {} });
+});
+
+test('the persisted diff is clipped to a bounded excerpt', async () => {
+  const longDiff = `diff --git a/src/a.js b/src/a.js\n${'+x'.repeat(9000)}`;
+  const { store, service } = setup({
+    gitOptions: { status: ' M src/a.js\n', diff: longDiff },
+  });
+  await seedFixing(store);
+
+  await service.start(SESSION_ID, CWD, 'BUG-1');
+  await waitForIdle(service);
+
+  const ticket = store.get('BUG-1');
+  assert.equal(ticket.workflow, 'fix_done');
+  const entry = ticket.fixes[0];
+  assert.equal(entry.status, 'succeeded');
+  assert.ok(entry.diff.length <= FIX_DIFF_MAX_CHARS, `diff length ${entry.diff.length}`);
+  assert.ok(entry.diff.includes('…（diff 已截断）'));
+});
+
+test('a non-stale persistence failure uses the save-failed copy, not the stale copy', async () => {
+  const { store, runner, service } = setup({ gitOptions: { status: ' M src/a.js\n' } });
+  await seedFixing(store);
+  const originalPatch = store.patchTicket.bind(store);
+  store.patchTicket = async (code, patch, options) => {
+    if (patch !== null && typeof patch === 'object' && Array.isArray(patch.fixes)) {
+      return { ok: false, code: 'invalid-payload', message: '工单数据未通过校验' };
+    }
+    return originalPatch(code, patch, options);
+  };
+
+  await service.start(SESSION_ID, CWD, 'BUG-1');
+  await waitForIdle(service);
+
+  assert.equal(runner.calls.length, 1);
+  const ticket = store.get('BUG-1');
+  assert.equal(ticket.workflow, 'fixing', 'a failed write must not advance the ticket');
+  assert.deepEqual(ticket.fixes, []);
+  const meta = store.getMeta(FIX_ERROR_META_PREFIX + 'BUG-1');
+  assert.equal(meta, SAVE_FAILED_MESSAGE);
+  assert.notEqual(meta, STALE_FIX_MESSAGE);
 });
