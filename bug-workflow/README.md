@@ -153,7 +153,7 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 | 合并检测/归档 | `mergeable` + MR `state=merged` → `mr_merged` → `merged`；下一 tick `dismiss(system)` → `done` 并离开看板。若在 `mr_open`/`fixing_review` 就被人工合并 → `block('review-merged-manually')`，不伪造 review pass。**插件从不调用 merge/close/approve/resolve**，合并必须由人在 GitLab 完成 |
 | 取消/恢复 | delivery/review-fix 的 `dispose()` 只取消并排水，**不写** block/错误；`fixing_review` 无运行任务时下一 tick 按持久化 findings 恢复（重启子代理 / 重推 pending commit / 不可恢复则 `block('review-recovery-unavailable')`）。迟到结果只写静态 `delivery.error`/`review.error`，绝不回退已推进的工单 |
 | 客户端 UX | `submitting` 显示「提交并创建 MR」+ 运行横幅 + 静态错误映射；`mr_open`/`fixing_review` 显示 MR 卡（!iid/URL/source→target/轮次 n/3/最近结论/轮询提示）；`fixing_review` 运行中显示「AI 正在修复 Review 问题…」（计时 `aria-live=off`）；`mergeable` 显示「等待人工在 GitLab 合并（插件不会自动合并）」；`merged` 显示「已合并，即将从看板移除」；`done` 不再出现在看板 |
-| 测试 | **597 个用例**（P4 基线 352，P5 新增/扩充 218、UI v2 新增 4、P6 平台登录新增 23：`review-parser` 45、`credentials` 16、`gitlab` 27、`git` 20、`store` 42、`delivery-service` 40、`review-service` 45、`agent-access` 49、`routes` 115、`client-action-map` 14、`client-stage-map` 4、`platform-login` 12、`client-platform-login` 4（routes +7）等；另有隔离 E2E 脚本 29 条断言） |
+| 测试 | **613 个用例**（P4 基线 352，P5 新增/扩充 218、UI v2 新增 4、P6 平台登录/同步/分析证据新增 39：`review-parser` 45、`credentials` 16、`gitlab` 27、`git` 20、`store` 42、`delivery-service` 40、`review-service` 45、`agent-access` 51、`analysis` 30、`sync` 31、`routes` 115、`attachments` 6、`platform-login` 14、`client-action-map` 14、`client-stage-map` 4、`client-platform-login` 4 等；另有隔离 E2E 脚本 29 条断言） |
 
 **P5 交付成功的前置条件（缺一不可）**
 
@@ -608,7 +608,7 @@ git worktree remove --force .dsh-worktrees/YGFNXDJRFWDJSYJJYY-648 \
 | `scripts/fixtures/platform/` | mock 工单/详情/字典/评论/附件 fixtures |
 | `scripts/cleanup-demo-tickets.mjs` | 安全清理 mock 遗留工单（dry-run 默认、0600 备份、原子写） |
 | `scripts/verify-domain-v2.mjs` | 用安装版 zod/domain 验证 v2 契约（Electron-as-node） |
-| `test/` | `node:test` 单元/集成测试（P5 新增/扩充：`review-parser`、`gitlab`、`delivery-service`、`review-service`、`credentials`、`git`、`store`、`routes`、`client-action-map`、`agent-access`；UI v2：`client-stage-map`；P6：`platform-login`、`client-platform-login`；总计 **597**） |
+| `test/` | `node:test` 单元/集成测试（P5 新增/扩充：`review-parser`、`gitlab`、`delivery-service`、`review-service`、`credentials`、`git`、`store`、`routes`、`client-action-map`、`agent-access`；UI v2：`client-stage-map`；P6：`platform-login`、`client-platform-login`、`attachments`；总计 **613**） |
 
 ## 许可
 
