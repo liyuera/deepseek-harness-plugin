@@ -569,9 +569,11 @@ window.__ModuleLoader__.load({
     });
 
     /**
-     * `POST /api/deliver` failure code -> actionable Chinese hint. Mirrors the
-     * route's `DELIVERY_ERROR_STATUS` map; the status fallback covers a host
-     * that returns a code this board does not know yet.
+     * `POST /api/deliver` failure code -> actionable Chinese hint. Covers every
+     * code the route's `DELIVERY_ERROR_STATUS` map can return (the status
+     * fallback still covers a future/host-side code this board does not know
+     * yet). `invalid-input`/`internal` are the route-level 400/500 buckets and
+     * intentionally share the same copy as the status fallback.
      */
     const DELIVERY_ERROR_HINTS = Object.freeze(Object.assign(Object.create(null), {
       'ticket-not-found': '工单不存在',
@@ -586,11 +588,13 @@ window.__ModuleLoader__.load({
       'worktree-conflict': '工作树当前分支与个人分支不一致，请重新执行修复',
       'invalid-branch': '个人分支或目标分支不合法，无法提交 MR',
       'invalid-code': '工单编号/工作区无效',
+      'invalid-input': '工单/工作树或 GitLab 配置无效',
       'unknown-workspace': '工单编号/工作区无效',
       'delivery-unavailable': '交付服务不可用，请稍后重试',
       'git-failed': '无法解析工作区仓库，无法提交 MR',
       'push-failed': '推送个人分支失败，请检查远程仓库后重试',
       'mr-failed': '创建 GitLab MR 失败，请稍后重试',
+      'internal': '交付启动失败，请稍后重试',
       'missing-session': '缺少会话上下文，无法提交 MR',
     }));
 
@@ -654,6 +658,12 @@ window.__ModuleLoader__.load({
 
     /** Polling hint rendered for every Review-owned state. */
     const REVIEW_POLL_HINT = '每 60 秒自动检查 AI Code Review 结论';
+
+    /**
+     * The review timer no-ops without a GitLab token, but the board keeps
+     * promising the next poll; this warning makes the paused poller visible.
+     */
+    const REVIEW_TOKEN_MISSING_HINT = '未配置 GitLab token，Review 轮询已暂停';
 
     /** Live progress copy while the review-fix job runs (elapsed appended). */
     const REVIEW_RUNNING_HINT = 'AI 正在修复 Review 问题…（最长约 15 分钟，可继续其他操作）';
@@ -1235,8 +1245,10 @@ window.__ModuleLoader__.load({
      * The persisted static review error for one code, or `null`.
      *
      * Same staleness rule as `analysisErrorFor`: `review.error:<code>` can
-     * survive on a ticket that moved on, so it is only rendered by the
-     * `mr_open`/`fixing_review` review panel, never on mergeable/merged/blocked.
+     * survive on a ticket that moved on, so the review panel only renders it
+     * for the states that consume review writes — `mr_open`, `fixing_review`,
+     * and `mergeable`/`merged` (where a failed merge/archival write leaves the
+     * host-recorded cause visible instead of only the success copy).
      */
     function reviewErrorFor(snapshot, code) {
       return serviceErrorFor(snapshot, 'review', code);
@@ -2433,6 +2445,13 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Title hint for the surfaces that share the token mutation gate: while one
+     * token card saves/clears, the other card and the settings save button are
+     * disabled but must still explain why.
+     */
+    const TOKEN_MUTATION_BUSY_HINT = '正在保存 token，请稍候';
+
+    /**
      * Write-only token card shared by the platform and GitLab connection
      * sections (P5 extracts it so both flow exactly the same way).
      *
@@ -2441,7 +2460,10 @@ window.__ModuleLoader__.load({
      * `snapshot.<service>.tokenPresent`, never a client copy of the value.
      * Save/clear are disabled while the session has no bound workspace (the
      * host token routes are profile-global, but the panel keeps the same gate
-     * as every other write) and while another request is in flight.
+     * as every other write) and while another request is in flight. The shared
+     * board mutation gate means a save/clear on the OTHER card (or a settings
+     * save) would silently no-op here, so `otherTokenBusy` disables this card's
+     * buttons too and names the reason in their title.
      */
     function TokenCard({
       scope,
@@ -2451,6 +2473,7 @@ window.__ModuleLoader__.load({
       ariaLabel,
       tokenDraft,
       tokenBusy,
+      otherTokenBusy,
       tokenPresent,
       disabled,
       canSave,
@@ -2459,8 +2482,10 @@ window.__ModuleLoader__.load({
       onClearToken,
     }) {
       const tokenLocked = disabled === true || tokenBusy === true || canSave !== true;
-      const saveTokenDisabled = tokenLocked || tokenDraft.trim() === '';
-      const clearTokenDisabled = tokenLocked || tokenPresent !== true;
+      const otherBusy = otherTokenBusy === true;
+      const actionLocked = tokenLocked || otherBusy;
+      const saveTokenDisabled = actionLocked || tokenDraft.trim() === '';
+      const clearTokenDisabled = actionLocked || tokenPresent !== true;
       const gateHint = canSave === true ? readyHint : SETTINGS_UNBOUND_HINT;
       const dotColor = tokenPresent === true ? C.success : C.textTertiary;
 
@@ -2529,16 +2554,20 @@ window.__ModuleLoader__.load({
             onClick: onSaveToken,
             disabled: saveTokenDisabled,
             'aria-busy': tokenBusy === true || undefined,
-            title: canSave !== true
-              ? SETTINGS_UNBOUND_HINT
-              : (tokenDraft.trim() === '' ? '请先粘贴 token' : '保存 token'),
+            title: otherBusy
+              ? TOKEN_MUTATION_BUSY_HINT
+              : (canSave !== true
+                ? SETTINGS_UNBOUND_HINT
+                : (tokenDraft.trim() === '' ? '请先粘贴 token' : '保存 token')),
             style: primaryButtonStyle(saveTokenDisabled),
           }, tokenBusy === true ? '保存中…' : '保存 token'),
           h('button', {
             type: 'button',
             onClick: onClearToken,
             disabled: clearTokenDisabled,
-            title: tokenPresent === true ? '清除已保存的 token' : '当前没有已保存的 token',
+            title: otherBusy
+              ? TOKEN_MUTATION_BUSY_HINT
+              : (tokenPresent === true ? '清除已保存的 token' : '当前没有已保存的 token'),
             style: smallButtonStyle(clearTokenDisabled),
           }, '清除'),
           h('span', {
@@ -2557,6 +2586,7 @@ window.__ModuleLoader__.load({
       canSave,
       tokenDraft,
       tokenBusy,
+      otherTokenBusy,
       tokenPresent,
       baseUrlInputRef,
       onFieldChange,
@@ -2616,6 +2646,7 @@ window.__ModuleLoader__.load({
           ariaLabel: '平台 token',
           tokenDraft,
           tokenBusy,
+          otherTokenBusy,
           tokenPresent,
           disabled,
           canSave,
@@ -2645,6 +2676,7 @@ window.__ModuleLoader__.load({
       canSave,
       tokenDraft,
       tokenBusy,
+      otherTokenBusy,
       tokenPresent,
       onFieldChange,
       onTokenChange,
@@ -2695,6 +2727,7 @@ window.__ModuleLoader__.load({
           ariaLabel: 'GitLab token',
           tokenDraft,
           tokenBusy,
+          otherTokenBusy,
           tokenPresent,
           disabled,
           canSave,
@@ -2740,6 +2773,11 @@ window.__ModuleLoader__.load({
       const panelRef = React.useRef(null);
       const firstInputRef = React.useRef(null);
       const canSave = sessionMissing !== true && configured === true;
+      // One shared mutation gate: while either token card saves/clears, the
+      // panel's own 「保存」 button would silently no-op too. Keep it disabled
+      // and name the reason instead of dropping the click.
+      const tokenMutationBusy = tokenBusy === true || gitlabTokenBusy === true;
+      const settingsSaveDisabled = saving === true || tokenMutationBusy || !canSave;
 
       React.useEffect(() => {
         const node = firstInputRef.current;
@@ -2794,6 +2832,9 @@ window.__ModuleLoader__.load({
       const hintTone = sessionMissing === true || workspaceKnown !== true || configured !== true
         ? TONES.warn
         : TONES.neutral;
+      const settingsSaveTitle = tokenMutationBusy
+        ? TOKEN_MUTATION_BUSY_HINT
+        : (canSave ? '保存设置' : hint);
       const workspaceLine = sessionMissing === true
         ? '缺少会话上下文'
         : (workspaceKnown !== true
@@ -2896,6 +2937,9 @@ window.__ModuleLoader__.load({
             canSave,
             tokenDraft,
             tokenBusy,
+            // The shared board mutation gate also blocks this card while the
+            // GitLab card is saving/clearing.
+            otherTokenBusy: gitlabTokenBusy === true,
             tokenPresent,
             baseUrlInputRef: firstInputRef,
             onFieldChange: onChange,
@@ -2910,6 +2954,7 @@ window.__ModuleLoader__.load({
             canSave,
             tokenDraft: gitlabTokenDraft,
             tokenBusy: gitlabTokenBusy,
+            otherTokenBusy: tokenBusy === true,
             tokenPresent: gitlabTokenPresent,
             onFieldChange: onChange,
             onTokenChange: onGitlabTokenChange,
@@ -2966,10 +3011,10 @@ window.__ModuleLoader__.load({
             h('button', {
               type: 'button',
               onClick: onSave,
-              disabled: saving === true || !canSave,
+              disabled: settingsSaveDisabled,
               'aria-busy': saving === true || undefined,
-              title: canSave ? '保存设置' : hint,
-              style: primaryButtonStyle(saving === true || !canSave),
+              title: settingsSaveTitle,
+              style: primaryButtonStyle(settingsSaveDisabled),
             }, saving === true ? '保存中…' : '保存'))));
     }
 
@@ -3671,12 +3716,18 @@ window.__ModuleLoader__.load({
 
     /**
      * Bounded issue list used by the Review card and the inline `mr_open`
-     * panel. Every field is clipped: issue text is AI-generated (and passed
-     * through an untrusted note), so an oversized value must not blow up the
-     * sidebar layout. `limit` caps the number of rendered issues without
-     * touching the stored array.
+     * panel.
+     *
+     * `bounded` is opt-in and only the P5 inline panel sets it: the P4
+     * `ReviewCard` keeps its pre-P5 rendering verbatim (full file/level/problem
+     * text), so the P5 clipping never changes an existing card. When
+     * `bounded:true`, every field is clipped because issue text is AI-generated
+     * (and passed through an untrusted note), so an oversized value must not
+     * blow up the sidebar layout. `limit` caps the number of rendered issues
+     * without touching the stored array.
      */
-    function IssueList({ issues, title, limit }) {
+    function IssueList({ issues, title, limit, bounded }) {
+      const isBounded = bounded === true;
       if (!Array.isArray(issues) || issues.length === 0) return null;
       const list = typeof limit === 'number' && Number.isFinite(limit) && limit > 0
         ? issues.slice(0, limit)
@@ -3687,10 +3738,10 @@ window.__ModuleLoader__.load({
           style: { listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: 5 },
         }, list.map((issue, index) => {
           const value = issue && typeof issue === 'object' ? issue : { problem: issue };
-          const heading = [
-            clip(textOf(value.file), 120),
-            clip(textOf(value.level), 40),
-          ].filter((part) => part !== '').join(' · ');
+          const heading = isBounded
+            ? [clip(textOf(value.file), 120), clip(textOf(value.level), 40)]
+              .filter((part) => part !== '').join(' · ')
+            : [textOf(value.file), textOf(value.level)].filter((part) => part !== '').join(' · ');
           return h('li', {
             key: `issue-${index}`,
             style: {
@@ -3705,12 +3756,20 @@ window.__ModuleLoader__.load({
             },
           },
             heading === '' ? null : h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textSecondary, wordBreak: 'break-all' } }, heading),
-            typeof value.location === 'string' && value.location !== ''
+            isBounded && typeof value.location === 'string' && value.location !== ''
               ? h('div', { style: { fontSize: 10.5, lineHeight: '15px', color: C.textTertiary, wordBreak: 'break-all' } }, clip(value.location, 160))
               : null,
-            h('div', { style: { ...fieldValueStyle, fontSize: 12, wordBreak: 'break-word' } }, clip(textOf(value.problem, '—'), 400)),
+            h('div', {
+              style: isBounded
+                ? { ...fieldValueStyle, fontSize: 12, wordBreak: 'break-word' }
+                : { ...fieldValueStyle, fontSize: 12 },
+            }, isBounded ? clip(textOf(value.problem, '—'), 400) : textOf(value.problem, '—')),
             typeof value.suggestion === 'string' && value.suggestion !== ''
-              ? h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary, wordBreak: 'break-word' } }, `建议：${clip(value.suggestion, 300)}`)
+              ? h('div', {
+                style: isBounded
+                  ? { fontSize: 11, lineHeight: '16px', color: C.textTertiary, wordBreak: 'break-word' }
+                  : { fontSize: 11, lineHeight: '16px', color: C.textTertiary },
+              }, `建议：${clip(value.suggestion, 300)}`)
               : null);
         })));
     }
@@ -3863,6 +3922,18 @@ window.__ModuleLoader__.load({
         : 0;
       const round = latestReviewRound(ticket);
       const reviewError = reviewErrorFor(snapshot, ticket.code);
+      // Strict `=== false`: a partial snapshot without the gitlab block must not
+      // claim the token is missing.
+      const gitlabTokenMissing = snapshot !== null
+        && typeof snapshot === 'object'
+        && snapshot.gitlab !== null
+        && typeof snapshot.gitlab === 'object'
+        && snapshot.gitlab.tokenPresent === false;
+      const tokenWarning = gitlabTokenMissing
+        ? h('div', {
+          style: { fontSize: 11, lineHeight: '16px', color: TONES.warn.color, wordBreak: 'break-word' },
+        }, `${REVIEW_TOKEN_MISSING_HINT}；请在「设置 → GitLab 连接」保存 token。`)
+        : null;
       const styleFor = (tone) => ({
         border: `0.5px solid ${tone.border}`,
         background: tone.background,
@@ -3899,7 +3970,8 @@ window.__ModuleLoader__.load({
           h('div', { style: { fontSize: 12, fontWeight: 600, color: TONES.success.color, lineHeight: '18px' } },
             REVIEW_MERGED_HINT),
           h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary } },
-            '宿主会在下一次 60 秒轮询自动归档，看板无需手动操作。'));
+            '宿主会在下一次 60 秒轮询自动归档，看板无需手动操作。'),
+          errorLine);
       }
 
       if (workflow === 'mergeable') {
@@ -3908,6 +3980,7 @@ window.__ModuleLoader__.load({
             REVIEW_MERGEABLE_HINT),
           h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary } },
             REVIEW_POLL_HINT),
+          errorLine,
           roundInfo);
       }
 
@@ -3927,6 +4000,7 @@ window.__ModuleLoader__.load({
           }, `已运行 ${formatElapsed(elapsed)}`),
           h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary } },
             '修复完成后宿主会自动提交并推送，然后重新请求 AI Review。'),
+          tokenWarning,
           roundInfo);
       }
 
@@ -3936,6 +4010,7 @@ window.__ModuleLoader__.load({
             REVIEW_NOT_RUNNING_HINT),
           h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary } },
             '无需手动操作；若长时间未恢复，请人工检查宿主日志与 GitLab MR。'),
+          tokenWarning,
           roundInfo,
           errorLine);
       }
@@ -3947,12 +4022,14 @@ window.__ModuleLoader__.load({
           '等待 AI Code Review 结论'),
         h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textSecondary } },
           REVIEW_POLL_HINT),
+        tokenWarning,
         h(IssueList, {
           issues: blocking,
           title: blocking.length > MAX_RENDERED_REVIEW_ISSUES
             ? `最近阻塞问题（共 ${blocking.length} 条，仅显示 ${MAX_RENDERED_REVIEW_ISSUES} 条）`
             : '最近阻塞问题',
           limit: MAX_RENDERED_REVIEW_ISSUES,
+          bounded: true,
         }),
         errorLine);
     }
@@ -3983,11 +4060,17 @@ window.__ModuleLoader__.load({
         })));
     }
 
-    function BlockedNotice({ ticket }) {
+    function BlockedNotice({ ticket, snapshot }) {
       if (ticket.workflow !== 'blocked') return null;
       const from = typeof ticket.blockedFrom === 'string' && ticket.blockedFrom !== ''
         ? workflowLabel(ticket.blockedFrom)
         : null;
+      // Only a delivery block reads the delivery namespace: the persisted
+      // `delivery.error:<code>` carries the lint/test/push/MR output tail
+      // (`buildFailureMessage` in delivery-service.js). A blocked ticket keeps
+      // only the mapped reason code, so without this line the host-recorded
+      // detail would never be visible. Never fall back to `snapshot.fix.errors`.
+      const deliveryDetail = isDeliveryBlock(ticket) ? deliveryErrorFor(snapshot, ticket.code) : null;
       return h('div', {
         role: 'status',
         style: {
@@ -4004,6 +4087,11 @@ window.__ModuleLoader__.load({
         h('div', { style: { fontSize: 12, fontWeight: 600, color: C.error, lineHeight: '18px' } }, '工单已阻塞，需要人工处理'),
         h('div', { style: { ...fieldValueStyle, fontSize: 12 } },
           `原因：${blockedReasonText(ticket)}`),
+        deliveryDetail === null
+          ? null
+          : h('div', {
+            style: { fontSize: 11, lineHeight: '16px', color: C.textSecondary, wordBreak: 'break-word' },
+          }, `宿主记录：${clip(deliveryDetail, 300)}`),
         from === null
           ? null
           : h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textSecondary } }, `阻塞前状态：${from}`),
@@ -4366,7 +4454,7 @@ window.__ModuleLoader__.load({
         // FixNotice already reports the blocked-fix cause and the restart
         // action (role="alert"); the generic blocked banner would repeat the
         // same reason. Keep it for every other block (analysis, plan review…).
-        fixBlock ? null : h(BlockedNotice, { ticket }),
+        fixBlock ? null : h(BlockedNotice, { ticket, snapshot }),
         planReview ? null : actionBar,
         h(FieldsBlock, { ticket, snapshot }),
         h(PlatformCard, { ticket }),

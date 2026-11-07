@@ -1216,7 +1216,8 @@ function legacyActionStore() {
 test('POST /action refuses analysis_done while the real analysis job runs for that code', async () => {
   const store = createFakeStore({ tickets: [{ ...inboxTicket('BUG-1'), workflow: 'analyzing' }] });
   const analysis = createFakeAnalysis({ status: { running: ['BUG-1'], errors: {} } });
-  const { handlers } = handlersWith({ store, analysis });
+  const fix = createFakeFix();
+  const { handlers } = handlersWith({ store, analysis, fix });
   const { res, json } = await call(handlers.action, {
     method: 'POST',
     url: API_PATHS.action,
@@ -1230,12 +1231,14 @@ test('POST /action refuses analysis_done while the real analysis job runs for th
   assert.equal(json.ticket, undefined, 'the refusal must not echo a ticket');
   assert.equal(store.calls.applyAction.length, 0, 'the guard must run before the store write');
   assert.equal(analysis.calls.status, 1);
+  assert.equal(fix.calls.status, 0, 'analysis_done must never read the fix service status');
 });
 
 test('POST /action refuses fix_done while the real fix job runs for that code', async () => {
   const store = createFakeStore({ tickets: [{ ...inboxTicket('BUG-1'), workflow: 'fixing' }] });
   const fix = createFakeFix({ status: { running: ['BUG-1'], errors: {} } });
-  const { handlers } = handlersWith({ store, fix });
+  const analysis = createFakeAnalysis();
+  const { handlers } = handlersWith({ store, analysis, fix });
   const { res, json } = await call(handlers.action, {
     method: 'POST',
     url: API_PATHS.action,
@@ -1246,6 +1249,7 @@ test('POST /action refuses fix_done while the real fix job runs for that code', 
   assert.equal(json.code, 'service-job-running');
   assert.equal(store.calls.applyAction.length, 0);
   assert.equal(fix.calls.status, 1);
+  assert.equal(analysis.calls.status, 0, 'fix_done must never read the analysis service status');
 });
 
 test('POST /action keeps the legacy path when another code is running or another action is sent', async () => {
@@ -1294,6 +1298,85 @@ test('POST /action keeps the legacy path when the service is unwired or its stat
       method: 'POST',
       url: API_PATHS.action,
       body: actionBody({ action: entry.action, actionId: `act-guard-${entry.action}` }),
+    });
+    assert.equal(res.statusCode, 200, `${entry.name} must keep the legacy path`);
+    assert.equal(json.ok, true, entry.name);
+    assert.equal(store.calls.applyAction.length, 1, `${entry.name} must still reach the store`);
+  }
+});
+
+test('POST /action keeps the legacy path for malformed service.status() results', async () => {
+  // `serviceJobRunningFor()` fail-opens on any shape other than a plain object
+  // with a string-only `running` array: malformed status must never turn into
+  // the new 409 failure mode for older/broken wiring.
+  const statuses = [
+    { name: 'null', status: null },
+    { name: 'array', status: [] },
+    { name: 'plain object without running', status: {} },
+    { name: 'non-array running', status: { running: 'BUG-1' } },
+    { name: 'null running', status: { running: null } },
+    { name: 'non-string running entry', status: { running: [42] } },
+    { name: 'code plus a non-string entry', status: { running: [1, 'BUG-1'] } },
+  ];
+
+  for (const entry of statuses) {
+    for (const action of ['analysis_done', 'fix_done']) {
+      const store = legacyActionStore();
+      const analysis = createFakeAnalysis({ status: action === 'analysis_done' ? entry.status : { running: [], errors: {} } });
+      const fix = createFakeFix({ status: action === 'fix_done' ? entry.status : { running: [], errors: {} } });
+      const { handlers } = handlersWith({ store, analysis, fix });
+      const { res, json } = await call(handlers.action, {
+        method: 'POST',
+        url: API_PATHS.action,
+        body: actionBody({ action, actionId: `act-guard-malformed-${action}` }),
+      });
+
+      assert.equal(res.statusCode, 200, `${entry.name}/${action} must keep the legacy path`);
+      assert.equal(json.ok, true, `${entry.name}/${action}`);
+      assert.equal(store.calls.applyAction.length, 1, `${entry.name}/${action} must still reach the store`);
+      assert.equal(analysis.calls.status + fix.calls.status, 1, `${entry.name}/${action} must read exactly one service`);
+      if (action === 'analysis_done') {
+        assert.equal(fix.calls.status, 0, `${entry.name}: analysis_done must not read the fix service`);
+      } else {
+        assert.equal(analysis.calls.status, 0, `${entry.name}: fix_done must not read the analysis service`);
+      }
+    }
+  }
+});
+
+test('POST /action keeps the legacy path when a service loses status() after wiring', async () => {
+  // `createHandlers()` already validates the service shape, so the helper's
+  // `typeof service?.status !== 'function'` branch is exercised by degrading a
+  // live deps object after wiring (a broken reload / partially disposed
+  // service): the guard must fail open instead of throwing or returning 409.
+  const cases = [
+    {
+      name: 'analysis service without status',
+      action: 'analysis_done',
+      prepare: (deps) => { deps.analysis.service.status = undefined; },
+    },
+    {
+      name: 'fix service object removed',
+      action: 'fix_done',
+      prepare: (deps) => { deps.fix.service = null; },
+    },
+    {
+      name: 'analysis deps object replaced',
+      action: 'analysis_done',
+      prepare: (deps) => { deps.analysis.service = {}; },
+    },
+  ];
+
+  for (const entry of cases) {
+    const store = legacyActionStore();
+    const analysis = createFakeAnalysis();
+    const fix = createFakeFix();
+    const { handlers } = handlersWith({ store, analysis, fix });
+    entry.prepare({ analysis, fix });
+    const { res, json } = await call(handlers.action, {
+      method: 'POST',
+      url: API_PATHS.action,
+      body: actionBody({ action: entry.action, actionId: `act-guard-no-status-${entry.action}` }),
     });
     assert.equal(res.statusCode, 200, `${entry.name} must keep the legacy path`);
     assert.equal(json.ok, true, entry.name);

@@ -560,6 +560,16 @@ export function createHandlers({
       // conditional patch/action becomes `stale-workflow` (the run's ledger is
       // lost). An unwired service (or a status read that fails) keeps the
       // legacy path: this guard only covers the live race, never a new failure.
+      //
+      // Accepted TOCTOU window: the job may settle (or start) between this
+      // `status()` read and the `store.applyAction` below. A job that finishes
+      // in that window makes the guard return 409 for a ticket whose run just
+      // completed — the safe direction, because the user simply retries; a job
+      // that starts in that window can still lose the race, but only a raw
+      // (board-hidden) POST can hit it and the window is microseconds wide.
+      // Closing it fully would need the write and the status read to share the
+      // service's lock, which is deliberately out of scope for this demo-action
+      // guard.
       const serviceDeps = action === 'analysis_done'
         ? analysisDeps
         : (action === 'fix_done' ? fixDeps : null);
@@ -1319,11 +1329,13 @@ function readServiceStatus(serviceDeps) {
 /**
  * True when `code` is in the service's live `status().running` set.
  *
- * Reading the service status is best-effort: an unwired dependency, a service
- * without `status()`, a throwing `status()` or a malformed result all read as
- * "not running" so the legacy `/api/action` path stays available (the guard
- * only ever removes the specific race with a real background job; it must not
- * turn into a new failure mode for older wiring).
+ * Reading the service status is best-effort and mirrors the snapshot
+ * normalizer above: an unwired dependency, a service without `status()`, a
+ * throwing `status()` or a malformed result — including a `running` array with
+ * non-string entries — all read as "not running" so the legacy `/api/action`
+ * path stays available (the guard only ever removes the specific race with a
+ * real background job; it must not turn into a new failure mode for older
+ * wiring).
  */
 function serviceJobRunningFor(serviceDeps, code) {
   if (serviceDeps === null || serviceDeps === undefined) return false;
@@ -1336,6 +1348,7 @@ function serviceJobRunningFor(serviceDeps, code) {
     return false;
   }
   if (!isPlainObject(status) || !Array.isArray(status.running)) return false;
+  if (!status.running.every((entry) => typeof entry === 'string')) return false;
   return status.running.includes(code);
 }
 

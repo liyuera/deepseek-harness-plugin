@@ -416,6 +416,95 @@ test('P5 delivery/review panels wire the real routes and keep counters out of li
   assert.ok(source.includes("patch: '交付信息已更新'"), 'EVENT_LABELS must map the patch timeline kind');
 });
 
+test('P5 delivery/review polish keeps host-recorded details and the shared mutation gate', () => {
+  const reviewStart = source.indexOf('function ReviewNotice(');
+  const reviewEnd = source.indexOf('function Timeline(', reviewStart);
+  assert.ok(reviewStart !== -1 && reviewEnd > reviewStart, 'client.js must declare ReviewNotice before Timeline');
+  const reviewBody = source.slice(reviewStart, reviewEnd);
+
+  // --- M1: a delivery block must surface the host-persisted error detail ---
+  const blockedStart = source.indexOf('function BlockedNotice(');
+  const blockedEnd = source.indexOf('function AnalysisNotice(', blockedStart);
+  assert.ok(blockedStart !== -1 && blockedEnd > blockedStart, 'client.js must declare BlockedNotice before AnalysisNotice');
+  const blockedBody = source.slice(blockedStart, blockedEnd);
+  assert.ok(blockedBody.includes('isDeliveryBlock(ticket)'), 'the delivery detail is only read for a delivery block');
+  assert.ok(
+    blockedBody.includes('deliveryErrorFor(snapshot, ticket.code)'),
+    'the delivery block must read snapshot.delivery.errors through the helper',
+  );
+  assert.ok(blockedBody.includes('`宿主记录：${clip(deliveryDetail, 300)}`'), 'the detail must be clipped and labelled 宿主记录');
+  assert.equal(blockedBody.includes('fixErrorFor('), false, 'a delivery block must never read snapshot.fix.errors');
+  assert.ok(
+    source.includes('h(BlockedNotice, { ticket, snapshot })'),
+    'TicketDetail must pass the snapshot to BlockedNotice',
+  );
+
+  // --- M2: mergeable/merged render review errors; review states warn on no token ---
+  assert.ok(
+    source.includes("const REVIEW_TOKEN_MISSING_HINT = '未配置 GitLab token，Review 轮询已暂停';"),
+    'the missing-token warning copy must stay stable',
+  );
+  assert.ok(reviewBody.includes('REVIEW_TOKEN_MISSING_HINT'), 'ReviewNotice must render the token warning');
+  assert.ok(
+    reviewBody.includes("snapshot.gitlab.tokenPresent === false"),
+    'the warning must key off the strict host value (not merely absent)',
+  );
+  assert.ok(
+    (reviewBody.match(/errorLine/g) || []).length >= 4,
+    'review errors must render in mr_open, fixing_review, mergeable and merged',
+  );
+  assert.ok(
+    reviewBody.includes("'data-bug-review': 'mergeable'") && reviewBody.includes("'data-bug-review': 'merged'"),
+    'the mergeable/merged branches must stay identifiable',
+  );
+
+  // --- M3: one shared token mutation gate across both cards and the save button ---
+  assert.ok(
+    source.includes("const TOKEN_MUTATION_BUSY_HINT = '正在保存 token，请稍候';"),
+    'the shared busy hint copy must stay stable',
+  );
+  const tokenCardStart = source.indexOf('function TokenCard(');
+  const tokenCardEnd = source.indexOf('function PlatformConnectionSection(', tokenCardStart);
+  assert.ok(tokenCardStart !== -1 && tokenCardEnd > tokenCardStart, 'client.js must declare TokenCard before the sections');
+  const tokenCardBody = source.slice(tokenCardStart, tokenCardEnd);
+  assert.ok(tokenCardBody.includes('otherTokenBusy'), 'TokenCard must accept the other card busy gate');
+  assert.ok(tokenCardBody.includes('const actionLocked = tokenLocked || otherBusy;'), 'the other busy state must lock the buttons');
+  assert.ok(tokenCardBody.includes('title: otherBusy'), 'the disabled buttons must explain the shared mutation');
+  assert.ok(
+    source.includes('otherTokenBusy: gitlabTokenBusy === true')
+      && source.includes('otherTokenBusy: tokenBusy === true'),
+    'each section must be told when the OTHER token card is busy',
+  );
+  assert.ok(source.includes('const settingsSaveDisabled = saving === true || tokenMutationBusy || !canSave;'));
+  assert.ok(source.includes('title: settingsSaveTitle'), 'the settings save button must carry the busy hint');
+
+  // --- M7: the hint map covers the route-level invalid-input/internal buckets ---
+  assert.ok(source.includes("'invalid-input': '工单/工作树或 GitLab 配置无效'"));
+  assert.ok(source.includes("'internal': '交付启动失败，请稍后重试'"));
+  assert.ok(
+    source.includes('DELIVERY_ERROR_HINTS') && source.includes('DELIVERY_STATUS_HINTS'),
+    'the status fallback must stay in place after the explicit hints',
+  );
+
+  // --- M8: clipping is P5-only; the P4 ReviewCard keeps its pre-5a rendering ---
+  const issueListStart = source.indexOf('function IssueList(');
+  const issueListEnd = source.indexOf('function ReviewCard(', issueListStart);
+  assert.ok(issueListStart !== -1 && issueListEnd > issueListStart, 'client.js must declare IssueList before ReviewCard');
+  const issueListBody = source.slice(issueListStart, issueListEnd);
+  assert.ok(issueListBody.includes('const isBounded = bounded === true;'), 'clipping must be opt-in');
+  assert.ok(
+    issueListBody.includes("clip(textOf(value.problem, '—'), 400) : textOf(value.problem, '—')"),
+    'the unbounded branch must render the full problem while the bounded branch clips it',
+  );
+  assert.ok(issueListBody.includes('isBounded && typeof value.location'), 'the location line is P5-only');
+  const reviewCardStart = source.indexOf('function ReviewCard(');
+  const reviewCardEnd = source.indexOf('function DeliveryNotice(', reviewCardStart);
+  assert.ok(reviewCardStart !== -1 && reviewCardEnd > reviewCardStart, 'client.js must declare ReviewCard before DeliveryNotice');
+  const reviewCardBody = source.slice(reviewCardStart, reviewCardEnd);
+  assert.equal(reviewCardBody.includes('bounded'), false, 'the P4 ReviewCard must not opt into clipping');
+  assert.ok(reviewBody.includes('bounded: true'), 'the P5 inline mr_open list must opt into clipping');
+});
+
 test('terminal state maps no actions and accepts none', () => {
   assert.equal(Array.isArray(ACTION_BY_STATE[TERMINAL_STATE]), true);
   assert.equal(ACTION_BY_STATE[TERMINAL_STATE].length, 0);
