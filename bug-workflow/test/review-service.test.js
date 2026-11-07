@@ -16,8 +16,11 @@
  * review_fix_done (rounds increment exactly once), a second round, the 3-round
  * cap, parse drift, non-AI note filtering, hidden-stat scrubbing, note-id
  * dedupe, merge detection for `mergeable`/`mr_open`, auto-archive to `done`,
- * review-fix failure/no-changes/worktree-conflict paths, dispose-without-writes,
- * timer start/stop, single-flight and shared-lock release.
+ * review-fix failure/no-changes/worktree-conflict paths, recovery after a
+ * failure/retry and a fresh instance (restart, lost write, pending commit),
+ * the pending-commit record's round/note binding (never replay a stale round),
+ * dispose-without-writes, timer start/stop, single-flight and shared-lock
+ * release.
  */
 
 import assert from 'node:assert/strict';
@@ -582,6 +585,53 @@ function reviewRoundEntry({ round = 1, noteId = 1, verdict = 'changes', status =
     finishedAt: STORE_TIME,
     changedFiles: [],
     status,
+  };
+}
+
+/** One truthful `fixes[]` entry (mirrors a persisted review-fix run). */
+function fixEntry({ runId = 'review-fix-seed-run', childId = 'child-seed' } = {}) {
+  return {
+    runId,
+    childId,
+    startedAt: STORE_TIME,
+    finishedAt: STORE_TIME,
+    changedFiles: ['readme.md'],
+    diffStat: '1 file changed',
+    diff: '',
+    summary: '种子的 Review 修复记录',
+    testResult: 'ok',
+    status: 'succeeded',
+  };
+}
+
+/**
+ * A pending-commit record shaped exactly like the one `runFixJob` writes before
+ * the push (I1). Tests seed it directly to simulate a record that survived a
+ * completed round through a dispose/clear failure (N1).
+ */
+function fixCommitRecord({
+  sha,
+  worktree,
+  branch = BRANCH.name,
+  round = 1,
+  noteId = 1,
+  runId = `review-fix-seed-${round}-${noteId}`,
+} = {}) {
+  return {
+    sha,
+    worktree,
+    branch,
+    round,
+    noteId,
+    startedAt: STORE_TIME,
+    finishedAt: STORE_TIME,
+    changedFiles: ['readme.md'],
+    diffStat: '1 file changed',
+    diff: '',
+    summary: '种子的 Review 修复记录',
+    testResult: 'ok',
+    runId,
+    status: 'succeeded',
   };
 }
 
@@ -1613,6 +1663,181 @@ test('a push failure records the pending commit and the retry pushes it without 
   assert.equal(bareRef(realOrigin, `refs/heads/${BRANCH.name}`), sha);
   assert.equal(h.store.getMeta(REVIEW_FIX_COMMIT_META_PREFIX + CODE), null);
   assert.equal(h.store.getMeta(REVIEW_ERROR_META_PREFIX + CODE), null);
+});
+
+// --- N1: a pending-commit record is bound to ONE round + claimed note ------
+// A record that survived the round that wrote it must never be replayed for a
+// later round: that would push the OLD commit, append no current ledger entry
+// and skip the current child entirely (workflow `mr_open`, `mr.rounds` +1 but
+// `fixes`/`reviewRounds` short one round).
+
+test('a previous round pending-commit record is purged when the next round starts and cannot fake completion', async (t) => {
+  const h = await createHarness(t, {
+    rounds: 1,
+    lastNoteId: 40,
+    reviewRounds: [reviewRoundEntry({ round: 1, noteId: 40 })],
+    fixes: [fixEntry({ runId: 'review-fix-seed-round-1' })],
+    notes: [note(41, CHANGES_BODY, '2026-11-07T04:00:20.000Z')],
+    runner: createFakeRunner((input, count) => {
+      if (count === 1) return { ok: false, code: 'analysis-failed', message: 'round 2 child failed' };
+      appendFileSync(join(input.worktreePath, 'readme.md'), '\nround 2 fixed after retry\n');
+      return {
+        ok: true,
+        result: {
+          summary: 'round 2 fixed after retry',
+          changedFiles: ['readme.md'],
+          testResult: 'ok',
+          notes: '',
+        },
+        childId: 'child-round-2-retry',
+        elapsedMs: 3,
+      };
+    }),
+  });
+  const staleSha = gitSync(h.fixture.worktree, ['rev-parse', 'HEAD']);
+  await h.store.setMeta(REVIEW_FIX_COMMIT_META_PREFIX + CODE, fixCommitRecord({
+    sha: staleSha,
+    worktree: h.fixture.worktree,
+    round: 1,
+    noteId: 40,
+  }));
+
+  // A NEW changes note starts round 2. The stale round-1 record must be purged
+  // before the round runs (it only ever describes round 1).
+  const startTick = await h.service.tick();
+  await waitForIdle(h.service);
+  assert.equal(startTick.transitioned, 1);
+  let ticket = h.store.get(CODE);
+  assert.equal(ticket.workflow, 'blocked');
+  assert.equal(ticket.blockedFrom, 'fixing_review');
+  assert.equal(ticket.blockedReason, 'review-fix-failed');
+  assert.equal(ticket.mr.rounds, 2);
+  assert.equal(h.store.getMeta(REVIEW_FIX_COMMIT_META_PREFIX + CODE), null);
+  assert.equal(h.runner.calls.length, 1);
+  assert.equal(h.runner.calls[0].mr.rounds, 2);
+  assert.equal(ticket.fixes.length, 1);
+  assert.equal(ticket.reviewRounds.length, 1);
+
+  // Retry after the round-2 child failure: recovery must rerun the CURRENT
+  // round instead of replaying the round-1 commit.
+  const retried = await h.store.applyAction(CODE, 'retry', { actor: 'user' });
+  assert.equal(retried.ok, true);
+  assert.equal(retried.ticket.workflow, 'fixing_review');
+  const recoveryTick = await h.service.tick();
+  await waitFor(() => h.runner.calls.length === 2, 'round 2 restarted');
+  await waitForIdle(h.service);
+  assert.equal(recoveryTick.transitioned, 0);
+  assert.equal(h.runner.calls[1].mr.rounds, 2);
+
+  ticket = h.store.get(CODE);
+  assert.equal(ticket.workflow, 'mr_open');
+  assert.equal(ticket.mr.rounds, 2);
+  assert.deepEqual(ticket.reviewRounds.map((entry) => entry.round), [1, 2]);
+  assert.equal(ticket.fixes.length, 2);
+  assert.equal(ticket.fixes[1].childId, 'child-round-2-retry');
+  // init + exactly one round-2 commit: the stale record never pushed/appended.
+  assert.equal(gitSync(h.fixture.worktree, ['rev-list', '--count', 'HEAD']), '2');
+  assert.notEqual(gitSync(h.fixture.worktree, ['rev-parse', 'HEAD']), staleSha);
+  assert.equal(
+    bareRef(h.fixture.origin, `refs/heads/${BRANCH.name}`),
+    gitSync(h.fixture.worktree, ['rev-parse', 'HEAD']),
+  );
+  assert.equal(h.store.getMeta(REVIEW_FIX_COMMIT_META_PREFIX + CODE), null);
+  assert.equal(h.store.getMeta(REVIEW_ERROR_META_PREFIX + CODE), null);
+});
+
+test('a stale pending-commit record cannot complete a later round (round/note binding)', async (t) => {
+  const blocking = parseReview(CHANGES_BODY).blocking;
+  const h = await createHarness(t, {
+    workflow: 'fixing_review',
+    rounds: 2,
+    mr: {
+      ...MR,
+      rounds: 2,
+      verdict: 'changes',
+      blockingIssues: blocking,
+      nonBlockingIssues: [],
+    },
+    reviewRounds: [reviewRoundEntry({ round: 1, noteId: 40 })],
+    fixes: [fixEntry({ runId: 'review-fix-seed-round-1' })],
+    lastNoteId: 41,
+  });
+  const staleSha = gitSync(h.fixture.worktree, ['rev-parse', 'HEAD']);
+  await h.store.setMeta(REVIEW_FIX_COMMIT_META_PREFIX + CODE, fixCommitRecord({
+    sha: staleSha,
+    worktree: h.fixture.worktree,
+    round: 1,
+    noteId: 40,
+  }));
+
+  // The record is otherwise perfectly valid (same worktree/branch/tip) but it
+  // belongs to round 1 while the ticket is in round 2. Recovery must drop it
+  // and rerun the round-2 child — never push+finish round 1 in its place.
+  const recoveryTick = await h.service.tick();
+  await waitForIdle(h.service);
+  const ticket = h.store.get(CODE);
+  assert.deepEqual(
+    {
+      workflow: ticket.workflow,
+      rounds: ticket.mr.rounds,
+      reviewRounds: ticket.reviewRounds.map((entry) => entry.round),
+      fixCount: ticket.fixes.length,
+      runnerCalls: h.runner.calls.length,
+    },
+    {
+      workflow: 'mr_open',
+      rounds: 2,
+      reviewRounds: [1, 2],
+      fixCount: 2,
+      runnerCalls: 1,
+    },
+  );
+  assert.equal(recoveryTick.transitioned, 0);
+  assert.equal(h.runner.calls[0].mr.rounds, 2);
+  assert.equal(h.store.getMeta(REVIEW_FIX_COMMIT_META_PREFIX + CODE), null);
+  const head = gitSync(h.fixture.worktree, ['rev-parse', 'HEAD']);
+  assert.notEqual(head, staleSha);
+  assert.equal(gitSync(h.fixture.worktree, ['rev-list', '--count', 'HEAD']), '2');
+  assert.equal(bareRef(h.fixture.origin, `refs/heads/${BRANCH.name}`), head);
+});
+
+test('a tampered pending-commit record is discarded and the round reruns', async (t) => {
+  const blocking = parseReview(CHANGES_BODY).blocking;
+  const h = await createHarness(t, {
+    workflow: 'fixing_review',
+    rounds: 1,
+    mr: {
+      ...MR,
+      rounds: 1,
+      verdict: 'changes',
+      blockingIssues: blocking,
+      nonBlockingIssues: [],
+    },
+    lastNoteId: 50,
+  });
+  // Well-formed and bound to the current round/note, but the recorded ref does
+  // not resolve to the branch tip: never push it (tampered record).
+  await h.store.setMeta(REVIEW_FIX_COMMIT_META_PREFIX + CODE, fixCommitRecord({
+    sha: 'a'.repeat(40),
+    worktree: h.fixture.worktree,
+    round: 1,
+    noteId: 50,
+  }));
+
+  const recoveryTick = await h.service.tick();
+  await waitForIdle(h.service);
+  assert.equal(recoveryTick.transitioned, 0);
+  assert.equal(h.runner.calls.length, 1);
+  assert.equal(h.runner.calls[0].mr.rounds, 1);
+
+  const ticket = h.store.get(CODE);
+  assert.equal(ticket.workflow, 'mr_open');
+  assert.equal(ticket.mr.rounds, 1);
+  assert.deepEqual(ticket.reviewRounds.map((entry) => entry.round), [1]);
+  assert.equal(h.store.getMeta(REVIEW_FIX_COMMIT_META_PREFIX + CODE), null);
+  const head = gitSync(h.fixture.worktree, ['rev-parse', 'HEAD']);
+  assert.equal(gitSync(h.fixture.worktree, ['rev-list', '--count', 'HEAD']), '2');
+  assert.equal(bareRef(h.fixture.origin, `refs/heads/${BRANCH.name}`), head);
 });
 
 test('a lost review_fix_done write is reconciled on the next tick without duplicating the ledger', async (t) => {

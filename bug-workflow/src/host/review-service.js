@@ -21,8 +21,9 @@
  *   recovery (fixing_review with NO in-flight job — retry after a failure,
  *   host reload, dispose)
  *     lost review_fix_done      -> retry the action (idempotent ledger replay)
- *     pending commit record     -> validate worktree+branch+sha, push, append
- *                                  the ledger once, review_fix_done
+ *     pending commit record     -> validate worktree+branch+sha AND that the
+ *                                  record belongs to the CURRENT round/note,
+ *                                  push, append the ledger once, review_fix_done
  *     persisted findings exist  -> restart the child (rounds NOT incremented)
  *     no findings               -> block('review-recovery-unavailable')
  *
@@ -57,6 +58,12 @@
  *     `review-fix-failed` before any git write. On success the host (not the
  *     child) runs `git add -A`/commit/revParse/push; a clean worktree blocks
  *     `review-fix-no-changes`.
+ *   - A pending-commit record is bound to the round and note that produced it:
+ *     recovery only replays a record whose `round === mr.rounds` and whose
+ *     `noteId` matches `review.last-note`. A record left behind by an earlier
+ *     round (dispose/clear failure) is dropped, never pushed, so it can never
+ *     fake completion of a later round (N1). The changes path also purges any
+ *     old record when it claims a new note for the next round.
  *   - Jobs share the injected repository single-flight lock with delivery
  *     (`owner = review:<code>`), so a delivery and a review-fix can never touch
  *     the same repository at once. The lock is acquired BEFORE the
@@ -493,6 +500,13 @@ export function createReviewService({
     // the M2 duplicate-round bug: a failed write left the same note unclaimed,
     // so the next tick started round 2 for one note. A failed claim now blocks
     // (and the ticket never enters a round it cannot dedupe).
+    //
+    // Known narrow window (N2): a refused transition write releases the claim
+    // below, but if the process dies AFTER this claim and BEFORE that write the
+    // restarted host still sees `mr_open` while the note is already claimed, so
+    // that note is skipped forever. That is the fail-safe direction (skip, never
+    // duplicate); a full fix needs a pending-round claim plus an `mr_open`
+    // reconciliation. Accepted as a known limitation here.
     const claimed = await writeLastNote(code, note, 'changes');
     if (disposed) {
       repoLock.release(repo, owner);
@@ -503,6 +517,13 @@ export function createReviewService({
       const blocked = await blockTicket(code, 'review-save-failed', 'mr_open');
       return { transitioned: blocked };
     }
+
+    // A claimed note means a NEW round starts below: any pending-commit record
+    // still stored for this ticket belongs to an earlier round (a dispose/clear
+    // failure can leave one behind) and must never be replayed for this round.
+    // Best effort here; the hard gate is the round/note binding in
+    // `pushRecordedFix()` / `finishRecordedFix()` (N1).
+    await clearFixCommitRecord(code);
 
     const applied = await applyActionSafe(
       code,
@@ -620,13 +641,25 @@ export function createReviewService({
    * `undefined` when there is nothing valid to push (stale record discarded), so
    * the caller can restart the child; a busy repository lock waits for the next
    * tick. The record is only trusted when it still matches THIS registered
-   * worktree and ITS branch tip — a foreign ref is never pushed.
+   * worktree and ITS branch tip — a foreign ref is never pushed — AND when it
+   * belongs to the CURRENT round and claimed note: replaying an older round's
+   * record would append the old ledger entry and fake completion of this round
+   * (N1), so a mismatch discards the record and falls through to the restart.
    */
   async function pushRecordedFix({ code, ticket, context }) {
     const branch = readBranch(ticket);
     if (branch === null) return undefined;
     const record = readFixCommitRecord(code, branch);
     if (record === undefined) return undefined;
+
+    // Round/note binding (N1). `mr.rounds` is incremented by the transition
+    // that started THIS round and `review.last-note` is the note it claimed;
+    // a record written by any other round must never complete this one.
+    const mrRounds = Number.isSafeInteger(ticket.mr?.rounds) ? ticket.mr.rounds : 0;
+    if (record.round !== mrRounds || !sameNoteId(record.noteId, readLastNoteId(code))) {
+      await clearFixCommitRecord(code);
+      return undefined;
+    }
 
     let repo;
     try {
@@ -696,6 +729,8 @@ export function createReviewService({
    * Append the recorded ledger entries (exactly once) and complete the round.
    * The patch reuses `record.runId` as its idempotency key, so a replay of an
    * already-applied patch returns the cached result instead of appending twice.
+   * The record must still belong to the CURRENT round/note (N1): a mismatch
+   * drops it and returns `undefined` so the caller restarts this round.
    */
   async function finishRecordedFix({ code, record }) {
     const current = readTicket(code);
@@ -704,12 +739,25 @@ export function createReviewService({
       return { transitioned: false };
     }
     const ticket = current.ticket;
+    // Defensive re-check of the binding: the caller validated it before the
+    // push, but the ticket could have moved (or a stale record could be passed
+    // in) — never append an older round's ledger entry here.
+    const mrRounds = Number.isSafeInteger(ticket.mr?.rounds) ? ticket.mr.rounds : 0;
+    if (record.round !== mrRounds || !sameNoteId(record.noteId, readLastNoteId(code))) {
+      await clearFixCommitRecord(code);
+      return undefined;
+    }
     const fixes = Array.isArray(ticket.fixes) ? ticket.fixes : [];
     const reviewRounds = Array.isArray(ticket.reviewRounds) ? ticket.reviewRounds : [];
+    // A succeeded entry only proves THIS run was applied when it is for the same
+    // round AND the same claimed note; the `fixes[]` run id is the second link.
     const alreadyApplied = reviewRounds.some(
       (entry) => isPlainObject(entry)
         && entry.round === record.round
-        && entry.status === 'succeeded',
+        && entry.status === 'succeeded'
+        && sameNoteId(entry.noteId, record.noteId),
+    ) || fixes.some(
+      (entry) => isPlainObject(entry) && entry.runId === record.runId,
     );
 
     if (!alreadyApplied) {
@@ -1112,6 +1160,10 @@ export function createReviewService({
       await rememberError(code, writeFailureMessage(applied));
       return;
     }
+    // Ledger + action are committed. Clearing is still best effort (a dispose
+    // race can skip it), but a leftover record is harmless: the next round
+    // purges it when it claims a note and recovery never replays a record whose
+    // round/note do not match (N1).
     await clearFixCommitRecord(code);
     await clearError(code);
   }
@@ -1340,8 +1392,9 @@ export function createReviewService({
   /**
    * Read and bound the pending-commit record. Only a record staged for THIS
    * worktree and THIS personal branch is returned; a corrupt/foreign record is
-   * ignored. The caller additionally verifies the branch tip via
-   * `probeWorktree` + `revParse` before pushing anything.
+   * ignored. The caller additionally binds it to the current `mr.rounds` /
+   * `review.last-note` and verifies the branch tip via `probeWorktree` +
+   * `revParse` before pushing anything.
    */
   function readFixCommitRecord(code, branch) {
     let value;
