@@ -89,8 +89,18 @@ function captchaRoute(res) {
   json(res, 200, { key: 'captcha-key-1', image: PNG_DATA_URL });
 }
 
-function tokenRoute(res, payload = { access_token: 'token-abc', token_type: 'bearer' }) {
-  json(res, 200, { code: 200, success: true, data: payload });
+// Real platform success response (verified live): a flat token object with no
+// `code/success/data` envelope.
+function tokenRoute(res, payload = {
+  access_token: 'token-abc',
+  token_type: 'bearer',
+  account: 'liyu',
+  nick_name: '李昱',
+  refresh_token: 'refresh-abc',
+  expires_in: 172799,
+  tenant_id: '000000',
+}) {
+  json(res, 200, payload);
 }
 
 function userInfoRoute(res) {
@@ -201,8 +211,27 @@ test('login() bootstraps the OAuth client, sends Basic auth + form body and retu
   assert.equal(form.get('password'), hashPassword(SECRET_PASSWORD));
   assert.equal(tokenRequest.raw.includes(SECRET_PASSWORD), false, 'raw password must never leave the host');
 
-  const infoRequest = mock.requests.find((request) => request.url === '/api/htwisdom-system/user-auth-info');
-  assert.equal(infoRequest.headers['htwisdom-auth'], 'token-abc');
+  assert.equal(form.get('source'), '');
+  // The flat token already carries `account`, so no user-auth-info round trip.
+  assert.equal(mock.requests.some((request) => request.url === '/api/htwisdom-system/user-auth-info'), false);
+});
+
+test('login() also accepts the wrapped {code:200,data:{token}} shape and falls back to user-auth-info for identity', async (t) => {
+  const mock = await startMock((req, res) => {
+    const url = new URL(req.url, 'http://127.0.0.1');
+    if (url.pathname === '/api/htwisdom-system/system/open-api/system-config') return configRoute(res);
+    if (url.pathname === '/api/htwisdom-auth/oauth/token') {
+      return json(res, 200, { code: 200, success: true, data: { access_token: 'token-abc', token_type: 'bearer' } });
+    }
+    if (url.pathname === '/api/htwisdom-system/user-auth-info') {
+      assert.equal(req.headers['htwisdom-auth'], 'token-abc');
+      return userInfoRoute(res);
+    }
+    return json(res, 404, {});
+  });
+  t.after(() => mock.close());
+  const result = await createPlatformLogin().login({ baseUrl: mock.baseUrl, username: 'u', password: 'p', code: 'c', captchaKey: 'k' });
+  assert.deepEqual(result, { token: 'token-abc', tokenType: 'bearer', username: 'liyu' });
 });
 
 test('login() prefers an explicit tenant id and falls back to the config default', async (t) => {
@@ -280,7 +309,9 @@ test('login() maps platform failure envelopes to static codes (captcha vs creden
 });
 
 test('login() rejects a success envelope without a token', async (t) => {
-  const mock = await startMock(defaultHandler({ token: {} }));
+  const mock = await startMock(defaultHandler({
+    tokenHandler: (res) => json(res, 200, { code: 200, success: true, data: {} }),
+  }));
   t.after(() => mock.close());
   await assert.rejects(
     () => createPlatformLogin().login({ baseUrl: mock.baseUrl, username: 'u', password: 'p', code: 'c', captchaKey: 'k' }),

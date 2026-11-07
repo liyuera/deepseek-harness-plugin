@@ -31,8 +31,19 @@
  */
 
 import { createHash } from 'node:crypto';
+import { appendFileSync } from 'node:fs';
 
 import { normalizeBaseUrl } from './platform.js';
+
+// TEMPORARY login diagnostics: envelope shape only (keys/status/code/msg),
+// never credentials, token or request body. Removed after live calibration.
+function debugCapture(entry) {
+  try {
+    appendFileSync('/tmp/bug-workflow-login-debug.log', `${JSON.stringify(entry)}\n`);
+  } catch {
+    // Diagnostics must never affect the login path.
+  }
+}
 
 /** Login request budget (the platform is on the intranet). */
 export const DEFAULT_LOGIN_TIMEOUT_MS = 15_000;
@@ -407,6 +418,7 @@ export function createPlatformLogin(options = {}) {
       grant_type: 'captcha',
       deptId: '',
       roleId: '',
+      source: '',
       tenantId: resolvedTenant,
       username,
       password: hashPassword(password),
@@ -441,8 +453,14 @@ export function createPlatformLogin(options = {}) {
       'login',
     );
 
+    // Success shape (verified against the live platform DevTools): the token
+    // endpoint returns the token object itself, with NO `code/success/data`
+    // wrapper — `{access_token, token_type, account, refresh_token, ...}`.
+    // Older/other gateways wrap it as `{code:200,success:true,data:{...}}`;
+    // both are accepted, failures are still the `{code,msg}` envelope.
+    const flatToken = typeof body.access_token === 'string' && body.access_token !== '' ? body : null;
     const envelopeCode = typeof body.code === 'number' ? body.code : (typeof body.code === 'string' ? Number(body.code) : NaN);
-    if (envelopeCode !== 200 || body.success === false) {
+    if (flatToken === null && (envelopeCode !== 200 || body.success === false)) {
       const upstreamMsg = typeof body.msg === 'string' ? body.msg : '';
       // Distinguish captcha failures from credential failures without echoing the
       // upstream message (it can contain environment details).
@@ -459,7 +477,7 @@ export function createPlatformLogin(options = {}) {
       throw new PlatformLoginError('login-failed', `${MESSAGE.loginFailed}${hint}`, status);
     }
 
-    const data = isPlainObject(body.data) ? body.data : {};
+    const data = flatToken !== null ? flatToken : (isPlainObject(body.data) ? body.data : {});
     const rawToken = typeof data.access_token === 'string'
       ? data.access_token
       : (typeof body.access_token === 'string' ? body.access_token : '');
@@ -471,22 +489,29 @@ export function createPlatformLogin(options = {}) {
       ? data.token_type.trim()
       : null;
 
-    // Best-effort identity for the UI ("已登录为 xxx"). A failure here never
-    // invalidates a successful login.
+    // Identity for the UI ("已登录为 xxx"): the flat token response already
+    // carries `account`; only fall back to user-auth-info when it is absent.
+    // A failure here never invalidates a successful login.
     let resolvedUsername = null;
-    try {
-      const info = await requestJson(
-        `${baseUrl}api/htwisdom-system/user-auth-info`,
-        { method: 'GET', headers: { Accept: 'application/json', 'Htwisdom-Auth': token } },
-        'login',
-      );
-      const infoData = isPlainObject(info.body.data) ? info.body.data : {};
-      const candidate = typeof infoData.username === 'string'
-        ? infoData.username
-        : (typeof infoData.account === 'string' ? infoData.account : null);
-      if (candidate !== null && candidate.trim() !== '') resolvedUsername = candidate.trim().slice(0, MAX_USERNAME_CHARS);
-    } catch {
-      // Identity is a nice-to-have; the token itself is what matters.
+    const account = typeof data.account === 'string' ? data.account.trim() : '';
+    const userField = typeof data.username === 'string' ? data.username.trim() : '';
+    const preferred = account !== '' ? account : userField;
+    if (preferred !== '') resolvedUsername = preferred.slice(0, MAX_USERNAME_CHARS);
+    if (resolvedUsername === null) {
+      try {
+        const info = await requestJson(
+          `${baseUrl}api/htwisdom-system/user-auth-info`,
+          { method: 'GET', headers: { Accept: 'application/json', 'Htwisdom-Auth': token } },
+          'login',
+        );
+        const infoData = isPlainObject(info.body.data) ? info.body.data : {};
+        const candidate = typeof infoData.username === 'string'
+          ? infoData.username
+          : (typeof infoData.account === 'string' ? infoData.account : null);
+        if (candidate !== null && candidate.trim() !== '') resolvedUsername = candidate.trim().slice(0, MAX_USERNAME_CHARS);
+      } catch {
+        // Identity is a nice-to-have; the token itself is what matters.
+      }
     }
 
     return { token, tokenType, username: resolvedUsername };
