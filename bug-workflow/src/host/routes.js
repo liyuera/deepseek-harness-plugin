@@ -4,7 +4,8 @@
  * Routes (all exact, all JSON, all same-origin/loopback only):
  *
  *   GET  /bug-workflow/api/health          -> { ok, domainOpenedAt, tickets }
- *   GET  /bug-workflow/api/snapshot        -> { ok, workspace, settings, platform, gitlab, dicts, tickets, serverTime }
+ *   GET  /bug-workflow/api/snapshot        -> { ok, workspace, settings, platform, gitlab, dicts,
+ *                                              analysis, fix, delivery, tickets, serverTime }
  *   POST /bug-workflow/api/action          -> { ok, ticket } | { ok:false, code, message, ticket? }
  *                                              action:'create' + payload.code imports that
  *                                              platform task by code (see `importTask`)
@@ -65,10 +66,11 @@
  * the same shape as `analysis`.
  *
  * P5 `/deliver` mapping: a missing ticket is 404; `not-submitting`,
- * `delivery-busy`, `delivery-no-changes` and `protected-branch` are 409;
- * missing worktree/settings and invalid branch input are 400;
- * `missing-gitlab-token` and an unwired service are retryable 503; unexpected
- * git/push/MR failures are 500. The snapshot always carries
+ * `delivery-busy`, `delivery-no-changes`, `protected-branch` and
+ * `worktree-conflict` (a personal branch checked out in another/manual
+ * worktree) are 409; missing worktree/settings and invalid branch/target input
+ * are 400; `missing-gitlab-token` and an unwired service are retryable 503;
+ * unexpected git/push/MR failures are 500. The snapshot always carries
  * `delivery:{running, errors}` where `errors` is keyed by ticket code and read
  * from the delivery-specific meta namespace (`delivery.error:<code>`), never
  * from `fix.error:<code>`. The background job's lint/test/commit/push/MR
@@ -261,6 +263,7 @@ const DELIVERY_ERROR_STATUS = Object.freeze({
   'delivery-busy': 409,
   'delivery-no-changes': 409,
   'protected-branch': 409,
+  'worktree-conflict': 409,
   'worktree-missing': 400,
   'invalid-gitlab-settings': 400,
   'invalid-branch': 400,

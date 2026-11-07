@@ -68,7 +68,10 @@
  *     `git worktree add` (an existing empty directory works; a non-empty
  *     plain directory becomes `git-failed`);
  *   - when the branch already exists (e.g. the retained branch after
- *     `worktreeRemove`), the add omits `-b` and checks the branch out.
+ *     `worktreeRemove`, or a manual `git worktree add` elsewhere), the add
+ *     omits `-b` and checks the branch out; if the branch is already checked
+ *     out in ANOTHER registered worktree the result is
+ *     `worktree-conflict` (409), never `git-failed`.
  *
  * Safety:
  *
@@ -127,6 +130,7 @@ const MESSAGE = Object.freeze({
   failed: 'git 命令执行失败',
   timeout: 'git 命令执行超时',
   conflict: '工作树已存在且分支与目标分支不一致',
+  branchBusy: '个人分支已在其它工作树中检出，请先清理该工作树',
   invalid: 'git 命令参数不合法',
   invalidWorktreePath: '工单号无法生成安全的工作树路径',
   invalidBranch: '分支名不合法，不允许推送',
@@ -380,6 +384,26 @@ export function createGit(options = {}) {
   }
 
   /**
+   * True when `branch` is checked out in a registered worktree other than
+   * `path`. Used to diagnose the "already checked out elsewhere" refusal of
+   * `git worktree add` (a user-created manual worktree) as a static 409
+   * instead of an opaque `git-failed`. A failed `worktree list` returns false
+   * so the caller keeps the original failure.
+   */
+  async function branchCheckedOutElsewhere(repo, path, branch) {
+    const listed = await listWorktrees(repo);
+    if (listed.ok !== true) return false;
+    const targetReal = await realpathOrNull(path);
+    for (const entry of listed.entries) {
+      if (entry.branch !== `refs/heads/${branch}`) continue;
+      const entryReal = await realpathOrNull(entry.path);
+      if (entryReal === null) continue;
+      if (targetReal === null || entryReal !== targetReal) return true;
+    }
+    return false;
+  }
+
+  /**
    * Create a worktree on `branch`, or reuse a registered one already at `path`.
    *
    * @param {{repo?: unknown, path?: unknown, branch?: unknown, base?: unknown}} input
@@ -427,6 +451,13 @@ export function createGit(options = {}) {
     if (raced.state === 'same') return { created: false };
     if (raced.state === 'different') {
       return failure('worktree-conflict', MESSAGE.conflict, COMMAND.worktreeAdd);
+    }
+    // The add can also fail because `branch` is already checked out in a
+    // DIFFERENT registered worktree (the user ran `git worktree add` manually);
+    // the target path itself is still absent, so re-probing it cannot see that.
+    const elsewhere = await branchCheckedOutElsewhere(repo, path, branch);
+    if (elsewhere === true) {
+      return failure('worktree-conflict', MESSAGE.branchBusy, COMMAND.worktreeAdd);
     }
     return added;
   }

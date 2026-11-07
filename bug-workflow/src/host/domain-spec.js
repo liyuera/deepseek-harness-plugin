@@ -64,7 +64,7 @@ export const PLATFORM_FIELDS = Object.freeze([
  * Build the record schemas from a zod namespace.
  *
  * @param {{z: object}} deps the zod namespace (`import { z } from 'zod'`)
- * @returns {{platformSchema: object, ticketSchema: object, settingsSchema: object, metaSchema: object, fixRunSchema: object}}
+ * @returns {{platformSchema: object, ticketSchema: object, settingsSchema: object, metaSchema: object, fixRunSchema: object, reviewRoundSchema: object}}
  */
 export function buildDomainSchemas({ z } = {}) {
   if (z === null || typeof z !== 'object' || typeof z.looseObject !== 'function') {
@@ -115,6 +115,24 @@ export function buildDomainSchemas({ z } = {}) {
     blockingIssues: z.array(z.unknown()),
     nonBlockingIssues: z.array(z.unknown()),
     rounds: z.number().int().nonnegative(),
+  });
+
+  /**
+   * One review-round ledger entry (P5 Task 4). The format is part of the v2
+   * ticket metadata (no domain version bump): `patchTicket()` appends entries
+   * after a review-fix run. The shape is bounded here and mirrored by the
+   * dependency-free `isReviewRoundEntry()` gate in `store.js` (the plain-Node
+   * store tests run without zod).
+   */
+  const reviewRoundSchema = z.looseObject({
+    round: z.number().int().nonnegative(),
+    noteId: z.union([z.string(), z.number()]),
+    verdict: z.enum(['pass', 'changes', 'unknown']),
+    startedAt: z.string().min(1).max(64),
+    finishedAt: z.string().min(1).max(64),
+    changedFiles: z.array(z.string().max(4096)).max(2000),
+    status: z.enum(['succeeded', 'failed', 'cancelled']),
+    childId: z.string().min(1).max(200).optional(),
   });
 
   /**
@@ -193,6 +211,8 @@ export function buildDomainSchemas({ z } = {}) {
     branch: branchSchema.nullable(),
     mr: mrSchema.nullable(),
     fixes: z.array(fixRunSchema),
+    // Optional: every ticket written before Task 4 simply has no ledger yet.
+    reviewRounds: z.array(reviewRoundSchema).optional(),
     timeline: z.array(timelineEventSchema),
     createdAt: z.string(),
     updatedAt: z.string(),
@@ -223,7 +243,7 @@ export function buildDomainSchemas({ z } = {}) {
     value: z.unknown(),
   });
 
-  return { platformSchema, ticketSchema, settingsSchema, metaSchema, fixRunSchema };
+  return { platformSchema, ticketSchema, settingsSchema, metaSchema, fixRunSchema, reviewRoundSchema };
 }
 
 /**

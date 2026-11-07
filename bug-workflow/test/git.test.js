@@ -241,6 +241,38 @@ test('a plain directory inside the repo is not mistaken for a registered worktre
   assert.ok(listed.includes(realpathSync(empty)));
 });
 
+test('an external worktree on the same branch maps to worktree-conflict, not git-failed', async (t) => {
+  const fixture = makeFixture();
+  t.after(fixture.cleanup);
+  const { git, repo } = fixture;
+
+  const first = productPath(repo, 'feat-V1-shared');
+  assert.deepEqual(
+    await git.worktreeAdd({ repo, path: first, branch: 'feat-V1-shared', base: 'main' }),
+    { created: true },
+  );
+
+  // A user manually checked the same personal branch out in another worktree.
+  // `git worktree add` refuses with a raw error; the executor must diagnose the
+  // real condition (409 worktree-conflict) instead of an opaque git-failed.
+  const second = productPath(repo, 'feat-V1-second');
+  const result = await git.worktreeAdd({
+    repo,
+    path: second,
+    branch: 'feat-V1-shared',
+    base: 'main',
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'worktree-conflict');
+  assert.equal(result.message, '个人分支已在其它工作树中检出，请先清理该工作树');
+  assert.equal(result.command, 'git worktree add');
+  assert.equal(existsSync(second), false);
+  assert.deepEqual(await git.probeWorktree(repo, second, 'feat-V1-shared'), {
+    ok: true,
+    state: 'absent',
+  });
+});
+
 test('worktreeAdd re-adds a retained branch after worktreeRemove', async (t) => {
   const fixture = makeFixture();
   t.after(fixture.cleanup);

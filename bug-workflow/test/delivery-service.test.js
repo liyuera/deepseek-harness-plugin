@@ -33,6 +33,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 
 import {
+  DELIVERY_COMMIT_META_PREFIX,
   DELIVERY_ERROR_META_PREFIX,
   DELIVERY_REASON_MESSAGES,
   DELIVERY_STALE_MESSAGE,
@@ -104,7 +105,8 @@ function gitSync(cwd, args) {
  * Build a real repository with one commit on `main`, a `feature-V1` target,
  * a linked worktree on the personal branch, and a local bare `origin`.
  */
-function createRepoFixture() {
+function createRepoFixture(options = {}) {
+  const branchName = typeof options.branchName === 'string' ? options.branchName : BRANCH.name;
   const root = mkdtempSync(join(tmpdir(), 'dsh-bw-delivery-'));
   const repo = join(root, 'repo');
   mkdirSync(repo);
@@ -126,7 +128,7 @@ function createRepoFixture() {
 
   const worktree = join(repo, '.dsh-worktrees', CODE);
   mkdirSync(join(repo, '.dsh-worktrees'), { recursive: true });
-  gitSync(repo, ['worktree', 'add', '-b', BRANCH.name, '--', worktree, 'main']);
+  gitSync(repo, ['worktree', 'add', '-b', branchName, '--', worktree, 'main']);
 
   return {
     root,
@@ -268,6 +270,28 @@ function createFakeExec({ results = {}, onCall } = {}) {
   return { calls, exec };
 }
 
+/** Shared repo-lock double that records every acquire/release (owner semantics). */
+function createCountingLock() {
+  const owners = new Map();
+  const acquires = [];
+  const releases = [];
+  return {
+    owners,
+    acquires,
+    releases,
+    acquire(repo, owner) {
+      acquires.push({ repo, owner });
+      if (owners.has(repo) && owners.get(repo) !== owner) return false;
+      owners.set(repo, owner);
+      return true;
+    },
+    release(repo, owner) {
+      releases.push({ repo, owner });
+      if (owners.get(repo) === owner) owners.delete(repo);
+    },
+  };
+}
+
 function readRequestBody(request) {
   return new Promise((resolve, reject) => {
     let body = '';
@@ -393,13 +417,15 @@ async function seedTicket(domain, {
  * Cleanup is registered on the test context.
  */
 async function createHarness(t, options = {}) {
-  const fixture = options.fixture ?? createRepoFixture();
+  const fixture = options.fixture ?? createRepoFixture({
+    branchName: options.fixtureBranch ?? BRANCH.name,
+  });
   const mock = await createMockGitlab(options.mock ?? {});
   const domain = createFakeDomain();
   const store = createStore(domain, () => STORE_TIME);
   const tokenStore = options.tokenStore ?? createFakeTokenStore();
   const exec = options.exec ?? createFakeExec();
-  const git = createGit();
+  const git = options.git ?? createGit();
 
   const gitlabClientFor = options.gitlabClientFor ?? ((settings) => createGitlabClient({
     baseUrl: settings.gitlabBaseUrl,
@@ -412,7 +438,10 @@ async function createHarness(t, options = {}) {
     tokenStore,
     gitlabClientFor,
     clock: createServiceClock(),
-    execCommand: exec.exec,
+    execCommand: options.execCommand ?? exec.exec,
+    ...(options.commandTimeoutMs === undefined
+      ? {}
+      : { commandTimeoutMs: options.commandTimeoutMs }),
     drainTimeoutMs: options.drainTimeoutMs ?? 100,
     ...(options.lock === undefined ? {} : { lock: options.lock }),
     ...(options.log === undefined ? {} : { log: options.log }),
@@ -429,7 +458,14 @@ async function createHarness(t, options = {}) {
 
   const branch = options.branch === undefined
     ? { ...BRANCH, worktree: fixture.worktree }
-    : options.branch;
+    : (options.branch === null
+      ? null
+      : {
+        ...options.branch,
+        worktree: typeof options.branch.worktree === 'string' && options.branch.worktree !== ''
+          ? options.branch.worktree
+          : fixture.worktree,
+      });
 
   // A delivery needs a changed worktree (the fix subagent is what edits code).
   // Tests that assert `delivery-no-changes` simply leave `dirty` off.
@@ -924,7 +960,9 @@ test('a duplicate start and a second ticket in the same repo are delivery-busy',
   });
   await seedTicket(h.domain, {
     code: 'BUG-2',
-    branch: { ...BRANCH, name: 'feat-V1-other', worktree: h.fixture.worktree },
+    // Same registered worktree/branch: the probe passes and the only reason to
+    // refuse is the repository single-flight lock held by the first delivery.
+    branch: h.branch,
   });
 
   assert.deepEqual(await h.service.start(SESSION_ID, h.fixture.repo, CODE), {
@@ -1132,4 +1170,441 @@ test('an unexpected store read failure is surfaced as a start failure, never an 
   assert.equal(result.code, 'internal');
   h.store.get = originalGet;
   assert.equal(existsSync(h.fixture.worktree), true);
+});
+
+// ---------------------------------------------------------------------------
+// I1: hard timeout (process-group kill + timer-driven settle)
+// ---------------------------------------------------------------------------
+
+test('the production execCommand hard-kills a timed-out command and settles fast', async () => {
+  const exec = createShellExecCommand();
+  const commands = [
+    // TERM is ignored (by the shell AND the inherited sleep), so only SIGKILL
+    // ends it; without a timer-driven settle the promise waits for 'close'.
+    "trap '' TERM; sleep 5",
+    // A background grandchild inherits the stdout/stderr pipes; killing only
+    // the shell would leave the promise waiting for the grandchild.
+    'sleep 5 & wait',
+  ];
+
+  for (const command of commands) {
+    const started = Date.now();
+    const result = await exec(command, { cwd: tmpdir(), timeoutMs: 120 });
+    const elapsed = Date.now() - started;
+    assert.equal(result.ok, false, command);
+    assert.equal(result.timedOut, true, command);
+    assert.ok(elapsed < 1_500, `${command} settled after ${elapsed}ms`);
+  }
+
+  // A fast successful command is unaffected by the kill machinery.
+  const fast = await exec('printf hello', { cwd: tmpdir(), timeoutMs: 5_000 });
+  assert.deepEqual(fast, { ok: true, output: 'hello' });
+});
+
+test('a timed-out lint command blocks the delivery and releases both locks', async (t) => {
+  const lock = createCountingLock();
+  const h = await createHarness(t, {
+    lock,
+    commandTimeoutMs: 120,
+    execCommand: createShellExecCommand(),
+    settings: { lintCommand: "trap '' TERM; sleep 5", testCommand: '' },
+  });
+  // A second ticket in the same repo proves the repository lock is not stuck.
+  await seedTicket(h.domain, { code: 'BUG-2', branch: h.branch });
+
+  const started = Date.now();
+  assert.deepEqual(
+    await h.service.start(SESSION_ID, h.fixture.repo, CODE),
+    { ok: true, running: true },
+  );
+  await waitForIdle(h.service);
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < 2_000, `timed-out delivery settled after ${elapsed}ms`);
+
+  const ticket = h.store.get(CODE);
+  assert.equal(ticket.workflow, 'blocked');
+  assert.equal(ticket.blockedReason, 'delivery-lint-failed');
+  assert.match(
+    h.store.getMeta(`${DELIVERY_ERROR_META_PREFIX}${CODE}`),
+    new RegExp(DELIVERY_REASON_MESSAGES['delivery-lint-failed']),
+  );
+  assert.equal(h.mock.requests.length, 0);
+  assert.equal(h.exec.calls.length, 0);
+  assert.equal(bareHasBranch(h.fixture.origin, BRANCH.name), false);
+
+  // The first job's running slot and repo lock are gone: another ticket in the
+  // SAME repository starts (and times out) instead of answering delivery-busy.
+  const second = await h.service.start(SESSION_ID, h.fixture.repo, 'BUG-2');
+  assert.deepEqual(second, { ok: true, running: true });
+  await waitForIdle(h.service);
+  assert.equal(lock.owners.size, 0);
+  assert.equal(lock.acquires.length, 2);
+  assert.equal(lock.releases.length, 2);
+});
+
+// ---------------------------------------------------------------------------
+// I2: worktree registration / branch identity
+// ---------------------------------------------------------------------------
+
+test('a plain directory inside the repo is refused before any commit (worktree-missing)', async (t) => {
+  const h = await createHarness(t, { seed: false });
+  const plain = join(h.fixture.repo, '.dsh-worktrees', 'PLAIN-DIR');
+  mkdirSync(plain, { recursive: true });
+  writeFileSync(join(plain, 'evil.txt'), 'must never reach the main repository\n');
+  await seedTicket(h.domain, {
+    code: CODE,
+    branch: { ...BRANCH, worktree: plain },
+  });
+  const before = structuredClone(h.store.get(CODE));
+  const mainHeadBefore = gitSync(h.fixture.repo, ['rev-parse', 'HEAD']);
+
+  const result = await h.service.start(SESSION_ID, h.fixture.repo, CODE);
+  assert.deepEqual(result, {
+    ok: false,
+    code: 'worktree-missing',
+    message: DELIVERY_START_MESSAGES['worktree-missing'],
+  });
+
+  // The fix: `git add -A`/commit never runs in the non-worktree directory, so
+  // the main repository's current branch cannot move.
+  assert.equal(gitSync(h.fixture.repo, ['rev-parse', 'HEAD']), mainHeadBefore);
+  assert.equal(gitSync(h.fixture.repo, ['status', '--porcelain']), '?? .dsh-worktrees/');
+  assert.deepEqual(h.store.get(CODE), before);
+  assert.equal(h.domain.table('meta').size, 0);
+  assert.equal(bareHasBranch(h.fixture.origin, BRANCH.name), false);
+  assert.equal(h.mock.requests.length, 0);
+});
+
+test('a worktree checked out on another branch is refused (worktree-conflict)', async (t) => {
+  const h = await createHarness(t, { dirty: true, seed: false });
+  await seedTicket(h.domain, {
+    code: CODE,
+    branch: { ...BRANCH, name: 'feat-V1-other', worktree: h.fixture.worktree },
+  });
+  const before = structuredClone(h.store.get(CODE));
+  const headBefore = gitSync(h.fixture.worktree, ['rev-parse', 'HEAD']);
+
+  const result = await h.service.start(SESSION_ID, h.fixture.repo, CODE);
+  assert.deepEqual(result, {
+    ok: false,
+    code: 'worktree-conflict',
+    message: DELIVERY_START_MESSAGES['worktree-conflict'],
+  });
+
+  assert.equal(gitSync(h.fixture.worktree, ['rev-parse', 'HEAD']), headBefore);
+  assert.match(gitSync(h.fixture.worktree, ['status', '--porcelain']), /fix-note\.txt/);
+  assert.deepEqual(h.store.get(CODE), before);
+  assert.equal(h.domain.table('meta').size, 0);
+  assert.equal(bareHasBranch(h.fixture.origin, BRANCH.name), false);
+  assert.equal(h.mock.requests.length, 0);
+});
+
+test('a commit that does not land on the personal branch blocks before push', async (t) => {
+  const realGit = createGit();
+  const h = await createHarness(t, {
+    dirty: true,
+    // Simulate a `-C` resolution surprise: the local commit happened, but the
+    // branch ref the push would use points somewhere else.
+    git: { ...realGit, revParse: async () => 'c'.repeat(40) },
+  });
+  const headBefore = gitSync(h.fixture.worktree, ['rev-parse', 'HEAD']);
+
+  await h.service.start(SESSION_ID, h.fixture.repo, CODE);
+  await waitForIdle(h.service);
+
+  const ticket = h.store.get(CODE);
+  assert.equal(ticket.workflow, 'blocked');
+  assert.equal(ticket.blockedReason, 'worktree-mismatch');
+  assert.match(
+    h.store.getMeta(`${DELIVERY_ERROR_META_PREFIX}${CODE}`),
+    new RegExp(DELIVERY_REASON_MESSAGES['worktree-mismatch']),
+  );
+  // The local commit exists, but the branch was never pushed and no MR exists.
+  assert.notEqual(gitSync(h.fixture.worktree, ['rev-parse', 'HEAD']), headBefore);
+  assert.equal(bareHasBranch(h.fixture.origin, BRANCH.name), false);
+  assert.equal(h.mock.requests.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// I3: retry after a post-commit failure reuses the recorded commit
+// ---------------------------------------------------------------------------
+
+test('a retry after push-failed reuses the recorded commit instead of delivery-no-changes', async (t) => {
+  const h = await createHarness(t, { dirty: true });
+  const realOrigin = h.fixture.origin;
+  gitSync(h.fixture.repo, [
+    'remote',
+    'set-url',
+    'origin',
+    join(h.fixture.root, 'missing-origin.git'),
+  ]);
+
+  await h.service.start(SESSION_ID, h.fixture.repo, CODE);
+  await waitForIdle(h.service);
+  assert.equal(h.store.get(CODE).workflow, 'blocked');
+  assert.equal(h.store.get(CODE).blockedReason, 'push-failed');
+
+  const sha = gitSync(h.fixture.worktree, ['rev-parse', 'HEAD']);
+  // Captured now, asserted after the retry so a pre-fix run fails on the real
+  // symptom (the retry blocks delivery-no-changes) rather than on metadata.
+  const record = h.store.getMeta(`${DELIVERY_COMMIT_META_PREFIX}${CODE}`);
+
+  // Fix the remote and retry exactly as the UI copy tells the user to.
+  gitSync(h.fixture.repo, ['remote', 'set-url', 'origin', realOrigin]);
+  const retried = await h.store.applyAction(CODE, 'retry', { actor: 'user' });
+  assert.equal(retried.ok, true);
+  assert.equal(retried.ticket.workflow, 'submitting');
+
+  assert.deepEqual(
+    await h.service.start(SESSION_ID, h.fixture.repo, CODE),
+    { ok: true, running: true },
+  );
+  await waitForIdle(h.service);
+
+  const ticket = h.store.get(CODE);
+  assert.equal(ticket.workflow, 'mr_open');
+  assert.equal(ticket.mr.iid, 77);
+  // No second empty/duplicate commit: init + exactly one delivery commit.
+  assert.equal(gitSync(h.fixture.worktree, ['rev-parse', 'HEAD']), sha);
+  assert.equal(gitSync(h.fixture.worktree, ['rev-list', '--count', 'HEAD']), '2');
+  assert.equal(gitSync(h.fixture.worktree, ['status', '--porcelain']), '');
+  assert.equal(bareRef(realOrigin, `refs/heads/${BRANCH.name}`), sha);
+  assert.equal(h.mock.requests.filter((request) => request.method === 'POST').length, 1);
+  assert.equal(record.sha, sha);
+  assert.equal(record.branch, BRANCH.name);
+  assert.equal(record.worktree, h.fixture.worktree);
+  assert.equal(h.store.getMeta(`${DELIVERY_COMMIT_META_PREFIX}${CODE}`), null);
+});
+
+test('a retry after mr-failed reuses the pushed commit and creates the MR', async (t) => {
+  let creates = 0;
+  const h = await createHarness(t, {
+    dirty: true,
+    mock: {
+      onCreate: () => {
+        creates += 1;
+        if (creates === 1) throw new Error('gitlab exploded');
+      },
+    },
+  });
+
+  await h.service.start(SESSION_ID, h.fixture.repo, CODE);
+  await waitForIdle(h.service);
+  const first = h.store.get(CODE);
+  assert.equal(first.workflow, 'blocked');
+  assert.equal(first.blockedReason, 'mr-failed');
+  const sha = gitSync(h.fixture.worktree, ['rev-parse', 'HEAD']);
+  assert.equal(bareRef(h.fixture.origin, `refs/heads/${BRANCH.name}`), sha);
+
+  const retried = await h.store.applyAction(CODE, 'retry', { actor: 'user' });
+  assert.equal(retried.ticket.workflow, 'submitting');
+  await h.service.start(SESSION_ID, h.fixture.repo, CODE);
+  await waitForIdle(h.service);
+
+  const ticket = h.store.get(CODE);
+  assert.equal(ticket.workflow, 'mr_open');
+  assert.equal(ticket.mr.iid, 77);
+  assert.equal(gitSync(h.fixture.worktree, ['rev-parse', 'HEAD']), sha);
+  assert.equal(gitSync(h.fixture.worktree, ['rev-list', '--count', 'HEAD']), '2');
+  assert.equal(h.mock.requests.filter((request) => request.method === 'POST').length, 2);
+  assert.equal(h.store.getMeta(`${DELIVERY_COMMIT_META_PREFIX}${CODE}`), null);
+});
+
+// ---------------------------------------------------------------------------
+// M1: project-path validation happens before commit/push
+// ---------------------------------------------------------------------------
+
+test('a syntactically invalid non-empty gitlabProjectPath is rejected before any work', async (t) => {
+  const invalidProjects = [
+    'group//project',
+    ' group/project ',
+    '%2Fgroup%2Fproject',
+    'project',
+  ];
+  for (const projectPath of invalidProjects) {
+    const h = await createHarness(t, { settings: { gitlabProjectPath: projectPath } });
+    const before = structuredClone(h.store.get(CODE));
+    const result = await h.service.start(SESSION_ID, h.fixture.repo, CODE);
+    assert.deepEqual(result, {
+      ok: false,
+      code: 'invalid-gitlab-settings',
+      message: DELIVERY_START_MESSAGES['invalid-gitlab-settings'],
+    }, projectPath);
+    assert.deepEqual(h.store.get(CODE), before, projectPath);
+    assert.equal(h.domain.table('meta').size, 0, projectPath);
+    assert.deepEqual(h.exec.calls, [], projectPath);
+    assert.equal(h.mock.requests.length, 0, projectPath);
+  }
+});
+
+test('a subgroup gitlabProjectPath is accepted and encoded as one segment', async (t) => {
+  const h = await createHarness(t, {
+    dirty: true,
+    settings: { gitlabProjectPath: 'group/sub/project' },
+  });
+
+  await h.service.start(SESSION_ID, h.fixture.repo, CODE);
+  await waitForIdle(h.service);
+
+  assert.equal(h.store.get(CODE).workflow, 'mr_open');
+  const create = h.mock.requests.find((request) => request.method === 'POST');
+  assert.equal(create.path, '/api/v4/projects/group%2Fsub%2Fproject/merge_requests');
+});
+
+// ---------------------------------------------------------------------------
+// M2: target-branch family consistency and protected targets
+// ---------------------------------------------------------------------------
+
+test('an inconsistent or protected target branch is refused before any work', async (t) => {
+  const cases = [
+    ['protected main', { ...BRANCH, target: 'main' }],
+    ['protected dev', { ...BRANCH, target: 'Dev' }],
+    ['release family', { ...BRANCH, target: 'release-V1' }],
+    ['feat personal/hotfix target', { ...BRANCH, target: 'hotfix-V1' }],
+    ['hot personal/feature target', { ...BRANCH, name: 'hot-V1-ly', target: 'feature-V1' }],
+    ['custom self target', { ...BRANCH, name: 'bugfix-1', target: 'bugfix-1' }],
+  ];
+  for (const [name, branch] of cases) {
+    const h = await createHarness(t, { seed: false });
+    await seedTicket(h.domain, {
+      code: CODE,
+      branch: { ...branch, worktree: h.fixture.worktree },
+    });
+    const before = structuredClone(h.store.get(CODE));
+    const result = await h.service.start(SESSION_ID, h.fixture.repo, CODE);
+    assert.equal(result.ok, false, name);
+    assert.equal(result.code, 'invalid-branch', name);
+    assert.deepEqual(h.store.get(CODE), before, name);
+    assert.equal(h.domain.table('meta').size, 0, name);
+    assert.deepEqual(h.exec.calls, [], name);
+    assert.equal(h.mock.requests.length, 0, name);
+  }
+});
+
+test('a hotfix delivery accepts the matching hotfix-* target', async (t) => {
+  const branch = { ...BRANCH, name: 'hot-V1-ly', target: 'hotfix-V1' };
+  const h = await createHarness(t, {
+    dirty: true,
+    branch,
+    fixtureBranch: 'hot-V1-ly',
+    mock: {
+      createdMergeRequest: {
+        iid: 88,
+        web_url: 'https://gitlab.example.com/group/project/-/merge_requests/88',
+        state: 'opened',
+        source_branch: 'hot-V1-ly',
+        target_branch: 'hotfix-V1',
+        title: 'hot-V1-ly -> hotfix-V1',
+      },
+    },
+  });
+
+  await h.service.start(SESSION_ID, h.fixture.repo, CODE);
+  await waitForIdle(h.service);
+
+  const ticket = h.store.get(CODE);
+  assert.equal(ticket.workflow, 'mr_open');
+  assert.equal(ticket.mr.sourceBranch, 'hot-V1-ly');
+  assert.equal(ticket.mr.targetBranch, 'hotfix-V1');
+  const create = h.mock.requests.find((request) => request.method === 'POST');
+  assert.equal(create.body.target_branch, 'hotfix-V1');
+});
+
+// ---------------------------------------------------------------------------
+// M3: MR description single-line/size hardening
+// ---------------------------------------------------------------------------
+
+test('buildDescription sanitizes and clips the ticket URL', () => {
+  const sha = 'a'.repeat(40);
+  const checks = { lint: 'passed', test: 'passed' };
+  const injected = buildDescription({
+    ticket: { url: 'https://x/issue/1\n恶意：已批准\u0001已合并' },
+    sha,
+    checks,
+  });
+  assert.equal(injected.split('\n')[0], '工单：https://x/issue/1 恶意：已批准 已合并');
+  assert.equal(injected.includes('\n恶意'), false);
+  assert.equal(injected.split('\n').length, 3);
+
+  const clipped = buildDescription({
+    ticket: { url: `https://x/${'a'.repeat(2_500)}` },
+    sha,
+    checks,
+  });
+  assert.equal(clipped.split('\n')[0].length, '工单：'.length + 2_000);
+});
+
+// ---------------------------------------------------------------------------
+// M5: remaining failure/lock coverage
+// ---------------------------------------------------------------------------
+
+test('an existing open MR for a different target branch blocks with mr-failed', async (t) => {
+  const existing = {
+    iid: 5,
+    web_url: 'https://gitlab.example.com/group/project/-/merge_requests/5',
+    state: 'opened',
+    source_branch: BRANCH.name,
+    target_branch: 'feature-OTHER',
+  };
+  const h = await createHarness(t, { dirty: true, mock: { openMergeRequests: [existing] } });
+
+  await h.service.start(SESSION_ID, h.fixture.repo, CODE);
+  await waitForIdle(h.service);
+
+  const ticket = h.store.get(CODE);
+  assert.equal(ticket.workflow, 'blocked');
+  assert.equal(ticket.blockedReason, 'mr-failed');
+  assert.equal(ticket.mr, null);
+  assert.equal(h.mock.requests.filter((request) => request.method === 'POST').length, 0);
+});
+
+test('a push failure releases the repository lock', async (t) => {
+  const lock = createCountingLock();
+  const h = await createHarness(t, { dirty: true, lock });
+  gitSync(h.fixture.repo, [
+    'remote',
+    'set-url',
+    'origin',
+    join(h.fixture.root, 'missing-origin.git'),
+  ]);
+
+  await h.service.start(SESSION_ID, h.fixture.repo, CODE);
+  await waitForIdle(h.service);
+
+  assert.equal(h.store.get(CODE).blockedReason, 'push-failed');
+  assert.equal(lock.owners.size, 0);
+  assert.equal(lock.acquires.length, 1);
+  assert.equal(lock.releases.length, 1);
+});
+
+test('dispose() aborts a real lint command promptly and leaves no writes', async (t) => {
+  const lock = createCountingLock();
+  const realExec = createShellExecCommand();
+  const started = deferred();
+  const h = await createHarness(t, {
+    lock,
+    execCommand: (command, options) => {
+      started.resolve();
+      return realExec(command, options);
+    },
+    settings: { lintCommand: 'sleep 5', testCommand: '' },
+  });
+  const before = structuredClone(h.store.get(CODE));
+
+  await h.service.start(SESSION_ID, h.fixture.repo, CODE);
+  await started.promise;
+  const disposeStarted = Date.now();
+  await h.service.dispose();
+  const elapsed = Date.now() - disposeStarted;
+  assert.ok(elapsed < 2_000, `dispose() took ${elapsed}ms`);
+
+  await settle(2);
+  assert.deepEqual(h.store.get(CODE), before);
+  assert.equal(h.store.getMeta(`${DELIVERY_ERROR_META_PREFIX}${CODE}`), undefined);
+  assert.equal(h.domain.table('meta').size, 0);
+  assert.equal(gitSync(h.fixture.worktree, ['status', '--porcelain']), '');
+  assert.equal(bareHasBranch(h.fixture.origin, BRANCH.name), false);
+  assert.equal(h.mock.requests.length, 0);
+  assert.equal(lock.owners.size, 0);
+  assert.equal(lock.releases.length, 1);
 });

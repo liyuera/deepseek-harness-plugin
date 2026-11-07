@@ -520,8 +520,13 @@ export function createStore(domain, clock = defaultClock, options = {}) {
     if (patch.mr !== undefined && patch.mr !== null && !isPlainObject(patch.mr)) {
       return failure('invalid-input', 'mr 必须是普通对象或 null');
     }
-    if (patch.reviewRounds !== undefined && !isReviewRounds(patch.reviewRounds)) {
-      return failure('invalid-input', 'reviewRounds 必须是对象数组');
+    if (patch.reviewRounds !== undefined) {
+      if (!Array.isArray(patch.reviewRounds)) {
+        return failure('invalid-input', 'reviewRounds 必须是对象数组');
+      }
+      if (!patch.reviewRounds.every(isReviewRoundEntry)) {
+        return failure('invalid-input', 'reviewRounds 条目字段不合法');
+      }
     }
 
     const found = readTicket(code);
@@ -1020,12 +1025,57 @@ function isPlainObject(value) {
 }
 
 /**
- * `reviewRounds` is the review-run ledger (P5 Task 4). Every entry is a plain
- * object; the domain schema does not model the array yet, so the store owns
- * this shape check and a malformed patch is rejected before any write.
+ * `reviewRounds` is the review-run ledger (P5 Task 4): one entry per review
+ * round, appended by `patchTicket()` after the review-fix run. The domain
+ * `ticketSchema` models the same shape (`domain-spec.js`); keep both in sync.
+ * This dependency-free check is the store's write-boundary gate so a malformed
+ * patch is rejected even when no domain validator is injected (fake domains).
  */
-function isReviewRounds(value) {
-  return Array.isArray(value) && value.every((entry) => isPlainObject(entry));
+const REVIEW_ROUND_VERDICTS = new Set(['pass', 'changes', 'unknown']);
+const REVIEW_ROUND_STATUSES = new Set(['succeeded', 'failed', 'cancelled']);
+const REVIEW_ROUND_TEXT_MAX = 64;
+const REVIEW_ROUND_CHILD_ID_MAX = 200;
+const REVIEW_ROUND_CHANGED_FILES_MAX = 2_000;
+const REVIEW_ROUND_FILE_MAX = 4_096;
+
+/**
+ * One review-round entry: `{round int>=0, noteId number|string, verdict
+ * 'pass'|'changes'|'unknown', startedAt, finishedAt, changedFiles string[],
+ * status 'succeeded'|'failed'|'cancelled', childId?}` with bounded strings and
+ * arrays. Anything else would poison the board/retry logic after write.
+ *
+ * @param {unknown} entry
+ * @returns {boolean}
+ */
+export function isReviewRoundEntry(entry) {
+  if (!isPlainObject(entry)) return false;
+  if (!Number.isSafeInteger(entry.round) || entry.round < 0) return false;
+  if (typeof entry.noteId === 'number') {
+    if (!Number.isFinite(entry.noteId)) return false;
+  } else if (typeof entry.noteId !== 'string') {
+    return false;
+  }
+  if (!REVIEW_ROUND_VERDICTS.has(entry.verdict)) return false;
+  if (!isBoundedText(entry.startedAt, REVIEW_ROUND_TEXT_MAX)) return false;
+  if (!isBoundedText(entry.finishedAt, REVIEW_ROUND_TEXT_MAX)) return false;
+  if (!Array.isArray(entry.changedFiles)) return false;
+  if (entry.changedFiles.length > REVIEW_ROUND_CHANGED_FILES_MAX) return false;
+  if (!entry.changedFiles.every((file) => typeof file === 'string' && file.length <= REVIEW_ROUND_FILE_MAX)) {
+    return false;
+  }
+  if (!REVIEW_ROUND_STATUSES.has(entry.status)) return false;
+  if (
+    entry.childId !== undefined
+    && !isBoundedText(entry.childId, REVIEW_ROUND_CHILD_ID_MAX)
+  ) {
+    return false;
+  }
+  return true;
+}
+
+/** Non-empty string with a length cap (timestamps/ids). */
+function isBoundedText(value, max) {
+  return typeof value === 'string' && value.length > 0 && value.length <= max;
 }
 
 function errorMessage(error) {

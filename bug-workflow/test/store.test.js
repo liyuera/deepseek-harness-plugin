@@ -1263,18 +1263,43 @@ test('patchTicket() persists reviewRounds and validates the array shape', async 
   assert.deepEqual(result.ticket.reviewRounds, [REVIEW_ROUND]);
   assert.equal(result.ticket.timeline.at(-1).kind, 'patch');
 
-  const invalid = [
+  const notArrays = [
     { reviewRounds: {} },
     { reviewRounds: 'nope' },
-    { reviewRounds: [1] },
-    { reviewRounds: [null] },
-    { reviewRounds: [cloneJson(REVIEW_ROUND), 'x'] },
+    { reviewRounds: null },
   ];
-  for (const [index, patch] of invalid.entries()) {
+  for (const [index, patch] of notArrays.entries()) {
     const rejected = await store.patchTicket('BUG-1', patch, { actionId: `bad-rounds-${index}` });
     assert.equal(rejected.ok, false, `invalid reviewRounds #${index}`);
     assert.equal(rejected.code, 'invalid-input', `invalid reviewRounds #${index}`);
     assert.equal(rejected.message, 'reviewRounds 必须是对象数组');
+  }
+
+  // Task 4 appends rounds; a malformed entry must be refused at the write
+  // boundary instead of poisoning the board/retry logic later.
+  const malformedEntries = [
+    [1],
+    [null],
+    [{}],
+    [{ ...cloneJson(REVIEW_ROUND), round: 'x' }],
+    [{ ...cloneJson(REVIEW_ROUND), round: -1 }],
+    [{ ...cloneJson(REVIEW_ROUND), noteId: {} }],
+    [{ ...cloneJson(REVIEW_ROUND), verdict: 'maybe' }],
+    [{ ...cloneJson(REVIEW_ROUND), status: 'done' }],
+    [{ ...cloneJson(REVIEW_ROUND), startedAt: 1 }],
+    [{ ...cloneJson(REVIEW_ROUND), changedFiles: ['src/a.js', 3] }],
+    [{ ...cloneJson(REVIEW_ROUND), childId: 7 }],
+    [cloneJson(REVIEW_ROUND), 'x'],
+  ];
+  for (const [index, reviewRounds] of malformedEntries.entries()) {
+    const rejected = await store.patchTicket(
+      'BUG-1',
+      { reviewRounds },
+      { actionId: `bad-round-entry-${index}` },
+    );
+    assert.equal(rejected.ok, false, `malformed reviewRounds entry #${index}`);
+    assert.equal(rejected.code, 'invalid-input', `malformed reviewRounds entry #${index}`);
+    assert.equal(rejected.message, 'reviewRounds 条目字段不合法');
   }
   assert.equal(store.get('BUG-1').timeline.length, 2, 'rejected patches append nothing');
 });

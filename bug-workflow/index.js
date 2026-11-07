@@ -11,7 +11,7 @@
  *          -> close the domain from the fiber disposer
  *
  *   GET  /bug-workflow/api/health    -> { ok, domainOpenedAt, tickets }
- *   GET  /bug-workflow/api/snapshot  -> { ok, workspace, settings, platform, gitlab, dicts, analysis, fix, tickets, serverTime }
+ *   GET  /bug-workflow/api/snapshot  -> { ok, workspace, settings, platform, gitlab, dicts, analysis, fix, delivery, tickets, serverTime }
  *   POST /bug-workflow/api/action    -> { ok, ticket } | { ok:false, code, message, ticket? }
  *                                       (create + payload.code = 按编号从平台导入)
  *   POST /bug-workflow/api/analyze   -> { ok, workflow:'analyzing', running }

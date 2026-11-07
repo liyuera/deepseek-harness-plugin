@@ -1886,14 +1886,19 @@ test('POST /deliver validates session, code and workspace before starting', asyn
 test('POST /deliver maps service failures to static HTTP statuses', async () => {
   const cases = [
     ['ticket-not-found', 404],
+    ['not-found', 404],
     ['not-submitting', 409],
     ['delivery-busy', 409],
     ['delivery-no-changes', 409],
     ['protected-branch', 409],
+    // An external manual worktree on the same personal branch: fix-service
+    // already answers 409, delivery must map it identically (never git-failed).
+    ['worktree-conflict', 409],
     ['invalid-branch', 400],
     ['worktree-missing', 400],
     ['invalid-gitlab-settings', 400],
     ['invalid-code', 400],
+    ['invalid-input', 400],
     ['unknown-workspace', 400],
     ['missing-gitlab-token', 503],
     ['delivery-unavailable', 503],
@@ -1917,6 +1922,22 @@ test('POST /deliver maps service failures to static HTTP statuses', async () => 
     assert.equal(json.code, code, code);
     assert.equal(json.message, `失败 ${code}`, code);
   }
+});
+
+test('POST /deliver maps an unmapped service code to a static 500 internal', async () => {
+  const delivery = createFakeDelivery({
+    start: () => ({ ok: false, code: 'mystery-code', message: '未知失败' }),
+  });
+  const { handlers } = handlersWith({ delivery });
+  const { res, json } = await call(handlers.deliver, {
+    method: 'POST',
+    url: API_PATHS.deliver,
+    body: deliverBody(),
+  });
+
+  assert.equal(res.statusCode, 500);
+  assert.equal(json.code, 'internal');
+  assert.equal(json.message, '交付启动失败');
 });
 
 test('POST /deliver answers 503 delivery-unavailable when the service is not wired', async () => {

@@ -68,20 +68,37 @@ createDeliveryService({
   gitlabClientFor: (settings) => gitlabClient,   // 首选；start() 内按当前 settings 调用
   // gitlab: 预构造 client 仅保留给直接测试；fetchImpl 用于内置 fallback factory
   clock, lock,                                   // lock: {acquire(repo,owner), release(repo,owner)} 共享仓库单飞
-  execCommand,                                   // (command,{cwd,timeoutMs,signal}) -> {ok,output}
+  execCommand,                                   // (command,{cwd,timeoutMs,signal}) -> {ok,output,timedOut?}
   commandTimeoutMs = 300000, drainTimeoutMs = 3000, log,
 })
   .start(sessionId, cwd, code) -> { ok:true, running:true } | { ok:false, code, message }
   .status() -> { running:string[], errors:Record<code,string> }   // errors 键 = 工单号
   .dispose() -> Promise<void>
-// 流程：校验 submitting + token/settings + branch 元数据 + worktree 存在（同步、零写入）→
-//        lint/test（空命令跳过，时间线记「未配置 lint/test」）→ commitAll → push →
+
+// 模块级导出 createRepoLock() -> { acquire(repo, owner), release(repo, owner) }
+//   index 只建一个实例注入 delivery（Task 4 提到 analysis/fix/delivery/review 共同作用域后注入 review-service）。
+//   owner 约定：`delivery:<工单号>` / `review:<工单号>`，不得直接用裸工单号——同一 repo 上不同服务必须互斥，
+//   同 owner 才是可重入。P4 fix-service 目前仍是内部 lockRepo/unlockRepo（本次不改）；Task 4 若要 fix 与
+//   delivery/review-fix 也互斥，必须把 fix-service 改为注入同一个 lock 实例，而不是各建一把。
+//   index.js:287 的 `const repoLock = createRepoLock()` 在 delivery-only try 块内；Task 4 接入 review-service
+//   时把它提升到 analysis/fix/delivery/review 共同作用域（同层构造、同一实例注入）。
+
+// 流程：校验 submitting + token/settings（含 normalizeProject(gitlabProjectPath)）+ branch 元数据
+//        + target 分支族（feat-*→feature-*、hot-*→hotfix-*，禁 main/dev/release）+
+//        worktree 是注册工作树且 checkout 在 branch.name（probeWorktree === 'same'）（同步、零写入）→
+//        lint/test（空命令跳过，时间线记「未配置 lint/test」；300s 硬超时：进程组 SIGTERM→SIGKILL，
+//        timer fallback settle，禁止把超时命令判为通过）→ commitAll →
+//        校验 revParse(worktree, branch.name) === sha（否则 block worktree-mismatch）→ push →
 //        findOpenMR 复用或 createMergeRequest →
 //        写队列内：submit_mr（intent）→ mr_created(expectedWorkflow:'submitting', mr:MRRecord) →
 //                  patchTicket({reviewRounds:[]})（仅当尚无该字段，expectedWorkflow:'mr_open'）
+// 重试恢复：commit 成功后、push 前写 meta `delivery.commit:<工单号>` =
+//   { sha, worktree, branch, message }；重试时 commitAll 返回 sha:null 且记录与当前 worktree/branch 匹配、
+//   revParse(branch.name) === 记录 sha，则跳过 commit 继续 push/MR（push 幂等）；成功交付后清 null。
+//   无该记录的空工作树仍 block delivery-no-changes。
 // 失败码：ticket-not-found|not-submitting|missing-gitlab-token|invalid-gitlab-settings|worktree-missing|
-//         protected-branch|invalid-branch|delivery-lint-failed|delivery-test-failed|delivery-no-changes|
-//         git-failed|push-failed|mr-failed|delivery-busy|delivery-unavailable
+//         worktree-conflict|protected-branch|invalid-branch|delivery-lint-failed|delivery-test-failed|
+//         delivery-no-changes|worktree-mismatch|git-failed|push-failed|mr-failed|delivery-busy|delivery-unavailable
 // 步骤失败 → block（静态 reason，expectedWorkflow:'submitting'）+ meta `delivery.error:<工单号>`；
 // 迟到/取消结果只写 meta，绝不回退已推进的工单；绝不触碰 `fix.error:<工单号>`
 
@@ -154,7 +171,7 @@ fixes:  [ fixRunSchema … ]                                   // review 修复�
 
 ### Task 4: Review 轮询 + review 修复轮 + 合并检测/自动归档
 
-**Files:** new `bug-workflow/src/host/review-service.js`；Modify `src/host/agent-access.js`（`runReviewFix`，prompt 含：review findings 数据块、只改 worktree、禁 commit/push/联网、禁止 resolve/approve）、`bug-workflow/index.js`（timer 接线、dispose 排水）、`src/host/store.js`（reviewRounds 校验如 Task 3 未覆盖）；Test 新增 `test/review-service.test.js`（loopback mock GitLab + 临时 git 仓库 + fake runner + fake timer/clock）。
+**Files:** new `bug-workflow/src/host/review-service.js`；Modify `src/host/agent-access.js`（`runReviewFix`，prompt 含：review findings 数据块、只改 worktree、禁 commit/push/联网、禁止 resolve/approve）、`bug-workflow/index.js`（**把 `repoLock` 提升到 delivery/review 共用作用域并注入同一 `createRepoLock()` 实例**、timer 接线、dispose 排水）、`src/host/store.js`（reviewRounds 形状 Task 3 已覆盖，Task 4 只 append）；Test 新增 `test/review-service.test.js`（loopback mock GitLab + 临时 git 仓库 + fake runner + fake timer/clock）。
 
 - [ ] **Step 1: 失败测试**：
   - `tick()`：无 token → 不请求、不写状态；`mr_open` + 新 `可直接合并` note → `review_pass`（expectedWorkflow 'mr_open'）→ `mergeable`；`需要修改` → `review_requests_changes` → `fixing_review` → runner（worktree 内）成功 → commit+push → `review_fix_done`（expectedWorkflow 'fixing_review'）+ `mr.rounds+1`/`reviewRounds[]`；runner 失败/超时 → `block('review-fix-failed')` 可重试；第 4 轮 → `block('review-rounds-exhausted')`；

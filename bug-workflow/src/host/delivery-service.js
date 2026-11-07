@@ -35,15 +35,39 @@
  *     `lock` accepts an injected `{acquire(repo, owner), release(repo, owner)}`
  *     so a later review service can share the same workspace lock.
  *   - Configured lint/test commands run FIRST in the worktree (300 s budget,
- *     bounded output tail). A failure writes the output tail to
- *     `meta['delivery.error:<ticket code>']`, blocks with the static reason
- *     `delivery-lint-failed` / `delivery-test-failed`, and never commits or
- *     pushes. Skipped commands are reported in the `submit_mr` timeline event.
+ *     bounded output tail). The budget is a HARD limit: on expiry the whole
+ *     process group is signalled (SIGTERM, then SIGKILL after a short grace),
+ *     a timer-driven fallback settles the promise even when a TERM-ignoring
+ *     command or a surviving grandchild still holds the stdio pipes, and the
+ *     result is always `ok:false` (never "timed out but exited 0"). A failure
+ *     writes the output tail to `meta['delivery.error:<ticket code>']`, blocks
+ *     with the static reason `delivery-lint-failed` / `delivery-test-failed`,
+ *     and never commits or pushes. Skipped commands are reported in the
+ *     `submit_mr` timeline event.
+ *   - The branch worktree must be a REGISTERED worktree of the resolved
+ *     repository checked out on `branch.name` (`git.probeWorktree === 'same'`).
+ *     A plain directory, an unregistered path or a worktree on another branch
+ *     is refused with `worktree-missing` / `worktree-conflict` before any
+ *     `git add -A`, so a commit can never land on the main worktree or on the
+ *     wrong branch. After the commit, the branch ref must resolve to the new
+ *     sha (`git.revParse`) before the push, otherwise the ticket blocks with
+ *     `worktree-mismatch`.
  *   - The commit message is exactly
  *     `<commitType>: 【jira单号】：<code>，【开发内容】：<summary>`
  *     (`commitType` defaults to `fix`; the summary is `plan.summary`, clipped
  *     to 120 chars, else the ticket title). An empty worktree blocks with
- *     `delivery-no-changes` instead of creating an empty commit.
+ *     `delivery-no-changes` instead of creating an empty commit — UNLESS a
+ *     previous attempt already recorded its commit for this branch
+ *     (`meta['delivery.commit:<code>']`) and the branch still points at it, in
+ *     which case a retry after a push/MR failure resumes from that sha instead
+ *     of short-circuiting. The record is cleared on success.
+ *   - `branch.target` must be a safe branch name whose family matches the
+ *     personal branch (`feat-*` → `feature-*`, `hot-*` → `hotfix-*`) and must
+ *     never be `main`/`master`/`dev`/`develop` or a `release-*` branch
+ *     (`invalid-branch`, 400, before any git work). `gitlabProjectPath` is
+ *     normalized (`normalizeProject`) before the job starts, so a malformed
+ *     non-empty path is a static `invalid-gitlab-settings` instead of a failure
+ *     after the push.
  *   - The push target is validated again by `git.pushBranch`; protected
  *     branches are refused before git runs and a push failure blocks with
  *     `push-failed`. `--force` is never used.
@@ -69,11 +93,15 @@ import { spawn } from 'node:child_process';
 import { realpath, stat } from 'node:fs/promises';
 import { sep } from 'node:path';
 
+import { isSafeBranchName } from './branch.js';
 import { GitError, assertPushableBranch } from './git.js';
-import { createGitlabClient } from './gitlab.js';
+import { createGitlabClient, normalizeProject } from './gitlab.js';
 
 /** `meta` key prefix of a persisted delivery error (suffix = ticket code). */
 export const DELIVERY_ERROR_META_PREFIX = 'delivery.error:';
+
+/** `meta` key prefix of the commit staged for a retryable delivery. */
+export const DELIVERY_COMMIT_META_PREFIX = 'delivery.commit:';
 
 /** Upper bound for one configured lint/test command (5 minutes). */
 export const DEFAULT_COMMAND_TIMEOUT_MS = 300_000;
@@ -86,6 +114,12 @@ export const DELIVERY_SUMMARY_MAX_CHARS = 120;
 
 /** Upper bound on `dispose()` draining aborted jobs. */
 export const DEFAULT_DRAIN_TIMEOUT_MS = 3_000;
+
+/** Grace after SIGTERM before the whole process group gets SIGKILL. */
+export const COMMAND_KILL_GRACE_MS = 100;
+
+/** Upper bound for the ticket URL embedded in the MR description. */
+export const DESCRIPTION_URL_MAX_CHARS = 2_000;
 
 /** Start refusal while another delivery owns the ticket/repository. */
 export const DELIVERY_BUSY_MESSAGE = '当前工作区已有交付任务在执行，请稍后重试';
@@ -103,6 +137,7 @@ export const DELIVERY_REASON_MESSAGES = Object.freeze({
   'delivery-no-changes': '没有可提交的改动，请确认修复已保存',
   'push-failed': '推送个人分支失败，请检查远程仓库后重试',
   'mr-failed': '创建 GitLab MR 失败，请稍后重试',
+  'worktree-mismatch': '提交未落在个人分支上，已停止推送，请重新执行修复',
   'git-failed': '提交失败，请检查工作树后重试',
 });
 
@@ -113,11 +148,12 @@ export const DELIVERY_START_MESSAGES = Object.freeze({
   'invalid-code': '缺少有效的工单编号 code',
   'unknown-workspace': '无法确定工作区路径，无法提交 MR',
   'worktree-missing': '未找到可提交的工作树，请先执行修复',
+  'worktree-conflict': '工作树当前分支与个人分支不一致，请重新执行修复',
   'invalid-gitlab-settings': 'GitLab 配置无效，请检查 GitLab 地址与项目路径',
   'missing-gitlab-token': '未配置 GitLab token，请先在设置中保存 GitLab token',
   'delivery-busy': DELIVERY_BUSY_MESSAGE,
   'protected-branch': '个人分支受保护，禁止推送',
-  'invalid-branch': '个人分支名不合法，无法推送',
+  'invalid-branch': '个人分支或目标分支不合法，无法提交 MR',
   'git-failed': '无法解析工作区仓库，无法提交 MR',
   'delivery-unavailable': '交付服务不可用，请稍后重试',
   internal: '交付启动失败，请重试',
@@ -133,6 +169,13 @@ const GIT_FAILED_MESSAGE = DELIVERY_START_MESSAGES['git-failed'];
  *
  *   lock.acquire(repo, owner) -> boolean  // false when another owner holds it
  *   lock.release(repo, owner)             // no-op unless `owner` still owns it
+ *
+ * Ownership convention: every service namespaces its owner by service, e.g.
+ * `delivery:<code>` / `review:<code>`. Plain ticket codes must not be used:
+ * two services for the same ticket would otherwise look like a re-entrant
+ * acquire and run concurrently on one repository. A different owner always
+ * blocks, even on the same ticket (the state machine already makes delivery and
+ * review-fix mutually exclusive, but the lock must not rely on it).
  *
  * @returns {{acquire: Function, release: Function}}
  */
@@ -154,7 +197,7 @@ export function createRepoLock() {
 
 /**
  * Production `execCommand`: run one configured shell command with `cwd` set to
- * the ticket worktree, a hard timeout, and a bounded output tail.
+ * the ticket worktree, a HARD timeout, and a bounded output tail.
  *
  * The command comes from the operator's workspace settings and is deliberately
  * executed through `/bin/sh -c` (it is a shell snippet, not an argv array). Git
@@ -163,8 +206,21 @@ export function createRepoLock() {
  * the operator configured themselves. Windows is not supported by this default
  * (the P5 findings list it as a user-verification item).
  *
+ * Timeout handling is deliberately not `child.kill('SIGTERM')` + wait for
+ * `close`:
+ *
+ *   - POSIX children are spawned `detached` so SIGTERM/SIGKILL can target the
+ *     whole process group (a shell that exits still leaves npm/jest/server
+ *     grandchildren holding the stdout/stderr pipes);
+ *   - SIGTERM is followed by SIGKILL after {@link COMMAND_KILL_GRACE_MS};
+ *   - a timer settles the promise at `timeoutMs + grace` with
+ *     `{ok:false, timedOut:true}` even if `close` never fires, so a
+ *     TERM-ignoring command can neither be reported as success nor hang the
+ *     delivery job/repo lock;
+ *   - an abort (host teardown) also kills the process group and settles fast.
+ *
  * @param {{shell?: string}} [options]
- * @returns {(command: string, options?: {cwd?: string, timeoutMs?: number, signal?: AbortSignal}) => Promise<{ok:boolean, output:string}>}
+ * @returns {(command: string, options?: {cwd?: string, timeoutMs?: number, signal?: AbortSignal}) => Promise<{ok:boolean, output:string, timedOut?:boolean}>}
  */
 export function createShellExecCommand(options = {}) {
   const shell = typeof options.shell === 'string' && options.shell.trim() !== ''
@@ -194,6 +250,8 @@ export function createShellExecCommand(options = {}) {
           cwd,
           stdio: ['ignore', 'pipe', 'pipe'],
           windowsHide: true,
+          // Own process group on POSIX so the whole tree can be killed.
+          detached: process.platform !== 'win32',
           ...(signal === undefined ? {} : { signal }),
         });
       } catch {
@@ -203,29 +261,77 @@ export function createShellExecCommand(options = {}) {
 
       let output = '';
       let settled = false;
+      let timedOut = false;
+      let graceTimer;
       const append = (chunk) => {
         output = tailClip(output + String(chunk), COMMAND_OUTPUT_MAX_CHARS);
       };
       child.stdout?.on('data', append);
       child.stderr?.on('data', append);
 
-      const timer = setTimeout(() => {
+      /** Signal the child's whole process group when possible. */
+      const killTree = (signalName) => {
+        if (typeof child.pid !== 'number' || child.pid <= 0) return;
+        if (process.platform !== 'win32') {
+          try {
+            process.kill(-child.pid, signalName);
+            return;
+          } catch {
+            // Fall through to the single-process kill (e.g. already reaped).
+          }
+        }
         try {
-          child.kill('SIGTERM');
+          child.kill(signalName);
         } catch {
           // The child may already be gone.
         }
-      }, timeoutMs);
+      };
 
       const finish = (ok) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        resolve({ ok, output });
+        if (graceTimer !== undefined) clearTimeout(graceTimer);
+        child.stdout?.removeAllListeners('data');
+        child.stderr?.removeAllListeners('data');
+        try {
+          child.stdout?.destroy();
+          child.stderr?.destroy();
+        } catch {
+          // Stream teardown is best effort.
+        }
+        if (signal !== undefined && typeof signal.removeEventListener === 'function') {
+          try {
+            signal.removeEventListener('abort', onAbort);
+          } catch {
+            // A hostile signal implementation must not block the settlement.
+          }
+        }
+        // A command that ignored SIGTERM and later exits 0 must never be
+        // reported as a passing check.
+        resolve(timedOut ? { ok: false, output, timedOut: true } : { ok, output });
       };
 
+      const timer = setTimeout(() => {
+        timedOut = true;
+        killTree('SIGTERM');
+        graceTimer = setTimeout(() => {
+          killTree('SIGKILL');
+          finish(false);
+        }, COMMAND_KILL_GRACE_MS);
+      }, timeoutMs);
+
+      const onAbort = () => {
+        killTree('SIGKILL');
+        finish(false);
+      };
+      if (signal !== undefined && typeof signal.addEventListener === 'function') {
+        if (signal.aborted === true) onAbort();
+        else signal.addEventListener('abort', onAbort, { once: true });
+      }
+
       child.on('error', () => finish(false));
-      child.on('close', (code, killedBy) => finish(code === 0 && killedBy === null));
+      child.on('close', (code, killedBy) => finish(code === 0 && killedBy === null && !timedOut));
     });
   };
 }
@@ -237,7 +343,7 @@ export function createShellExecCommand(options = {}) {
  * @param {object} deps.store opened ticket store
  *   (`get/list/applyAction/patchTicket/getSettings/getMeta/setMeta`)
  * @param {object} deps.git `createGit()` result; delivery uses
- *   `repoRoot`/`commitAll`/`pushBranch`
+ *   `repoRoot`/`probeWorktree`/`revParse`/`commitAll`/`pushBranch`
  * @param {{get: () => Promise<string|null>}} deps.tokenStore GitLab token store
  *   (only `get` is used; the token never leaves the service)
  * @param {(settings: object) => object} [deps.gitlabClientFor] per-workspace
@@ -344,6 +450,14 @@ export function createDeliveryService({
     if (!isUsableGitlabSettings(settings)) {
       return failure('invalid-gitlab-settings', DELIVERY_START_MESSAGES['invalid-gitlab-settings']);
     }
+    // A non-empty but syntactically invalid project path (double slash,
+    // whitespace, pre-encoded `%2F`, bare segment) would otherwise only fail on
+    // the first GitLab call AFTER the commit/push. Validate it here, while the
+    // request is still side-effect free.
+    const project = normalizeProject(settings.gitlabProjectPath);
+    if (project.ok !== true) {
+      return failure('invalid-gitlab-settings', DELIVERY_START_MESSAGES['invalid-gitlab-settings']);
+    }
 
     // Read the token before any state write; a missing/unreadable credential
     // is a retryable 503 and must not leave a block/error behind.
@@ -359,13 +473,21 @@ export function createDeliveryService({
 
     const branch = readBranch(ticket);
     if (!branch.ok) return branch.failure;
+    let pushableName;
     try {
-      assertPushableBranch(branch.name);
+      pushableName = assertPushableBranch(branch.name);
     } catch (error) {
       const failureCode = error instanceof GitError && error.code === 'protected-branch'
         ? 'protected-branch'
         : 'invalid-branch';
       return failure(failureCode, DELIVERY_START_MESSAGES[failureCode]);
+    }
+    // The target is persisted metadata: never trust it blindly. A `feat-*`
+    // personal branch may only target `feature-*`, `hot-*` only `hotfix-*`, and
+    // an integration branch (main/dev/develop, release-*) is never a valid MR
+    // target for this workflow.
+    if (!isValidDeliveryTarget(pushableName, branch.target)) {
+      return failure('invalid-branch', DELIVERY_START_MESSAGES['invalid-branch']);
     }
 
     let worktreeStat;
@@ -416,9 +538,29 @@ export function createDeliveryService({
       return failure('worktree-missing', DELIVERY_START_MESSAGES['worktree-missing']);
     }
 
+    // The stored `branch.worktree` is persisted metadata, not proof: a plain
+    // directory below the repo would make `git -C` resolve to the MAIN
+    // worktree, and a worktree checked out on another branch would commit to
+    // the wrong ref. Require a registered worktree on exactly `branch.name`
+    // BEFORE anything is staged or committed.
+    const probe = await git.probeWorktree(repo, branch.worktree, pushableName);
+    if (probe === null || typeof probe !== 'object' || probe.ok !== true) {
+      return failure('git-failed', GIT_FAILED_MESSAGE);
+    }
+    if (probe.state === 'different') {
+      return failure('worktree-conflict', DELIVERY_START_MESSAGES['worktree-conflict']);
+    }
+    if (probe.state !== 'same') {
+      return failure('worktree-missing', DELIVERY_START_MESSAGES['worktree-missing']);
+    }
+
     if (disposed) return failure('delivery-unavailable', UNAVAILABLE_MESSAGE);
     if (running.has(key)) return failure('delivery-busy', DELIVERY_BUSY_MESSAGE);
-    if (!repoLock.acquire(repo, key)) {
+    // Namespaced owner: a future review-fix job shares this lock instance with
+    // `review:<code>` and must not accidentally be treated as re-entrant with
+    // a delivery for the same ticket code.
+    const lockOwner = `delivery:${key}`;
+    if (!repoLock.acquire(repo, lockOwner)) {
       return failure('delivery-busy', DELIVERY_BUSY_MESSAGE);
     }
 
@@ -437,7 +579,7 @@ export function createDeliveryService({
       .finally(() => {
         jobs.delete(job);
         if (running.get(key) === entry) running.delete(key);
-        repoLock.release(repo, key);
+        repoLock.release(repo, lockOwner);
       })
       .catch(() => {
         // runDelivery contains every failure; belt-and-braces only.
@@ -475,11 +617,41 @@ export function createDeliveryService({
         await failDelivery(key, 'git-failed', '');
         return;
       }
+
+      let sha;
       if (committed.sha === null) {
-        await failDelivery(key, 'delivery-no-changes', '');
+        // The worktree is clean. That is a genuine no-op on a first delivery,
+        // but on a retry after `push-failed`/`mr-failed` the commit already
+        // exists: resume from the recorded sha (the branch ref is verified
+        // below) instead of blocking before the push/MR can be retried.
+        const recorded = readRecordedCommit(key, branch);
+        if (recorded === undefined) {
+          await failDelivery(key, 'delivery-no-changes', '');
+          return;
+        }
+        sha = recorded.sha;
+      } else {
+        sha = committed.sha;
+        // Persist BEFORE the push: if the push/MR fails, the retry must find
+        // this commit instead of hitting `delivery-no-changes`.
+        await rememberCommit(key, {
+          sha,
+          worktree: branch.worktree,
+          branch: branch.name,
+          message,
+        });
+        if (entry.cancelled) return;
+      }
+
+      // Second identity gate: the ref we are about to push must resolve to the
+      // commit we just staged. This also catches a `git -C` surprise where the
+      // commit landed somewhere other than the personal branch.
+      const head = await git.revParse(branch.worktree, branch.name);
+      if (entry.cancelled) return;
+      if (typeof head !== 'string' || head !== sha) {
+        await failDelivery(key, 'worktree-mismatch', '');
         return;
       }
-      const sha = committed.sha;
 
       const pushed = await git.pushBranch({
         root: branch.worktree,
@@ -659,6 +831,9 @@ export function createDeliveryService({
 
     notifyLog(log, 'delivery-done', { code: key, sha, iid: mr.iid ?? null, url: mr.url ?? null });
     await clearError(key);
+    // The retry record has served its purpose; a future delivery of this ticket
+    // starts from a fresh commit.
+    await clearCommit(key);
   }
 
   /** Apply an action with a generated actionId and `expectedWorkflow:'submitting'`. */
@@ -744,6 +919,46 @@ export function createDeliveryService({
     }
   }
 
+  /**
+   * Record the commit staged for this ticket/branch. Persisted before the
+   * push so a push/MR failure remains retryable; best effort (a metadata write
+   * failure must not turn a successful delivery into an error).
+   */
+  function rememberCommit(key, record) {
+    try {
+      return store.setMeta(DELIVERY_COMMIT_META_PREFIX + key, record).catch(() => {});
+    } catch {
+      return Promise.resolve();
+    }
+  }
+
+  /** Forget the retry record after a successful delivery. */
+  function clearCommit(key) {
+    try {
+      return store.setMeta(DELIVERY_COMMIT_META_PREFIX + key, null).catch(() => {});
+    } catch {
+      return Promise.resolve();
+    }
+  }
+
+  /**
+   * Read the commit recorded by a previous attempt, but only when it was
+   * staged for THIS worktree and THIS personal branch. A corrupt/foreign
+   * record is ignored (falls back to `delivery-no-changes`).
+   */
+  function readRecordedCommit(key, branch) {
+    let value;
+    try {
+      value = store.getMeta(DELIVERY_COMMIT_META_PREFIX + key);
+    } catch {
+      return undefined;
+    }
+    if (!isPlainObject(value)) return undefined;
+    if (typeof value.sha !== 'string' || !/^[0-9a-f]{40,64}$/i.test(value.sha)) return undefined;
+    if (value.worktree !== branch.worktree || value.branch !== branch.name) return undefined;
+    return value;
+  }
+
   function readPersistedError(key) {
     let value;
     try {
@@ -808,7 +1023,7 @@ export function buildCommitMessage(settings, code, ticket) {
  */
 export function buildDescription({ ticket, sha, checks }) {
   const lines = [];
-  const url = typeof ticket?.url === 'string' ? ticket.url.trim() : '';
+  const url = normalizeOneLine(ticket?.url ?? '', DESCRIPTION_URL_MAX_CHARS);
   if (url !== '') lines.push(`工单：${url}`);
   const summary = planSummary(ticket);
   if (summary !== '') lines.push(`方案摘要：${summary}`);
@@ -852,10 +1067,10 @@ function resolveSummary(ticket) {
   return summary !== '' ? summary : normalizeOneLine(String(ticket?.code ?? ''), DELIVERY_SUMMARY_MAX_CHARS);
 }
 
-/** Collapse line breaks/tabs into spaces and clip to `max` characters. */
+/** Collapse control characters/line breaks into spaces and clip to `max`. */
 function normalizeOneLine(value, max) {
   const text = String(value)
-    .replace(/[\u0000\r\n\t]+/g, ' ')
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ')
     .replace(/\s{2,}/g, ' ')
     .trim();
   return text.length <= max ? text : text.slice(0, max);
@@ -918,6 +1133,37 @@ function isUsableGitlabSettings(settings) {
     && settings.gitlabProjectPath.trim() !== '';
 }
 
+/** Integration branches that may never be the target of an automatic MR. */
+const FORBIDDEN_TARGET_EXACT = new Set(['main', 'master', 'dev', 'develop']);
+
+/**
+ * True for the `{personal, target}` pair written by the fix service:
+ *
+ *   - target is a syntactically safe branch name;
+ *   - target is not the personal branch itself;
+ *   - target is not an integration branch (`main`/`master`/`dev`/`develop`)
+ *     and not the protected `release-*` family;
+ *   - family consistency: `feat-*` personal branches deliver to `feature-*`,
+ *     `hot-*` personal branches to `hotfix-*`. Custom personal branches keep
+ *     the (non-protected) target the operator recorded.
+ *
+ * `personal` is the value returned by `assertPushableBranch` (refs/heads/
+ * stripped). This is defense in depth: `branch.target` is persisted metadata
+ * that a hand edit or a future override UI could otherwise point at `main`.
+ */
+function isValidDeliveryTarget(personal, target) {
+  if (!isSafeBranchName(target)) return false;
+  if (personal === target) return false;
+  const lower = target.toLowerCase();
+  if (FORBIDDEN_TARGET_EXACT.has(lower)) return false;
+  if (/^release(?:[-/]|$)/i.test(lower)) return false;
+
+  const personalLower = personal.toLowerCase();
+  if (personalLower.startsWith('feat-')) return lower.startsWith('feature-');
+  if (personalLower.startsWith('hot-')) return lower.startsWith('hotfix-');
+  return true;
+}
+
 function isUsableGitlabClient(client) {
   return isPlainObject(client)
     && typeof client.findOpenMergeRequest === 'function'
@@ -972,7 +1218,13 @@ function assertGit(git) {
   if (git === null || typeof git !== 'object') {
     throw new TypeError('createDeliveryService() requires a git executor');
   }
-  for (const method of ['repoRoot', 'commitAll', 'pushBranch']) {
+  for (const method of [
+    'repoRoot',
+    'probeWorktree',
+    'revParse',
+    'commitAll',
+    'pushBranch',
+  ]) {
     if (typeof git[method] !== 'function') {
       throw new TypeError(`createDeliveryService() git.${method} must be a function`);
     }
