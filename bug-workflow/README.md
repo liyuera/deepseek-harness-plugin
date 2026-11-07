@@ -111,7 +111,7 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 | 人工测试 | `fix_done` 详情展示 branch/target/worktree、`changedFiles`、`diffStat`、summary、`testResult` 与修复记录；人工测试后点「标记测试通过」→ `mark_test_passed` → `submitting`。真实人工测试由用户完成；P4 live 验收中的该点击是模拟动作 |
 | 客户端 UX | `fixing` 且从未启动（无 `branch.worktree`、无 `fixes`、无错误）→「开始修复」；有 branch/修复记录/错误但无运行任务 →「上次修复已中断，可重新修复」；运行中 →「AI 修复中…（最长约 15 分钟）」+ 本地计时（计时行 `aria-live=off`）；blocked(fixing) → 静态原因 +「重新修复」；`fix_done` → 修复记录卡（摘要/改动文件/`diffStat`/耗时）+ 测试卡（`testResult`）+「标记测试通过」。所有按钮二次确认，demo「修复完成」按钮隐藏 |
 | 超时/成本 | 单次修复预算 **15 分钟**（`DEFAULT_FIX_TIMEOUT_MS=900000`，代码级默认，无 host setting）；真子代理消耗模型 token 与真实时间 |
-| 测试 | **350 个用例**（P3 基线 263；P4 新增/扩充：`branch` 14、`git` 13、`fix-service` 36、`agent-access` +8、`store` +8、`routes` +8） |
+| 测试 | **352 个用例**（P3 基线 263；P4 新增/扩充：`branch` 14、`git` 13、`fix-service` 38、`agent-access` +8、`store` +8、`routes` +8） |
 
 **P4 修复成功的前置条件（缺一不可）**
 
@@ -330,6 +330,8 @@ P2 **未对真实平台执行**同步/导入（无真实 token，用户不在场
 - **真实业务仓库未验证**：P4 live 的目标工单 648 来自平台，但其 plan 是 P3 在**插件仓库**里分析出来的（plan `risks` 已标注归属存疑）；live 修复改的是插件仓库的「导出 Excel」功能，**不是 648 的真实业务实现**。真实业务仓库的代码质量、依赖、构建命令与修复效果未验证。
 - **真实人工测试未执行**：live 的「标记测试通过」是模拟动作（`mark_test_passed` → `submitting`）；没有真机/QA 验证，真实业务测试由用户完成。
 - **外部手工 worktree 撞同名分支会 500**：`fix-branch-busy` 只覆盖本插件记录过、且 `git status` 可读的工作树。若有人在同分支上手工 `git worktree add`，git 返回 `git-failed` → `/api/fix` 500；工单保持 `fixing`（可重试）后由孤儿路径恢复，无数据丢失。P5 应改用 `git worktree list --porcelain` 预检并映射为 409。
+- **`fix-branch-busy` 会把 `fixing` 工单直接 block**：个人分支被其它工单 worktree 占用时 `/api/fix` 返回 409，当前工单被 `block`（`blockedReason:'fix-branch-busy'`）且不会自动恢复；清理冲突 worktree 后再 `POST /api/fix`（`blocked(fixing)` 走自动 retry）。
+- **`diffStat`/`diff` 只覆盖 tracked 改动**：`changedFiles` 来自 `git status --porcelain`（含 `??` 未跟踪文件），而 `diffStat`/`diff` 来自 `git diff`；只新增文件的修复会出现 `changedFiles` 非空而 `diffStat` 为空。
 - **同仓库并发锁是进程内的**：`fix-busy` 由 `fix-service` 的内存 Map 保证；多 host 进程/重载重叠时无效（DSH desktop 是单 host 进程，正常使用不受影响）。
 - **blocked 重启失败保留旧 `blockedReason`**：`blocked(fixing)` 重启时若 git 准备失败，工单保持原 `blocked` 与原 `blockedReason`，新原因只写 `meta['fix.error:<code>']` 并由看板优先展示（`snapshot.fix.errors[code]`）；没有「只改 `blockedReason` 不 retry」的 store 动作。
 - **无提交级 client 行为测试**：仓库内仍只有 `client-action-map.test.js` 的静态映射校验；P4 修复 UI 的渲染/交互只有未提交的 `/tmp` harness 与源码审阅（P3 顺延项，仍未补）。
@@ -363,7 +365,7 @@ P2 **未对真实平台执行**同步/导入（无真实 token，用户不在场
 无构建步骤：host 是纯 ESM JavaScript，client 是自包含 React bundle（只 `require('react')`，由宿主 module table 提供）。
 
 ```sh
-# 全部单元测试（在仓库根目录执行）——P4 收尾 350/350
+# 全部单元测试（在仓库根目录执行）——P4 收尾 352/352
 node --test bug-workflow/test/*.test.js
 
 # 语法/静态检查
@@ -427,7 +429,7 @@ git worktree remove --force .dsh-worktrees/YGFNXDJRFWDJSYJJYY-648 \
 | `scripts/fixtures/platform/` | mock 工单/详情/字典/评论/附件 fixtures |
 | `scripts/cleanup-demo-tickets.mjs` | 安全清理 mock 遗留工单（dry-run 默认、0600 备份、原子写） |
 | `scripts/verify-domain-v2.mjs` | 用安装版 zod/domain 验证 v2 契约（Electron-as-node） |
-| `test/` | `node:test` 单元测试（P4 新增/扩充：`branch`、`git`、`fix-service`、`agent-access`、`store`、`routes`、`domain-v2`；总计 350） |
+| `test/` | `node:test` 单元测试（P4 新增/扩充：`branch`、`git`、`fix-service`、`agent-access`、`store`、`routes`、`domain-v2`；总计 352） |
 
 ## 许可
 

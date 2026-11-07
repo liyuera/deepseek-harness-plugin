@@ -12,12 +12,12 @@
 
 - **硬边界（违反即 bug）**：永不 push/merge 到 `main`、`dev`、`feature-*`、`hotfix-*`、`release-*`；永不 force push；不 merge/close/resolve/approve/waive；不创建集成分支、不打 tag、不改版本号。`pushBranch` 与 `gitlab.createMergeRequest` 必须在代码层校验分支名/目标分支，非法即静态报错。
 - **人工测试通过前不创建 MR**：delivery 只接受 `submitting` 工单（`mark_test_passed` 之后）；`fix_done` 及更早状态一律 409。
-- **提交前必须跑配置的 lint/test**（`settings.lintCommand` / `testCommand`，为空则跳过并在 timeline 记录「未配置」）；失败则 `block`（静态原因 `delivery-lint-failed` / `delivery-test-failed`），输出尾部（截断）写入 `fix.error` meta 供看板展示，不进入 MR。
+- **提交前必须跑配置的 lint/test**（`settings.lintCommand` / `testCommand`，为空则跳过并在 timeline 记录「未配置」）；失败则 `block`（静态原因 `delivery-lint-failed` / `delivery-test-failed`），输出尾部（截断）写入 **`delivery.error:<code>`** meta，不进入 MR。**不要复用 P4 的 `fix.error:<code>`**：该命名空间由 fix-service 独占（下一次修复启动成功会 `clearError`），`snapshot.fix.errors` 又会把它渲染成「修复失败」；delivery 的 meta 由 snapshot `delivery.errors` 呈现，两者互不清空。
 - **提交信息模板**：`<commitType>: 【jira单号】：<工单号>，【开发内容】：<一句话摘要>`（`commitType` 取 settings，默认 `fix`；摘要取 `plan.summary`，取不到用 `ticket.title`，截断到 120 字）。
 - **轮询语义**：60s 一次；只处理 body 含 `AI Code Review` 且含 `结论:` 的最新 note（parser 已实现）；按 note id 去重（meta `review:last-note:<code>`）；解析失败 → `block`（`review-parse-failed`），不自动重试；`fixing_review` 最多 3 轮（复用 `MAX_REVIEW_ROUNDS`），超限 → `block`（`review-rounds-exhausted`）；review 修复后必须 commit+push 再 `review_fix_done`。
 - **状态写入**：全部经 store 写队列 + `expectedWorkflow` 条件写；迟到结果不回退；dispose 不写 block/error；repo 单飞锁复用 P4 语义（同仓库同一时间一个 delivery 或 review-fix job）。
 - **安全**：GitLab token 只存 credentials、只放 `PRIVATE-TOKEN` header、`redirect:'error'`、超时 15s、错误静态化不打印 token/堆栈；工单/评论/方案文本按不可信数据 nonce 数据块处理，parser 已裁剪「备注：以下隐藏数据…」之后内容，review 修复 prompt 不得包含被裁剪段。
-- **测试**：`node --test bug-workflow/test/*.test.js`（P4 收尾基线 350）；热重载 `remove_bundle`→`install_bundle`；不打印敏感信息；mock GitLab 服务器只监听 loopback。
+- **测试**：`node --test bug-workflow/test/*.test.js`（P4 收尾基线 352）；热重载 `remove_bundle`→`install_bundle`；不打印敏感信息；mock GitLab 服务器只监听 loopback。
 - 参考：[设计 spec](../specs/2026-11-06-dsh-bug-workflow-plugin-design.md) §7 状态机/§8.2 MR/§8.3 Git 规范/§9 子代理、[P0 findings](../spikes/2026-11-06-p0-findings.md)（AI Review 解析、GitLab 只读探查）、[P4 findings](../spikes/2026-11-07-p4-findings.md)。
 
 ## 接口与数据契约
@@ -25,7 +25,9 @@
 ```js
 // git.js 扩展（注入 execFile，返回结构化结果；分支名先过 assertPushableBranch）
 createGit({ execFile }) -> {
-  // P4 已有：repoRoot/refExists/listWorktrees/probeWorktree/worktreeAdd/status/diffStat/diff/worktreeRemove
+  // P4 已导出：repoRoot/refExists/worktreePath/worktreeAdd({created})/status/diffStat/diff/worktreeRemove
+  // 注意：listWorktrees/probeWorktree 只是 git.js 内部闭包，**不是 P4 公开 API**；
+  //       P5 Task 3 必须先把它们从 createGit() 导出（或提供等价公开方法）再使用。
   assertPushableBranch(name) -> void        // 抛 GitError('protected-branch')；main/dev/feature-*/hotfix-*/release-* 拒绝
   revParse(repo, ref) -> Promise<string>,
   commitAll({ root, message }) -> Promise<{ sha }>,   // git add -A && git commit -m；无改动 → { sha:null }
@@ -88,13 +90,13 @@ fixes:  [ fixRunSchema … ]                                   // review 修复�
 **路由**：
 - `POST /bug-workflow/api/deliver` body `{sessionId, code}` → 200 `{ok:true, running:true, workflow:'submitting'}`；400/404/409/503/500（409：`not-submitting`、`delivery-busy`、`protected-branch`；503：`missing-gitlab-token`、`delivery-unavailable`）。
 - `PUT /bug-workflow/api/gitlab-token` body `{sessionId, token}` → 200 `{ok:true}`（保存进 credentials）；`DELETE` → 清除；语义复用平台 token 端点（415/413/400 守卫一致）。
-- **snapshot 扩展**：`delivery: { running:string[], errors:Record<code,string> }`、`gitlab: { tokenPresent:boolean }`（保留既有字段）。
+- **snapshot 扩展**：`delivery: { running:string[], errors:Record<code,string> }`（`errors` 的键来自 `delivery.error:<code>` meta，与 `fix.errors` 平行、互不清空）、`gitlab: { tokenPresent:boolean }`（保留既有字段）。
 
 ---
 
 ### Task 1: GitLab 设置/凭证 + review-parser 迁移
 
-**Files:** Modify `bug-workflow/src/host/store.js`（`DEFAULT_SETTINGS.gitlabBaseUrl`）、`src/host/credentials.js`（`GITLAB_TOKEN_REF = 'BUG_WORKFLOW_GITLAB_TOKEN'`，导出名字与校验复用平台 token 逻辑）、`src/host/routes.js`（`/api/gitlab-token` PUT/DELETE、snapshot `gitlab.tokenPresent`、JSDoc/错误映射）、`src/host/index.js` 无改动（token 存储走既有 deps）；new `src/host/review-parser.js`（迁移 `scripts/review-parser.mjs` 主体，导出 `parseReview` 及现有辅助），`scripts/review-parser.mjs` 改为薄复导出；Test `test/credentials.test.js`、`test/routes.test.js`、`test/domain-v2.test.js`（settings 默认值）、新增 `test/review-parser.test.js`（把现在脚本测试改为导入 canonical；脚本级 smoke 保留）。
+**Files:** Modify `bug-workflow/src/host/store.js`（`DEFAULT_SETTINGS.gitlabBaseUrl`）、`src/host/credentials.js`（`GITLAB_TOKEN_REF = 'BUG_WORKFLOW_GITLAB_TOKEN'`，导出名字与校验复用平台 token 逻辑）、`src/host/routes.js`（`/api/gitlab-token` PUT/DELETE、snapshot `gitlab.tokenPresent`、JSDoc/错误映射）、`bug-workflow/index.js` 无改动（token 存储走既有 deps）；new `src/host/review-parser.js`（迁移 `scripts/review-parser.mjs` 主体，导出 `parseReview` 及现有辅助），`scripts/review-parser.mjs` 改为薄复导出；Test `test/credentials.test.js`、`test/routes.test.js`、`test/domain-v2.test.js`（settings 默认值）、新增 `test/review-parser.test.js`（把现在脚本测试改为导入 canonical；脚本级 smoke 保留）。
 
 - [ ] **Step 1: 失败测试**：settings 默认 `gitlabBaseUrl='https://git.htwisdom.cn'` 且旧行缺键读为默认；GitLab token 保存/清除/缺失三种 snapshot 状态；PUT 非字符串/超长/空 → 400，未绑定工作区 → 409，415/413 守卫复用；`parseReview` 经 canonical 导入的全部分支与迁移前一致（pass/changes/unknown、门禁分类、隐藏段裁剪、AI 标记过滤）。
 - [ ] **Step 2: 实现**：`DEFAULT_SETTINGS` 加键（domain settingsSchema 由 DEFAULT_SETTINGS 生成，looseObject 兼容旧行，无需升 domain）；`credentials.js` 增加 GitLab ref（保存/读取/清除，token 仅内存 + credentials，不落 store）；routes 增加端点与 snapshot 字段（复用 `guard/guardJsonContentType/guardOrigin/readJsonBody` 与静态错误文案）；迁移 parser：canonical 新文件 + script 复导出 + 所有 import 改 canonical。
@@ -112,20 +114,22 @@ fixes:  [ fixRunSchema … ]                                   // review 修复�
 
 ### Task 3: git commit/push + delivery-service + `/api/deliver`
 
-**Files:** Modify `bug-workflow/src/host/git.js`（`assertPushableBranch`/`revParse`/`commitAll`/`pushBranch`）、`src/host/store.js`（`PATCHABLE_TICKET_FIELDS` 加 `mr`、`reviewRounds` + 校验）、`src/host/routes.js`（`/api/deliver` + snapshot `delivery`）、`src/host/index.js`（构造 gitlab/delivery、dispose 顺序）；new `src/host/delivery-service.js`；Test `test/git.test.js`、`test/store.test.js`、`test/routes.test.js`、新增 `test/delivery-service.test.js`（临时 git 仓库 + 本地 bare origin + loopback mock GitLab）。
+**Files:** Modify `bug-workflow/src/host/git.js`（**先导出 `listWorktrees`/`probeWorktree`（P4 内闭包）**，再 `assertPushableBranch`/`revParse`/`commitAll`/`pushBranch`）、`src/host/store.js`（`PATCHABLE_TICKET_FIELDS` 加 `mr`、`reviewRounds` + 校验 + **timeline kind 泛化**）、`src/host/routes.js`（`/api/deliver` + snapshot `delivery`）、`bug-workflow/index.js`（构造 gitlab/delivery、dispose 顺序）；new `src/host/delivery-service.js`；Test `test/git.test.js`、`test/store.test.js`、`test/routes.test.js`、新增 `test/delivery-service.test.js`（临时 git 仓库 + 本地 bare origin + loopback mock GitLab）。
 
 - [ ] **Step 1: 失败测试**（真 git，临时仓库）：
+  - `listWorktrees`/`probeWorktree` 从 `createGit()` 导出（或新增等价公开 API）并覆盖：已注册工作树解析、外部手工 `git worktree add` 同分支 → 映射 409（`worktree-conflict` 或 `fix-branch-busy`），不再落 `git-failed` 500。P4 的 `createGit()` 只导出 `{repoRoot,refExists,worktreePath,worktreeAdd,status,diffStat,diff,worktreeRemove}`，**不得假设 `listWorktrees`/`probeWorktree` 可用**。
+  - `patchTicket` timeline 泛化：`branch` → `worktree`、`fixes` → `fix-run`、仅 `mr`/`reviewRounds` → `patch`；断言只有 `mr` 的 patch **不会**追加「AI 修复已执行」的 `fix-run` 事件，也不再与 `mr_created` 的时间线重复/矛盾（当前 `store.js:522-531` 硬编码 `hasBranch ? 'worktree' : 'fix-run'`）。
   - `assertPushableBranch` 拒绝 main/dev/feature-x/hotfix-x/release-x（含大小写/前缀变体），允许 feat-X-user/hot-X-user/自定义非保护分支；
   - `commitAll`：有改动 → sha 且工作树干净；无改动 → sha null 不写空提交；提交信息含工单号（防注入：消息作为单个 `-m` 参数，不做 shell 拼接）；
   - `pushBranch`：推到本地 bare origin 成功、创建上游；保护分支被拒绝；不传 `--force`；
-  - delivery：`submitting` + 完整配置 → lint/test 执行（注入 execCommand：成功；lint 失败 → block `delivery-lint-failed` 且不 commit/push；test 失败同理）→ commit → push → MR 创建（title=`<source> -> <target>`、description 含工单链接/方案摘要/测试说明）→ 写队列内 `submit_mr`+`mr_created(expectedWorkflow:'submitting')`+`patchTicket(mr)`；已有 open MR → 复用不重复创建；缺 token/settings/worktree/分支 → 静态 409/503/400，零写入；重入单飞（`delivery-busy`）；迟到/取消不回退已提交的 `mr_open`。
-- [ ] **Step 2: 实现** git 扩展（execFile 参数数组，超时 30s；push 前硬校验）、store 字段扩展（mr/reviewRounds 形状校验，写队列内）、delivery-service（步骤化、每步失败静态映射、状态写入带 expectedWorkflow）、路由与 index 接线（`deliveryDeps` 未接线 → `/api/deliver` 503 `delivery-unavailable`、snapshot 空形状）。
+  - delivery：`submitting` + 完整配置 → lint/test 执行（注入 execCommand：成功；lint 失败 → block `delivery-lint-failed` 且不 commit/push；test 失败同理）→ commit → push → MR 创建（title=`<source> -> <target>`、description 含工单链接/方案摘要/测试说明）→ 写队列内 `submit_mr`+`mr_created(expectedWorkflow:'submitting')`+`patchTicket(mr)`；已有 open MR → 复用不重复创建；缺 token/settings/worktree/分支 → 静态 409/503/400，零写入；重入单飞（`delivery-busy`）；迟到/取消不回退已提交的 `mr_open`；lint/test 失败的错误 meta 只写 `delivery.error:<code>`（`snapshot.delivery.errors`），断言不写 `fix.error:<code>`。
+- [ ] **Step 2: 实现** git 扩展（先导出 `listWorktrees`/`probeWorktree`；execFile 参数数组，超时 30s；push 前硬校验）、store 字段扩展（mr/reviewRounds 形状校验，写队列内；timeline 按字段映射：`branch`→`worktree`、`fixes`→`fix-run`、其它→`patch`）、delivery-service（步骤化、每步失败静态映射、错误 meta 用 `delivery.error:<code>`、状态写入带 expectedWorkflow）、路由与 index 接线（`deliveryDeps` 未接线 → `/api/deliver` 503 `delivery-unavailable`、snapshot 空形状 `delivery:{running:[],errors:{}}`）。
 - [ ] **Step 3: 验证**：全量 tests 全过；live 只读：snapshot 含 `delivery:{running:[],errors:{}}`、`/api/deliver` 未接线/未知工单/非 submitting 的 503/404/409；不执行真 push。
 - [ ] **Step 4: 提交** `feat(bug-workflow): 提交推送与 MR 创建`.
 
 ### Task 4: Review 轮询 + review 修复轮 + 合并检测/自动归档
 
-**Files:** new `bug-workflow/src/host/review-service.js`；Modify `src/host/agent-access.js`（`runReviewFix`，prompt 含：review findings 数据块、只改 worktree、禁 commit/push/联网、禁止 resolve/approve）、`src/host/index.js`（timer 接线、dispose 排水）、`src/host/store.js`（reviewRounds 校验如 Task 3 未覆盖）；Test 新增 `test/review-service.test.js`（loopback mock GitLab + 临时 git 仓库 + fake runner + fake timer/clock）。
+**Files:** new `bug-workflow/src/host/review-service.js`；Modify `src/host/agent-access.js`（`runReviewFix`，prompt 含：review findings 数据块、只改 worktree、禁 commit/push/联网、禁止 resolve/approve）、`bug-workflow/index.js`（timer 接线、dispose 排水）、`src/host/store.js`（reviewRounds 校验如 Task 3 未覆盖）；Test 新增 `test/review-service.test.js`（loopback mock GitLab + 临时 git 仓库 + fake runner + fake timer/clock）。
 
 - [ ] **Step 1: 失败测试**：
   - `tick()`：无 token → 不请求、不写状态；`mr_open` + 新 `可直接合并` note → `review_pass`（expectedWorkflow 'mr_open'）→ `mergeable`；`需要修改` → `review_requests_changes` → `fixing_review` → runner（worktree 内）成功 → commit+push → `review_fix_done`（expectedWorkflow 'fixing_review'）+ `mr.rounds+1`/`reviewRounds[]`；runner 失败/超时 → `block('review-fix-failed')` 可重试；第 4 轮 → `block('review-rounds-exhausted')`；
@@ -139,12 +143,14 @@ fixes:  [ fixRunSchema … ]                                   // review 修复�
 
 ### Task 5: Client P5 UX + E2E 脚本 + README/findings + 收尾
 
-**Files:** Modify `bug-workflow/client.js`（settings GitLab 字段/token 卡、submitting 提交按钮、mr_open/fixing_review/mergeable/merged 面板、delivery/gitlab snapshot 归一、错误文案）、`bug-workflow/README.md`（P5 章节）、新增 `docs/superpowers/spikes/2026-11-07-p5-findings.md`、新增 `bug-workflow/scripts/e2e-delivery.mjs`（隔离 E2E：临时仓库 + 本地 bare origin + loopback mock GitLab + 真 store/domain/delivery/review 服务 + fake review-fix runner，跑完整链路 fix_done→submitting→MR→changes→修复→pass→merged→done 并断言看板消失）；Test 现有全绿 + client-action-map 不变。
+**Files:** Modify `bug-workflow/client.js`（settings GitLab 字段/token 卡、submitting 提交按钮、mr_open/fixing_review/mergeable/merged 面板、delivery/gitlab snapshot 归一、错误文案、demo 动作移除）、`src/host/routes.js`（`/api/action` 的服务专属 demo 动作守卫）、`bug-workflow/index.js`（把 analysis/fix 运行状态传给 action 守卫）、`bug-workflow/README.md`（P5 章节 + demo 动作的宿主行为）、新增 `docs/superpowers/spikes/2026-11-07-p5-findings.md`、新增 `bug-workflow/scripts/e2e-delivery.mjs`（隔离 E2E：临时仓库 + 本地 bare origin + loopback mock GitLab + 真 store/domain/delivery/review 服务 + fake review-fix runner，跑完整链路 fix_done→submitting→MR→changes→修复→pass→merged→done 并断言看板消失）；Test 现有全绿 + 同步 `test/client-action-map.test.js`（若移除 demo 映射）。
 
 - [ ] **Step 1: client 实现**：
   - 设置页：`gitlabBaseUrl` 输入、GitLab token 保存/清除卡（与平台 token 卡同交互，snapshot `gitlab.tokenPresent`）；校验/提示复用平台 token 文案模式。
-  - `submitting`：显示「提交并创建 MR」按钮（先 mark_test_passed 之后），POST `/api/deliver`，运行中显示进度横幅（`snapshot.delivery.running`）+ 静态错误映射（`missing-gitlab-token`/`protected-branch`/`delivery-lint-failed`/`delivery-test-failed`/`delivery-busy`/`mr-failed`）；演示 `submit_mr`/`mr_created` 按钮隐藏（host 接管），action-map literal 不变。
+  - `submitting`：显示「提交并创建 MR」按钮（先 mark_test_passed 之后），POST `/api/deliver`，运行中显示进度横幅（`snapshot.delivery.running`）+ 静态错误映射（`missing-gitlab-token`/`protected-branch`/`delivery-lint-failed`/`delivery-test-failed`/`delivery-busy`/`mr-failed`）；错误横幅/提示读 `snapshot.delivery.errors`（`delivery.error:<code>`），**不要**读 `snapshot.fix.errors`；演示 `submit_mr`/`mr_created` 按钮移除（host 接管），同步 `ACTION_BY_STATE` 与 `test/client-action-map.test.js`。
   - `mr_open`/`fixing_review`：MR 卡（!iid、URL、source→target、Review 轮次 n/3、最近结论、轮询提示）；`fixing_review` 显示「AI 正在修复 Review 问题…」计时（轮询/running 状态）；`mergeable` 显示「AI Review 通过，等待人工合并（插件不会自动合并）」；`merged` 显示「已合并，即将从看板移除」；`done` 不出现在看板（既有过滤）。
+  - **timeline `patch` 文案**：Task 3 泛化后 `patchTicket` 的 `mr`/`reviewRounds` 写入会追加 `kind:'patch'` 事件；`EVENT_LABELS` 补 `patch`（如「工单信息已更新」/「交付信息已更新」），避免看板出现空文案。
+  - **移除/守卫剩余 demo 动作**：`fix_done`/`analysis_done` 仍可通过原始 `POST /api/action` 在真实修复/分析运行期间调用——会把工单提前推进（如 `fix_done`），使服务端带 `expectedWorkflow:'fixing'` 的 `fixes` patch 变成 `stale-workflow` 并丢掉本次修复记录。二选一：(a) 宿主在 `/api/action` 拒绝「服务专属 demo 动作」（`analysis_done`/`fix_done`）当对应的真实 job 正在运行（或直接始终拒绝，只允许宿主服务写）；(b) 从 `ACTION_BY_STATE`/路由移除并在 README 如实记录宿主行为。推荐 (a)+(b) 一起做，Task 5 完成后 `analysis_done`/`fix_done` 不再由看板/裸 POST 驱动。
   - 错误/空态防御、主题 token、`require('react')` only、aria-live 计时关闭。
 - [ ] **Step 2: E2E 脚本**：`node bug-workflow/scripts/e2e-delivery.mjs` 在临时目录跑完整链路（含 lint/test 命令、commit 信息断言、MR 创建/复用、review 需要修改→修复→pass、merge→自动归档），退出码 0/1，输出关键断言；不联网、不触碰真实仓库/真实 GitLab。
 - [ ] **Step 3: 验证**：`node --test bug-workflow/test/*.test.js` 全绿；`node --check`；E2E 脚本通过；live 只读：reinstall 后看板 snapshot/health 正常、settings 新字段可见（GUI 视觉与真实 GitLab 由用户验收）。
@@ -156,5 +162,6 @@ fixes:  [ fixRunSchema … ]                                   // review 修复�
 - `node --test bug-workflow/test/*.test.js` 全绿（git/gitlab/delivery/review/routes/store/parser 新用例）。
 - E2E 脚本在隔离环境跑通完整链路：submitting → MR 创建 → review changes → 修复提交推送 → review pass → mergeable → merged → done 出看板；硬边界用例（保护分支/force/merge/close/approve/waive）全部拒绝。
 - live：插件卸载重装后 snapshot 含 `delivery`/`gitlab`，`/api/deliver` 未配置时 503 且看板提示正确；真实 GitLab 推送/MR 不执行（无 token/真实业务仓库），列为用户验收项。
+- demo 动作收口：`analysis_done`/`fix_done`（及 `submit_mr`/`mr_created`/`review_*`/`mr_merged`/`dismiss` 的假按钮）不再由看板驱动；`fix_done`/`analysis_done` 的裸 `POST /api/action` 在有真实 job 时被宿主拒绝（或已在 client/README 中明确移除并由测试覆盖）。
 - 无 Critical/Important 审查问题；GUI 视觉、真实 GitLab、真机人工测试列为用户验收项。
 - 全部合并回 `main`（`--no-ff`，测试全绿后删分支）。
