@@ -313,6 +313,17 @@ const fakeResizeObserver = class {
 };
 
 function fakeFetch(path) {
+  if (path.includes('/api/platform-login/captcha')) {
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        ok: true,
+        key: 'preview-captcha-key',
+        image: 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI5NiIgaGVpZ2h0PSIzMiI+PHJlY3Qgd2lkdGg9Ijk2IiBoZWlnaHQ9IjMyIiBmaWxsPSIjZjJmM2Y1Ii8+PHRleHQgeD0iOCIgdT0iMCIgeT0iMjIiIGZvbnQtc2l6ZT0iMTYiIGZpbGw9IiM0ZTU5NjkiPkE3YjM8L3RleHQ+PC9zdmc+',
+      }),
+    });
+  }
   return Promise.resolve({
     ok: true,
     status: 200,
@@ -321,7 +332,11 @@ function fakeFetch(path) {
 }
 
 const sandbox = {
-  window: {},
+  window: {
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    matchMedia: () => ({ matches: false, addEventListener: () => {}, removeEventListener: () => {} }),
+  },
   fetch: fakeFetch,
   AbortController,
   AbortSignal,
@@ -460,7 +475,8 @@ async function render() {
 
 let tree = await render();
 
-const DETAIL = process.argv[3] === 'detail';
+const MODE = process.argv[3] === 'detail' ? 'detail' : (process.argv[3] === 'settings' ? 'settings' : null);
+const DETAIL = MODE === 'detail';
 const DETAIL_TARGET = typeof process.argv[4] === 'string' ? process.argv[4] : null;
 
 function findTicketButton(node) {
@@ -485,6 +501,43 @@ function findTicketButton(node) {
     }
   }
   return null;
+}
+
+function findButtonByLabel(node, match) {
+  if (node === null || node === undefined || typeof node !== 'object') return null;
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const found = findButtonByLabel(item, match);
+      if (found !== null) return found;
+    }
+    return null;
+  }
+  if (node.kind === 'element') {
+    const props = node.props || {};
+    const label = props['aria-label'];
+    const title = props.title;
+    if (typeof props.onClick === 'function'
+      && ((typeof label === 'string' && label.includes(match))
+        || (typeof title === 'string' && title.includes(match)))) {
+      return node;
+    }
+    for (const child of node.children || []) {
+      const found = findButtonByLabel(child, match);
+      if (found !== null) return found;
+    }
+  }
+  return null;
+}
+
+if (MODE === 'settings') {
+  const button = findButtonByLabel(tree, '设置');
+  if (button === null) {
+    console.error('preview: no settings button found');
+    process.exit(6);
+  }
+  button.props.onClick();
+  await flush();
+  tree = await render();
 }
 
 if (DETAIL) {

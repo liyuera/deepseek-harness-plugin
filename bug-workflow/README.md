@@ -153,7 +153,7 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 | 合并检测/归档 | `mergeable` + MR `state=merged` → `mr_merged` → `merged`；下一 tick `dismiss(system)` → `done` 并离开看板。若在 `mr_open`/`fixing_review` 就被人工合并 → `block('review-merged-manually')`，不伪造 review pass。**插件从不调用 merge/close/approve/resolve**，合并必须由人在 GitLab 完成 |
 | 取消/恢复 | delivery/review-fix 的 `dispose()` 只取消并排水，**不写** block/错误；`fixing_review` 无运行任务时下一 tick 按持久化 findings 恢复（重启子代理 / 重推 pending commit / 不可恢复则 `block('review-recovery-unavailable')`）。迟到结果只写静态 `delivery.error`/`review.error`，绝不回退已推进的工单 |
 | 客户端 UX | `submitting` 显示「提交并创建 MR」+ 运行横幅 + 静态错误映射；`mr_open`/`fixing_review` 显示 MR 卡（!iid/URL/source→target/轮次 n/3/最近结论/轮询提示）；`fixing_review` 运行中显示「AI 正在修复 Review 问题…」（计时 `aria-live=off`）；`mergeable` 显示「等待人工在 GitLab 合并（插件不会自动合并）」；`merged` 显示「已合并，即将从看板移除」；`done` 不再出现在看板 |
-| 测试 | **574 个用例**（P4 基线 352，P5 新增/扩充 218、UI v2 新增 4：`review-parser` 45、`credentials` 16、`gitlab` 27、`git` 20、`store` 42、`delivery-service` 40、`review-service` 45、`agent-access` 49、`routes` 115、`client-action-map` 14、`client-stage-map` 4 等；另有隔离 E2E 脚本 29 条断言） |
+| 测试 | **597 个用例**（P4 基线 352，P5 新增/扩充 218、UI v2 新增 4、P6 平台登录新增 23：`review-parser` 45、`credentials` 16、`gitlab` 27、`git` 20、`store` 42、`delivery-service` 40、`review-service` 45、`agent-access` 49、`routes` 115、`client-action-map` 14、`client-stage-map` 4、`platform-login` 12、`client-platform-login` 4（routes +7）等；另有隔离 E2E 脚本 29 条断言） |
 
 **P5 交付成功的前置条件（缺一不可）**
 
@@ -227,16 +227,19 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 
 ### 1. 前置条件
 
-1. 用浏览器登录星瞰河山一体化平台（`https://ecard.htwisdom.cn/HT_TEAM/…`）。P2 **不做登录自动化**，没有验证码/RSA/SSO 流程。
-2. 在平台页面打开开发者工具 → Console，读取：
+1. 能访问星瞰河山一体化平台（`https://ecard.htwisdom.cn/HT_TEAM/…`），并拥有可登录的平台账号。
+2. **主路径：看板内登录**（P6 已实现）。打开看板 → 右上「设置」→「平台连接」，输入**平台账号 / 密码 / 图形验证码**（验证码图片由宿主实时向平台请求，点图可换一张）→「登录平台」。
+   - 宿主用 `POST /api/htwisdom-auth/oauth/token`（`grant_type=captcha`，密码按平台前端规则 **MD5** 后发送）完成登录，成功后把 `access-token` 写入 `ctx.credentials`；
+   - **密码只用于这一次登录请求**：不保存、不写日志、不回显；账号名可记住（浏览器 localStorage），密码永不记住；
+   - 登录失败会给出静态原因（验证码错误/账号密码错误/网络/超时）。
+3. **降级路径：手动粘贴 token**（登录接口不可用时）。在平台页面 Console 读取：
 
    ```js
-   // P0 实测键名带命名空间；页面版本不同时回退到无前缀键
    localStorage.getItem('app/access-token') ?? localStorage.getItem('access-token')
    ```
 
-   P0 实测的完整键名是 **`app/access-token`**（纯字符串，不是 JWT）；看板内 token 提示文案只写了 `access-token`，是简写。**两个键都试，以页面实际存在的为准**：先 `app/access-token`，再回退 `access-token`。
-3. 复制返回值。**不要把 token 发到聊天、issue、日志或提交到 git**；本插件只需要它在宿主凭据里。
+   P0 实测完整键名是 **`app/access-token`**（纯字符串，不是 JWT）。复制后在设置的「手动填写 token（降级方式）」里保存；**不要把 token 发到聊天、issue、日志或提交到 git**。
+4. 登录 token **不会自动续期**（未使用 refresh_token）：过期后同步/导入返回 401，重新登录即可；`platform.tokenPresent` 只看凭据是否存在，不校验有效性。
 
 ### 2. 配置步骤（看板设置）
 
@@ -265,6 +268,11 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 | --- | --- | --- |
 | 未保存 token / 凭据服务不可用 | 400 `no-platform-token` | 到设置里保存 token |
 | 平台地址非法 | 400 `invalid-platform-config` | 检查 `platformBaseUrl`：必须 `http(s)`、无内嵌账号密码、非空 |
+| 登录参数缺失/验证码格式错 | 400 `invalid-input` / `invalid-base-url` | 检查账号/密码/验证码是否填写，平台地址是否合法 |
+| 图形验证码错误或过期 | 400 `captcha-invalid` | 点验证码图片换一张后重新输入 |
+| 平台账号或密码错误 | 401 `invalid-credentials` | 检查账号密码；看板不会回显密码 |
+| 登录网络失败/超时 | 502 `login-unavailable` / 504 `login-timeout` | 检查网络/VPN 后重试 |
+| 登录成功但写入凭据失败 | 503 `credentials-unavailable` | 凭据服务不可用；检查宿主日志后重试 |
 | 同步时会话没有工作区 | 400 `unknown-workspace` | 换到有工作区目录的会话，或先保存工作区 |
 | 导入编号不合法 | 400 `invalid-code` | 只支持字母/数字/点/下划线/短横线，最长 128 字符 |
 | 平台 token 失效 | 401 `platform-unauthorized` | 重新从浏览器复制 token 并保存 |
@@ -286,7 +294,7 @@ node bug-workflow/scripts/mock-platform.mjs --port 0 --token test-token \
 # 输出：MOCK_PLATFORM_URL=http://127.0.0.1:<随机端口>
 ```
 
-- 在设置里把 **平台地址** 改成该 URL、**平台项目编码** 填 `YGFNXDJRFWDJSYJJYY`、**token** 填 `test-token`，点「同步」。
+- 在设置里把 **平台地址** 改成该 URL、**平台项目编码** 填 `YGFNXDJRFWDJSYJJYY`，再用手动降级入口把 token 填 `test-token`（mock 不需要登录接口，验证码会失败），点「同步」。
 - fixtures 含 3 张工单：`YGFNXDJRFWDJSYJJYY-647`（缺陷/进行中）、`YGFNXDJRFWDJSYJJYY-648`（需求/待验证）、`HTSMART-12`（智慧门户/待处理）。项目编码过滤后应得到 `synced:2 / total:3 / filtered:1`。
 - 字典 4/3/3 组；详情/评论/附件接口也由 mock 提供。`--latency <ms>` 可模拟慢响应。
 - mock 只监听回环、无 TLS/真实登录/网关；**不能当作真实平台证据**。停止用 `Ctrl-C`/SIGINT，确认端口无监听：
@@ -316,7 +324,7 @@ P2 **未对真实平台执行**同步/导入（无真实 token，用户不在场
 | P3 | 分析子代理 + 真实方案审核/驳回重跑 | **已完成（live 真子代理验收；真实业务仓库与 GUI 待用户验收）** |
 | P4 | 修复子代理 + worktree、diff/fixes 回填、人工测试 | **已完成（live 真修复验收；真实业务仓库、GUI、真机测试待用户验收）** |
 | P5 | GitLab 交付：提交前 lint/test、commit/push、MR 创建/复用、AI Review 轮询、回修、合并检测、完成归档 | **已完成（隔离 E2E + live 只读验收；真实 GitLab token/TLS/MR、真实业务仓库与 GUI 待用户验收）** |
-| P6 | 平台状态写回（进行中/已修复）、Review 修复轮 lint/test、MR discussions、closed MR 处理、客户端行为测试与 GUI 截图 | 未开始 |
+| P6 | **已完成：插件内平台登录（账号+密码+图形验证码）**；进行中：平台状态写回（进行中/已修复）、Review 修复轮 lint/test、MR discussions、closed MR 处理、客户端行为测试与 GUI 截图 | 进行中 |
 
 ## 打包与交接（P6 前仍需处理）
 
@@ -372,7 +380,9 @@ P2 **未对真实平台执行**同步/导入（无真实 token，用户不在场
 | POST | `/bug-workflow/api/deliver` | `{ sessionId, code }` → `{ ok:true, workflow:'submitting', running:true }` 或 `{ ok:false, code, message }`；校验 `submitting`/设置/token/分支/worktree 后后台跑 lint/test → commit → push → MR；重复点击同仓库 `delivery-busy` 409 |
 | GET | `/bug-workflow/api/deliver` | 405（只允许 POST） |
 | POST | `/bug-workflow/api/settings` | `{ sessionId, settings }` → `{ ok, settings }` |
-| POST | `/bug-workflow/api/platform-token` | `{ sessionId, token }` 保存；`{ token:null }` 清除 → `{ ok, tokenPresent }`；无 token 回显 |
+| POST | `/bug-workflow/api/platform-token` | `{ sessionId, token }` 保存；`{ token:null }` 清除 → `{ ok, tokenPresent }`；无 token 回显（降级路径） |
+| POST | `/bug-workflow/api/platform-login/captcha` | `{ sessionId }` → `{ ok, key, image }`（`image` 为 `data:image/...;base64`；宿主代理平台验证码接口） |
+| POST | `/bug-workflow/api/platform-login` | `{ sessionId, username, password, code, captchaKey, tenantId? }` → `{ ok, tokenPresent, username }`，token 只写凭据、不回显；失败 400/401/502/504/503 |
 | POST | `/bug-workflow/api/gitlab-token` | `{ sessionId, token }` 保存；`{ token:null }` 清除 → `{ ok, tokenPresent }`；独立 credentials ref；无 token 回显；`GET` → 405 |
 | POST | `/bug-workflow/api/sync` | `{ sessionId }` → `{ ok, synced, created, updated, total, filtered, lastSyncAt }` 或 `{ ok:false, code, message }` |
 
@@ -475,12 +485,15 @@ P2 **未对真实平台执行**同步/导入（无真实 token，用户不在场
 - **`lastSyncError` 不会因清 token 自动清除**：只有下一次成功同步才会清空；`lastSyncAt` 在恢复设置/停止 mock 后仍是上一次成功同步时间。
 - **凭据环境变量 fallback**：若用环境变量提供 token，`describe()` 会显示「已配置」，清除只删托管层；这是 credentials 服务的语义，P2 未改。
 
+- **平台登录只覆盖账号密码 + 图形验证码**：未接入 SSO/第三方登录；token 过期不会自动续期（未使用 refresh_token），需重新登录；验证码图片依赖平台接口不变。
+- **平台登录密码处理**：密码只在宿主内存中 MD5 后用于一次登录请求，不落库、不写日志、不回显；账号名保存在**浏览器 localStorage**（可手动清除），密码永不保存。
+
 ## 开发
 
 无构建步骤：host 是纯 ESM JavaScript，client 是自包含 React bundle（只 `require('react')`，由宿主 module table 提供）。
 
 ```sh
-# 全部单元/集成测试（在仓库根目录执行）——574/574
+# 全部单元/集成测试（在仓库根目录执行）——597/597
 node --test bug-workflow/test/*.test.js
 
 # P5 隔离 E2E（临时 git 仓库 + 本地 bare origin + loopback mock GitLab；
@@ -579,7 +592,7 @@ git worktree remove --force .dsh-worktrees/YGFNXDJRFWDJSYJJYY-648 \
 | `scripts/fixtures/platform/` | mock 工单/详情/字典/评论/附件 fixtures |
 | `scripts/cleanup-demo-tickets.mjs` | 安全清理 mock 遗留工单（dry-run 默认、0600 备份、原子写） |
 | `scripts/verify-domain-v2.mjs` | 用安装版 zod/domain 验证 v2 契约（Electron-as-node） |
-| `test/` | `node:test` 单元/集成测试（P5 新增/扩充：`review-parser`、`gitlab`、`delivery-service`、`review-service`、`credentials`、`git`、`store`、`routes`、`client-action-map`、`agent-access`；UI v2：`client-stage-map`；总计 **574**） |
+| `test/` | `node:test` 单元/集成测试（P5 新增/扩充：`review-parser`、`gitlab`、`delivery-service`、`review-service`、`credentials`、`git`、`store`、`routes`、`client-action-map`、`agent-access`；UI v2：`client-stage-map`；P6：`platform-login`、`client-platform-login`；总计 **597**） |
 
 ## 许可
 

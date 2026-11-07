@@ -109,6 +109,8 @@ window.__ModuleLoader__.load({
       deliver: '/bug-workflow/api/deliver',
       settings: '/bug-workflow/api/settings',
       platformToken: '/bug-workflow/api/platform-token',
+      platformCaptcha: '/bug-workflow/api/platform-login/captcha',
+      platformLogin: '/bug-workflow/api/platform-login',
       gitlabToken: '/bug-workflow/api/gitlab-token',
       sync: '/bug-workflow/api/sync',
     });
@@ -946,6 +948,43 @@ window.__ModuleLoader__.load({
       combined: '设置与 GitLab token 已保存',
       cleared: 'GitLab token 已清除',
     });
+    /** P6 in-board login copy (captcha + account, token is write-only). */
+    const PLATFORM_LOGIN_HINT = '用平台账号登录后自动保存 token；密码只用于这一次登录请求，不保存、不回显。';
+    const PLATFORM_LOGIN_USERNAME_KEY = 'bug-workflow:platform-username';
+    const PLATFORM_LOGIN_UI = Object.freeze({
+      loggedIn: '平台已登录',
+      loggedOut: '平台未登录',
+      fetchCaptcha: '获取验证码',
+      refreshCaptcha: '看不清？换一张',
+      submit: '登录平台',
+      submitting: '登录中…',
+      passwordHint: '密码只在本次登录使用，不会被保存',
+      missingFields: '请输入账号、密码和验证码',
+      manualToggle: '手动填写 token（降级方式）',
+      manualToggleOpen: '收起手动 token',
+    });
+
+    function readRememberedUsername() {
+      try {
+        if (typeof localStorage === 'undefined' || localStorage === null) return '';
+        const value = localStorage.getItem(PLATFORM_LOGIN_USERNAME_KEY);
+        return typeof value === 'string' ? value.slice(0, 100) : '';
+      } catch {
+        return '';
+      }
+    }
+
+    function rememberUsername(name) {
+      try {
+        if (typeof localStorage === 'undefined' || localStorage === null) return;
+        const value = typeof name === 'string' ? name.trim().slice(0, 100) : '';
+        if (value === '') localStorage.removeItem(PLATFORM_LOGIN_USERNAME_KEY);
+        else localStorage.setItem(PLATFORM_LOGIN_USERNAME_KEY, value);
+      } catch {
+        // Remembering the account name is best-effort only.
+      }
+    }
+
     const PLATFORM_WRITEBACK_LABEL = '写回平台状态（P5 使用）';
     const PLATFORM_WRITEBACK_HINT = 'P2 只保存该开关，不会向平台写回状态；P5 接入写回后生效。';
     const PLATFORM_IMPORT_HINT = '将从平台导入该编号的工单；重复编号会提示已存在';
@@ -2646,6 +2685,204 @@ window.__ModuleLoader__.load({
      * save) would silently no-op here, so `otherTokenBusy` disables this card's
      * buttons too and names the reason in their title.
      */
+    /** Map a platform-login failure to actionable static copy (never raw codes). */
+    function platformLoginErrorView(result) {
+      const view = toErrorView(result);
+      const hints = {
+        'invalid-credentials': '账号或密码错误，请检查后重试',
+        'captcha-invalid': '验证码错误或已过期，请点击图片换一张',
+        'invalid-input': '请输入正确的账号、密码和验证码',
+        'invalid-base-url': '平台地址无效，请先检查「平台地址」设置',
+        'invalid-settings': '平台地址无效，请先检查「平台地址」设置',
+        'login-timeout': '登录请求超时，请稍后重试',
+        'login-unavailable': '无法连接平台登录服务，请检查网络后重试',
+        'login-bad-response': '平台登录响应异常，请稍后重试',
+        'login-failed': '平台登录失败，请稍后重试',
+        'login-unavailable-service': '平台登录服务不可用，请稍后重试',
+        'credentials-unavailable': '凭据服务不可用，暂时无法保存 token',
+        'captcha-unavailable': '获取验证码失败，请稍后重试',
+        'captcha-bad-response': '平台验证码响应异常，请稍后重试',
+      };
+      const hint = ownServiceValue(hints, view.code)
+        ?? (view.status === 401 ? hints['invalid-credentials'] : null)
+        ?? (view.status === 503 ? hints['login-unavailable-service'] : null)
+        ?? (view.status === 504 ? hints['login-timeout'] : null);
+      return { ...view, title: '平台登录', message: hint === null ? view.message : hint };
+    }
+
+    /**
+     * In-board platform login form (P6): account + password + image captcha.
+     * The password is a one-shot field: it is cleared after success and never
+     * stored; only the account name is remembered (localStorage).
+     */
+    function PlatformLoginBlock({
+      username,
+      password,
+      code,
+      captcha,
+      busy,
+      error,
+      tokenPresent,
+      disabled,
+      canSave,
+      tokenBusy,
+      otherTokenBusy,
+      onUsernameChange,
+      onPasswordChange,
+      onCodeChange,
+      onRefreshCaptcha,
+      onSubmit,
+    }) {
+      const locked = disabled === true || busy === true || canSave !== true
+        || tokenBusy === true || otherTokenBusy === true;
+      const image = captcha !== null && typeof captcha === 'object' && typeof captcha.image === 'string'
+        ? captcha.image
+        : null;
+      const ready = typeof username === 'string' && username.trim() !== ''
+        && typeof password === 'string' && password !== ''
+        && typeof code === 'string' && code.trim() !== ''
+        && captcha !== null && typeof captcha === 'object' && typeof captcha.key === 'string' && captcha.key !== '';
+      const submitDisabled = locked || ready !== true;
+      const inputStyle = {
+        font: 'inherit',
+        fontSize: 12,
+        lineHeight: '18px',
+        padding: '4px 8px',
+        borderRadius: 6,
+        border: `0.5px solid ${C.borderStrong}`,
+        background: 'transparent',
+        color: C.text,
+        flex: '1 1 120px',
+        minWidth: 0,
+        boxSizing: 'border-box',
+        opacity: locked ? 0.55 : 1,
+      };
+      return h('div', {
+        'data-bug-platform-login': 'form',
+        style: { display: 'flex', flexDirection: 'column', gap: 6, minWidth: 0 },
+      },
+        h('div', {
+          style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', minWidth: 0 },
+        },
+          h('span', {
+            'aria-hidden': 'true',
+            style: {
+              width: 7,
+              height: 7,
+              borderRadius: '50%',
+              background: tokenPresent === true ? C.success : C.textTertiary,
+              flex: '0 0 auto',
+            },
+          }),
+          h('span', {
+            role: 'status',
+            style: {
+              fontSize: 11,
+              lineHeight: '16px',
+              color: tokenPresent === true ? C.success : C.textTertiary,
+            },
+          }, tokenPresent === true ? PLATFORM_LOGIN_UI.loggedIn : PLATFORM_LOGIN_UI.loggedOut),
+          busy === true
+            ? h('span', { style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary } }, '处理中…')
+            : null),
+        h('div', {
+          style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary, wordBreak: 'break-word' },
+        }, PLATFORM_LOGIN_HINT),
+        error === null || error === undefined
+          ? null
+          : h('div', {
+            role: 'alert',
+            style: {
+              padding: '5px 8px',
+              border: `0.5px solid ${TONES.danger.border}`,
+              borderRadius: 6,
+              background: TONES.danger.background,
+              color: C.error,
+              fontSize: 11.5,
+              lineHeight: '17px',
+              minWidth: 0,
+              wordBreak: 'break-word',
+            },
+          }, typeof error.message === 'string' && error.message !== '' ? error.message : '平台登录失败'),
+        h('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap', minWidth: 0 } },
+          h('input', {
+            type: 'text',
+            value: username,
+            onChange: (event) => onUsernameChange(event.target.value),
+            placeholder: '平台账号',
+            'aria-label': '平台账号',
+            autoComplete: 'username',
+            disabled: locked,
+            style: inputStyle,
+          }),
+          h('input', {
+            type: 'password',
+            value: password,
+            onChange: (event) => onPasswordChange(event.target.value),
+            placeholder: '平台密码',
+            'aria-label': '平台密码',
+            autoComplete: 'current-password',
+            spellCheck: false,
+            disabled: locked,
+            style: inputStyle,
+          })),
+        h('div', { style: { display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', minWidth: 0 } },
+          h('input', {
+            type: 'text',
+            value: code,
+            onChange: (event) => onCodeChange(event.target.value),
+            placeholder: '图形验证码',
+            'aria-label': '图形验证码',
+            autoComplete: 'off',
+            spellCheck: false,
+            maxLength: 16,
+            disabled: locked,
+            style: { ...inputStyle, flex: '1 1 80px' },
+          }),
+          image === null
+            ? h('button', {
+              type: 'button',
+              onClick: onRefreshCaptcha,
+              disabled: locked,
+              style: smallButtonStyle(locked),
+            }, PLATFORM_LOGIN_UI.fetchCaptcha)
+            : h('button', {
+              type: 'button',
+              onClick: onRefreshCaptcha,
+              disabled: locked,
+              title: PLATFORM_LOGIN_UI.refreshCaptcha,
+              'aria-label': PLATFORM_LOGIN_UI.refreshCaptcha,
+              style: {
+                padding: 0,
+                border: `0.5px solid ${C.border}`,
+                borderRadius: 6,
+                background: C.surfaceAlt,
+                cursor: locked ? 'default' : 'pointer',
+                flex: '0 0 auto',
+                lineHeight: 0,
+                overflow: 'hidden',
+                opacity: locked ? 0.55 : 1,
+              },
+            }, h('img', {
+              src: image,
+              alt: '图形验证码',
+              width: 96,
+              height: 32,
+              style: { display: 'block', width: 96, height: 32, objectFit: 'cover' },
+            }))),
+        h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', minWidth: 0 } },
+          h('button', {
+            type: 'button',
+            onClick: onSubmit,
+            disabled: submitDisabled,
+            'aria-busy': busy === true || undefined,
+            title: canSave === true ? undefined : SETTINGS_UNBOUND_HINT,
+            style: primaryButtonStyle(submitDisabled),
+          }, busy === true ? PLATFORM_LOGIN_UI.submitting : PLATFORM_LOGIN_UI.submit),
+          h('span', { style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary, minWidth: 0 } },
+            PLATFORM_LOGIN_UI.passwordHint)));
+    }
+
     function TokenCard({
       scope,
       statusText,
@@ -2769,12 +3006,26 @@ window.__ModuleLoader__.load({
       tokenBusy,
       otherTokenBusy,
       tokenPresent,
+      loginUsername,
+      loginPassword,
+      loginCode,
+      loginCaptcha,
+      loginBusy,
+      loginError,
       baseUrlInputRef,
       onFieldChange,
       onTokenChange,
       onSaveToken,
       onClearToken,
+      onLoginUsernameChange,
+      onLoginPasswordChange,
+      onLoginCodeChange,
+      onRefreshCaptcha,
+      onLoginSubmit,
     }) {
+      // The manual token paste is a documented fallback; keep it collapsed so
+      // the normal path (account + captcha login) stays the obvious one.
+      const [manualOpen, setManualOpen] = React.useState(false);
       return h('section', {
         'data-bug-platform-connection': 'section',
         style: {
@@ -2800,7 +3051,7 @@ window.__ModuleLoader__.load({
           }, '平台连接'),
           h('span', {
             style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary, minWidth: 0 },
-          }, 'token 仅保存在宿主凭据服务')),
+          }, '登录后 token 仅保存在宿主凭据服务')),
         h('div', {
           style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary, wordBreak: 'break-word' },
         }, PLATFORM_SECTION_HINT),
@@ -2819,22 +3070,58 @@ window.__ModuleLoader__.load({
           disabled: disabled === true,
           onChange: onFieldChange,
         }),
-        h(TokenCard, {
-          scope: 'platform',
-          statusText: tokenPresent === true ? PLATFORM_TOKEN_PRESENT : PLATFORM_TOKEN_ABSENT,
-          readyHint: PLATFORM_TOKEN_HINT,
-          placeholder: '粘贴平台 access-token',
-          ariaLabel: '平台 token',
-          tokenDraft,
+        h(PlatformLoginBlock, {
+          username: loginUsername,
+          password: loginPassword,
+          code: loginCode,
+          captcha: loginCaptcha,
+          busy: loginBusy === true,
+          error: loginError,
+          tokenPresent,
+          disabled: disabled === true,
+          canSave,
           tokenBusy,
           otherTokenBusy,
-          tokenPresent,
-          disabled,
-          canSave,
-          onTokenChange,
-          onSaveToken,
-          onClearToken,
+          onUsernameChange: onLoginUsernameChange,
+          onPasswordChange: onLoginPasswordChange,
+          onCodeChange: onLoginCodeChange,
+          onRefreshCaptcha,
+          onSubmit: onLoginSubmit,
         }),
+        h('div', {
+          style: { display: 'flex', flexDirection: 'column', gap: 6, minWidth: 0 },
+        },
+          h('button', {
+            type: 'button',
+            onClick: () => setManualOpen((current) => current !== true),
+            'aria-expanded': manualOpen === true ? 'true' : 'false',
+            disabled: disabled === true,
+            style: {
+              ...smallButtonStyle(disabled === true),
+              alignSelf: 'flex-start',
+              padding: '1px 8px',
+              fontSize: 11,
+              lineHeight: '16px',
+            },
+          }, manualOpen === true ? PLATFORM_LOGIN_UI.manualToggleOpen : PLATFORM_LOGIN_UI.manualToggle),
+          manualOpen === true
+            ? h(TokenCard, {
+              scope: 'platform',
+              statusText: tokenPresent === true ? PLATFORM_TOKEN_PRESENT : PLATFORM_TOKEN_ABSENT,
+              readyHint: PLATFORM_TOKEN_HINT,
+              placeholder: '粘贴平台 access-token',
+              ariaLabel: '平台 token',
+              tokenDraft,
+              tokenBusy,
+              otherTokenBusy,
+              tokenPresent,
+              disabled,
+              canSave,
+              onTokenChange,
+              onSaveToken,
+              onClearToken,
+            })
+            : null),
         h(SettingsToggle, {
           label: PLATFORM_WRITEBACK_LABEL,
           hint: PLATFORM_WRITEBACK_HINT,
@@ -2889,7 +3176,7 @@ window.__ModuleLoader__.load({
           }, 'GitLab 连接'),
           h('span', {
             style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary, minWidth: 0 },
-          }, 'token 仅保存在宿主凭据服务')),
+          }, '登录后 token 仅保存在宿主凭据服务')),
         h('div', {
           style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary, wordBreak: 'break-word' },
         }, GITLAB_SECTION_HINT),
@@ -2941,6 +3228,12 @@ window.__ModuleLoader__.load({
       gitlabTokenDraft,
       gitlabTokenBusy,
       gitlabTokenPresent,
+      loginUsername,
+      loginPassword,
+      loginCode,
+      loginCaptcha,
+      loginBusy,
+      loginError,
       onChange,
       onTokenChange,
       onSaveToken,
@@ -2948,6 +3241,11 @@ window.__ModuleLoader__.load({
       onGitlabTokenChange,
       onSaveGitlabToken,
       onClearGitlabToken,
+      onLoginUsernameChange,
+      onLoginPasswordChange,
+      onLoginCodeChange,
+      onRefreshCaptcha,
+      onLoginSubmit,
       onSave,
       onCancel,
     }) {
@@ -3122,11 +3420,22 @@ window.__ModuleLoader__.load({
             // GitLab card is saving/clearing.
             otherTokenBusy: gitlabTokenBusy === true,
             tokenPresent,
+            loginUsername,
+            loginPassword,
+            loginCode,
+            loginCaptcha,
+            loginBusy,
+            loginError,
             baseUrlInputRef: firstInputRef,
             onFieldChange: onChange,
             onTokenChange,
             onSaveToken,
             onClearToken,
+            onLoginUsernameChange,
+            onLoginPasswordChange,
+            onLoginCodeChange,
+            onRefreshCaptcha,
+            onLoginSubmit,
           }),
           h(GitlabConnectionSection, {
             draft,
@@ -5105,6 +5414,13 @@ window.__ModuleLoader__.load({
       const [tokenBusy, setTokenBusy] = React.useState(false);
       const [gitlabTokenDraft, setGitlabTokenDraft] = React.useState('');
       const [gitlabTokenBusy, setGitlabTokenBusy] = React.useState(false);
+      // P6 in-board platform login (account + password + image captcha).
+      const [loginUsername, setLoginUsername] = React.useState(() => readRememberedUsername());
+      const [loginPassword, setLoginPassword] = React.useState('');
+      const [loginCode, setLoginCode] = React.useState('');
+      const [loginCaptcha, setLoginCaptcha] = React.useState(null);
+      const [loginBusy, setLoginBusy] = React.useState(false);
+      const [loginError, setLoginError] = React.useState(null);
       const [syncing, setSyncing] = React.useState(false);
       const busyRef = React.useRef(false);
       const laneBodyRef = React.useRef(null);
@@ -5113,6 +5429,7 @@ window.__ModuleLoader__.load({
       const settingsSavingRef = React.useRef(false);
       const tokenBusyRef = React.useRef(false);
       const gitlabTokenBusyRef = React.useRef(false);
+      const loginBusyRef = React.useRef(false);
       const syncingRef = React.useRef(false);
       const pendingSelectRef = React.useRef(null);
       const settingsTouchedRef = React.useRef(false);
@@ -5222,6 +5539,11 @@ window.__ModuleLoader__.load({
         // Tokens typed but not saved must not outlive the panel.
         setTokenDraft('');
         setGitlabTokenDraft('');
+        // The platform password/captcha are one-shot values: never keep them.
+        setLoginPassword('');
+        setLoginCode('');
+        setLoginCaptcha(null);
+        setLoginError(null);
         focusSettingsButton();
       }, [focusSettingsButton]);
 
@@ -5237,6 +5559,11 @@ window.__ModuleLoader__.load({
         setSettingsErrors({});
         setTokenDraft('');
         setGitlabTokenDraft('');
+        setLoginUsername(readRememberedUsername());
+        setLoginPassword('');
+        setLoginCode('');
+        setLoginCaptcha(null);
+        setLoginError(null);
         setSettingsOpen(true);
       }, [snapshot]);
 
@@ -5519,6 +5846,107 @@ window.__ModuleLoader__.load({
         setTokenDraft: setGitlabTokenDraft,
         cleared: GITLAB_TOKEN_UI.cleared,
       }), [clearToken]);
+
+      // -------------------------------------------------------------------
+      // P6 in-board platform login (account + password + image captcha)
+      // -------------------------------------------------------------------
+
+      /** Fetch one fresh image captcha from the host (which proxies the platform). */
+      const fetchLoginCaptcha = React.useCallback(async () => {
+        if (loginBusyRef.current || sessionId === null || configured !== true) return;
+        loginBusyRef.current = true;
+        setLoginBusy(true);
+        setLoginError(null);
+        try {
+          const result = await postMutation(API.platformCaptcha, { sessionId });
+          if (result.aborted === true) return;
+          if (result.ok) {
+            const data = result.data !== null && typeof result.data === 'object' ? result.data : {};
+            const key = typeof data.key === 'string' ? data.key : '';
+            const image = typeof data.image === 'string' ? data.image : '';
+            if (key !== '' && image !== '') {
+              setLoginCaptcha({ key, image });
+            } else {
+              setLoginError({
+                code: 'captcha-bad-response',
+                title: '平台登录',
+                message: '平台验证码响应异常，请稍后重试',
+                status: null,
+              });
+            }
+          } else {
+            setLoginError(platformLoginErrorView(result));
+          }
+        } finally {
+          loginBusyRef.current = false;
+          setLoginBusy(false);
+        }
+      }, [configured, postMutation, sessionId]);
+
+      /**
+       * Submit the platform login. The raw password lives only in component
+       * state for this request; on success it is cleared and the refreshed
+       * snapshot's `platform.tokenPresent` becomes true.
+       */
+      const submitPlatformLogin = React.useCallback(async () => {
+        if (loginBusyRef.current || sessionId === null || configured !== true) return;
+        const username = loginUsername.trim();
+        const code = loginCode.trim();
+        if (username === '' || loginPassword === '' || code === ''
+          || loginCaptcha === null || typeof loginCaptcha.key !== 'string') {
+          setLoginError({
+            code: 'invalid-input',
+            title: '平台登录',
+            message: PLATFORM_LOGIN_UI.missingFields,
+            status: null,
+          });
+          return;
+        }
+        loginBusyRef.current = true;
+        setLoginBusy(true);
+        setLoginError(null);
+        try {
+          const result = await postMutation(API.platformLogin, {
+            sessionId,
+            username,
+            password: loginPassword,
+            code,
+            captchaKey: loginCaptcha.key,
+          });
+          if (result.aborted === true) return;
+          if (result.ok) {
+            const data = result.data !== null && typeof result.data === 'object' ? result.data : {};
+            const resolvedName = typeof data.username === 'string' && data.username !== '' ? data.username : username;
+            rememberUsername(resolvedName);
+            setLoginUsername(resolvedName);
+            setLoginPassword('');
+            setLoginCode('');
+            setLoginCaptcha(null);
+            setLoginError(null);
+            setFlash(`平台登录成功：${resolvedName}`);
+            try {
+              await polling.refresh();
+            } catch {
+              // The polling banner (or the next poll) reports a failed refresh.
+            }
+          } else {
+            setLoginError(platformLoginErrorView(result));
+          }
+        } finally {
+          loginBusyRef.current = false;
+          setLoginBusy(false);
+        }
+      }, [configured, loginCaptcha, loginCode, loginPassword, loginUsername, polling, postMutation, sessionId]);
+
+      // When the settings panel opens for a not-yet-logged-in workspace, fetch
+      // the first captcha automatically (one request, retryable via the image).
+      React.useEffect(() => {
+        if (settingsOpen !== true) return;
+        if (tokenPresent === true) return;
+        if (loginCaptcha !== null || loginError !== null) return;
+        if (loginBusyRef.current || configured !== true || sessionId === null) return;
+        fetchLoginCaptcha();
+      }, [settingsOpen, tokenPresent, loginCaptcha, loginError, configured, sessionId, fetchLoginCaptcha]);
 
       /**
        * Run one platform sync. Requires a session workspace and a stored token
@@ -6087,6 +6515,12 @@ window.__ModuleLoader__.load({
               gitlabTokenDraft,
               gitlabTokenBusy,
               gitlabTokenPresent,
+              loginUsername,
+              loginPassword,
+              loginCode,
+              loginCaptcha,
+              loginBusy,
+              loginError,
               onChange: updateSettingsField,
               onTokenChange: setTokenDraft,
               onSaveToken: savePlatformToken,
@@ -6094,6 +6528,11 @@ window.__ModuleLoader__.load({
               onGitlabTokenChange: setGitlabTokenDraft,
               onSaveGitlabToken: saveGitlabToken,
               onClearGitlabToken: clearGitlabToken,
+              onLoginUsernameChange: setLoginUsername,
+              onLoginPasswordChange: setLoginPassword,
+              onLoginCodeChange: setLoginCode,
+              onRefreshCaptcha: fetchLoginCaptcha,
+              onLoginSubmit: submitPlatformLogin,
               onSave: saveSettings,
               onCancel: closeSettings,
             })

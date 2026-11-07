@@ -21,6 +21,10 @@
  *   POST /bug-workflow/api/deliver   -> { ok, workflow:'submitting', running }
  *                                       (P5 delivery: lint/test → commit → push → MR)
  *   POST /bug-workflow/api/settings  -> { ok, settings }
+ *   POST /bug-workflow/api/platform-login/captcha -> { ok, key, image }
+ *   POST /bug-workflow/api/platform-login  -> { ok, tokenPresent, username }
+ *                                       (P6 in-board login: account + password +
+ *                                        image captcha; token is write-only)
  *   POST /bug-workflow/api/platform-token -> { ok, tokenPresent }
  *   POST /bug-workflow/api/gitlab-token   -> { ok, tokenPresent } (P5 GitLab token)
  *   POST /bug-workflow/api/sync      -> { ok, synced, created, updated, total, filtered, lastSyncAt }
@@ -103,6 +107,7 @@ import { createGit } from './src/host/git.js';
 import { createGitlabClient } from './src/host/gitlab.js';
 import { createTokenStore, GITLAB_TOKEN_REF } from './src/host/credentials.js';
 import { createPlatformClient } from './src/host/platform.js';
+import { createPlatformLogin } from './src/host/platform-login.js';
 import { createReviewService } from './src/host/review-service.js';
 import {
   registerRoutes,
@@ -358,6 +363,17 @@ export function apply(ctx) {
           }
         }
 
+        // P6 in-board platform login (account + password + image captcha).
+        // Construction is non-fatal: without it both login routes answer 503
+        // and the token-paste fallback keeps the platform integration usable.
+        let platformLogin = null;
+        try {
+          platformLogin = { service: createPlatformLogin() };
+        } catch (error) {
+          platformLogin = null;
+          logWarning(storageCtx, 'bug-workflow: 平台登录服务初始化失败', error);
+        }
+
         // Automatic sync is registered BEFORE the real routes are mounted: if
         // the optional timer service misbehaves, the catch path still owns the
         // fallback route set (never real handlers over a closed domain).
@@ -381,6 +397,7 @@ export function apply(ctx) {
           fix,
           delivery,
           review,
+          platformLogin,
           clock,
           domainOpenedAt: handle.openedAt,
           // Full request errors stay in the host log; only clipped summaries

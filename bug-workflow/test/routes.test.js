@@ -632,6 +632,34 @@ function tokenFixture(initial = {}) {
   return { credentials, tokenStore: createTokenStore(credentials) };
 }
 
+/**
+ * Fake platform login service (P6): records calls and returns deterministic
+ * results. `captcha` answers `{key,image}`; `login` answers a token or throws a
+ * PlatformLoginError-like object so the route mapping can be exercised.
+ */
+function createFakePlatformLogin({ captchaResult, loginResult, loginError } = {}) {
+  const calls = { captcha: [], login: [] };
+  return {
+    calls,
+    service: {
+      async captcha(input) {
+        calls.captcha.push(input);
+        if (captchaResult instanceof Error) throw captchaResult;
+        return captchaResult === undefined
+          ? { key: 'captcha-key-1', image: 'data:image/png;base64,AAAA' }
+          : captchaResult;
+      },
+      async login(input) {
+        calls.login.push(input);
+        if (loginError !== undefined) throw loginError;
+        return loginResult === undefined
+          ? { token: 'login-token-1', tokenType: 'bearer', username: 'liyu' }
+          : loginResult;
+      },
+    },
+  };
+}
+
 function handlersWith({
   store = createFakeStore(),
   workspace = createWorkspace(),
@@ -643,6 +671,7 @@ function handlersWith({
   fix,
   delivery,
   review,
+  platformLogin,
   clock = () => SERVER_TIME,
   domainOpenedAt = OPENED_AT,
 } = {}) {
@@ -663,6 +692,8 @@ function handlersWith({
   const deliveryDeps = delivery === undefined ? createFakeDelivery() : delivery;
   // And for the P5 timer-driven review service (snapshot only, no route).
   const reviewDeps = review === undefined ? createFakeReview() : review;
+  // P6 in-board platform login (captcha + login routes).
+  const platformLoginDeps = platformLogin === undefined ? createFakePlatformLogin() : platformLogin;
   return {
     store,
     workspace,
@@ -674,6 +705,7 @@ function handlersWith({
     fix: fixDeps,
     delivery: deliveryDeps,
     review: reviewDeps,
+    platformLogin: platformLoginDeps,
     handlers: createHandlers({
       store,
       workspace,
@@ -685,6 +717,7 @@ function handlersWith({
       fix: fixDeps,
       delivery: deliveryDeps,
       review: reviewDeps,
+      platformLogin: platformLoginDeps,
       clock,
       domainOpenedAt,
     }),
@@ -3233,6 +3266,211 @@ test('fallback snapshot GET without a Content-Type answers 503 while POST keeps 
   assert.equal(json.res.statusCode, 503);
   assert.equal(json.json.code, 'storage-unavailable');
 
+  dispose();
+  assert.equal(webServer.routes.size, 0);
+});
+
+// ---------------------------------------------------------------------------
+// P6 in-board platform login
+// ---------------------------------------------------------------------------
+
+test('POST /platform-login/captcha returns the captcha image and key', async () => {
+  const store = createFakeStore();
+  const fake = createFakePlatformLogin();
+  const { handlers } = handlersWith({ store, platformLogin: fake });
+  const { res, json } = await call(handlers.platformCaptcha, {
+    method: 'POST',
+    url: API_PATHS.platformCaptcha,
+    body: JSON.stringify({ sessionId: SESSION_ID }),
+  });
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(json, { ok: true, key: 'captcha-key-1', image: 'data:image/png;base64,AAAA' });
+  assert.equal(fake.calls.captcha.length, 1);
+  assert.equal(typeof fake.calls.captcha[0].baseUrl, 'string');
+  assert.equal(store.calls.applyAction.length, 0);
+});
+
+test('POST /platform-login/captcha maps service errors and guards the transport', async () => {
+  // Unwired service -> 503.
+  {
+    const { handlers } = handlersWith({ platformLogin: null });
+    const { res, json } = await call(handlers.platformCaptcha, {
+      method: 'POST',
+      url: API_PATHS.platformCaptcha,
+      body: JSON.stringify({ sessionId: SESSION_ID }),
+    });
+    assert.equal(res.statusCode, 503);
+    assert.equal(json.code, 'login-unavailable-service');
+  }
+  // Upstream/network failure -> 502 static message.
+  {
+    const fake = createFakePlatformLogin({
+      captchaResult: Object.assign(new Error('平台验证码响应异常'), { code: 'captcha-bad-response' }),
+    });
+    const { handlers } = handlersWith({ platformLogin: fake });
+    const { res, json } = await call(handlers.platformCaptcha, {
+      method: 'POST',
+      url: API_PATHS.platformCaptcha,
+      body: JSON.stringify({ sessionId: SESSION_ID }),
+    });
+    assert.equal(res.statusCode, 502);
+    assert.equal(json.code, 'captcha-bad-response');
+  }
+  // Configuration error -> 400.
+  {
+    const fake = createFakePlatformLogin({
+      captchaResult: Object.assign(new Error('平台地址无效'), { code: 'invalid-base-url' }),
+    });
+    const { handlers } = handlersWith({ platformLogin: fake });
+    const { res } = await call(handlers.platformCaptcha, {
+      method: 'POST',
+      url: API_PATHS.platformCaptcha,
+      body: JSON.stringify({ sessionId: SESSION_ID }),
+    });
+    assert.equal(res.statusCode, 400);
+  }
+  // Transport guards: GET -> 405, text/plain -> 415, foreign Origin -> 403.
+  const { handlers } = handlersWith();
+  const getResult = await call(handlers.platformCaptcha, { method: 'GET', url: API_PATHS.platformCaptcha });
+  assert.equal(getResult.res.statusCode, 405);
+  const textResult = await call(handlers.platformCaptcha, {
+    method: 'POST',
+    url: API_PATHS.platformCaptcha,
+    body: 'x'.repeat(4),
+    contentType: 'text/plain',
+  });
+  assert.equal(textResult.res.statusCode, 415);
+  const evil = await call(handlers.platformCaptcha, {
+    method: 'POST',
+    url: API_PATHS.platformCaptcha,
+    body: JSON.stringify({ sessionId: SESSION_ID }),
+    origin: 'https://evil.example.com',
+  });
+  assert.equal(evil.res.statusCode, 403);
+});
+
+test('POST /platform-login writes the token and never echoes it', async () => {
+  const { credentials, tokenStore } = tokenFixture();
+  const store = createFakeStore();
+  const fake = createFakePlatformLogin();
+  const { handlers } = handlersWith({ store, tokenStore, platformLogin: fake });
+  const { res, json } = await call(handlers.platformLogin, {
+    method: 'POST',
+    url: API_PATHS.platformLogin,
+    body: JSON.stringify({
+      sessionId: SESSION_ID,
+      username: 'liyu',
+      password: 'p@ssw0rd',
+      code: '8h3k',
+      captchaKey: 'captcha-key-1',
+    }),
+  });
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(json, { ok: true, tokenPresent: true, username: 'liyu' });
+  assert.equal(JSON.stringify(json).includes('login-token-1'), false);
+  assert.equal(JSON.stringify(json).includes('p@ssw0rd'), false);
+  assert.deepEqual(credentials.calls.set, [
+    { ref: PLATFORM_TOKEN_REF, value: 'login-token-1' },
+  ]);
+  // The service receives the raw fields; validation/hashing is its job.
+  assert.equal(fake.calls.login.length, 1);
+  assert.equal(fake.calls.login[0].username, 'liyu');
+  assert.equal(fake.calls.login[0].password, 'p@ssw0rd');
+  assert.equal(fake.calls.login[0].code, '8h3k');
+  assert.equal(fake.calls.login[0].captchaKey, 'captcha-key-1');
+  assert.equal(typeof fake.calls.login[0].baseUrl, 'string');
+});
+
+test('POST /platform-login maps captcha/credential failures without writing a token', async () => {
+  const cases = [
+    { error: Object.assign(new Error('验证码错误或已过期'), { code: 'captcha-invalid' }), status: 400 },
+    { error: Object.assign(new Error('账号或密码错误'), { code: 'invalid-credentials' }), status: 401 },
+    { error: Object.assign(new Error('平台登录失败'), { code: 'login-failed' }), status: 502 },
+    { error: Object.assign(new Error('登录请求超时'), { code: 'login-timeout' }), status: 504 },
+  ];
+  for (const item of cases) {
+    const { credentials, tokenStore } = tokenFixture();
+    const fake = createFakePlatformLogin({ loginError: item.error });
+    const { handlers } = handlersWith({ tokenStore, platformLogin: fake });
+    const { res, json } = await call(handlers.platformLogin, {
+      method: 'POST',
+      url: API_PATHS.platformLogin,
+      body: JSON.stringify({
+        sessionId: SESSION_ID,
+        username: 'liyu',
+        password: 'p@ssw0rd',
+        code: 'x',
+        captchaKey: 'k',
+      }),
+    });
+    assert.equal(res.statusCode, item.status, item.error.code);
+    assert.equal(json.ok, false);
+    assert.equal(JSON.stringify(json).includes('p@ssw0rd'), false);
+    assert.equal(credentials.calls.set.length, 0);
+  }
+});
+
+test('POST /platform-login answers 503 when the login or credential service is unavailable', async () => {
+  // Login service unwired.
+  {
+    const { handlers } = handlersWith({ platformLogin: null });
+    const { res, json } = await call(handlers.platformLogin, {
+      method: 'POST',
+      url: API_PATHS.platformLogin,
+      body: JSON.stringify({ sessionId: SESSION_ID, username: 'u', password: 'p', code: 'c', captchaKey: 'k' }),
+    });
+    assert.equal(res.statusCode, 503);
+    assert.equal(json.code, 'login-unavailable-service');
+  }
+  // Credentials service unwired: the login succeeds but the token cannot be
+  // stored, so no success is claimed.
+  {
+    const { handlers } = handlersWith({ tokenStore: null });
+    const { res, json } = await call(handlers.platformLogin, {
+      method: 'POST',
+      url: API_PATHS.platformLogin,
+      body: JSON.stringify({ sessionId: SESSION_ID, username: 'u', password: 'p', code: 'c', captchaKey: 'k' }),
+    });
+    assert.equal(res.statusCode, 503);
+    assert.equal(json.code, 'credentials-unavailable');
+    assert.equal(JSON.stringify(json).includes('login-token-1'), false);
+  }
+});
+
+test('POST /platform-login guards the transport like every other write route', async () => {
+  const { handlers } = handlersWith();
+  const getResult = await call(handlers.platformLogin, { method: 'GET', url: API_PATHS.platformLogin });
+  assert.equal(getResult.res.statusCode, 405);
+  const textResult = await call(handlers.platformLogin, {
+    method: 'POST',
+    url: API_PATHS.platformLogin,
+    body: 'x'.repeat(4),
+    contentType: 'text/plain',
+  });
+  assert.equal(textResult.res.statusCode, 415);
+  const evil = await call(handlers.platformLogin, {
+    method: 'POST',
+    url: API_PATHS.platformLogin,
+    body: JSON.stringify({ sessionId: SESSION_ID }),
+    origin: 'https://evil.example.com',
+  });
+  assert.equal(evil.res.statusCode, 403);
+  const missingSession = await call(handlers.platformLogin, {
+    method: 'POST',
+    url: API_PATHS.platformLogin,
+    body: JSON.stringify({}),
+  });
+  assert.equal(missingSession.res.statusCode, 400);
+  assert.equal(missingSession.json.code, 'missing-session');
+});
+
+test('the unavailable route table covers both platform-login paths', async () => {
+  const webServer = createFakeWebServer();
+  const dispose = registerUnavailableRoutes({ webServer });
+  assert.ok(webServer.routes.has(API_PATHS.platformCaptcha));
+  assert.ok(webServer.routes.has(API_PATHS.platformLogin));
   dispose();
   assert.equal(webServer.routes.size, 0);
 });

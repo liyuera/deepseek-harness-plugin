@@ -20,6 +20,8 @@
  *                                              | { ok:false, code, message } (P5 delivery/MR)
  *   POST /bug-workflow/api/settings        -> { ok, settings }
  *   POST /bug-workflow/api/platform-token  -> { ok, tokenPresent } (token is only written, never read back)
+ *   POST /bug-workflow/api/platform-login/captcha -> { ok, key, image } (P6 in-board login)
+ *   POST /bug-workflow/api/platform-login  -> { ok, tokenPresent, username } (login, token write-only)
  *   POST /bug-workflow/api/gitlab-token    -> { ok, tokenPresent } (P5 GitLab token, same contract)
  *   POST /bug-workflow/api/sync            -> { ok, synced, created, updated, total, filtered, lastSyncAt }
  *                                              | { ok:false, code, message }
@@ -95,6 +97,7 @@
  */
 
 import { ACTIONS } from './protocol.js';
+import { PLATFORM_LOGIN_ERROR_STATUS } from './platform-login.js';
 
 /** Exact route paths; exported so index/tests/client agree on one source. */
 export const API_PATHS = Object.freeze({
@@ -106,6 +109,8 @@ export const API_PATHS = Object.freeze({
   deliver: '/bug-workflow/api/deliver',
   settings: '/bug-workflow/api/settings',
   platformToken: '/bug-workflow/api/platform-token',
+  platformCaptcha: '/bug-workflow/api/platform-login/captcha',
+  platformLogin: '/bug-workflow/api/platform-login',
   gitlabToken: '/bug-workflow/api/gitlab-token',
   sync: '/bug-workflow/api/sync',
 });
@@ -138,6 +143,8 @@ const ROUTE_METHODS = Object.freeze({
   deliver: 'POST',
   settings: 'POST',
   platformToken: 'POST',
+  platformCaptcha: 'POST',
+  platformLogin: 'POST',
   gitlabToken: 'POST',
   sync: 'POST',
 });
@@ -358,6 +365,7 @@ export function createHandlers({
   fix = null,
   delivery = null,
   review = null,
+  platformLogin = null,
   clock = defaultClock,
   domainOpenedAt = null,
   bodyTimeoutMs = BODY_TIMEOUT_MS,
@@ -433,6 +441,16 @@ export function createHandlers({
     }
   }
   const reviewDeps = review === undefined ? null : review;
+  if (platformLogin !== null && platformLogin !== undefined) {
+    if (typeof platformLogin !== 'object'
+      || typeof platformLogin.service?.captcha !== 'function'
+      || typeof platformLogin.service?.login !== 'function') {
+      throw new TypeError(
+        'createHandlers() platformLogin.service must expose captcha() and login()',
+      );
+    }
+  }
+  const platformLoginDeps = platformLogin === undefined ? null : platformLogin;
   if (typeof clock !== 'function') {
     throw new TypeError('createHandlers() requires clock to be a function');
   }
@@ -972,6 +990,144 @@ export function createHandlers({
       GITLAB_CREDENTIALS_UNAVAILABLE_MESSAGE,
       bodyTimeoutMs,
     )),
+
+    /**
+     * Fetch one image captcha for the in-board platform login (P6).
+     *
+     * Body `{sessionId}`: the platform base URL comes from the workspace
+     * settings (`platformBaseUrl`), exactly like sync/import. The response is
+     * `{ok, key, image}` where `image` is a `data:image/...;base64` URL and
+     * `key` is the captcha key the login request must send back. The captcha key
+     * is short-lived metadata, not a credential; the login answer is write-only.
+     */
+    platformCaptcha: safe(async (req, res) => {
+      if (!guard(req, res, ROUTE_METHODS.platformCaptcha)) return;
+      if (!guardJsonContentType(req, res)) return;
+      if (!guardOrigin(req, res)) return;
+
+      const body = await readJsonBody(req, bodyTimeoutMs);
+      if (!body.ok) {
+        sendError(res, body.status, body.code, body.message);
+        if (body.destroyRequest === true) destroyRequest(req);
+        return;
+      }
+      const input = body.value;
+      const sessionId = normalizeSessionId(input.sessionId);
+      if (sessionId === undefined) {
+        sendError(res, 400, 'missing-session', '缺少有效的 sessionId');
+        return;
+      }
+      if (platformLoginDeps === null) {
+        sendError(res, 503, 'login-unavailable-service', '平台登录服务不可用，请稍后重试');
+        return;
+      }
+      const resolved = normalizeWorkspace(workspace.resolve(sessionId));
+      if (resolved.path === null) {
+        sendError(res, 400, 'unknown-workspace', '无法确定工作区路径，无法获取验证码');
+        return;
+      }
+      let settings = {};
+      try {
+        settings = store.getSettings(resolved.path);
+      } catch {
+        settings = {};
+      }
+      try {
+        const result = await platformLoginDeps.service.captcha({ baseUrl: settings.platformBaseUrl });
+        sendJsonSafe(res, 200, { ok: true, key: result.key, image: result.image });
+      } catch (error) {
+        const failureCode = typeof error?.code === 'string' ? error.code : 'captcha-unavailable';
+        const status = PLATFORM_LOGIN_ERROR_STATUS[failureCode] ?? 502;
+        sendError(
+          res,
+          status,
+          failureCode,
+          clipMessage(typeof error?.message === 'string' ? error.message : '获取验证码失败'),
+        );
+      }
+    }),
+
+    /**
+     * In-board platform login (P6): `{sessionId, username, password, code,
+     * captchaKey, tenantId?}`.
+     *
+     * The host performs the platform OAuth/captcha login and writes the
+     * resulting access token into the write-only credentials store. Neither the
+     * password nor the token is ever returned or logged: success answers
+     * `{ok:true, tokenPresent:true, username}` only. The password is used for
+     * exactly one upstream request (see `platform-login.js`).
+     */
+    platformLogin: safe(async (req, res) => {
+      if (!guard(req, res, ROUTE_METHODS.platformLogin)) return;
+      if (!guardJsonContentType(req, res)) return;
+      if (!guardOrigin(req, res)) return;
+
+      const body = await readJsonBody(req, bodyTimeoutMs);
+      if (!body.ok) {
+        sendError(res, body.status, body.code, body.message);
+        if (body.destroyRequest === true) destroyRequest(req);
+        return;
+      }
+      const input = body.value;
+      const sessionId = normalizeSessionId(input.sessionId);
+      if (sessionId === undefined) {
+        sendError(res, 400, 'missing-session', '缺少有效的 sessionId');
+        return;
+      }
+      if (platformLoginDeps === null) {
+        sendError(res, 503, 'login-unavailable-service', '平台登录服务不可用，请稍后重试');
+        return;
+      }
+      const resolved = normalizeWorkspace(workspace.resolve(sessionId));
+      if (resolved.path === null) {
+        sendError(res, 400, 'unknown-workspace', '无法确定工作区路径，无法登录平台');
+        return;
+      }
+      let settings = {};
+      try {
+        settings = store.getSettings(resolved.path);
+      } catch {
+        settings = {};
+      }
+
+      let result;
+      try {
+        result = await platformLoginDeps.service.login({
+          baseUrl: settings.platformBaseUrl,
+          username: input.username,
+          password: input.password,
+          code: input.code,
+          captchaKey: input.captchaKey,
+          tenantId: input.tenantId,
+        });
+      } catch (error) {
+        const failureCode = typeof error?.code === 'string' ? error.code : 'login-failed';
+        const status = PLATFORM_LOGIN_ERROR_STATUS[failureCode] ?? 502;
+        sendError(
+          res,
+          status,
+          failureCode,
+          clipMessage(typeof error?.message === 'string' ? error.message : '平台登录失败'),
+        );
+        return;
+      }
+
+      if (tokenStoreSafe === null) {
+        sendError(res, 503, 'credentials-unavailable', CREDENTIALS_UNAVAILABLE_MESSAGE);
+        return;
+      }
+      try {
+        await tokenStoreSafe.set(result.token);
+      } catch {
+        sendError(res, 503, 'credentials-unavailable', CREDENTIALS_UNAVAILABLE_MESSAGE);
+        return;
+      }
+      sendJsonSafe(res, 200, {
+        ok: true,
+        tokenPresent: true,
+        username: typeof result.username === 'string' && result.username !== '' ? result.username : null,
+      });
+    }),
   };
 }
 
@@ -1090,6 +1246,8 @@ export function registerUnavailableRoutes(ctx, health = {}) {
     deliver: unavailableHandler(ROUTE_METHODS.deliver, health),
     settings: unavailableHandler(ROUTE_METHODS.settings, health),
     platformToken: unavailableHandler(ROUTE_METHODS.platformToken, health),
+    platformCaptcha: unavailableHandler(ROUTE_METHODS.platformCaptcha, health),
+    platformLogin: unavailableHandler(ROUTE_METHODS.platformLogin, health),
     gitlabToken: unavailableHandler(ROUTE_METHODS.gitlabToken, health),
     sync: unavailableHandler(ROUTE_METHODS.sync, health),
   };
