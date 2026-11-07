@@ -153,7 +153,7 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 | 合并检测/归档 | `mergeable` + MR `state=merged` → `mr_merged` → `merged`；下一 tick `dismiss(system)` → `done` 并离开看板。若在 `mr_open`/`fixing_review` 就被人工合并 → `block('review-merged-manually')`，不伪造 review pass。**插件从不调用 merge/close/approve/resolve**，合并必须由人在 GitLab 完成 |
 | 取消/恢复 | delivery/review-fix 的 `dispose()` 只取消并排水，**不写** block/错误；`fixing_review` 无运行任务时下一 tick 按持久化 findings 恢复（重启子代理 / 重推 pending commit / 不可恢复则 `block('review-recovery-unavailable')`）。迟到结果只写静态 `delivery.error`/`review.error`，绝不回退已推进的工单 |
 | 客户端 UX | `submitting` 显示「提交并创建 MR」+ 运行横幅 + 静态错误映射；`mr_open`/`fixing_review` 显示 MR 卡（!iid/URL/source→target/轮次 n/3/最近结论/轮询提示）；`fixing_review` 运行中显示「AI 正在修复 Review 问题…」（计时 `aria-live=off`）；`mergeable` 显示「等待人工在 GitLab 合并（插件不会自动合并）」；`merged` 显示「已合并，即将从看板移除」；`done` 不再出现在看板 |
-| 测试 | **564 个用例**（P4 基线 352；P5 新增/扩充：`review-parser` 45、`credentials` 16、`gitlab` 27、`git` 20、`store` 42、`delivery-service` 40、`review-service` 39、`agent-access` 49、`routes` 115、`client-action-map` 14 等；另有隔离 E2E 脚本 28 条断言） |
+| 测试 | **570 个用例**（@`0ac209b`；P4 基线 352，P5 新增/扩充 218：`review-parser` 45、`credentials` 16、`gitlab` 27、`git` 20、`store` 42、`delivery-service` 40、`review-service` 45、`agent-access` 49、`routes` 115、`client-action-map` 14 等；另有隔离 E2E 脚本 29 条断言） |
 
 **P5 交付成功的前置条件（缺一不可）**
 
@@ -181,14 +181,14 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 
 - 标题固定 `<source> -> <target>`；`remove_source_branch:false`；不发送 reviewer/reviewer_ids；description 含工单 URL、方案摘要、lint/test 结论、提交 sha。
 - 只创建/复用 source 分支的 **open** MR；不创建集成分支、不打 tag、不改版本号。
-- 目标分支禁 `main`/`master`/`dev`/`develop`/`release-*`，且 `feat-*` 只能进 `feature-*`、`hot-*` 只能进 `hotfix-*`；个人分支禁 push（`assertPushableBranch` 在 spawn 前拒绝）。
+- 目标分支禁 `main`/`master`/`dev`/`develop`/`release-*`，且 `feat-*` 只能进 `feature-*`、`hot-*` 只能进 `hotfix-*`；**受保护分支禁 push**（`assertPushableBranch` 在 spawn 前拒绝，个人分支 `feat-*`/`hot-*` 正常推送）。
 - GitLab 客户端只有 5 类请求：`GET /user`、`GET merge_requests?state=opened&source_branch=`、`POST merge_requests`、`GET merge_requests/:iid`、`GET merge_requests/:iid/notes`；**没有** merge/close/approve/unapprove/resolve/discussions/rebase/todo 端点。
 - 永不 force push；永不自动 merge；合并后的 `dismiss` 只是本地归档，不写 GitLab。
 
 **Review 规则**
 
 - 识别人工/机器人噪音：只接受**自己的顶层行**同时含 `AI Code Review` 与 `结论:` 的非 system note；引用块/代码块里粘贴的 review 不算；`system:true` 与其它机器人内容被忽略。
-- 取 `created_at` 最新的一条（客户端再按 note id 兜底排序）；同一 note id 只处理一次（meta `review.last-note:<code>`）；claim 写失败 → `block('review-save-failed')`，不会重复起轮。
+- 取 `created_at` 最新的一条（排序在**宿主** `pickLatestAiNote`：先按 `created_at`、再按 note id 兜底；GitLab HTTP client 保留上游 `sort=desc&order_by=created_at` 顺序，浏览器 client 不参与排序）；同一 note id 只处理一次（meta `review.last-note:<code>`）；claim 写失败 → `block('review-save-failed')`，不会重复起轮。
 - `需要修改` 的 findings 先裁剪（blocking ≤20、non-blocking ≤10、单字段 ≤600 字符）再持久化/传给子代理；隐藏统计段已裁掉，prompt 不含该段。
 - 解析失败/模板漂移 → `block('review-parse-failed')`，不自动重试；轮次耗尽 → `block('review-rounds-exhausted')`；人工提前合并 → `block('review-merged-manually')`。
 - Review 修复子代理必须绑定 live 根 Agent：delivery 的 `sessionId` 精确匹配不到 live Agent 时会回退到最后一个 live root（`resolveParent` 语义），失败映射 `review-fix-unavailable`/`review-fix-failed`/`review-fix-timeout`。
@@ -372,7 +372,7 @@ P2 **未对真实平台执行**同步/导入（无真实 token，用户不在场
 
 > **错误命名空间（P5 必读）**：delivery 的错误只写 `delivery.error:<code>`（snapshot `delivery.errors`），Review 的错误只写 `review.error:<code>`（snapshot `review.errors`）；两者都**不写** P4 的 `fix.error:<code>`。下一次成功启动/轮询会清本命名空间的旧错误，不会互相清空。
 
-错误映射：参数/设置/配置 400，`action-id-reused` / `invalid-transition` / `duplicate-code` / review 轮次耗尽 / `service-job-running` 409，工单不存在 404，上游 401 映射 401，网络/上游异常 502，内部错误 500。`review_requests_changes` 第 4 次返回 409 `review-rounds-exhausted`，同时工单进入 `blocked`，`retry` 回到 `mr_open`。`/analyze` 额外：分析服务未接线、或 `runner.available()` 为 false（缺 `subagents`/`agents` 服务）→ 同步 503 `analysis-unavailable`，工单不改；**无 live 会话 Agent 不是 503**——路由照常回 200 受理并落 `start_analysis`，后台失败后工单被 `block`，原因 `no-live-agent`；工单状态不能分析 → 409 `invalid-state`；未绑定工作区/空 `code`/缺 `sessionId` → 400；GET → 405。`/fix` 额外：`ticket-not-found` 404；`invalid-state`/`plan-not-approved`/`fix-busy`/`fix-branch-busy`/`worktree-conflict` 409；分支/工作树参数错误 400；`fix-unavailable`/`git-timeout` 503；`git-failed`/`internal` 500；GET → 405（完整映射见「P4 真修复」）。`/deliver` 额外：`ticket-not-found` 404；`not-submitting`/`delivery-busy`/`delivery-no-changes`/`protected-branch`/`worktree-conflict` 409；`worktree-missing`/`invalid-gitlab-settings`/`invalid-branch`/`invalid-code`/`invalid-input`/`unknown-workspace` 400；`missing-gitlab-token`/`delivery-unavailable` 503；`git-failed`/`push-failed`/`mr-failed`/`internal` 500。**lint/test/commit/push/MR 失败发生在 200 之后**：路由同步错误映射覆盖不到它们，工单会被 `block` 并把静态原因/输出尾部写进 `snapshot.delivery.errors`。`/gitlab-token` 与 `/platform-token` 同契约：非 JSON 415、缺 session 400、token 非字符串且非 null 400、凭据不可用 503、`GET` 405。
+错误映射：参数/设置/配置 400，`action-id-reused` / `invalid-transition` / `duplicate-code` / review 轮次耗尽 / `service-job-running` 409，工单不存在 404，上游 401 映射 401，网络/上游异常 502，内部错误 500。`review_requests_changes` 第 4 次返回 409 `review-rounds-exhausted`，同时工单进入 `blocked`，`retry` 回到 `mr_open`。`/analyze` 额外：分析服务未接线、或 `runner.available()` 为 false（缺 `subagents`/`agents` 服务）→ 同步 503 `analysis-unavailable`，工单不改；**无 live 会话 Agent 不是 503**——路由照常回 200 受理并落 `start_analysis`，后台失败后工单被 `block`，原因 `no-live-agent`；工单状态不能分析 → 409 `invalid-state`；未绑定工作区/空 `code`/缺 `sessionId` → 400；GET → 405。`/fix` 额外：`ticket-not-found` 404；`invalid-state`/`plan-not-approved`/`fix-busy`/`fix-branch-busy`/`worktree-conflict` 409；分支/工作树参数错误 400；`fix-unavailable`/`git-timeout` 503；`git-failed`/`internal` 500；GET → 405（完整映射见「P4 真修复」）。`/deliver` 额外：`ticket-not-found` 404；`not-submitting`/`delivery-busy`/`protected-branch`/`worktree-conflict` 409；`worktree-missing`/`invalid-gitlab-settings`/`invalid-branch`/`invalid-code`/`invalid-input`/`unknown-workspace` 400；`missing-gitlab-token`/`delivery-unavailable` 503；`git-failed`/`push-failed`/`mr-failed`/`internal` 500。**`delivery-no-changes` 不是同步 409**：它是 commit 阶段在 200 之后的后台失败（`failDelivery('delivery-no-changes')`，工单 `block`），路由只为防御性保留该 code 的 409 映射。**lint/test/commit/push/MR 失败发生在 200 之后**：路由同步错误映射覆盖不到它们，工单会被 `block` 并把静态原因/输出尾部写进 `snapshot.delivery.errors`。`/gitlab-token` 与 `/platform-token` 同契约：非 JSON 415、缺 session 400、token 非字符串且非 null 400、凭据不可用 503、`GET` 405。
 
 ## 数据位置
 
@@ -467,7 +467,7 @@ P2 **未对真实平台执行**同步/导入（无真实 token，用户不在场
 无构建步骤：host 是纯 ESM JavaScript，client 是自包含 React bundle（只 `require('react')`，由宿主 module table 提供）。
 
 ```sh
-# 全部单元/集成测试（在仓库根目录执行）——P5 收尾 564/564
+# 全部单元/集成测试（在仓库根目录执行）——P5 收尾 570/570（@0ac209b）
 node --test bug-workflow/test/*.test.js
 
 # P5 隔离 E2E（临时 git 仓库 + 本地 bare origin + loopback mock GitLab；
@@ -500,28 +500,29 @@ node bug-workflow/scripts/mock-platform.mjs --port 0 --token test-token \
 # 本地 mock GitLab（P5 验收可用 loopback mock；E2E 脚本内部自带）
 # 注意：真实 GitLab 不要填真实 token 到文档/聊天/提交里。
 
-# live 冒烟（端口取当前 DSH Web GUI，示例 49254）
-curl -s http://127.0.0.1:49254/bug-workflow/api/health
-curl -s 'http://127.0.0.1:49254/bug-workflow/api/snapshot?sessionId=<session-id>'
+# live 冒烟（端口跟随当前运行的 DSH Web GUI；下面是当前示例 49192，
+# 实际端口以启动日志/页面 URL 为准，每次启动可能不同）
+curl -s http://127.0.0.1:49192/bug-workflow/api/health
+curl -s 'http://127.0.0.1:49192/bug-workflow/api/snapshot?sessionId=<session-id>'
 
 # 真分析（会在 live 会话下起真子代理、消耗 token；按需手动执行）
-curl -s -X POST http://127.0.0.1:49254/bug-workflow/api/analyze \
+curl -s -X POST http://127.0.0.1:49192/bug-workflow/api/analyze \
   -H 'Content-Type: application/json' \
   -d '{"sessionId":"<live-session-id>","code":"<ticket-code>"}'
 
 # 真修复（会建 worktree/个人分支并起真子代理、消耗 token；按需手动执行）
-curl -s -X POST http://127.0.0.1:49254/bug-workflow/api/fix \
+curl -s -X POST http://127.0.0.1:49192/bug-workflow/api/fix \
   -H 'Content-Type: application/json' \
   -d '{"sessionId":"<live-session-id>","code":"<ticket-code>"}'
 
 # 真交付（会跑 lint/test、commit、push、创建/复用 GitLab MR；需要真实
 # GitLab token 与可用的个人分支/worktree；按需手动执行）
-curl -s -X POST http://127.0.0.1:49254/bug-workflow/api/deliver \
+curl -s -X POST http://127.0.0.1:49192/bug-workflow/api/deliver \
   -H 'Content-Type: application/json' \
   -d '{"sessionId":"<live-session-id>","code":"<ticket-code>"}'
 
 # 清除 GitLab token（写 null；不会回显 token）
-curl -s -X POST http://127.0.0.1:49254/bug-workflow/api/gitlab-token \
+curl -s -X POST http://127.0.0.1:49192/bug-workflow/api/gitlab-token \
   -H 'Content-Type: application/json' \
   -d '{"sessionId":"<live-session-id>","token":null}'
 
@@ -559,7 +560,7 @@ git worktree remove --force .dsh-worktrees/YGFNXDJRFWDJSYJJYY-648 \
 | `scripts/fixtures/platform/` | mock 工单/详情/字典/评论/附件 fixtures |
 | `scripts/cleanup-demo-tickets.mjs` | 安全清理 mock 遗留工单（dry-run 默认、0600 备份、原子写） |
 | `scripts/verify-domain-v2.mjs` | 用安装版 zod/domain 验证 v2 契约（Electron-as-node） |
-| `test/` | `node:test` 单元/集成测试（P5 新增/扩充：`review-parser`、`gitlab`、`delivery-service`、`review-service`、`credentials`、`git`、`store`、`routes`、`client-action-map`、`agent-access`；总计 **564**） |
+| `test/` | `node:test` 单元/集成测试（P5 新增/扩充：`review-parser`、`gitlab`、`delivery-service`、`review-service`、`credentials`、`git`、`store`、`routes`、`client-action-map`、`agent-access`；总计 **570**，@`0ac209b`） |
 
 ## 许可
 
