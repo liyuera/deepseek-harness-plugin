@@ -180,12 +180,14 @@ export function apply(ctx) {
         // `credentials` is read optionally rather than injected: hardening the
         // storage routes must not depend on a service the board can live
         // without. Absent credentials -> tokenPresent:false + 503 on writes.
-        const tokenStore = createTokenStore(readCredentials(storageCtx));
+        // One lookup backs both token stores (platform + GitLab).
+        const credentials = readCredentials(storageCtx);
+        const tokenStore = createTokenStore(credentials);
         // P5: the GitLab token is a second, independent reference over the same
         // optional credentials service. The token value never leaves it; the
         // routes only read presence for the snapshot.
         const gitlabTokenStore = createTokenStore(
-          readCredentials(storageCtx),
+          credentials,
           { ref: GITLAB_TOKEN_REF },
         );
 

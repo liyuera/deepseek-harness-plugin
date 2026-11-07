@@ -319,3 +319,55 @@ test('the GitLab store reports unavailable credentials instead of throwing', asy
     await assert.rejects(store.clear(), { code: 'credentials-unavailable' });
   }
 });
+
+// ---------------------------------------------------------------------------
+// ref validation (P5 Task 2 folded review minor)
+// ---------------------------------------------------------------------------
+
+test('createTokenStore rejects malformed refs instead of falling back to the platform ref', async () => {
+  const invalidRefs = [
+    '',
+    ' ',
+    '  BUG_WORKFLOW_GITLAB_TOKEN',
+    'bug-workflow.gitlab-token',
+    'BUG-WORKFLOW-GITLAB-TOKEN',
+    '1BUG_WORKFLOW',
+    'BUG WORKFLOW',
+    'BUG/WORKFLOW',
+    42,
+    {},
+    [],
+    true,
+    null,
+  ];
+
+  for (const ref of invalidRefs) {
+    const credentials = createFakeCredentials();
+    assert.throws(
+      () => createTokenStore(credentials, { ref }),
+      (error) => error instanceof TypeError && /ref/.test(error.message),
+      String(ref),
+    );
+    // Nothing was read or written: an invalid ref never degrades to the
+    // platform credential.
+    assert.equal(credentials.calls.resolve.length, 0, String(ref));
+    assert.equal(credentials.calls.set.length, 0, String(ref));
+  }
+
+  for (const options of ['ref', 42, true]) {
+    assert.throws(() => createTokenStore(createFakeCredentials(), options), TypeError, String(options));
+  }
+
+  // Valid environment-shaped refs pass and write only their own reference.
+  const custom = createFakeCredentials();
+  const customStore = createTokenStore(custom, { ref: 'BUG_WORKFLOW_CUSTOM_TOKEN' });
+  await customStore.set(TOKEN);
+  assert.deepEqual(custom.calls.set, [{ ref: 'BUG_WORKFLOW_CUSTOM_TOKEN', value: TOKEN }]);
+  assert.equal(custom.calls.set.some((call) => call.ref === PLATFORM_TOKEN_REF), false);
+  assert.equal(custom.values.has(PLATFORM_TOKEN_REF), false);
+
+  const lower = createFakeCredentials();
+  const lowerStore = createTokenStore(lower, { ref: 'bug_workflow_lower_token' });
+  await lowerStore.set(TOKEN);
+  assert.deepEqual(lower.calls.set, [{ ref: 'bug_workflow_lower_token', value: TOKEN }]);
+});

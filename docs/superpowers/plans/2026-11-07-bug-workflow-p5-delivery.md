@@ -35,19 +35,22 @@ createGit({ execFile }) -> {
 }
 
 // gitlab.js
-createGitlabClient({ baseUrl, token, fetchImpl, timeoutMs = 15000 }) -> {
+createGitlabClient({ baseUrl, tokenProvider, fetchImpl, timeoutMs = 15000 }) -> {
   getCurrentUser() -> Promise<{ id, username }>,
   findOpenMergeRequest({ project, sourceBranch }) -> Promise<MR | null>, // GET /projects/:id/merge_requests?state=opened&source_branch=
   createMergeRequest({ project, sourceBranch, targetBranch, title, description }) -> Promise<MR>,
   getMergeRequest({ project, iid }) -> Promise<MR>,
   listNotes({ project, iid }) -> Promise<Note[]>          // GET .../notes?sort=desc&order_by=created_at
 }
-// MR: { iid:number, webUrl, sourceBranch, targetBranch, state, title }
-// Note: { id, body, createdAt, authorUsername }
-// 错误：GitlabError code ∈ no-token|unauthorized|forbidden|not-found|rate-limited|network|timeout|bad-response|invalid-project|invalid-merge-request
+// tokenProvider：async () => string|null（即 Task 1 tokenStore.get）；缺失/空 → 抛 GitlabError('no-token') 且不发请求
+// 无效 baseUrl 在构造时抛 GitlabError('invalid-project')；超时/重定向/大小上限在客户端内收口
+// MR: { iid:number, url, sourceBranch, targetBranch, state, title }
+// Note: { id, body, createdAt, authorUsername, system }
+// 错误：GitlabError code ∈ no-token|unauthorized|forbidden|not-found|conflict|rate-limited|network|timeout|bad-response|invalid-project|invalid-merge-request
 
 // review-parser.js：canonical 迁移，scripts/review-parser.mjs 复导出
-export function parseReview(body) -> { verdict:'pass'|'changes'|'unknown', blocking:[], nonBlocking:[], summary, noteMeta }
+export function parseReview(body) -> { verdict:'pass'|'changes'|'unknown', blocking: Issue[], nonBlocking: Issue[] }
+// Issue: { file, fid, level, gateCategory, location, problem, suggestion }；无 summary/noteMeta；隐藏统计段已裁掉
 
 // delivery-service.js
 createDeliveryService({ store, git, gitlab, settings, clock, lock, execCommand })
