@@ -277,6 +277,31 @@ async function waitForIdle(service, limit = 500) {
   throw new Error('fix job did not settle');
 }
 
+/**
+ * Store write-boundary double mirroring the three `fixRunSchema` bounds this
+ * fix hardens: `elapsedMs` must be a non-negative integer, `childId` ≤200 and
+ * each `changedFiles` path ≤4096. Throwing makes `patchTicket()` reject the
+ * merged record exactly like the host zod schema (`invalid-payload`), so a
+ * writer that emits out-of-bounds data loses the entry and leaves the ticket
+ * `fixing` with `SAVE_FAILED`.
+ */
+function strictFixRunBounds(ticket) {
+  for (const entry of ticket.fixes) {
+    if (entry.elapsedMs !== undefined
+      && (!Number.isInteger(entry.elapsedMs) || entry.elapsedMs < 0)) {
+      throw new Error('fixes.elapsedMs 必须是非负整数');
+    }
+    if (entry.childId !== undefined && entry.childId.length > 200) {
+      throw new Error('fixes.childId 不能超过 200 字符');
+    }
+    for (const file of entry.changedFiles) {
+      if (file.length > 4096) throw new Error('fixes.changedFiles 路径不能超过 4096 字符');
+    }
+  }
+  return cloneJson(ticket);
+}
+
+
 // ---------------------------------------------------------------------------
 // Happy path: branch/worktree + fix_done
 // ---------------------------------------------------------------------------
@@ -1064,4 +1089,176 @@ test('a non-stale persistence failure uses the save-failed copy, not the stale c
   const meta = store.getMeta(FIX_ERROR_META_PREFIX + 'BUG-1');
   assert.equal(meta, SAVE_FAILED_MESSAGE);
   assert.notEqual(meta, STALE_FIX_MESSAGE);
+});
+
+// ---------------------------------------------------------------------------
+// P4 Task 2 minor fix: start/dispose race (N2) and fixes writer bounds (N1)
+// ---------------------------------------------------------------------------
+
+test('a dispose during the final clearError() launches no job and returns fix-unavailable', async () => {
+  const { store, runner, service } = setup({ gitOptions: { status: ' M src/a.js\n' } });
+  await seedFixing(store);
+  // A persisted error makes clearError() actually await a meta write, which is
+  // the last await of start() before activation.
+  await store.setMeta(FIX_ERROR_META_PREFIX + 'BUG-1', FIX_REASON_MESSAGES['fix-failed']);
+
+  const gate = deferred();
+  let gatedClears = 0;
+  const originalSetMeta = store.setMeta.bind(store);
+  store.setMeta = async (key, value) => {
+    if (value === null) {
+      gatedClears += 1;
+      await gate.promise;
+    }
+    return originalSetMeta(key, value);
+  };
+
+  const started = service.start(SESSION_ID, CWD, 'BUG-1');
+  for (let index = 0; index < 200 && gatedClears === 0; index += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(gatedClears, 1, 'start() must be suspended in clearError()');
+
+  // The window is exactly between the persisted branch metadata and activation:
+  // the worktree is recorded, but no runner call exists yet.
+  const beforeDispose = store.get('BUG-1');
+  assert.equal(beforeDispose.workflow, 'fixing');
+  assert.equal(beforeDispose.branch.worktree, WORKTREE);
+  assert.equal(runner.calls.length, 0);
+
+  const disposePromise = service.dispose();
+  gate.resolve();
+  const result = await started;
+  await disposePromise;
+  await waitForIdle(service);
+
+  // The start drops the reservation with the documented 503 contract instead
+  // of returning the 200 running shape, and the runner is never called.
+  assert.deepEqual(result, {
+    ok: false,
+    code: 'fix-unavailable',
+    message: '修复服务不可用，请稍后重试',
+  });
+  assert.equal(runner.calls.length, 0, 'no job may launch after dispose');
+
+  // No ticket write happened after teardown: branch metadata is the last
+  // persisted shape, no fixes entry / fix_done / block was appended.
+  assert.deepEqual(store.get('BUG-1'), beforeDispose, 'no ticket write may follow dispose');
+  assert.deepEqual(store.get('BUG-1').fixes, []);
+  assert.equal(store.get('BUG-1').timeline.some((entry) => entry.kind === 'fix_done'), false);
+  assert.equal(store.get('BUG-1').timeline.some((entry) => entry.kind === 'blocked'), false);
+  // The error clear was already in flight when dispose landed; it completes as
+  // a null (no error), which is not a terminal fix write.
+  assert.equal(store.getMeta(FIX_ERROR_META_PREFIX + 'BUG-1'), null);
+  assert.deepEqual(service.status(), { running: [], errors: {} });
+});
+
+test('a dispose during worktree preparation writes no terminal block for fix-branch-busy', async () => {
+  const gate = deferred();
+  const { store, git, runner, service } = setup({
+    gitOptions: { statusResult: () => gate.promise },
+  });
+  await seedFixing(store, { code: 'BUG-1' });
+  await seedFixing(store, { code: 'BUG-2' });
+  await store.patchTicket('BUG-2', {
+    branch: {
+      name: 'feat-V1.6.1-ly',
+      target: 'feature-V1.6.1',
+      baseSource: 'origin',
+      worktree: `${REPO}/.dsh-worktrees/BUG-2`,
+      createdAt: STORE_TIME,
+    },
+  });
+  const before = store.get('BUG-1');
+
+  const started = service.start(SESSION_ID, CWD, 'BUG-1');
+  for (let index = 0; index < 200 && git.calls.status.length === 0; index += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(git.calls.status.length, 1, 'the branch-collision probe is awaited');
+
+  const disposePromise = service.dispose();
+  gate.resolve(' M src/a.js\n');
+  const result = await started;
+  await disposePromise;
+
+  // The structured preparation failure is still returned, but teardown is not
+  // turned into a terminal block/meta and no worktree is created.
+  assert.deepEqual(result, {
+    ok: false,
+    code: 'fix-branch-busy',
+    message: FIX_REASON_MESSAGES['fix-branch-busy'],
+  });
+  assert.deepEqual(store.get('BUG-1'), before, 'no state write may follow dispose');
+  assert.equal(store.get('BUG-1').workflow, 'fixing');
+  assert.equal(store.getMeta(FIX_ERROR_META_PREFIX + 'BUG-1'), undefined);
+  assert.deepEqual(git.calls.worktreeAdd, []);
+  assert.equal(runner.calls.length, 0);
+  assert.deepEqual(service.status(), { running: [], errors: {} });
+});
+
+test('a fractional or negative elapsedMs is normalized and the successful run still persists', async () => {
+  const domain = createFakeDomain();
+  const store = createStore(domain, () => STORE_TIME, { validateTicket: strictFixRunBounds });
+  const elapsedValues = [12.75, -3.5];
+  const { service } = setup({
+    domain,
+    store,
+    gitOptions: { status: ' M src/a.js\n' },
+    runnerOptions: {
+      run: () => Promise.resolve({ ...cloneJson(SUCCESS_RESULT), elapsedMs: elapsedValues.shift() }),
+    },
+  });
+  // Different versions derive different personal branches (no collision probe).
+  await seedFixing(store, { code: 'BUG-1', version: 'V1.6.1' });
+  await seedFixing(store, { code: 'BUG-2', version: 'V1.7.0' });
+
+  for (const code of ['BUG-1', 'BUG-2']) {
+    const started = await service.start(SESSION_ID, CWD, code);
+    assert.equal(started.ok, true);
+    await waitForIdle(service);
+    const ticket = store.get(code);
+    assert.equal(ticket.workflow, 'fix_done', `${code} must advance despite the abnormal clock value`);
+    assert.equal(ticket.fixes.length, 1);
+    assert.ok(Number.isInteger(ticket.fixes[0].elapsedMs), 'elapsedMs must be an integer');
+    assert.ok(ticket.fixes[0].elapsedMs >= 0, 'elapsedMs must be non-negative');
+  }
+
+  assert.equal(store.get('BUG-1').fixes[0].elapsedMs, 12);
+  assert.equal(store.get('BUG-2').fixes[0].elapsedMs, 0);
+  assert.equal(store.getMeta(FIX_ERROR_META_PREFIX + 'BUG-1'), undefined);
+  assert.equal(store.getMeta(FIX_ERROR_META_PREFIX + 'BUG-2'), undefined);
+});
+
+test('an overlong childId and changed-file path are truncated so the entry persists', async () => {
+  const domain = createFakeDomain();
+  const store = createStore(domain, () => STORE_TIME, { validateTicket: strictFixRunBounds });
+  const longChildId = 'child-'.padEnd(300, 'x');
+  const longPath = `src/${'a'.repeat(4_090)}.js`;
+  assert.ok(longChildId.length > 200);
+  assert.ok(longPath.length > 4_096);
+
+  const { service } = setup({
+    domain,
+    store,
+    gitOptions: { status: ` M ${longPath}\n` },
+    runnerOptions: {
+      run: () => Promise.resolve({ ...cloneJson(SUCCESS_RESULT), childId: longChildId }),
+    },
+  });
+  await seedFixing(store);
+
+  const started = await service.start(SESSION_ID, CWD, 'BUG-1');
+  assert.equal(started.ok, true);
+  await waitForIdle(service);
+
+  const ticket = store.get('BUG-1');
+  assert.equal(ticket.workflow, 'fix_done', 'the run must not be lost to the schema bounds');
+  assert.equal(ticket.fixes.length, 1);
+  const entry = ticket.fixes[0];
+  assert.equal(entry.childId, longChildId.slice(0, 200));
+  assert.equal(entry.childId.length, 200);
+  assert.deepEqual(entry.changedFiles, [longPath.slice(0, 4_096)]);
+  assert.equal(entry.changedFiles[0].length, 4_096);
+  assert.equal(store.getMeta(FIX_ERROR_META_PREFIX + 'BUG-1'), undefined);
 });

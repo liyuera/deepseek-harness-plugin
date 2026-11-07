@@ -67,6 +67,10 @@
  *     the next host load restarts it through the orphan path. The cancelled
  *     flag is re-checked after every await in the finish path (including the
  *     git collection), so a dispose during post-run collection writes nothing.
+ *     A start that races teardown likewise re-checks `disposed` after every
+ *     await: a dispose during the final `clearError()` returns
+ *     `fix-unavailable` without launching a job, and a preparation failure
+ *     that lands after teardown writes no terminal block/meta.
  *     The drain is bounded and idempotent; the host awaits it before closing
  *     the domain.
  *   - The background job never rejects. Error messages are static Chinese
@@ -123,6 +127,17 @@ export const FIX_DIFF_MAX_CHARS = 4_000;
 
 /** Free-text cap for the persisted summary/testResult/notes (schema mirrors it). */
 const FIX_TEXT_MAX_CHARS = 8_000;
+
+/**
+ * Bounds mirrored from the host `fixRunSchema` (`domain-spec.js`). The writer
+ * normalizes every optional field it emits to these limits, so a clock/runner
+ * anomaly (fractional or negative elapsed, an overlong child id or path) can
+ * never turn an otherwise successful run into `invalid-payload`/SAVE_FAILED
+ * and lose the `fixes` entry (review N1).
+ */
+const FIX_CHILD_ID_MAX_CHARS = 200;
+const FIX_CHANGED_FILE_MAX_CHARS = 4_096;
+const FIX_CHANGED_FILES_MAX = 2_000;
 
 /** Runner failure code -> persisted block reason. */
 const RUNNER_CODE_TO_REASON = Object.freeze({
@@ -287,6 +302,9 @@ export function createFixService({
       if (disposed) return disposedStart(key, entry);
 
       await clearError(key);
+      // Final re-check before activation: a dispose can land while the error
+      // meta is cleared. Teardown must never launch a job (or return 200).
+      if (disposed) return disposedStart(key, entry);
       launchJob({
         entry,
         key,
@@ -507,6 +525,10 @@ export function createFixService({
    * same static reason.
    */
   async function reportStartFailure(key, blockedRestart, startFailure) {
+    // A dispose during preparation is teardown, not a fix failure: write no
+    // terminal block or error meta after the service is disposed (N2). The
+    // start still returns the structured preparation failure.
+    if (disposed) return;
     const code = startFailure?.code;
     if (code === 'fix-branch-busy') {
       if (blockedRestart) await rememberError(key, FIX_REASON_MESSAGES['fix-branch-busy']);
@@ -736,14 +758,22 @@ export function createFixService({
     } catch {
       finishedAt = new Date().toISOString();
     }
+    // Normalize the run metadata to the host `fixRunSchema` bounds before the
+    // patch. A fractional/negative elapsedMs, an overlong child id or an
+    // overlong changed-file path would otherwise make the host reject the whole
+    // record (`invalid-payload`) although the fix itself succeeded (N1).
+    const changedFiles = (Array.isArray(collected.changedFiles) ? collected.changedFiles : [])
+      .filter((file) => typeof file === 'string')
+      .slice(0, FIX_CHANGED_FILES_MAX)
+      .map((file) => file.slice(0, FIX_CHANGED_FILE_MAX_CHARS));
     const fixEntry = {
       runId: patchActionId,
       ...(typeof result.childId === 'string' && result.childId !== ''
-        ? { childId: result.childId }
+        ? { childId: result.childId.slice(0, FIX_CHILD_ID_MAX_CHARS) }
         : {}),
       startedAt,
       finishedAt,
-      changedFiles: collected.changedFiles.slice(0, 2000),
+      changedFiles,
       diffStat: clipText(collected.diffStat, 4_000),
       diff: collected.diff,
       summary: clipText(result.result?.summary, FIX_TEXT_MAX_CHARS),
@@ -751,7 +781,9 @@ export function createFixService({
       notes: clipText(result.result?.notes, FIX_TEXT_MAX_CHARS),
       status: noChanges ? 'failed' : 'succeeded',
       ...(noChanges ? { error: 'fix-no-changes' } : {}),
-      ...(Number.isFinite(result.elapsedMs) ? { elapsedMs: result.elapsedMs } : {}),
+      ...(Number.isFinite(result.elapsedMs)
+        ? { elapsedMs: Math.max(0, Math.trunc(result.elapsedMs)) }
+        : {}),
     };
 
     let patched;
