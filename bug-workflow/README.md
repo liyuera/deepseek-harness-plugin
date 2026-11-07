@@ -87,7 +87,7 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 - **计时是近似值**：宿主未持久化 `analysis.startedAt`，详情页计时从首次看到 `analysis.running` 起算，刷新/重开详情会从 0 开始；真实耗时以 `analysis_done` 时间线为准。
 - **无提交级 client 行为测试**：仓库内只有 `client-action-map.test.js` 的静态映射校验；分析交互（计时、重新分析、失败 banner、方案卡）没有提交的渲染/行为测试。
 - **真实失败路径未 live 覆盖**：超时/坏输出/无 Agent 只有单元测试；live 只验证了 404/409/400/405 等路由错误，10 分钟超时未在 live 触发。
-- **503 文案已收敛（P3 修复轮）**：同步 503 只表示「分析服务不可用」（服务未接线，或缺 `subagents`/`agents` 服务导致 `runner.available()` false），响应与客户端都显示「分析服务不可用，请稍后重试」；`no-live-agent` 不再是 503——它是 200 受理后的后台失败，工单被 `block`，详情页从 `blockedReason` 渲染「当前没有可用的会话 Agent」。P4 修复错误码保持同一区分：`fix-unavailable` 只在**启动前**（服务未接线/无 live Agent）同步 503，后台失败一律 `blocked` + 静态原因。
+- **503 文案已收敛（P3 修复轮）**：同步 503 只表示「分析服务不可用」（服务未接线，或缺 `subagents`/`agents` 服务导致 `runner.available()` false），响应与客户端都显示「分析服务不可用，请稍后重试」；`no-live-agent` 不再是 503——它是 200 受理后的后台失败，工单被 `block`，详情页从 `blockedReason` 渲染「当前没有可用的会话 Agent」。P4 修复错误码保持同一区分：`fix-unavailable` 只在**启动前**（修复服务未接线，或 `runner.available()` 为 false，即缺 `subagents`/`agents` 服务）同步 503，工单不改；**服务已接线但没有 live 会话 Agent 时仍是 200 受理后的后台失败**（`block` + `no-live-agent`），不是 503；其余后台失败一律 `blocked` + 静态原因。
 - **子代理会留下持久化子会话**（P0 已观察）：每次分析在会话列表新增一个 `analysis:<code>` 子会话，父会话多一条 `subagent/catalog`；P3 不删除，属预期副作用。
 - **失败晚到竞态已收敛（P3 修复轮）**：`block` 现在带 `expectedWorkflow:'analyzing'`，由 store 在写队列临界区内复核；失败晚到时返回 `stale-workflow`，只写静态错误 meta，不再把已进入 `plan_review`/`fixing` 的工单回退成 `blocked`（用 held-write-queue 竞争测试覆盖）。P4 的修复流程已沿用同样的 conditional mutation（`expectedWorkflow:'fixing'`）。
 - **多工单并行**只有设计/单测级保证，未 live 验证两路同时跑。
@@ -117,7 +117,7 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 
 1. **工单必须 `fixing` 且方案已批准**：`/api/fix` 只接受 `fixing`，或可重启的 `blocked`/`blockedFrom:'fixing'`；未批准方案返回 409 `plan-not-approved`。
 2. **会话绑定工作区、且是 git 仓库**：`workspace.resolve(sessionId)` 必须解析到目录，`git rev-parse --show-toplevel` 必须成功；否则 400 `unknown-workspace` / 500 `git-failed`。
-3. **修复服务已接线且有 live 会话 Agent**：服务未接线或 `runner.available()` false → 同步 503 `fix-unavailable`，工单不改；**服务已接线但没有 live 会话 Agent** 时也在启动前返回 503（`fix-unavailable`，消息「当前没有可用的会话 Agent」），不会先把工单写成 `fixing`。
+3. **修复服务已接线，且后台能解析到 live 会话 Agent**：**修复服务未接线**（旧 host/构造失败）或 **`runner.available()` 为 false**（缺 `subagents`/`agents` 服务）时，`/api/fix` 同步返回 503 `fix-unavailable`，工单状态不变。**服务已接线但没有 live 会话 Agent** 时路由仍返回 **200**：宿主先创建/复用分支与 worktree 并写入 `branch` 元数据（`blocked(fixing)` 重启则同时 `retry` 回 `fixing`），后台 `runFix` 解析父 Agent 失败后以 `analysis-unavailable` 失败，service 把它映射成 `no-live-agent` 并**阻塞**工单（`blocked`、`blockedFrom='fixing'`，分支/worktree 保留供重试），`snapshot.fix.errors[code]` 为「当前没有可用的会话 Agent」。所以 200 只表示「已受理」，不是修复真的在跑；这与 P3 分析的「200 → `analyzing` → `block(no-live-agent)`」是同一语义（P4 对应 `fixing`），**不是同步 503**。
 4. **分支/工作树可创建**：版本号缺失 → 400 `invalid-version`；`branchUser` 非法 → 400 `invalid-branch-user`；code 无法生成安全路径 → 400 `invalid-worktree-path`；git 超时 → 503 `git-timeout`。
 
 **P4 错误码 / HTTP 映射（`/api/fix`）**
@@ -128,8 +128,10 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 | `invalid-state` / `plan-not-approved` | 409 | 当前状态不能修复 / 方案未通过 |
 | `fix-busy` | 409 | 同仓库已有修复在执行 |
 | `fix-branch-busy` | 409 | 个人分支已被其它工单工作树占用 |
+| `worktree-conflict` | 409 | 工作树路径已存在且分支不一致（git 返回冲突，未覆盖既有工作树） |
+| `missing-session` | 400 | 请求缺少有效 `sessionId`（路由层校验） |
 | `invalid-code` / `unknown-workspace` / `invalid-branch` / `invalid-branch-user` / `invalid-family` / `invalid-version` / `invalid-worktree-path` / `invalid-payload` | 400 | 参数/分支/工作树输入错误 |
-| `fix-unavailable` / `git-timeout` | 503 | 修复服务/Agent 不可用；git 准备超时 |
+| `fix-unavailable` / `git-timeout` | 503 | 修复服务/子代理服务未接线或不可用（缺 `subagents`/`agents` 服务）；git 准备超时 |
 | `git-failed` / `internal` | 500 | git 或宿主内部错误（外部手工 worktree 撞同名分支会落在这里，见「已知限制」） |
 
 > **动作映射的维护约束（每期必读）**：按钮只来自 `bug-workflow/client.js` 的 `ACTION_BY_STATE` 字面量（按 `workflow` 的静态列表）；宿主 `canApply` 是转移的权威，但两者是**两份独立数据**。`test/client-action-map.test.js` 只做单向校验（map → host：每个映射动作在该状态必须被 `canApply` 接受），**不校验 host → map**，所以新增宿主动作不会自动出现按钮。每加/改一个动作，必须同步更新该映射并运行 `node --test bug-workflow/test/*.test.js`。已知一处偏差：宿主支持 `block`（任意非终态可执行），但看板没有「阻塞」按钮。review 轮次上限已由映射处理，不再是偏差：`review_requests_changes` 声明 `maxRounds: 3`，`mr.rounds = 3` 时该按钮在界面上禁用并显示「轮次已耗尽」提示，不会发出必然被拒的请求；宿主仍是权威（绕过 UI 直接 POST 仍返回 409 `review-rounds-exhausted`，工单进入 `blocked`）。P3 的两个分析入口都不经过 `/api/action`，但来源不同：「**开始分析**」的按钮来自 `ACTION_BY_STATE.start_analysis`（`inbox` 的按钮来源，映射里保留），只有它的**执行**绕过映射、直接 POST `/api/analyze`；「**重新分析**」是**看板临时动作**（`client.js` 的 `ANALYSIS_RETRY_DESCRIPTOR`，复用 `action:'start_analysis'` 但不属于 `ACTION_BY_STATE`），只在 `analyzing` 已无运行任务、或 `blockedFrom='analyzing'` 时由详情页按上下文追加，因此它连按钮来源也不在映射里。P4 的「开始修复」「重新修复」同理：`FIX_START_DESCRIPTOR`/`FIX_RETRY_DESCRIPTOR` 是看板临时动作，直接 POST `/api/fix`，不属于 `ACTION_BY_STATE`；demo「修复完成」按钮对**所有** `fixing` 工单隐藏（真实 `fix_done` 由宿主在修复成功后写入）。
@@ -325,6 +327,7 @@ P2 **未对真实平台执行**同步/导入（无真实 token，用户不在场
 - **P3 分析只读同样仍是 prompt 级**：P3 的只读约束与 P4 修复写范围同级，宿主未强制（见 P3 findings §8、本文件「P3 真分析」）。
 - **lint/test 命令配置了但修复结束时不执行**：`lintCommand`/`testCommand` 只是设置字段，P4 的「修复完成」只要求 worktree 有改动；`devCommand`/`previewUrl` 的视觉留证也未实现。P4 findings §6 记录；P5 提交前必须补门禁，或明确豁免。
 - **P4 不 commit/push/建 MR**：改动只留在 worktree（未提交），提交/推送/MR 是 P5；看板的「提交 MR / 模拟 MR 已创建 / 模拟 Review… / 模拟已合并 / 完成并移除」仍是假按钮（见「P4 之后仍是「假引擎」的部分」）。
+- **demo「分析完成」/「修复完成」仍可由宿主直接写入**：`analysis_done`/`fix_done` 仍是 `ACTION_BY_STATE` 里的演示动作，看板只是对全部 `analyzing`/`fixing` 隐藏入口；raw `POST /api/action` 仍可在真分析/真修复运行期间把工单推进，随后真任务的结果因条件写（`expectedWorkflow`）过期而只落静态错误、不写状态。P5 移除 demo 动作时一并收紧（真实服务写这两个动作的路径需保留）。
 - **GUI 未目视（P2–P4）**：没有刷新页面后的截图/点击/窄栏验证；P2 的 client inspect 曾超时（`Slots.listSubTree` / `Theme.listTokens` 均 10 s）。P4 的修复进度、中断/阻塞面板与 `fix_done` 结果卡只有源码审阅 + 未提交的 fake-React harness（`/tmp`）。client 代码更新后需刷新页面，否则可能仍加载上一版 bundle。
 - **读屏/计时未做真实 AT 验证**：修复计时行在 `role=status`/`aria-live=polite` 内嵌 `aria-live=off`，设计意图是只播报开始/完成；没有用真实屏幕阅读器验证。
 - **真实业务仓库未验证**：P4 live 的目标工单 648 来自平台，但其 plan 是 P3 在**插件仓库**里分析出来的（plan `risks` 已标注归属存疑）；live 修复改的是插件仓库的「导出 Excel」功能，**不是 648 的真实业务实现**。真实业务仓库的代码质量、依赖、构建命令与修复效果未验证。

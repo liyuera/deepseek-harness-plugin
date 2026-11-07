@@ -256,9 +256,12 @@ export function createFixService({
     if (!hasApprovedPlan(current)) {
       return failure('plan-not-approved', '方案尚未审核通过，无法开始修复');
     }
-    // Availability is checked before any state write (notably the blocked
-    // restart's `retry`): with no live agent there is nothing to run and the
-    // ticket must stay where it is (route 503).
+    // Service wiring check only: `runner.available()` reports whether the
+    // `subagents`/`agents` services are wired, NOT whether a live parent Agent
+    // exists. An unwired service is a synchronous 503 before any state write
+    // (notably the blocked restart's `retry`); a wired service with no live
+    // parent passes here, is accepted with 200 and blocks later as
+    // `no-live-agent` from the background run.
     if (!runnerAvailable()) {
       return failure('fix-unavailable', FIX_REASON_MESSAGES['no-live-agent']);
     }
