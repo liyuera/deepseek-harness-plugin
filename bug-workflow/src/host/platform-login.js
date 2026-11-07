@@ -453,11 +453,10 @@ export function createPlatformLogin(options = {}) {
         throw new PlatformLoginError('invalid-credentials', MESSAGE.invalidCredentials, status);
       }
       const detail = safeUpstreamDetail(upstreamMsg, [password, username]);
-      throw new PlatformLoginError(
-        'login-failed',
-        detail === '' ? MESSAGE.loginFailed : `${MESSAGE.loginFailed}（平台：${detail}）`,
-        status,
-      );
+      const hint = detail !== ''
+        ? `（平台：${detail}）`
+        : `（平台错误码 ${Number.isNaN(envelopeCode) ? status : envelopeCode}）`;
+      throw new PlatformLoginError('login-failed', `${MESSAGE.loginFailed}${hint}`, status);
     }
 
     const data = isPlainObject(body.data) ? body.data : {};

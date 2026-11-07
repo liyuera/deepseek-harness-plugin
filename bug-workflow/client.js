@@ -100,7 +100,7 @@ window.__ModuleLoader__.load({
     const h = React.createElement;
     const ID = '@liyuera/dsh-bug-workflow';
     /** Visible build tag so the running UI can be verified after a reload. */
-    const CLIENT_BUILD = 'p6-login.2026-11-08.2';
+    const CLIENT_BUILD = 'p6-login.2026-11-08.3';
 
     /** Snapshot/action endpoints (same origin as the Harness Web page). */
     const API = Object.freeze({
@@ -2709,6 +2709,11 @@ window.__ModuleLoader__.load({
         ?? (view.status === 401 ? hints['invalid-credentials'] : null)
         ?? (view.status === 503 ? hints['login-unavailable-service'] : null)
         ?? (view.status === 504 ? hints['login-timeout'] : null);
+      // `login-failed` carries the platform's sanitized reason in view.message;
+      // keep it instead of hiding it behind the generic static hint.
+      if (view.code === 'login-failed' && typeof view.message === 'string' && view.message.trim() !== '') {
+        return { ...view, title: '平台登录', message: view.message };
+      }
       return { ...view, title: '平台登录', message: hint === null ? view.message : hint };
     }
 

@@ -239,7 +239,9 @@ const snapshot = {
     previewUrl: '',
     writebackStatus: false,
   },
-  platform: { tokenPresent: true, lastSyncAt: iso(2), lastSyncError: null },
+  // The preview starts logged out so the in-board login form (and its captcha
+  // fetch) is exercised; the manual token card stays collapsed.
+  platform: { tokenPresent: false, lastSyncAt: iso(2), lastSyncError: null },
   gitlab: { tokenPresent: true },
   dicts: { status: [], type: [], priority: [] },
   analysis: { running: [], errors: {} },
