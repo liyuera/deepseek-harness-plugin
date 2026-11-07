@@ -11,15 +11,18 @@
  *          -> close the domain from the fiber disposer
  *
  *   GET  /bug-workflow/api/health    -> { ok, domainOpenedAt, tickets }
- *   GET  /bug-workflow/api/snapshot  -> { ok, workspace, settings, platform, dicts, analysis, fix, tickets, serverTime }
+ *   GET  /bug-workflow/api/snapshot  -> { ok, workspace, settings, platform, gitlab, dicts, analysis, fix, delivery, review, tickets, serverTime }
  *   POST /bug-workflow/api/action    -> { ok, ticket } | { ok:false, code, message, ticket? }
  *                                       (create + payload.code = 按编号从平台导入)
  *   POST /bug-workflow/api/analyze   -> { ok, workflow:'analyzing', running }
  *                                       (P3 real analysis; see below)
  *   POST /bug-workflow/api/fix       -> { ok, workflow:'fixing', running }
  *                                       (P4 real fix; see below)
+ *   POST /bug-workflow/api/deliver   -> { ok, workflow:'submitting', running }
+ *                                       (P5 delivery: lint/test → commit → push → MR)
  *   POST /bug-workflow/api/settings  -> { ok, settings }
  *   POST /bug-workflow/api/platform-token -> { ok, tokenPresent }
+ *   POST /bug-workflow/api/gitlab-token   -> { ok, tokenPresent } (P5 GitLab token)
  *   POST /bug-workflow/api/sync      -> { ok, synced, created, updated, total, filtered, lastSyncAt }
  *
  * Analysis wiring (P3 Task 2): one `createAgentRunner()` per fiber resolves the
@@ -38,6 +41,29 @@
  * answers 503 and the snapshot reports an empty `fix` block), and teardown
  * disposes/drains it together with the analysis service before the domain
  * closes.
+ *
+ * Delivery wiring (P5 Task 3): `createDeliveryService()` owns lint/test →
+ * commit → push → MR over the same store/git/clock and the GitLab token store
+ * from Task 1. The GitLab HTTP client is built PER WORKSPACE inside the
+ * service (`gitlabClientFor(settings)`), because `gitlabBaseUrl` is a
+ * per-workspace setting and `createGitlabClient` binds its base URL at
+ * construction; a per-request factory is the Task 2 review M4 contract (a
+ * single pre-built client would ignore later settings changes). Construction
+ * is non-fatal (the board still loads, `/deliver` answers 503 and the snapshot
+ * reports an empty `delivery` block), and teardown disposes/drains delivery
+ * alongside analysis/fix before the domain closes.
+ *
+ * Review wiring (P5 Task 4b): `createReviewService()` owns the 60 s AI Review
+ * poll, the review-fix job and merge/auto-archive. It is timer-driven (no HTTP
+ * route): `readTimer(storageCtx)` is read optionally, and an absent timer only
+ * disables polling (logged), never the board. It consumes the
+ * `delivery.context:<code>` meta written by delivery (the timer has no live
+ * session/workspace), reads the newest AI note, and shares the ONE
+ * `createRepoLock()` instance with delivery (`review:<code>` vs
+ * `delivery:<code>`), so git-writing jobs on one repository serialize.
+ * Construction is non-fatal (the snapshot `review` block stays empty), and
+ * teardown disposes/drains review BEFORE analysis/fix/delivery and before the
+ * domain closes.
  *
  * Sync wiring (P2 Task 4): `createSyncService()` reads the token from
  * `ctx.credentials`, maps platform tasks into the v2 ticket store, and persists
@@ -67,10 +93,17 @@
 import { closeDomain, openDomain, settingsSchema, ticketSchema } from './src/host/domain.js';
 import { createAgentRunner } from './src/host/agent-access.js';
 import { createAnalysisService } from './src/host/analysis-service.js';
+import {
+  createDeliveryService,
+  createRepoLock,
+  createShellExecCommand,
+} from './src/host/delivery-service.js';
 import { createFixService } from './src/host/fix-service.js';
 import { createGit } from './src/host/git.js';
-import { createTokenStore } from './src/host/credentials.js';
+import { createGitlabClient } from './src/host/gitlab.js';
+import { createTokenStore, GITLAB_TOKEN_REF } from './src/host/credentials.js';
 import { createPlatformClient } from './src/host/platform.js';
+import { createReviewService } from './src/host/review-service.js';
 import {
   registerRoutes,
   registerUnavailableRoutes,
@@ -111,6 +144,8 @@ export function apply(ctx) {
   // running analyses/fixes are aborted before the storage domain closes.
   let analysisService;
   let fixService;
+  let deliveryService;
+  let reviewService;
 
   // One runner per fiber. Resolving the optional delegation services lazily via
   // `ctx.get` keeps the plugin loadable in profiles without subagents/agents:
@@ -179,7 +214,16 @@ export function apply(ctx) {
         // `credentials` is read optionally rather than injected: hardening the
         // storage routes must not depend on a service the board can live
         // without. Absent credentials -> tokenPresent:false + 503 on writes.
-        const tokenStore = createTokenStore(readCredentials(storageCtx));
+        // One lookup backs both token stores (platform + GitLab).
+        const credentials = readCredentials(storageCtx);
+        const tokenStore = createTokenStore(credentials);
+        // P5: the GitLab token is a second, independent reference over the same
+        // optional credentials service. The token value never leaves it; the
+        // routes only read presence for the snapshot.
+        const gitlabTokenStore = createTokenStore(
+          credentials,
+          { ref: GITLAB_TOKEN_REF },
+        );
 
         // Sync engine: token from credentials, platform client over the
         // workspace's `platformBaseUrl`. `createPlatformClient` throws for an
@@ -214,13 +258,23 @@ export function apply(ctx) {
         // P4 fix orchestration. Same non-fatal policy: a broken git executor or
         // service construction leaves `/fix` at 503 and the snapshot `fix`
         // block empty instead of taking the board/analysis down.
+        //
+        // The git executor is shared with the P5 delivery service, so it is
+        // built once and a construction failure disables both features only.
+        let gitExecutor = null;
+        try {
+          gitExecutor = createGit();
+        } catch (error) {
+          logWarning(storageCtx, 'bug-workflow: git 执行器初始化失败', error);
+        }
+
         let fix = null;
         try {
-          const git = createGit();
+          if (gitExecutor === null) throw new Error('git executor unavailable');
           fixService = createFixService({
             store,
             runner,
-            git,
+            git: gitExecutor,
             getSettings: (cwd) => store.getSettings(cwd),
             clock,
           });
@@ -228,6 +282,80 @@ export function apply(ctx) {
         } catch (error) {
           fixService = undefined;
           logWarning(storageCtx, 'bug-workflow: 修复服务初始化失败', error);
+        }
+
+        // P5 delivery/review shared wiring. The GitLab client is built per
+        // workspace from the CURRENT settings (`gitlabBaseUrl` is per-workspace
+        // and the client binds it at construction); the factory is called inside
+        // the services, which map construction errors to static failures
+        // instead of failing the plugin load.
+        const gitlabClientFor = (settings) => createGitlabClient({
+          baseUrl: settings.gitlabBaseUrl,
+          tokenProvider: () => gitlabTokenStore.get(),
+        });
+        // One repository single-flight lock shared by delivery and the review
+        // fix job: owner `delivery:<code>` vs `review:<code>` on the same repo
+        // are mutually exclusive, so two git-writing jobs can never overlap.
+        const repoLock = createRepoLock();
+
+        let delivery = null;
+        try {
+          if (gitExecutor === null) throw new Error('git executor unavailable');
+          deliveryService = createDeliveryService({
+            store,
+            git: gitExecutor,
+            tokenStore: gitlabTokenStore,
+            gitlabClientFor,
+            clock,
+            lock: repoLock,
+            execCommand: createShellExecCommand(),
+          });
+          delivery = { service: deliveryService };
+        } catch (error) {
+          deliveryService = undefined;
+          logWarning(storageCtx, 'bug-workflow: 交付服务初始化失败', error);
+        }
+
+        // P5 AI Review polling + review-fix + merge/auto-archive. Timer-driven
+        // (no HTTP route), constructed non-fatally: a broken construction leaves
+        // the snapshot `review` block empty and the timer off, while delivery/
+        // fix/analysis keep working. `readTimer()` is optional — an absent timer
+        // service disables polling only (never the board).
+        try {
+          if (gitExecutor === null) throw new Error('git executor unavailable');
+          reviewService = createReviewService({
+            store,
+            git: gitExecutor,
+            runner,
+            tokenStore: gitlabTokenStore,
+            gitlabClientFor,
+            clock,
+            lock: repoLock,
+            getSettings: (cwd) => store.getSettings(cwd),
+            log: (entry) => logWarning(
+              storageCtx,
+              `bug-workflow: Review ${entry?.event ?? 'tick'} 失败`,
+              entry?.error,
+            ),
+          });
+        } catch (error) {
+          reviewService = undefined;
+          logWarning(storageCtx, 'bug-workflow: Review 服务初始化失败', error);
+        }
+        let review = reviewService === undefined ? null : { service: reviewService };
+        if (review !== null) {
+          const timer = readTimer(storageCtx);
+          if (timer === null) {
+            logWarning(storageCtx, 'bug-workflow: timer service unavailable, review polling disabled');
+          } else {
+            try {
+              reviewService.start(timer);
+            } catch (error) {
+              // A broken timer service only disables polling; the snapshot
+              // `review` block (status/errors) still works.
+              logWarning(storageCtx, 'bug-workflow: Review 轮询启动失败', error);
+            }
+          }
         }
 
         // Automatic sync is registered BEFORE the real routes are mounted: if
@@ -241,6 +369,7 @@ export function apply(ctx) {
           store,
           workspace,
           tokenStore,
+          gitlabTokenStore,
           sync,
           // By-code import shares the sync service's token/settings/platform
           // client wiring. Guarding the method keeps an older/sync-less build
@@ -250,6 +379,8 @@ export function apply(ctx) {
             : null,
           analysis,
           fix,
+          delivery,
+          review,
           clock,
           domainOpenedAt: handle.openedAt,
           // Full request errors stay in the host log; only clipped summaries
@@ -260,11 +391,14 @@ export function apply(ctx) {
         if (!mounted) {
           // The fiber was disposed while the domain was opening; no request can
           // reach these handlers any more, so release the domain immediately
-          // instead of leaving a handle behind. Drain any analysis/fix job
-          // before closing the domain so an in-flight job write cannot land on
-          // it.
+          // instead of leaving a handle behind. Drain any review/analysis/fix/
+          // delivery job before closing the domain so an in-flight job write
+          // cannot land on it (the review poller uses the same repo lock as
+          // delivery, so it is stopped first).
+          await reviewService?.dispose();
           await analysisService?.dispose();
           await fixService?.dispose();
+          await deliveryService?.dispose();
           await closeDomain(handle);
           return handle;
         }
@@ -276,8 +410,13 @@ export function apply(ctx) {
       } catch (error) {
         // Release a domain that opened but could not be attached to a store (or
         // to routes); otherwise the facility would report `already-open` on
-        // every reload. Abort and drain any analysis/fix job first; it may
-        // still write through the store.
+        // every reload. Abort and drain any review/analysis/fix/delivery job
+        // first; it may still write through the store.
+        try {
+          await reviewService?.dispose();
+        } catch {
+          // Teardown must continue regardless.
+        }
         try {
           await analysisService?.dispose();
         } catch {
@@ -285,6 +424,11 @@ export function apply(ctx) {
         }
         try {
           await fixService?.dispose();
+        } catch {
+          // Teardown must continue regardless.
+        }
+        try {
+          await deliveryService?.dispose();
         } catch {
           // Teardown must continue regardless.
         }
@@ -317,10 +461,16 @@ export function apply(ctx) {
     // a late successful open; `closeDomain` is idempotent.
     storageCtx.effect(
       () => async () => {
-        // Abort and drain running analyses/fixes first: their background jobs
-        // may still write through the store, and the domain must not close
-        // under a live job. Both drains are bounded, so a stuck runner cannot
-        // hang unload.
+        // Abort and drain running services first: their background jobs may
+        // still write through the store, and the domain must not close under a
+        // live job. The review poller is stopped first (it shares the repo lock
+        // with delivery). Every drain is bounded, so a stuck runner/command
+        // cannot hang unload.
+        try {
+          await reviewService?.dispose();
+        } catch {
+          // Disposal is best-effort; the domain teardown still has to run.
+        }
         try {
           await analysisService?.dispose();
         } catch {
@@ -328,6 +478,11 @@ export function apply(ctx) {
         }
         try {
           await fixService?.dispose();
+        } catch {
+          // Disposal is best-effort; the domain teardown still has to run.
+        }
+        try {
+          await deliveryService?.dispose();
         } catch {
           // Disposal is best-effort; the domain teardown still has to run.
         }

@@ -81,11 +81,17 @@ export const MAX_ACTION_RESULTS = 500;
 export const PLATFORM_DICTS_KEY = 'platform.dicts';
 
 /**
- * Ticket fields `patchTicket()` is allowed to change. P4 only needs the git
- * branch/worktree metadata and the fix-run ledger; every workflow transition
- * still goes through `applyAction()`/the state machine.
+ * Ticket fields `patchTicket()` is allowed to change. P4 needed the git
+ * branch/worktree metadata and the fix-run ledger; P5 adds the delivery
+ * metadata (`mr`) and the review-round ledger (`reviewRounds`). Every workflow
+ * transition still goes through `applyAction()`/the state machine.
  */
-export const PATCHABLE_TICKET_FIELDS = Object.freeze(['branch', 'fixes']);
+export const PATCHABLE_TICKET_FIELDS = Object.freeze([
+  'branch',
+  'fixes',
+  'mr',
+  'reviewRounds',
+]);
 
 /** Dictionary groups exposed by `/snapshot`; every group is always an array. */
 export const DICT_GROUPS = Object.freeze(['status', 'type', 'priority']);
@@ -105,6 +111,10 @@ const SYNCED_TICKET_FIELDS = Object.freeze([
 export const DEFAULT_SETTINGS = Object.freeze({
   platformBaseUrl: 'https://ecard.htwisdom.cn',
   platformProjectCode: '',
+  // P5 GitLab API root. Added without a domain bump: the settings schema is a
+  // looseObject built from this object, so an older row without the key reads
+  // the default here and on open.
+  gitlabBaseUrl: 'https://git.htwisdom.cn',
   gitlabProjectPath: '',
   branchUser: 'ly',
   gitlabReviewer: '',
@@ -417,13 +427,14 @@ export function createStore(domain, clock = defaultClock, options = {}) {
   }
 
   /**
-   * Patch whitelisted metadata fields of an existing ticket (P4).
+   * Patch whitelisted metadata fields of an existing ticket (P4/P5).
    *
    * `fix-service` owns the ticket lifecycle, but `branch`/`fixes` are not a
    * state transition: they are git worktree metadata and the fix-run ledger.
    * This method is the only supported way to persist them, so they still pass
-   * the write queue and the domain schema. Everything else (workflow, plan,
-   * blocked fields, ...) must go through `applyAction()`.
+   * the write queue and the domain schema. P5 extends the same mechanism to
+   * `mr` and `reviewRounds`. Everything else (workflow, plan, blocked fields,
+   * ...) must go through `applyAction()`.
    *
    * Queued as a whole: the actionId replay check, ticket read, expected
    * workflow guard, merge and put are one critical section. Unknown fields are
@@ -432,16 +443,19 @@ export function createStore(domain, clock = defaultClock, options = {}) {
    * the action ledger untouched), `updatedAt` is bumped and exactly one static
    * timeline event is appended:
    *
-   *   branch present -> kind `worktree`, actor `system`
-   *   fixes present  -> kind `fix-run`,  actor `agent`
+   *   branch present      -> kind `worktree`, actor `system`
+   *   else fixes present  -> kind `fix-run`,  actor `agent`
+   *   else (mr/rounds)    -> kind `patch`,    actor `system`
    *
-   * When both are present the call is still one event; `branch` wins because it
-   * is the prerequisite of the run.
+   * When several fields are present the call is still one event; the order is
+   * `branch` > `fixes` > `patch`. This is what stops an `mr`-only delivery
+   * patch from claiming "AI 修复已执行".
    *
    * @param {string} rawCode ticket code
-   * @param {{branch?: object|null, fixes?: object[]}} patch whitelisted fields
-   *   (`fixes` entries are validated by the domain `ticketSchema` at the write
-   *   boundary, i.e. the injected `checkTicket()` validator)
+   * @param {{branch?: object|null, fixes?: object[], mr?: object|null,
+   *   reviewRounds?: object[]}} patch whitelisted fields (`fixes` entries and
+   *   `mr` are validated by the domain `ticketSchema` at the write boundary,
+   *   i.e. the injected `checkTicket()` validator)
    * @param {{actionId?: string, expectedWorkflow?: string}} [options]
    *   idempotency key and optional in-queue workflow guard (same semantics as
    *   `applyAction()`; a stale guard writes neither the ticket nor the ledger)
@@ -488,7 +502,10 @@ export function createStore(domain, clock = defaultClock, options = {}) {
       // Checking every key (not just the known ones) makes an attempt to patch
       // `workflow`/`plan` an explicit error instead of a silent no-op.
       if (!PATCHABLE_TICKET_FIELDS.includes(field)) {
-        return failure('invalid-input', 'patchTicket 只允许修改 branch 与 fixes');
+        return failure(
+          'invalid-input',
+          'patchTicket 只允许修改 branch、fixes、mr 与 reviewRounds',
+        );
       }
       if (patch[field] === undefined) {
         return failure('invalid-input', 'patch 字段不能为 undefined');
@@ -499,6 +516,17 @@ export function createStore(domain, clock = defaultClock, options = {}) {
     }
     if (patch.branch !== undefined && patch.branch !== null && !isPlainObject(patch.branch)) {
       return failure('invalid-input', 'branch 必须是普通对象或 null');
+    }
+    if (patch.mr !== undefined && patch.mr !== null && !isPlainObject(patch.mr)) {
+      return failure('invalid-input', 'mr 必须是普通对象或 null');
+    }
+    if (patch.reviewRounds !== undefined) {
+      if (!Array.isArray(patch.reviewRounds)) {
+        return failure('invalid-input', 'reviewRounds 必须是对象数组');
+      }
+      if (!patch.reviewRounds.every(isReviewRoundEntry)) {
+        return failure('invalid-input', 'reviewRounds 条目字段不合法');
+      }
     }
 
     const found = readTicket(code);
@@ -519,15 +547,20 @@ export function createStore(domain, clock = defaultClock, options = {}) {
     const next = cloneTicket(found.ticket);
     for (const field of fields) next[field] = structuredClone(patch[field]);
     next.updatedAt = at;
-    const hasBranch = Object.prototype.hasOwnProperty.call(patch, 'branch');
+    // Exactly one timeline event per patch. Order: branch (worktree created) >
+    // fixes (AI run recorded) > patch (delivery metadata update). An `mr`-only
+    // patch must never look like a fix run.
+    let event;
+    if (Object.prototype.hasOwnProperty.call(patch, 'branch')) {
+      event = { kind: 'worktree', actor: 'system', message: '已创建个人分支与工作树' };
+    } else if (Object.prototype.hasOwnProperty.call(patch, 'fixes')) {
+      event = { kind: 'fix-run', actor: 'agent', message: 'AI 修复已执行' };
+    } else {
+      event = { kind: 'patch', actor: 'system', message: '交付信息已更新' };
+    }
     next.timeline = [
       ...(Array.isArray(next.timeline) ? next.timeline : []),
-      {
-        at,
-        kind: hasBranch ? 'worktree' : 'fix-run',
-        actor: hasBranch ? 'system' : 'agent',
-        message: hasBranch ? '已创建个人分支与工作树' : 'AI 修复已执行',
-      },
+      { at, ...event },
     ];
 
     const checked = checkTicket(next);
@@ -989,6 +1022,60 @@ function isStateError(error) {
 
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * `reviewRounds` is the review-run ledger (P5 Task 4): one entry per review
+ * round, appended by `patchTicket()` after the review-fix run. The domain
+ * `ticketSchema` models the same shape (`domain-spec.js`); keep both in sync.
+ * This dependency-free check is the store's write-boundary gate so a malformed
+ * patch is rejected even when no domain validator is injected (fake domains).
+ */
+const REVIEW_ROUND_VERDICTS = new Set(['pass', 'changes', 'unknown']);
+const REVIEW_ROUND_STATUSES = new Set(['succeeded', 'failed', 'cancelled']);
+const REVIEW_ROUND_TEXT_MAX = 64;
+const REVIEW_ROUND_CHILD_ID_MAX = 200;
+const REVIEW_ROUND_CHANGED_FILES_MAX = 2_000;
+const REVIEW_ROUND_FILE_MAX = 4_096;
+
+/**
+ * One review-round entry: `{round int>=0, noteId number|string, verdict
+ * 'pass'|'changes'|'unknown', startedAt, finishedAt, changedFiles string[],
+ * status 'succeeded'|'failed'|'cancelled', childId?}` with bounded strings and
+ * arrays. Anything else would poison the board/retry logic after write.
+ *
+ * @param {unknown} entry
+ * @returns {boolean}
+ */
+export function isReviewRoundEntry(entry) {
+  if (!isPlainObject(entry)) return false;
+  if (!Number.isSafeInteger(entry.round) || entry.round < 0) return false;
+  if (typeof entry.noteId === 'number') {
+    if (!Number.isFinite(entry.noteId)) return false;
+  } else if (typeof entry.noteId !== 'string') {
+    return false;
+  }
+  if (!REVIEW_ROUND_VERDICTS.has(entry.verdict)) return false;
+  if (!isBoundedText(entry.startedAt, REVIEW_ROUND_TEXT_MAX)) return false;
+  if (!isBoundedText(entry.finishedAt, REVIEW_ROUND_TEXT_MAX)) return false;
+  if (!Array.isArray(entry.changedFiles)) return false;
+  if (entry.changedFiles.length > REVIEW_ROUND_CHANGED_FILES_MAX) return false;
+  if (!entry.changedFiles.every((file) => typeof file === 'string' && file.length <= REVIEW_ROUND_FILE_MAX)) {
+    return false;
+  }
+  if (!REVIEW_ROUND_STATUSES.has(entry.status)) return false;
+  if (
+    entry.childId !== undefined
+    && !isBoundedText(entry.childId, REVIEW_ROUND_CHILD_ID_MAX)
+  ) {
+    return false;
+  }
+  return true;
+}
+
+/** Non-empty string with a length cap (timestamps/ids). */
+function isBoundedText(value, max) {
+  return typeof value === 'string' && value.length > 0 && value.length <= max;
 }
 
 function errorMessage(error) {

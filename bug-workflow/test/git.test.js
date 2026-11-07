@@ -50,7 +50,10 @@ import test from 'node:test';
 import {
   DEFAULT_GIT_TIMEOUT_MS,
   DIFF_TRUNCATED_MARKER,
+  GitError,
+  PUSH_TIMEOUT_MS,
   WORKTREE_DIR,
+  assertPushableBranch,
   createGit,
   worktreePath,
 } from '../src/host/git.js';
@@ -236,6 +239,38 @@ test('a plain directory inside the repo is not mistaken for a registered worktre
   const listed = gitSync(repo, ['worktree', 'list', '--porcelain']);
   assert.ok(!listed.includes(realpathSync(blocked)));
   assert.ok(listed.includes(realpathSync(empty)));
+});
+
+test('an external worktree on the same branch maps to worktree-conflict, not git-failed', async (t) => {
+  const fixture = makeFixture();
+  t.after(fixture.cleanup);
+  const { git, repo } = fixture;
+
+  const first = productPath(repo, 'feat-V1-shared');
+  assert.deepEqual(
+    await git.worktreeAdd({ repo, path: first, branch: 'feat-V1-shared', base: 'main' }),
+    { created: true },
+  );
+
+  // A user manually checked the same personal branch out in another worktree.
+  // `git worktree add` refuses with a raw error; the executor must diagnose the
+  // real condition (409 worktree-conflict) instead of an opaque git-failed.
+  const second = productPath(repo, 'feat-V1-second');
+  const result = await git.worktreeAdd({
+    repo,
+    path: second,
+    branch: 'feat-V1-shared',
+    base: 'main',
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'worktree-conflict');
+  assert.equal(result.message, '个人分支已在其它工作树中检出，请先清理该工作树');
+  assert.equal(result.command, 'git worktree add');
+  assert.equal(existsSync(second), false);
+  assert.deepEqual(await git.probeWorktree(repo, second, 'feat-V1-shared'), {
+    ok: true,
+    state: 'absent',
+  });
 });
 
 test('worktreeAdd re-adds a retained branch after worktreeRemove', async (t) => {
@@ -548,4 +583,301 @@ test('worktreePath only accepts a safe ticket code', () => {
     assert.equal(result.ok, false);
     assert.equal(result.code, 'invalid-worktree-path');
   }
+});
+
+// ---------------------------------------------------------------------------
+// P5: public worktree inspection, push safety, commit/push
+// ---------------------------------------------------------------------------
+
+/** Build a local bare repository to act as `origin`; no network is used. */
+function makeBareOrigin(root) {
+  const origin = join(root, 'origin.git');
+  mkdirSync(origin);
+  execFileSync('git', ['init', '--bare', '-q', origin], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  return origin;
+}
+
+test('listWorktrees/probeWorktree are public and map registered worktrees', async (t) => {
+  const fixture = makeFixture();
+  t.after(fixture.cleanup);
+  const { git, repo } = fixture;
+
+  const worktree = productPath(repo, 'feat-V1-probe');
+  assert.deepEqual(
+    await git.worktreeAdd({ repo, path: worktree, branch: 'feat-V1-probe', base: 'main' }),
+    { created: true },
+  );
+
+  const listed = await git.listWorktrees(repo);
+  assert.equal(listed.ok, true);
+  const paths = listed.entries.map((entry) => realpathSync(entry.path));
+  assert.ok(paths.includes(realpathSync(repo)), 'main worktree is listed');
+  assert.ok(paths.includes(realpathSync(worktree)), 'linked worktree is listed');
+  const entry = listed.entries.find((item) => realpathSync(item.path) === realpathSync(worktree));
+  assert.equal(entry.branch, 'refs/heads/feat-V1-probe');
+
+  assert.deepEqual(await git.probeWorktree(repo, worktree, 'feat-V1-probe'), {
+    ok: true,
+    state: 'same',
+  });
+  assert.deepEqual(await git.probeWorktree(repo, worktree, 'other-branch'), {
+    ok: true,
+    state: 'different',
+  });
+  assert.deepEqual(
+    await git.probeWorktree(repo, join(repo, WORKTREE_DIR, 'MISSING-1'), 'feat-V1-probe'),
+    { ok: true, state: 'absent' },
+  );
+
+  const plain = join(repo, WORKTREE_DIR, 'PLAIN-1');
+  mkdirSync(plain, { recursive: true });
+  assert.deepEqual(await git.probeWorktree(repo, plain, 'feat-V1-probe'), {
+    ok: true,
+    state: 'unregistered',
+  });
+
+  // A probe on a non-repository is a structured git failure, not "absent".
+  const notRepo = await git.listWorktrees(join(fixture.root, 'nope'));
+  assert.equal(notRepo.ok, false);
+  assert.equal(notRepo.code, 'git-failed');
+  assert.equal(notRepo.command, 'git worktree list --porcelain');
+});
+
+test('assertPushableBranch rejects every protected family and accepts personal branches', () => {
+  const protectedNames = [
+    'main',
+    'MAIN',
+    'dev',
+    'Dev',
+    'master',
+    'develop',
+    'feature-V1',
+    'Feature-X',
+    'feature/x',
+    'hotfix-1',
+    'release-2',
+    'refs/heads/main',
+    'refs/heads/feature-V1',
+    'refs/heads/Release-2',
+  ];
+  for (const name of protectedNames) {
+    assert.throws(
+      () => assertPushableBranch(name),
+      (error) => error instanceof GitError && error.code === 'protected-branch',
+      `expected protected branch rejection for ${name}`,
+    );
+  }
+
+  const invalidNames = [
+    '',
+    '   ',
+    undefined,
+    null,
+    42,
+    '-x',
+    'bad ref',
+    'a..b',
+    'a.lock',
+    'refs/heads/',
+    // Only branch refs may be pushed; a tag/remote ref would smuggle a
+    // non-branch refspec into `git push`.
+    'refs/tags/v1.0.0',
+    'refs/remotes/origin/main',
+  ];
+  for (const name of invalidNames) {
+    assert.throws(
+      () => assertPushableBranch(name),
+      (error) => error instanceof GitError && error.code === 'invalid-branch',
+      `expected invalid branch rejection for ${JSON.stringify(name)}`,
+    );
+  }
+
+  // Personal branches and other non-protected names are allowed; the refs/heads/
+  // form is normalized so callers always push the plain branch name.
+  assert.equal(assertPushableBranch('feat-V1.6.1-ly'), 'feat-V1.6.1-ly');
+  assert.equal(assertPushableBranch('hot-V1-ly'), 'hot-V1-ly');
+  assert.equal(assertPushableBranch('feat-custom-user'), 'feat-custom-user');
+  assert.equal(assertPushableBranch('bugfix-123'), 'bugfix-123');
+  assert.equal(assertPushableBranch('refs/heads/feat-V1-ly'), 'feat-V1-ly');
+});
+
+test('revParse resolves a full sha and reports missing/invalid refs statically', async (t) => {
+  const fixture = makeFixture();
+  t.after(fixture.cleanup);
+  const { git, repo } = fixture;
+
+  const head = await git.revParse(repo, 'HEAD');
+  assert.equal(typeof head, 'string');
+  assert.match(head, /^[0-9a-f]{40}$/);
+  assert.equal(head, gitSync(repo, ['rev-parse', 'HEAD']));
+
+  const missing = await git.revParse(repo, 'does-not-exist');
+  assert.equal(missing.ok, false);
+  assert.equal(missing.code, 'git-failed');
+  assert.equal(missing.command, 'git rev-parse');
+
+  const invalid = await git.revParse(repo, 'bad ref');
+  assert.equal(invalid.ok, false);
+  assert.equal(invalid.code, 'git-failed');
+  assert.equal(invalid.message, 'git 命令参数不合法');
+  assert.equal(invalid.command, 'git rev-parse');
+});
+
+test('commitAll creates one commit with the exact message and refuses an empty commit', async (t) => {
+  const fixture = makeFixture();
+  t.after(fixture.cleanup);
+  const { git, repo } = fixture;
+
+  const worktree = productPath(repo, 'feat-V1-commit');
+  assert.deepEqual(
+    await git.worktreeAdd({ repo, path: worktree, branch: 'feat-V1-commit', base: 'main' }),
+    { created: true },
+  );
+  const before = gitSync(worktree, ['rev-list', '--count', 'HEAD']);
+
+  writeFileSync(join(worktree, 'readme.md'), 'hello\nchanged\n');
+  writeFileSync(join(worktree, 'new-file.txt'), 'new\n');
+  // Shell metacharacters in the message must stay literal: an argv array is
+  // used, never a shell string.
+  const message = 'fix: 【jira单号】：BUG-1，【开发内容】：修复登录 $(touch PWNED) ; echo hi';
+  const committed = await git.commitAll({ root: worktree, message });
+
+  assert.equal(committed.ok, true);
+  assert.match(committed.sha, /^[0-9a-f]{40}$/);
+  assert.equal(gitSync(worktree, ['log', '-1', '--format=%B']), message);
+  assert.equal(gitSync(worktree, ['status', '--porcelain']), '');
+  assert.equal(existsSync(join(worktree, 'PWNED')), false);
+  assert.equal(gitSync(worktree, ['rev-list', '--count', 'HEAD']), String(Number(before) + 1));
+
+  // No changes -> sha null, no empty commit.
+  const again = await git.commitAll({ root: worktree, message: 'fix: empty' });
+  assert.deepEqual(again, { ok: true, sha: null });
+  assert.equal(gitSync(worktree, ['rev-list', '--count', 'HEAD']), String(Number(before) + 1));
+});
+
+test('commitAll passes the message as one argv element and never spawns a shell', async () => {
+  const calls = [];
+  const fakeGit = createGit({
+    execFile: async (file, args, options) => {
+      calls.push({ file, args, options });
+      if (args.includes('add')) return { stdout: '', stderr: '' };
+      if (args.includes('--cached')) {
+        throw Object.assign(new Error('changes'), { code: 1, signal: null });
+      }
+      if (args.includes('commit')) return { stdout: '', stderr: '' };
+      if (args.includes('rev-parse')) return { stdout: `${'a'.repeat(40)}\n`, stderr: '' };
+      return { stdout: '', stderr: '' };
+    },
+  });
+
+  const message = 'fix: 【jira单号】：BUG-1，【开发内容】：$(touch pwned); rm -rf /';
+  const result = await fakeGit.commitAll({ root: '/tmp/fake-worktree', message });
+  assert.deepEqual(result, { ok: true, sha: 'a'.repeat(40) });
+
+  const commitCall = calls.find((call) => call.args.includes('commit'));
+  assert.deepEqual(commitCall.args, ['-C', '/tmp/fake-worktree', 'commit', '-m', message]);
+  assert.equal(commitCall.options.shell, undefined);
+
+  // Invalid messages never reach git.
+  const noCalls = [];
+  const strictGit = createGit({
+    execFile: async (file, args) => {
+      noCalls.push(args);
+      return { stdout: '' };
+    },
+  });
+  for (const bad of ['', '   ', null, 42, 'a\u0000b']) {
+    const rejected = await strictGit.commitAll({ root: '/tmp/fake-worktree', message: bad });
+    assert.equal(rejected.ok, false, String(bad));
+    assert.equal(rejected.code, 'git-failed');
+    assert.equal(rejected.message, '提交信息不合法');
+  }
+  assert.equal(noCalls.length, 0);
+});
+
+test('pushBranch pushes to a local bare origin, sets upstream and never forces', async (t) => {
+  const fixture = makeFixture();
+  t.after(fixture.cleanup);
+  const { git, repo, root } = fixture;
+  const origin = makeBareOrigin(root);
+  gitSync(repo, ['remote', 'add', 'origin', origin]);
+
+  const worktree = productPath(repo, 'feat-V1-push');
+  assert.deepEqual(
+    await git.worktreeAdd({ repo, path: worktree, branch: 'feat-V1-push', base: 'main' }),
+    { created: true },
+  );
+  writeFileSync(join(worktree, 'readme.md'), 'hello\npush me\n');
+  const committed = await git.commitAll({ root: worktree, message: 'fix: 【jira单号】：BUG-1' });
+  assert.equal(committed.ok, true);
+
+  const pushed = await git.pushBranch({ root: worktree, remote: 'origin', branch: 'feat-V1-push' });
+  assert.deepEqual(pushed, { ok: true, branch: 'feat-V1-push', remote: 'origin' });
+  assert.equal(
+    gitSync(worktree, ['rev-parse', '--abbrev-ref', '@{upstream}']),
+    'origin/feat-V1-push',
+  );
+  assert.equal(
+    execFileSync('git', ['--git-dir', origin, 'rev-parse', '--verify', 'refs/heads/feat-V1-push'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim(),
+    committed.sha,
+  );
+
+  // Protected branches are rejected before git runs; nothing is spawned.
+  const calls = [];
+  const fakeGit = createGit({
+    execFile: async (file, args, options) => {
+      calls.push({ args, options });
+      return { stdout: '' };
+    },
+  });
+  for (const branch of ['main', 'refs/heads/main', 'feature-V1', 'hotfix-1', 'release-1']) {
+    const rejected = await fakeGit.pushBranch({ root: '/tmp/fake-worktree', branch });
+    assert.equal(rejected.ok, false, branch);
+    assert.equal(rejected.code, 'protected-branch', branch);
+    assert.equal(rejected.command, 'git push -u', branch);
+  }
+  assert.equal(calls.length, 0);
+
+  // Exact argv + 60 s budget for a pushable branch, and no force flag.
+  const allowed = await fakeGit.pushBranch({
+    root: '/tmp/fake-worktree',
+    remote: 'origin',
+    branch: 'feat-V1-ly',
+  });
+  assert.deepEqual(allowed, { ok: true, branch: 'feat-V1-ly', remote: 'origin' });
+  assert.deepEqual(calls[0].args, [
+    '-C',
+    '/tmp/fake-worktree',
+    'push',
+    '-u',
+    'origin',
+    'feat-V1-ly',
+  ]);
+  assert.equal(calls[0].options.timeout, PUSH_TIMEOUT_MS);
+  assert.equal(calls[0].options.shell, undefined);
+  assert.ok(!calls[0].args.some((arg) => arg.includes('force')));
+
+  // A failed push is a static git failure with no child output leaked.
+  const failingGit = createGit({
+    execFile: async () => {
+      throw Object.assign(new Error('fatal: secret-remote-token'), {
+        code: 128,
+        stderr: 'secret-remote-token\n',
+      });
+    },
+  });
+  const failed = await failingGit.pushBranch({
+    root: '/tmp/fake-worktree',
+    branch: 'feat-V1-ly',
+  });
+  assert.equal(failed.ok, false);
+  assert.equal(failed.code, 'git-failed');
+  assert.equal(failed.command, 'git push -u');
+  assert.ok(!JSON.stringify(failed).includes('secret-remote-token'));
 });

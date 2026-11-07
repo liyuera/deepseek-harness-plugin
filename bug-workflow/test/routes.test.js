@@ -25,7 +25,7 @@ import {
   registerUnavailableRoutes,
 } from '../src/host/routes.js';
 import { createAnalysisService } from '../src/host/analysis-service.js';
-import { PLATFORM_TOKEN_REF, createTokenStore } from '../src/host/credentials.js';
+import { GITLAB_TOKEN_REF, MAX_TOKEN_LENGTH, PLATFORM_TOKEN_REF, createTokenStore } from '../src/host/credentials.js';
 import { DEFAULT_SETTINGS, createStore } from '../src/host/store.js';
 import { MAX_REVIEW_ROUNDS, initialTicket } from '../src/host/state-machine.js';
 import { resolveWorkspace } from '../src/host/workspace.js';
@@ -413,6 +413,14 @@ function fixBody(overrides = {}) {
   });
 }
 
+function deliverBody(overrides = {}) {
+  return JSON.stringify({
+    sessionId: SESSION_ID,
+    code: 'BUG-1',
+    ...overrides,
+  });
+}
+
 function settingsBody(overrides = {}) {
   return JSON.stringify({
     sessionId: SESSION_ID,
@@ -425,6 +433,14 @@ function platformTokenBody(overrides = {}) {
   return JSON.stringify({
     sessionId: SESSION_ID,
     token: 'p2-dummy-token',
+    ...overrides,
+  });
+}
+
+function gitlabTokenBody(overrides = {}) {
+  return JSON.stringify({
+    sessionId: SESSION_ID,
+    token: 'p5-dummy-gitlab-token',
     ...overrides,
   });
 }
@@ -538,6 +554,50 @@ function createFakeFix({ start, status } = {}) {
   };
 }
 
+/**
+ * Fake delivery service (P5). Same contract as `createFakeAnalysis`/
+ * `createFakeFix`: the route only consumes `start()`'s structured result and
+ * `status()`'s snapshot block.
+ */
+function createFakeDelivery({ start, status } = {}) {
+  const calls = { start: [], status: 0 };
+  return {
+    calls,
+    service: {
+      async start(sessionId, cwd, code) {
+        calls.start.push({ sessionId, cwd, code });
+        if (typeof start === 'function') return start(sessionId, cwd, code);
+        return { ok: true, running: true };
+      },
+      status() {
+        calls.status += 1;
+        if (typeof status === 'function') return status();
+        if (status !== undefined) return clone(status);
+        return { running: [], errors: {} };
+      },
+    },
+  };
+}
+
+/**
+ * Fake review service (P5 Task 4b). Review is timer-driven and exposes NO HTTP
+ * route, so the snapshot only consumes `status()`.
+ */
+function createFakeReview({ status } = {}) {
+  const calls = { status: 0 };
+  return {
+    calls,
+    service: {
+      status() {
+        calls.status += 1;
+        if (typeof status === 'function') return status();
+        if (status !== undefined) return clone(status);
+        return { running: [], errors: {} };
+      },
+    },
+  };
+}
+
 /** Fake credentials service used by the token-store integration. */
 function createFakeCredentials(initial = {}) {
   const values = new Map(Object.entries(initial));
@@ -576,10 +636,13 @@ function handlersWith({
   store = createFakeStore(),
   workspace = createWorkspace(),
   tokenStore = createTokenStore(createFakeCredentials()),
+  gitlabTokenStore = createTokenStore(createFakeCredentials(), { ref: GITLAB_TOKEN_REF }),
   sync,
   importTask,
   analysis,
   fix,
+  delivery,
+  review,
   clock = () => SERVER_TIME,
   domainOpenedAt = OPENED_AT,
 } = {}) {
@@ -596,22 +659,32 @@ function handlersWith({
   const analysisDeps = analysis === undefined ? createFakeAnalysis() : analysis;
   // Same convention for the P4 fix service.
   const fixDeps = fix === undefined ? createFakeFix() : fix;
+  // Same convention for the P5 delivery service.
+  const deliveryDeps = delivery === undefined ? createFakeDelivery() : delivery;
+  // And for the P5 timer-driven review service (snapshot only, no route).
+  const reviewDeps = review === undefined ? createFakeReview() : review;
   return {
     store,
     workspace,
     tokenStore,
+    gitlabTokenStore,
     sync: syncService,
     importTask: importTaskFn,
     analysis: analysisDeps,
     fix: fixDeps,
+    delivery: deliveryDeps,
+    review: reviewDeps,
     handlers: createHandlers({
       store,
       workspace,
       tokenStore,
+      gitlabTokenStore,
       sync: syncService,
       importTask: importTaskFn,
       analysis: analysisDeps,
       fix: fixDeps,
+      delivery: deliveryDeps,
+      review: reviewDeps,
       clock,
       domainOpenedAt,
     }),
@@ -715,9 +788,12 @@ test('GET /snapshot composes workspace, settings, tickets and serverTime', async
     workspace: { path: WORKSPACE, configured: true },
     settings: DEFAULT_SETTINGS,
     platform: { tokenPresent: false, lastSyncAt: null, lastSyncError: null },
+    gitlab: { tokenPresent: false },
     dicts: { status: [], type: [], priority: [] },
     analysis: { running: [], errors: {} },
     fix: { running: [], errors: {} },
+    delivery: { running: [], errors: {} },
+    review: { running: [], errors: {} },
     tickets: [ticket],
     serverTime: SERVER_TIME,
   });
@@ -751,6 +827,54 @@ test('GET /snapshot keeps tokenPresent false when credentials is unavailable', a
     lastSyncError: null,
   });
   assert.deepEqual(json.dicts, { status: [], type: [], priority: [] });
+});
+
+test('GET /snapshot reports gitlab.tokenPresent independently of the platform token', async () => {
+  const credentials = createFakeCredentials({ [GITLAB_TOKEN_REF]: 'p5-dummy-gitlab-token' });
+  const gitlabTokenStore = createTokenStore(credentials, { ref: GITLAB_TOKEN_REF });
+  const { handlers } = handlersWith({ gitlabTokenStore });
+  const { res, json } = await call(handlers.snapshot, { url: snapshotUrl() });
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(json.gitlab, { tokenPresent: true });
+  // A GitLab credential never leaks into (or lights up) the platform block.
+  assert.deepEqual(json.platform, {
+    tokenPresent: false,
+    lastSyncAt: null,
+    lastSyncError: null,
+  });
+  assert.equal(JSON.stringify(json).includes('p5-dummy-gitlab-token'), false);
+  // Presence is a status read: the snapshot never resolves the value.
+  assert.deepEqual(credentials.calls.resolve, []);
+});
+
+test('GET /snapshot degrades gitlab.tokenPresent to false when unwired or failing', async () => {
+  const unwired = await call(handlersWith({ gitlabTokenStore: null }).handlers.snapshot, {
+    url: snapshotUrl(),
+  });
+  assert.equal(unwired.res.statusCode, 200);
+  assert.deepEqual(unwired.json.gitlab, { tokenPresent: false });
+
+  const unavailable = await call(
+    handlersWith({
+      gitlabTokenStore: createTokenStore(undefined, { ref: GITLAB_TOKEN_REF }),
+    }).handlers.snapshot,
+    { url: snapshotUrl() },
+  );
+  assert.equal(unavailable.res.statusCode, 200);
+  assert.deepEqual(unavailable.json.gitlab, { tokenPresent: false });
+
+  const failing = {
+    async get() { return null; },
+    async set() {},
+    async clear() {},
+    async present() { throw new Error('credentials boom'); },
+  };
+  const failed = await call(handlersWith({ gitlabTokenStore: failing }).handlers.snapshot, {
+    url: snapshotUrl(),
+  });
+  assert.equal(failed.res.statusCode, 200);
+  assert.deepEqual(failed.json.gitlab, { tokenPresent: false });
 });
 
 test('GET /snapshot reports sync status and mapped dictionaries', async () => {
@@ -917,6 +1041,101 @@ test('GET /snapshot sanitizes malformed fix status fields', async () => {
   });
 });
 
+test('GET /snapshot reports the delivery running set and delivery-specific errors', async () => {
+  const delivery = createFakeDelivery({
+    status: {
+      running: ['BUG-4'],
+      errors: { 'BUG-1': '提交前 lint 未通过，请修复后重试' },
+    },
+  });
+  const { handlers } = handlersWith({ delivery });
+  const { res, json } = await call(handlers.snapshot, { url: snapshotUrl() });
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(json.delivery, {
+    running: ['BUG-4'],
+    errors: { 'BUG-1': '提交前 lint 未通过，请修复后重试' },
+  });
+  assert.equal(delivery.calls.status, 1);
+  // The delivery error block is parallel to fix; it never reuses fix errors.
+  assert.deepEqual(json.fix, { running: [], errors: {} });
+});
+
+test('GET /snapshot degrades delivery to empty when unwired or failing', async () => {
+  const unwired = await call(handlersWith({ delivery: null }).handlers.snapshot, {
+    url: snapshotUrl(),
+  });
+  assert.equal(unwired.res.statusCode, 200);
+  assert.deepEqual(unwired.json.delivery, { running: [], errors: {} });
+
+  const failing = createFakeDelivery({
+    status: () => {
+      throw new Error('delivery status unavailable');
+    },
+  });
+  const { res, json } = await call(handlersWith({ delivery: failing }).handlers.snapshot, {
+    url: snapshotUrl(),
+  });
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(json.delivery, { running: [], errors: {} });
+});
+
+test('GET /snapshot sanitizes malformed delivery status fields', async () => {
+  const delivery = createFakeDelivery({
+    status: {
+      running: ['BUG-2', '', 42],
+      errors: { 'BUG-1': '交付失败', 'BUG-3': null },
+    },
+  });
+  const { json } = await call(handlersWith({ delivery }).handlers.snapshot, {
+    url: snapshotUrl(),
+  });
+  assert.deepEqual(json.delivery, {
+    running: ['BUG-2'],
+    errors: { 'BUG-1': '交付失败' },
+  });
+});
+
+test('GET /snapshot reports the review running set and review-specific errors', async () => {
+  const review = createFakeReview({
+    status: {
+      running: ['BUG-7'],
+      errors: { 'BUG-2': 'AI Review 结论解析失败，请人工检查 MR 评论' },
+    },
+  });
+  const { handlers } = handlersWith({ review });
+  const { res, json } = await call(handlers.snapshot, { url: snapshotUrl() });
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(json.review, {
+    running: ['BUG-7'],
+    errors: { 'BUG-2': 'AI Review 结论解析失败，请人工检查 MR 评论' },
+  });
+  assert.equal(review.calls.status, 1);
+  // Review errors are their own namespace; delivery/fix stay empty.
+  assert.deepEqual(json.delivery, { running: [], errors: {} });
+  assert.deepEqual(json.fix, { running: [], errors: {} });
+});
+
+test('GET /snapshot degrades review to empty when unwired or failing', async () => {
+  const unwired = await call(handlersWith({ review: null }).handlers.snapshot, {
+    url: snapshotUrl(),
+  });
+  assert.equal(unwired.res.statusCode, 200);
+  assert.deepEqual(unwired.json.review, { running: [], errors: {} });
+
+  const failing = createFakeReview({
+    status: () => {
+      throw new Error('review status unavailable');
+    },
+  });
+  const { res, json } = await call(handlersWith({ review: failing }).handlers.snapshot, {
+    url: snapshotUrl(),
+  });
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(json.review, { running: [], errors: {} });
+});
+
 test('GET /snapshot returns an unbound workspace for an unknown live session', async () => {
   const ticket = inboxTicket('BUG-1');
   const { store, handlers } = handlersWith({ store: createFakeStore({ tickets: [ticket] }) });
@@ -975,6 +1194,194 @@ test('POST /action advances a ticket (start_analysis)', async () => {
   assert.equal(res.statusCode, 200);
   assert.equal(json.ticket.workflow, 'analyzing');
   assert.equal(json.ticket.timeline.at(-1).kind, 'start_analysis');
+});
+
+// ---------------------------------------------------------------------------
+// Service-owned demo action guard (P5 Task 5): a raw `/action analysis_done` /
+// `/action fix_done` must not advance a ticket while the real background job is
+// running for that code — otherwise the service's own conditional write turns
+// into `stale-workflow` and the run's ledger is lost.
+// ---------------------------------------------------------------------------
+
+/** Fake store whose `applyAction` succeeds without a state-machine check. */
+function legacyActionStore() {
+  return createFakeStore({
+    applyAction: (code, action) => ({
+      ok: true,
+      ticket: { ...inboxTicket(code), workflow: action === 'analysis_done' ? 'plan_review' : 'fix_done' },
+    }),
+  });
+}
+
+test('POST /action refuses analysis_done while the real analysis job runs for that code', async () => {
+  const store = createFakeStore({ tickets: [{ ...inboxTicket('BUG-1'), workflow: 'analyzing' }] });
+  const analysis = createFakeAnalysis({ status: { running: ['BUG-1'], errors: {} } });
+  const fix = createFakeFix();
+  const { handlers } = handlersWith({ store, analysis, fix });
+  const { res, json } = await call(handlers.action, {
+    method: 'POST',
+    url: API_PATHS.action,
+    body: actionBody({ action: 'analysis_done', actionId: 'act-guard-analysis' }),
+  });
+
+  assert.equal(res.statusCode, 409);
+  assert.equal(json.ok, false);
+  assert.equal(json.code, 'service-job-running');
+  assert.match(json.message, /AI 任务正在运行/);
+  assert.equal(json.ticket, undefined, 'the refusal must not echo a ticket');
+  assert.equal(store.calls.applyAction.length, 0, 'the guard must run before the store write');
+  assert.equal(analysis.calls.status, 1);
+  assert.equal(fix.calls.status, 0, 'analysis_done must never read the fix service status');
+});
+
+test('POST /action refuses fix_done while the real fix job runs for that code', async () => {
+  const store = createFakeStore({ tickets: [{ ...inboxTicket('BUG-1'), workflow: 'fixing' }] });
+  const fix = createFakeFix({ status: { running: ['BUG-1'], errors: {} } });
+  const analysis = createFakeAnalysis();
+  const { handlers } = handlersWith({ store, analysis, fix });
+  const { res, json } = await call(handlers.action, {
+    method: 'POST',
+    url: API_PATHS.action,
+    body: actionBody({ action: 'fix_done', actionId: 'act-guard-fix' }),
+  });
+
+  assert.equal(res.statusCode, 409);
+  assert.equal(json.code, 'service-job-running');
+  assert.equal(store.calls.applyAction.length, 0);
+  assert.equal(fix.calls.status, 1);
+  assert.equal(analysis.calls.status, 0, 'fix_done must never read the analysis service status');
+});
+
+test('POST /action keeps the legacy path when another code is running or another action is sent', async () => {
+  const store = legacyActionStore();
+  const analysis = createFakeAnalysis({ status: { running: ['BUG-OTHER'], errors: {} } });
+  const { handlers } = handlersWith({ store, analysis });
+
+  const otherCode = await call(handlers.action, {
+    method: 'POST',
+    url: API_PATHS.action,
+    body: actionBody({ action: 'analysis_done', actionId: 'act-guard-other-code' }),
+  });
+  assert.equal(otherCode.res.statusCode, 200, 'a job for another ticket must not gate this one');
+  assert.equal(otherCode.json.ticket.workflow, 'plan_review');
+  assert.equal(store.calls.applyAction.length, 1);
+
+  // Only the two service-owned demo actions are guarded: `start_analysis`
+  // bypasses nothing (it is the P1 demo entry point, not a service result).
+  const otherAction = await call(handlers.action, {
+    method: 'POST',
+    url: API_PATHS.action,
+    body: actionBody({ action: 'start_analysis', actionId: 'act-guard-other-action' }),
+  });
+  assert.equal(otherAction.res.statusCode, 200);
+  assert.equal(store.calls.applyAction.length, 2);
+  assert.deepEqual(store.calls.applyAction.map((entry) => entry.action), ['analysis_done', 'start_analysis']);
+  assert.equal(analysis.calls.status, 1, 'only the guarded action reads the live service status');
+});
+
+test('POST /action keeps the legacy path when the service is unwired or its status throws', async () => {
+  const throwStatus = () => {
+    throw new Error('service status unavailable');
+  };
+
+  const cases = [
+    { name: 'analysis unwired', deps: { analysis: null }, action: 'analysis_done' },
+    { name: 'fix unwired', deps: { fix: null }, action: 'fix_done' },
+    { name: 'analysis status throws', deps: { analysis: createFakeAnalysis({ status: throwStatus }) }, action: 'analysis_done' },
+    { name: 'fix status throws', deps: { fix: createFakeFix({ status: throwStatus }) }, action: 'fix_done' },
+  ];
+
+  for (const entry of cases) {
+    const store = legacyActionStore();
+    const { handlers } = handlersWith({ store, ...entry.deps });
+    const { res, json } = await call(handlers.action, {
+      method: 'POST',
+      url: API_PATHS.action,
+      body: actionBody({ action: entry.action, actionId: `act-guard-${entry.action}` }),
+    });
+    assert.equal(res.statusCode, 200, `${entry.name} must keep the legacy path`);
+    assert.equal(json.ok, true, entry.name);
+    assert.equal(store.calls.applyAction.length, 1, `${entry.name} must still reach the store`);
+  }
+});
+
+test('POST /action keeps the legacy path for malformed service.status() results', async () => {
+  // `serviceJobRunningFor()` fail-opens on any shape other than a plain object
+  // with a string-only `running` array: malformed status must never turn into
+  // the new 409 failure mode for older/broken wiring.
+  const statuses = [
+    { name: 'null', status: null },
+    { name: 'array', status: [] },
+    { name: 'plain object without running', status: {} },
+    { name: 'non-array running', status: { running: 'BUG-1' } },
+    { name: 'null running', status: { running: null } },
+    { name: 'non-string running entry', status: { running: [42] } },
+    { name: 'code plus a non-string entry', status: { running: [1, 'BUG-1'] } },
+  ];
+
+  for (const entry of statuses) {
+    for (const action of ['analysis_done', 'fix_done']) {
+      const store = legacyActionStore();
+      const analysis = createFakeAnalysis({ status: action === 'analysis_done' ? entry.status : { running: [], errors: {} } });
+      const fix = createFakeFix({ status: action === 'fix_done' ? entry.status : { running: [], errors: {} } });
+      const { handlers } = handlersWith({ store, analysis, fix });
+      const { res, json } = await call(handlers.action, {
+        method: 'POST',
+        url: API_PATHS.action,
+        body: actionBody({ action, actionId: `act-guard-malformed-${action}` }),
+      });
+
+      assert.equal(res.statusCode, 200, `${entry.name}/${action} must keep the legacy path`);
+      assert.equal(json.ok, true, `${entry.name}/${action}`);
+      assert.equal(store.calls.applyAction.length, 1, `${entry.name}/${action} must still reach the store`);
+      assert.equal(analysis.calls.status + fix.calls.status, 1, `${entry.name}/${action} must read exactly one service`);
+      if (action === 'analysis_done') {
+        assert.equal(fix.calls.status, 0, `${entry.name}: analysis_done must not read the fix service`);
+      } else {
+        assert.equal(analysis.calls.status, 0, `${entry.name}: fix_done must not read the analysis service`);
+      }
+    }
+  }
+});
+
+test('POST /action keeps the legacy path when a service loses status() after wiring', async () => {
+  // `createHandlers()` already validates the service shape, so the helper's
+  // `typeof service?.status !== 'function'` branch is exercised by degrading a
+  // live deps object after wiring (a broken reload / partially disposed
+  // service): the guard must fail open instead of throwing or returning 409.
+  const cases = [
+    {
+      name: 'analysis service without status',
+      action: 'analysis_done',
+      prepare: (deps) => { deps.analysis.service.status = undefined; },
+    },
+    {
+      name: 'fix service object removed',
+      action: 'fix_done',
+      prepare: (deps) => { deps.fix.service = null; },
+    },
+    {
+      name: 'analysis deps object replaced',
+      action: 'analysis_done',
+      prepare: (deps) => { deps.analysis.service = {}; },
+    },
+  ];
+
+  for (const entry of cases) {
+    const store = legacyActionStore();
+    const analysis = createFakeAnalysis();
+    const fix = createFakeFix();
+    const { handlers } = handlersWith({ store, analysis, fix });
+    entry.prepare({ analysis, fix });
+    const { res, json } = await call(handlers.action, {
+      method: 'POST',
+      url: API_PATHS.action,
+      body: actionBody({ action: entry.action, actionId: `act-guard-no-status-${entry.action}` }),
+    });
+    assert.equal(res.statusCode, 200, `${entry.name} must keep the legacy path`);
+    assert.equal(json.ok, true, entry.name);
+    assert.equal(store.calls.applyAction.length, 1, `${entry.name} must still reach the store`);
+  }
 });
 
 test('POST /action rejects malformed JSON with 400', async () => {
@@ -1678,6 +2085,147 @@ test('POST /fix maps an unexpected service failure to 500 internal', async () =>
 });
 
 // ---------------------------------------------------------------------------
+// Deliver (P5 delivery: lint/test -> commit -> push -> MR)
+// ---------------------------------------------------------------------------
+
+test('POST /deliver starts delivery for the resolved workspace', async () => {
+  const delivery = createFakeDelivery();
+  const { handlers } = handlersWith({ delivery });
+  const { res, json } = await call(handlers.deliver, {
+    method: 'POST',
+    url: API_PATHS.deliver,
+    body: deliverBody({ code: '  BUG-1  ' }),
+  });
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(json, { ok: true, workflow: 'submitting', running: true });
+  assert.deepEqual(delivery.calls.start, [
+    { sessionId: SESSION_ID, cwd: WORKSPACE, code: 'BUG-1' },
+  ]);
+});
+
+test('POST /deliver validates session, code and workspace before starting', async () => {
+  const delivery = createFakeDelivery();
+  const { handlers } = handlersWith({ delivery });
+
+  const missingSession = await call(handlers.deliver, {
+    method: 'POST',
+    url: API_PATHS.deliver,
+    body: deliverBody({ sessionId: '   ' }),
+  });
+  assert.equal(missingSession.res.statusCode, 400);
+  assert.equal(missingSession.json.code, 'missing-session');
+
+  for (const code of ['', '   ', undefined]) {
+    const missingCode = await call(handlers.deliver, {
+      method: 'POST',
+      url: API_PATHS.deliver,
+      body: deliverBody({ code }),
+    });
+    assert.equal(missingCode.res.statusCode, 400, String(code));
+    assert.equal(missingCode.json.code, 'invalid-code', String(code));
+  }
+
+  const unbound = await call(handlers.deliver, {
+    method: 'POST',
+    url: API_PATHS.deliver,
+    body: deliverBody({ sessionId: UNBOUND_SESSION_ID }),
+  });
+  assert.equal(unbound.res.statusCode, 400);
+  assert.equal(unbound.json.code, 'unknown-workspace');
+  assert.equal(delivery.calls.start.length, 0);
+});
+
+test('POST /deliver maps service failures to static HTTP statuses', async () => {
+  const cases = [
+    ['ticket-not-found', 404],
+    ['not-found', 404],
+    ['not-submitting', 409],
+    ['delivery-busy', 409],
+    ['delivery-no-changes', 409],
+    ['protected-branch', 409],
+    // An external manual worktree on the same personal branch: fix-service
+    // already answers 409, delivery must map it identically (never git-failed).
+    ['worktree-conflict', 409],
+    ['invalid-branch', 400],
+    ['worktree-missing', 400],
+    ['invalid-gitlab-settings', 400],
+    ['invalid-code', 400],
+    ['invalid-input', 400],
+    ['unknown-workspace', 400],
+    ['missing-gitlab-token', 503],
+    ['delivery-unavailable', 503],
+    ['git-failed', 500],
+    ['push-failed', 500],
+    ['mr-failed', 500],
+    ['internal', 500],
+  ];
+  for (const [code, status] of cases) {
+    const delivery = createFakeDelivery({
+      start: () => ({ ok: false, code, message: `失败 ${code}` }),
+    });
+    const { handlers } = handlersWith({ delivery });
+    const { res, json } = await call(handlers.deliver, {
+      method: 'POST',
+      url: API_PATHS.deliver,
+      body: deliverBody(),
+    });
+    assert.equal(res.statusCode, status, code);
+    assert.equal(json.ok, false, code);
+    assert.equal(json.code, code, code);
+    assert.equal(json.message, `失败 ${code}`, code);
+  }
+});
+
+test('POST /deliver maps an unmapped service code to a static 500 internal', async () => {
+  const delivery = createFakeDelivery({
+    start: () => ({ ok: false, code: 'mystery-code', message: '未知失败' }),
+  });
+  const { handlers } = handlersWith({ delivery });
+  const { res, json } = await call(handlers.deliver, {
+    method: 'POST',
+    url: API_PATHS.deliver,
+    body: deliverBody(),
+  });
+
+  assert.equal(res.statusCode, 500);
+  assert.equal(json.code, 'internal');
+  assert.equal(json.message, '交付启动失败');
+});
+
+test('POST /deliver answers 503 delivery-unavailable when the service is not wired', async () => {
+  const { handlers } = handlersWith({ delivery: null });
+  const { res, json } = await call(handlers.deliver, {
+    method: 'POST',
+    url: API_PATHS.deliver,
+    body: deliverBody(),
+  });
+
+  assert.equal(res.statusCode, 503);
+  assert.equal(json.ok, false);
+  assert.equal(json.code, 'delivery-unavailable');
+  assert.match(json.message, /交付/);
+});
+
+test('POST /deliver maps an unexpected service failure to 500 internal', async () => {
+  const failing = createFakeDelivery({
+    start: () => {
+      throw new Error('delivery blew up');
+    },
+  });
+  const { handlers } = handlersWith({ delivery: failing });
+  const { res, json } = await call(handlers.deliver, {
+    method: 'POST',
+    url: API_PATHS.deliver,
+    body: deliverBody(),
+  });
+
+  assert.equal(res.statusCode, 500);
+  assert.equal(json.code, 'internal');
+  assert.match(json.message, /delivery blew up/);
+});
+
+// ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
 
@@ -2057,6 +2605,215 @@ test('POST /platform-token maps an unexpected token-store failure to 500 interna
 });
 
 // ---------------------------------------------------------------------------
+// GitLab token
+// ---------------------------------------------------------------------------
+
+test('POST /gitlab-token writes the string into the GitLab credential and answers only tokenPresent', async () => {
+  const credentials = createFakeCredentials({ [PLATFORM_TOKEN_REF]: 'p2-dummy-token' });
+  const tokenStore = createTokenStore(credentials);
+  const gitlabTokenStore = createTokenStore(credentials, { ref: GITLAB_TOKEN_REF });
+  const store = createFakeStore();
+  const { handlers } = handlersWith({ store, tokenStore, gitlabTokenStore });
+  const { res, json } = await call(handlers.gitlabToken, {
+    method: 'POST',
+    url: API_PATHS.gitlabToken,
+    body: gitlabTokenBody(),
+  });
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(json, { ok: true, tokenPresent: true });
+  assert.deepEqual(credentials.calls.set, [
+    { ref: GITLAB_TOKEN_REF, value: 'p5-dummy-gitlab-token' },
+  ]);
+  assert.equal(credentials.values.get(GITLAB_TOKEN_REF), 'p5-dummy-gitlab-token');
+  // The platform credential is untouched, the ticket/settings stores are not
+  // involved, and the response never echoes the token.
+  assert.equal(credentials.values.get(PLATFORM_TOKEN_REF), 'p2-dummy-token');
+  assert.equal(store.calls.applyAction.length, 0);
+  assert.equal(store.calls.putSettings.length, 0);
+  assert.equal(JSON.stringify(json).includes('p5-dummy-gitlab-token'), false);
+});
+
+test('POST /gitlab-token with token:null clears only the GitLab credential', async () => {
+  const credentials = createFakeCredentials({
+    [PLATFORM_TOKEN_REF]: 'p2-dummy-token',
+    [GITLAB_TOKEN_REF]: 'p5-dummy-gitlab-token',
+  });
+  const tokenStore = createTokenStore(credentials);
+  const gitlabTokenStore = createTokenStore(credentials, { ref: GITLAB_TOKEN_REF });
+  const { handlers } = handlersWith({ tokenStore, gitlabTokenStore });
+  const { res, json } = await call(handlers.gitlabToken, {
+    method: 'POST',
+    url: API_PATHS.gitlabToken,
+    body: gitlabTokenBody({ token: null }),
+  });
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(json, { ok: true, tokenPresent: false });
+  assert.deepEqual(credentials.calls.unset, [GITLAB_TOKEN_REF]);
+  assert.equal(credentials.values.has(GITLAB_TOKEN_REF), false);
+  assert.equal(credentials.values.get(PLATFORM_TOKEN_REF), 'p2-dummy-token');
+  assert.equal(JSON.stringify(json).includes('p5-dummy-gitlab-token'), false);
+});
+
+test('the GitLab token routes never change the platform token', async () => {
+  const credentials = createFakeCredentials();
+  const tokenStore = createTokenStore(credentials);
+  const gitlabTokenStore = createTokenStore(credentials, { ref: GITLAB_TOKEN_REF });
+  const { handlers } = handlersWith({ tokenStore, gitlabTokenStore });
+
+  const platformSaved = await call(handlers.platformToken, {
+    method: 'POST',
+    url: API_PATHS.platformToken,
+    body: platformTokenBody(),
+  });
+  assert.deepEqual(platformSaved.json, { ok: true, tokenPresent: true });
+
+  await call(handlers.gitlabToken, {
+    method: 'POST',
+    url: API_PATHS.gitlabToken,
+    body: gitlabTokenBody(),
+  });
+  const cleared = await call(handlers.gitlabToken, {
+    method: 'POST',
+    url: API_PATHS.gitlabToken,
+    body: gitlabTokenBody({ token: null }),
+  });
+  assert.deepEqual(cleared.json, { ok: true, tokenPresent: false });
+
+  const snapshot = await call(handlers.snapshot, { url: snapshotUrl() });
+  assert.deepEqual(snapshot.json.platform, {
+    tokenPresent: true,
+    lastSyncAt: null,
+    lastSyncError: null,
+  });
+  assert.deepEqual(snapshot.json.gitlab, { tokenPresent: false });
+});
+
+test('POST /gitlab-token rejects a missing, non-string, empty or oversized token with 400', async () => {
+  for (const [label, token] of [
+    ['missing', undefined],
+    ['number', 42],
+    ['object', { token: 'x' }],
+    ['array', ['x']],
+    ['empty', ''],
+    ['blank', '   '],
+    ['oversized', 'x'.repeat(MAX_TOKEN_LENGTH + 1)],
+  ]) {
+    const credentials = createFakeCredentials();
+    const gitlabTokenStore = createTokenStore(credentials, { ref: GITLAB_TOKEN_REF });
+    const { handlers } = handlersWith({ gitlabTokenStore });
+    const parsed = JSON.parse(gitlabTokenBody());
+    if (token === undefined) delete parsed.token;
+    else parsed.token = token;
+    const { res, json } = await call(handlers.gitlabToken, {
+      method: 'POST',
+      url: API_PATHS.gitlabToken,
+      body: JSON.stringify(parsed),
+    });
+
+    assert.equal(res.statusCode, 400, label);
+    assert.equal(json.ok, false, label);
+    assert.equal(json.code, 'invalid-token', label);
+    assert.equal(credentials.calls.set.length, 0, label);
+  }
+});
+
+test('POST /gitlab-token requires a sessionId', async () => {
+  const credentials = createFakeCredentials();
+  const gitlabTokenStore = createTokenStore(credentials, { ref: GITLAB_TOKEN_REF });
+  const { handlers } = handlersWith({ gitlabTokenStore });
+  const { res, json } = await call(handlers.gitlabToken, {
+    method: 'POST',
+    url: API_PATHS.gitlabToken,
+    body: gitlabTokenBody({ sessionId: undefined }),
+  });
+
+  assert.equal(res.statusCode, 400);
+  assert.equal(json.code, 'missing-session');
+  assert.equal(credentials.calls.set.length, 0);
+});
+
+test('POST /gitlab-token accepts an unbound session (the token is profile-global)', async () => {
+  const credentials = createFakeCredentials();
+  const gitlabTokenStore = createTokenStore(credentials, { ref: GITLAB_TOKEN_REF });
+  const { handlers } = handlersWith({ gitlabTokenStore });
+  const { res, json } = await call(handlers.gitlabToken, {
+    method: 'POST',
+    url: API_PATHS.gitlabToken,
+    body: gitlabTokenBody({ sessionId: UNBOUND_SESSION_ID }),
+  });
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(json, { ok: true, tokenPresent: true });
+  assert.equal(credentials.values.get(GITLAB_TOKEN_REF), 'p5-dummy-gitlab-token');
+});
+
+test('POST /gitlab-token answers 503 credentials-unavailable when credentials is absent', async () => {
+  for (const gitlabTokenStore of [
+    null,
+    createTokenStore(undefined, { ref: GITLAB_TOKEN_REF }),
+  ]) {
+    const { handlers } = handlersWith({ gitlabTokenStore });
+    for (const token of ['p5-dummy-gitlab-token', null]) {
+      const { res, json } = await call(handlers.gitlabToken, {
+        method: 'POST',
+        url: API_PATHS.gitlabToken,
+        body: gitlabTokenBody({ token }),
+      });
+      assert.equal(res.statusCode, 503, String(token));
+      assert.equal(json.code, 'credentials-unavailable', String(token));
+      assert.equal(JSON.stringify(json).includes('p5-dummy-gitlab-token'), false);
+    }
+  }
+});
+
+test('POST /gitlab-token maps an unexpected token-store failure to 500 internal', async () => {
+  const gitlabTokenStore = {
+    async get() { return null; },
+    async set() { throw new Error('disk full'); },
+    async clear() {},
+    async present() { return false; },
+  };
+  const { handlers } = handlersWith({ gitlabTokenStore });
+  const { res, json } = await call(handlers.gitlabToken, {
+    method: 'POST',
+    url: API_PATHS.gitlabToken,
+    body: gitlabTokenBody(),
+  });
+
+  assert.equal(res.statusCode, 500);
+  assert.equal(json.code, 'internal');
+});
+
+test('POST /gitlab-token rejects a body over 64 KiB with 413', async () => {
+  const { handlers } = handlersWith();
+  const oversized = JSON.stringify({
+    sessionId: SESSION_ID,
+    token: 'x'.repeat(MAX_BODY_BYTES),
+  });
+  assert.ok(Buffer.byteLength(oversized) > MAX_BODY_BYTES);
+
+  const declared = await call(handlers.gitlabToken, {
+    method: 'POST',
+    url: API_PATHS.gitlabToken,
+    body: oversized,
+  });
+  assert.equal(declared.res.statusCode, 413);
+  assert.equal(declared.json.code, 'payload-too-large');
+
+  // Chunked requests carry no content-length: the cap must still apply.
+  const chunked = await call(handlers.gitlabToken, {
+    method: 'POST',
+    url: API_PATHS.gitlabToken,
+    body: oversized,
+    contentLength: false,
+  });
+  assert.equal(chunked.res.statusCode, 413);
+  assert.equal(chunked.json.code, 'payload-too-large');
+});
+
+// ---------------------------------------------------------------------------
 // Host / method guards
 // ---------------------------------------------------------------------------
 
@@ -2067,8 +2824,11 @@ test('every route rejects a non-loopback Host with 403', async () => {
     ['snapshot', 'GET', snapshotUrl(), undefined],
     ['action', 'POST', API_PATHS.action, actionBody()],
     ['analyze', 'POST', API_PATHS.analyze, analyzeBody()],
+    ['fix', 'POST', API_PATHS.fix, fixBody()],
+    ['deliver', 'POST', API_PATHS.deliver, deliverBody()],
     ['settings', 'POST', API_PATHS.settings, settingsBody()],
     ['platformToken', 'POST', API_PATHS.platformToken, platformTokenBody()],
+    ['gitlabToken', 'POST', API_PATHS.gitlabToken, gitlabTokenBody()],
     ['sync', 'POST', API_PATHS.sync, syncBody()],
   ];
   for (const [name, method, url, body] of cases) {
@@ -2119,8 +2879,10 @@ test('every route rejects the wrong HTTP method with 405 and an Allow header', a
     ['action', 'GET', API_PATHS.action, 'POST'],
     ['analyze', 'GET', API_PATHS.analyze, 'POST'],
     ['fix', 'GET', API_PATHS.fix, 'POST'],
+    ['deliver', 'GET', API_PATHS.deliver, 'POST'],
     ['settings', 'GET', API_PATHS.settings, 'POST'],
     ['platformToken', 'GET', API_PATHS.platformToken, 'POST'],
+    ['gitlabToken', 'GET', API_PATHS.gitlabToken, 'POST'],
     ['sync', 'GET', API_PATHS.sync, 'POST'],
   ];
   for (const [name, method, url, allow] of cases) {
@@ -2139,8 +2901,10 @@ const POST_ROUTES = [
   ['action', API_PATHS.action, () => actionBody()],
   ['analyze', API_PATHS.analyze, () => analyzeBody()],
   ['fix', API_PATHS.fix, () => fixBody()],
+  ['deliver', API_PATHS.deliver, () => deliverBody()],
   ['settings', API_PATHS.settings, () => settingsBody()],
   ['platformToken', API_PATHS.platformToken, () => platformTokenBody()],
+  ['gitlabToken', API_PATHS.gitlabToken, () => gitlabTokenBody()],
   ['sync', API_PATHS.sync, () => syncBody()],
 ];
 
@@ -2256,8 +3020,10 @@ test('every route rejects a non-loopback remote address with 403', async () => {
     ['action', 'POST', API_PATHS.action, () => actionBody()],
     ['analyze', 'POST', API_PATHS.analyze, () => analyzeBody()],
     ['fix', 'POST', API_PATHS.fix, () => fixBody()],
+    ['deliver', 'POST', API_PATHS.deliver, () => deliverBody()],
     ['settings', 'POST', API_PATHS.settings, () => settingsBody()],
     ['platformToken', 'POST', API_PATHS.platformToken, () => platformTokenBody()],
+    ['gitlabToken', 'POST', API_PATHS.gitlabToken, () => gitlabTokenBody()],
     ['sync', 'POST', API_PATHS.sync, () => syncBody()],
   ];
   for (const [name, method, url, body] of cases) {
@@ -2388,6 +3154,13 @@ test('registerUnavailableRoutes() keeps health 500/503 and all data routes 503 u
   assert.equal(platformToken.res.statusCode, 503);
   assert.equal(platformToken.json.code, 'storage-unavailable');
 
+  const gitlabToken = await callRegistered(webServer, API_PATHS.gitlabToken, {
+    method: 'POST',
+    body: gitlabTokenBody(),
+  });
+  assert.equal(gitlabToken.res.statusCode, 503);
+  assert.equal(gitlabToken.json.code, 'storage-unavailable');
+
   const sync = await callRegistered(webServer, API_PATHS.sync, {
     method: 'POST',
     body: syncBody(),
@@ -2408,6 +3181,13 @@ test('registerUnavailableRoutes() keeps health 500/503 and all data routes 503 u
   });
   assert.equal(fix.res.statusCode, 503);
   assert.equal(fix.json.code, 'storage-unavailable');
+
+  const deliver = await callRegistered(webServer, API_PATHS.deliver, {
+    method: 'POST',
+    body: deliverBody(),
+  });
+  assert.equal(deliver.res.statusCode, 503);
+  assert.equal(deliver.json.code, 'storage-unavailable');
 
   dispose();
   assert.equal(webServer.routes.size, 0);

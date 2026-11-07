@@ -82,6 +82,11 @@
  * The client never re-implements the state machine: action buttons are derived
  * from the declarative `ACTION_BY_STATE` map (extracted and cross-checked
  * against `src/host/state-machine.js` by `test/client-action-map.test.js`).
+ * P5 removed the demo delivery/review write-back actions (`submit_mr`,
+ * `mr_created`, `review_requests_changes`, `review_pass`, `review_fix_done`,
+ * `mr_merged`, `dismiss`) from that literal; the host services own those
+ * transitions, and the raw `analysis_done`/`fix_done` demo actions are refused
+ * by the host while the matching real job is running.
  * `actionUnavailableHint` applies the map's declarative `maxRounds` cap so a
  * button the host would reject (409 + block) is disabled with a hint instead.
  * The host remains the authority on transitions (an illegal one comes back as a
@@ -101,8 +106,10 @@ window.__ModuleLoader__.load({
       action: '/bug-workflow/api/action',
       analyze: '/bug-workflow/api/analyze',
       fix: '/bug-workflow/api/fix',
+      deliver: '/bug-workflow/api/deliver',
       settings: '/bug-workflow/api/settings',
       platformToken: '/bug-workflow/api/platform-token',
+      gitlabToken: '/bug-workflow/api/gitlab-token',
       sync: '/bug-workflow/api/sync',
     });
 
@@ -163,6 +170,9 @@ window.__ModuleLoader__.load({
       // (branch/worktree metadata and the finished run).
       worktree: '创建分支/工作树',
       'fix-run': 'AI 修复执行',
+      // P5 Task 3 generalizes patchTicket: mr/reviewRounds-only patches append
+      // a `patch` event (delivery/MR metadata updates).
+      patch: '交付信息已更新',
     });
 
     const ACTOR_LABELS = Object.freeze({ user: '用户', agent: '代理', system: '系统' });
@@ -251,76 +261,16 @@ window.__ModuleLoader__.load({
           tone: 'primary',
         },
       ],
-      submitting: [
-        {
-          action: 'submit_mr',
-          label: '提交 MR',
-          confirm: '确认提交 MR？',
-          tone: 'primary',
-        },
-        {
-          action: 'mr_created',
-          label: '模拟 MR 已创建',
-          confirm: '确认模拟 MR 已创建？',
-          tone: 'plain',
-        },
-      ],
-      mr_open: [
-        {
-          action: 'review_requests_changes',
-          label: '模拟 Review 需修改',
-          confirm: '确认模拟 Review 要求修改？将生成一条演示阻塞问题。',
-          tone: 'plain',
-          // Declarative cap mirrored from the host state machine: at
-          // `mr.rounds >= maxRounds` the host answers 409 and blocks the
-          // ticket, so the board disables the button instead of sending it.
-          maxRounds: 3,
-          payload: {
-            blockingIssues: [
-              {
-                fid: 'demo-1',
-                file: 'src/demo.ts',
-                level: '中',
-                gateCategory: '逻辑错误',
-                location: 'src/demo.ts:1-2',
-                problem: 'P1 演示问题',
-                suggestion: '演示建议',
-                blocking: true,
-              },
-            ],
-          },
-        },
-        {
-          action: 'review_pass',
-          label: '模拟 Review 通过',
-          confirm: '确认模拟 Review 通过？',
-          tone: 'primary',
-        },
-      ],
-      fixing_review: [
-        {
-          action: 'review_fix_done',
-          label: 'Review 修复完成',
-          confirm: '确认 Review 阻塞问题已修复并重新提交？',
-          tone: 'primary',
-        },
-      ],
-      mergeable: [
-        {
-          action: 'mr_merged',
-          label: '模拟已合并',
-          confirm: '确认模拟 MR 已合并？',
-          tone: 'primary',
-        },
-      ],
-      merged: [
-        {
-          action: 'dismiss',
-          label: '完成并移除',
-          confirm: '确认完成并移除该工单？终态后不可再操作。',
-          tone: 'primary',
-        },
-      ],
+      // P5 delivery/review are service-owned: the board renders the real
+      // board-only 「提交并创建 MR」 descriptor (POST /api/deliver) and the
+      // review/merge status banners instead of demo write-back buttons. The
+      // host state machine still accepts submit_mr/mr_created/review_*/dismiss
+      // for its services; they are deliberately absent from this literal.
+      submitting: [],
+      mr_open: [],
+      fixing_review: [],
+      mergeable: [],
+      merged: [],
       blocked: [
         {
           action: 'retry',
@@ -426,16 +376,21 @@ window.__ModuleLoader__.load({
     }));
 
     /**
-     * Own-property lookup for the analysis copy maps. `blockedReason` and the
-     * host error code are untrusted strings: with a plain object index,
+     * Own-property lookup shared by every static copy map (`analysis`, `fix`,
+     * `delivery`, `review`). `blockedReason` and the host error code are
+     * untrusted strings: with a plain object index,
      * `'__proto__'`/`'constructor'`/`'toString'` would return
      * Object.prototype/a function instead of copy, which crashes the render.
      * The maps are null-prototype objects, and every read goes through
      * `Object.hasOwn` as a second guard.
      */
-    function ownAnalysisValue(map, key) {
+    function ownServiceValue(map, key) {
       if (typeof key !== 'string' && typeof key !== 'number') return undefined;
       return Object.hasOwn(map, key) ? map[key] : undefined;
+    }
+
+    function ownAnalysisValue(map, key) {
+      return ownServiceValue(map, key);
     }
 
     /** Persisted block reason -> static client copy (never a prototype value). */
@@ -548,8 +503,7 @@ window.__ModuleLoader__.load({
      * index would resolve `__proto__`/`constructor` to a non-copy value.
      */
     function ownFixValue(map, key) {
-      if (typeof key !== 'string' && typeof key !== 'number') return undefined;
-      return Object.hasOwn(map, key) ? map[key] : undefined;
+      return ownServiceValue(map, key);
     }
 
     /** Persisted fix block reason -> static client copy (never a raw code). */
@@ -565,6 +519,197 @@ window.__ModuleLoader__.load({
     }
 
     // ---------------------------------------------------------------------
+    // P5 delivery (POST /api/deliver + snapshot.delivery feedback)
+    // ---------------------------------------------------------------------
+
+    /**
+     * Static copy for the delivery failure reasons persisted by the host
+     * (`DELIVERY_REASON_MESSAGES` in `src/host/delivery-service.js`). A blocked
+     * ticket only keeps the reason code, so the board attaches the Chinese hint
+     * and never renders a raw code. The start-validation codes are included
+     * too: a 503/409 route error may also be persisted as a block reason by a
+     * future flow, and `blockedReasonText` must stay total.
+     */
+    const DELIVERY_REASON_LABELS = Object.freeze(Object.assign(Object.create(null), {
+      'missing-gitlab-token': '未配置 GitLab token，请先在设置中保存 GitLab token',
+      'invalid-gitlab-settings': 'GitLab 配置无效，请检查 GitLab 地址与项目路径',
+      'protected-branch': '个人分支受保护，禁止推送',
+      'delivery-lint-failed': '提交前 lint 未通过，请修复后重试',
+      'delivery-test-failed': '提交前测试未通过，请修复后重试',
+      'delivery-no-changes': '没有可提交的改动，请确认修复已保存',
+      'delivery-busy': '当前工作区已有交付任务在执行，请稍后重试',
+      'push-failed': '推送个人分支失败，请检查远程仓库后重试',
+      'mr-failed': '创建 GitLab MR 失败，请稍后重试',
+      'worktree-missing': '未找到可提交的工作树，请先执行修复',
+      'worktree-mismatch': '提交未落在个人分支上，已停止推送，请重新执行修复',
+      'worktree-conflict': '工作树当前分支与个人分支不一致，请重新执行修复',
+      'invalid-branch': '个人分支或目标分支不合法，无法提交 MR',
+      'git-failed': '提交失败，请检查工作树后重试',
+      'not-submitting': '工单尚未通过人工测试，不能提交 MR',
+    }));
+
+    /** Live progress copy for a running delivery job (elapsed appended locally). */
+    const DELIVERY_RUNNING_HINT = '正在提交并创建 MR…（先运行 lint/test，再提交、推送并创建 MR）';
+
+    /** Normal `submitting` copy when no delivery job is running. */
+    const DELIVERY_READY_HINT = '人工测试已通过，可以提交并创建 MR';
+
+    /**
+     * Board-only delivery descriptor. It is NOT part of `ACTION_BY_STATE` (that
+     * literal is the state-machine contract checked by
+     * `test/client-action-map.test.js`); `executeAction` routes it to
+     * `POST /api/deliver` instead of `/action`, because the host owns the
+     * submit_mr/mr_created transitions after the real job succeeds.
+     */
+    const DELIVER_DESCRIPTOR = Object.freeze({
+      action: 'start_deliver',
+      label: '提交并创建 MR',
+      confirm: '确认提交并创建 MR？（先运行配置的 lint/test，再提交、推送个人分支并创建 GitLab MR）',
+      tone: 'primary',
+    });
+
+    /**
+     * `POST /api/deliver` failure code -> actionable Chinese hint. Covers every
+     * code the route's `DELIVERY_ERROR_STATUS` map can return (the status
+     * fallback still covers a future/host-side code this board does not know
+     * yet). `invalid-input`/`internal` are the route-level 400/500 buckets and
+     * intentionally share the same copy as the status fallback.
+     */
+    const DELIVERY_ERROR_HINTS = Object.freeze(Object.assign(Object.create(null), {
+      'ticket-not-found': '工单不存在',
+      'not-found': '工单不存在',
+      'not-submitting': '工单尚未通过人工测试，不能提交 MR',
+      'missing-gitlab-token': '未配置 GitLab token，请先在设置中保存 GitLab token',
+      'invalid-gitlab-settings': 'GitLab 配置无效，请检查 GitLab 地址与项目路径',
+      'protected-branch': '个人分支受保护，禁止推送',
+      'delivery-busy': '当前工作区已有交付任务在执行，请稍后重试',
+      'delivery-no-changes': '没有可提交的改动，请确认修复已保存',
+      'worktree-missing': '未找到可提交的工作树，请先执行修复',
+      'worktree-conflict': '工作树当前分支与个人分支不一致，请重新执行修复',
+      'invalid-branch': '个人分支或目标分支不合法，无法提交 MR',
+      'invalid-code': '工单编号/工作区无效',
+      'invalid-input': '工单/工作树或 GitLab 配置无效',
+      'unknown-workspace': '工单编号/工作区无效',
+      'delivery-unavailable': '交付服务不可用，请稍后重试',
+      'git-failed': '无法解析工作区仓库，无法提交 MR',
+      'push-failed': '推送个人分支失败，请检查远程仓库后重试',
+      'mr-failed': '创建 GitLab MR 失败，请稍后重试',
+      'internal': '交付启动失败，请稍后重试',
+      'missing-session': '缺少会话上下文，无法提交 MR',
+    }));
+
+    /** Product-status fallback for `POST /api/deliver` (400/404/409/500/503). */
+    const DELIVERY_STATUS_HINTS = Object.freeze(Object.assign(Object.create(null), {
+      400: '工单/工作树或 GitLab 配置无效',
+      404: '工单不存在',
+      409: '当前状态不能提交（可能尚未通过人工测试，或已有交付在执行）',
+      500: '提交并创建 MR 失败，请稍后重试',
+      503: '交付服务不可用，请稍后重试',
+    }));
+
+    /** Persisted delivery block reason -> static client copy (never a raw code). */
+    function deliveryReasonLabel(reason) {
+      return ownServiceValue(DELIVERY_REASON_LABELS, reason);
+    }
+
+    /**
+     * `POST /api/deliver` failure copy: 404 missing ticket, 409 stale state /
+     * not test-passed / busy, 503 missing GitLab token or unwired service, 400
+     * invalid worktree/branch/GitLab configuration, 500 unexpected git/push/MR
+     * failure. The hint replaces the host message so the banner always tells the
+     * user what to do; the server code/status stay for diagnosis.
+     */
+    function deliverErrorView(result) {
+      const view = toErrorView(result);
+      const hint = ownServiceValue(DELIVERY_ERROR_HINTS, view.code)
+        ?? (view.status === null ? undefined : ownServiceValue(DELIVERY_STATUS_HINTS, view.status))
+        ?? null;
+      return {
+        ...view,
+        title: '提交并创建 MR 失败',
+        message: hint === null ? view.message : hint,
+      };
+    }
+
+    // ---------------------------------------------------------------------
+    // P5 AI Review polling / merge detection (snapshot.review only, no route)
+    // ---------------------------------------------------------------------
+
+    /**
+     * Static copy for the review failure reasons persisted by the host
+     * (`REVIEW_REASON_MESSAGES` in `src/host/review-service.js` plus the
+     * runner-failure reasons the review fix maps). A blocked ticket only keeps
+     * the code, so the board attaches the Chinese hint; raw codes are never
+     * rendered.
+     */
+    const REVIEW_REASON_LABELS = Object.freeze(Object.assign(Object.create(null), {
+      'review-parse-failed': 'AI Review 结论解析失败，请人工检查 MR 评论',
+      'review-rounds-exhausted': `AI Review 修复已满 ${MAX_REVIEW_ROUNDS} 轮，需人工介入`,
+      'review-merged-manually': 'MR 在 AI Review 通过前被合并，请人工确认',
+      'review-fix-failed': 'AI Review 修复失败，请检查工作区后重试',
+      'review-fix-timeout': 'AI Review 修复超时，请稍后重试',
+      'review-fix-unavailable': '无法启动 AI Review 修复子代理，请检查会话与工作区后重试',
+      'review-fix-no-changes': 'AI Review 修复未产生改动，请人工检查',
+      'review-recovery-unavailable': 'Review 修复恢复条件不足，请人工检查',
+      'review-fix-write-failed': 'Review 修复结果写入失败，请重试',
+      'review-save-failed': 'Review 记录保存失败，请重试',
+      'review-fix-branch-busy': '个人分支已被其它工单占用，请先清理后再试',
+    }));
+
+    /** Polling hint rendered for every Review-owned state. */
+    const REVIEW_POLL_HINT = '每 60 秒自动检查 AI Code Review 结论';
+
+    /**
+     * The review timer no-ops without a GitLab token, but the board keeps
+     * promising the next poll; this warning makes the paused poller visible.
+     */
+    const REVIEW_TOKEN_MISSING_HINT = '未配置 GitLab token，Review 轮询已暂停';
+
+    /** Live progress copy while the review-fix job runs (elapsed appended). */
+    const REVIEW_RUNNING_HINT = 'AI 正在修复 Review 问题…（最长约 15 分钟，可继续其他操作）';
+
+    /** `fixing_review` with no live job: the host recovers on its next poll. */
+    const REVIEW_NOT_RUNNING_HINT = 'Review 修复未在运行，宿主会在下次轮询自动恢复';
+
+    /** `mergeable`: the plugin never merges; a human must do it in GitLab. */
+    const REVIEW_MERGEABLE_HINT = 'AI Review 已通过，等待人工在 GitLab 合并（插件不会自动合并）';
+
+    /** `merged`: the next host poll archives the ticket out of the board. */
+    const REVIEW_MERGED_HINT = '已合并，工单即将自动从看板移除';
+
+    /** Blocking issues rendered inline by the MR/Review status panel. */
+    const MAX_RENDERED_REVIEW_ISSUES = 5;
+
+    /** `reviewRounds[].status` -> short Chinese label. */
+    const REVIEW_ROUND_STATUS_LABELS = Object.freeze(Object.assign(Object.create(null), {
+      succeeded: '已完成',
+      failed: '失败',
+      cancelled: '已取消',
+      running: '进行中',
+    }));
+
+    /** Persisted review block reason -> static client copy (never a raw code). */
+    function reviewReasonLabel(reason) {
+      return ownServiceValue(REVIEW_REASON_LABELS, reason);
+    }
+
+    /** Newest `reviewRounds` entry, or null (defensive against partial data). */
+    function latestReviewRound(ticket) {
+      if (ticket === null || typeof ticket !== 'object' || !Array.isArray(ticket.reviewRounds)) return null;
+      for (let index = ticket.reviewRounds.length - 1; index >= 0; index -= 1) {
+        const entry = ticket.reviewRounds[index];
+        if (entry !== null && typeof entry === 'object') return entry;
+      }
+      return null;
+    }
+
+    /** `reviewRounds[].status` display copy; unknown values stay clipped. */
+    function reviewRoundStatusLabel(status) {
+      if (typeof status !== 'string' || status === '') return '';
+      return ownServiceValue(REVIEW_ROUND_STATUS_LABELS, status) ?? clip(status, 40);
+    }
+
+    // ---------------------------------------------------------------------
     // Workspace settings (the host stores them per workspace cwd)
     // ---------------------------------------------------------------------
 
@@ -576,6 +721,8 @@ window.__ModuleLoader__.load({
     const SETTINGS_DEFAULTS = Object.freeze({
       platformBaseUrl: 'https://ecard.htwisdom.cn',
       platformProjectCode: '',
+      // P5 GitLab API root (host default; the token is write-only below).
+      gitlabBaseUrl: 'https://git.htwisdom.cn',
       gitlabProjectPath: '',
       branchUser: 'ly',
       gitlabReviewer: '',
@@ -673,6 +820,19 @@ window.__ModuleLoader__.load({
       placeholder: 'YGFNXDJRFWDJSYJJYY',
     });
 
+    /**
+     * The GitLab API root row. Same validation as `platformBaseUrl`: an
+     * absolute http(s) URL without embedded credentials. Rendered inside the
+     * 「GitLab 连接」 section together with the write-only token card.
+     */
+    const GITLAB_BASE_URL_FIELD = Object.freeze({
+      key: 'gitlabBaseUrl',
+      label: 'GitLab 地址',
+      hint: 'GitLab 根地址，必须是 http(s) URL，且不能内嵌账号密码',
+      placeholder: 'https://git.htwisdom.cn',
+      required: true,
+    });
+
     /** `group/project`, two non-empty segments without whitespace. */
     const GITLAB_PROJECT_PATH_RE = /^[^/\s]+\/[^/\s]+$/;
 
@@ -685,6 +845,25 @@ window.__ModuleLoader__.load({
     const PLATFORM_TOKEN_HINT = '从浏览器 localStorage 的 `access-token` 复制';
     const PLATFORM_TOKEN_PRESENT = 'token 已配置';
     const PLATFORM_TOKEN_ABSENT = 'token 未配置';
+
+    const GITLAB_SECTION_HINT = '用于提交个人分支并创建 GitLab MR。token 只写入宿主凭据服务，看板与接口都不会回显。';
+    const GITLAB_TOKEN_HINT = 'GitLab Personal Access Token（需要 api 权限）';
+    const GITLAB_TOKEN_PRESENT = 'GitLab token 已配置';
+    const GITLAB_TOKEN_ABSENT = 'GitLab token 未配置';
+
+    /** Flash/validation copy for the two shared token-card flows. */
+    const PLATFORM_TOKEN_UI = Object.freeze({
+      empty: '请输入平台 token',
+      saved: 'token 已保存',
+      combined: '设置与 token 已保存',
+      cleared: 'token 已清除',
+    });
+    const GITLAB_TOKEN_UI = Object.freeze({
+      empty: '请输入 GitLab token',
+      saved: 'GitLab token 已保存',
+      combined: '设置与 GitLab token 已保存',
+      cleared: 'GitLab token 已清除',
+    });
     const PLATFORM_WRITEBACK_LABEL = '写回平台状态（P5 使用）';
     const PLATFORM_WRITEBACK_HINT = 'P2 只保存该开关，不会向平台写回状态；P5 接入写回后生效。';
     const PLATFORM_IMPORT_HINT = '将从平台导入该编号的工单；重复编号会提示已存在';
@@ -1031,6 +1210,62 @@ window.__ModuleLoader__.load({
       return typeof message === 'string' && message !== '' ? message : null;
     }
 
+    /** Snapshot `delivery.running` lookup; a missing block means "not running". */
+    function deliveryRunningFor(snapshot, code) {
+      return serviceRunningFor(snapshot, 'delivery', code);
+    }
+
+    /** Snapshot `review.running` lookup; a missing block means "not running". */
+    function reviewRunningFor(snapshot, code) {
+      return serviceRunningFor(snapshot, 'review', code);
+    }
+
+    /** Shared `snapshot.<service>.running` lookup (analysis/fix/delivery/review). */
+    function serviceRunningFor(snapshot, block, code) {
+      if (typeof code !== 'string' || code === '') return false;
+      if (snapshot === null || typeof snapshot !== 'object') return false;
+      const value = snapshot[block];
+      if (value === null || typeof value !== 'object' || !Array.isArray(value.running)) return false;
+      return value.running.includes(code);
+    }
+
+    /**
+     * The persisted static delivery error for one code, or `null`.
+     *
+     * `delivery.error:<code>` is the delivery-specific meta namespace (never
+     * `fix.error:<code>`); a later successful delivery clears it. Callers only
+     * render it for the `submitting` panel, where it is the live record of the
+     * last failed attempt.
+     */
+    function deliveryErrorFor(snapshot, code) {
+      return serviceErrorFor(snapshot, 'delivery', code);
+    }
+
+    /**
+     * The persisted static review error for one code, or `null`.
+     *
+     * Same staleness rule as `analysisErrorFor`: `review.error:<code>` can
+     * survive on a ticket that moved on, so the review panel only renders it
+     * for the states that consume review writes — `mr_open`, `fixing_review`,
+     * and `mergeable`/`merged` (where a failed merge/archival write leaves the
+     * host-recorded cause visible instead of only the success copy).
+     */
+    function reviewErrorFor(snapshot, code) {
+      return serviceErrorFor(snapshot, 'review', code);
+    }
+
+    /** Shared `snapshot.<service>.errors[code]` lookup. */
+    function serviceErrorFor(snapshot, block, code) {
+      if (typeof code !== 'string' || code === '') return null;
+      if (snapshot === null || typeof snapshot !== 'object') return null;
+      const value = snapshot[block];
+      if (value === null || typeof value !== 'object') return null;
+      const errors = value.errors;
+      if (errors === null || typeof errors !== 'object' || Array.isArray(errors)) return null;
+      const message = errors[code];
+      return typeof message === 'string' && message !== '' ? message : null;
+    }
+
     /**
      * True when a `blocked` ticket was blocked by the analysis flow. The host
      * only blocks an analysis failure from `analyzing` (the cleanup write is
@@ -1077,6 +1312,28 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * True when a `blocked` ticket was blocked by the delivery flow
+     * (`blockedFrom:'submitting'`). Only the host contract decides; the reason
+     * code is never used for flow detection (same rule as `isFixBlock`).
+     */
+    function isDeliveryBlock(ticket) {
+      if (ticket === null || typeof ticket !== 'object' || ticket.workflow !== 'blocked') return false;
+      return ticket.blockedFrom === 'submitting';
+    }
+
+    /**
+     * True when a `blocked` ticket was blocked by the AI Review polling or
+     * merge-detection flow. The host blocks from `mr_open` (parse failure,
+     * rounds exhausted, manual merge before pass), `fixing_review` (fix
+     * failure) and possibly `mergeable`; `blockedFrom` is the contract.
+     */
+    const REVIEW_BLOCK_SOURCES = Object.freeze(['mr_open', 'fixing_review', 'mergeable']);
+    function isReviewBlock(ticket) {
+      if (ticket === null || typeof ticket !== 'object' || ticket.workflow !== 'blocked') return false;
+      return REVIEW_BLOCK_SOURCES.includes(ticket.blockedFrom);
+    }
+
+    /**
      * True when the branch/worktree metadata the host persists at the start of
      * a run (`persistBranch` in `fix-service.js`) is present. A cancelled or
      * host-unloaded job writes neither a `fixes` entry nor `fix.error`, so this
@@ -1106,13 +1363,21 @@ window.__ModuleLoader__.load({
       return '修复失败，可重新修复';
     }
 
-    /** Blocked-reason display text: mapped analysis/fix copy, raw code otherwise. */
+    /**
+     * Blocked-reason display text: mapped analysis/fix/delivery/review copy,
+     * clipped raw reason otherwise. Every P5 reason code has static Chinese
+     * copy, so a regular ticket never shows a raw code.
+     */
     function blockedReasonText(ticket) {
       const reason = ticket !== null && typeof ticket === 'object' && typeof ticket.blockedReason === 'string'
         ? ticket.blockedReason
         : '';
       if (reason === '') return '未记录';
-      return analysisReasonLabel(reason) ?? fixReasonLabel(reason) ?? clip(reason, 300);
+      return analysisReasonLabel(reason)
+        ?? fixReasonLabel(reason)
+        ?? deliveryReasonLabel(reason)
+        ?? reviewReasonLabel(reason)
+        ?? clip(reason, 300);
     }
 
     function safeHttpUrl(value) {
@@ -1216,12 +1481,13 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Snapshot `analysis` block: `{running: string[], errors: {[code]: string}}`.
-     * The host always sends it (empty when the analysis service is not wired),
-     * but normalize defensively so a partial/older response cannot crash the
-     * board or leak non-string entries into rendered output.
+     * Snapshot service block: `{running: string[], errors: {[code]: string}}`.
+     * Shared by `analysis`/`fix`/`delivery`/`review`. The host always sends
+     * each block (empty when the service is not wired), but normalize
+     * defensively so a partial/older response cannot crash the board or leak
+     * non-string entries into rendered output.
      */
-    function normalizeAnalysis(raw) {
+    function normalizeServiceStatus(raw) {
       const value = raw !== null && typeof raw === 'object' ? raw : {};
       const running = Array.isArray(value.running)
         ? value.running.filter((code) => typeof code === 'string' && code !== '')
@@ -1235,30 +1501,27 @@ window.__ModuleLoader__.load({
       return { running, errors };
     }
 
-    /**
-     * Snapshot `fix` block: `{running: string[], errors: {[code]: string}}`.
-     * Same defensive normalization as `analysis` (the host always sends it,
-     * empty when the fix service is not wired, but a partial/older response
-     * must not crash the board or leak non-string entries into render).
-     */
+    function normalizeAnalysis(raw) {
+      return normalizeServiceStatus(raw);
+    }
+
     function normalizeFix(raw) {
-      const value = raw !== null && typeof raw === 'object' ? raw : {};
-      const running = Array.isArray(value.running)
-        ? value.running.filter((code) => typeof code === 'string' && code !== '')
-        : [];
-      const errors = {};
-      if (value.errors !== null && typeof value.errors === 'object' && !Array.isArray(value.errors)) {
-        for (const [code, message] of Object.entries(value.errors)) {
-          if (typeof message === 'string' && message !== '') errors[code] = message;
-        }
-      }
-      return { running, errors };
+      return normalizeServiceStatus(raw);
+    }
+
+    function normalizeDelivery(raw) {
+      return normalizeServiceStatus(raw);
+    }
+
+    function normalizeReview(raw) {
+      return normalizeServiceStatus(raw);
     }
 
     function normalizeSnapshot(payload) {
       const value = payload && typeof payload === 'object' ? payload : {};
       const workspace = value.workspace && typeof value.workspace === 'object' ? value.workspace : {};
       const platform = value.platform && typeof value.platform === 'object' ? value.platform : {};
+      const gitlab = value.gitlab && typeof value.gitlab === 'object' ? value.gitlab : {};
       const dicts = value.dicts && typeof value.dicts === 'object' ? value.dicts : {};
       return {
         workspace: {
@@ -1271,12 +1534,20 @@ window.__ModuleLoader__.load({
           lastSyncAt: typeof platform.lastSyncAt === 'string' ? platform.lastSyncAt : null,
           lastSyncError: typeof platform.lastSyncError === 'string' ? platform.lastSyncError : null,
         },
+        // P5: GitLab token presence only; the value never reaches the client.
+        gitlab: {
+          tokenPresent: gitlab.tokenPresent === true,
+        },
         // P3 analysis progress/errors (empty shape when the host has no
         // analysis service, e.g. a profile without subagent services).
         analysis: normalizeAnalysis(value.analysis),
         // P4 fix progress/errors, normalized exactly like `analysis` so a
         // partial host response cannot crash the board.
         fix: normalizeFix(value.fix),
+        // P5 delivery progress/errors (`delivery.error:<code>` namespace).
+        delivery: normalizeDelivery(value.delivery),
+        // P5 review polling/merge-detection progress/errors (`review.error:<code>`).
+        review: normalizeReview(value.review),
         // Task 4 guarantees all three groups; normalize anyway so a partial
         // host response can never make the filter crash.
         dicts: {
@@ -1340,14 +1611,17 @@ window.__ModuleLoader__.load({
     /**
      * Field errors for a settings draft. Empty `gitlabProjectPath` means "not
      * configured" and is valid; `branchUser` and `commitType` must not be empty;
-     * command/preview fields may be empty. `platformBaseUrl` must be an
-     * http(s) URL without embedded credentials.
+     * command/preview fields may be empty. Both base URLs
+     * (`platformBaseUrl`/`gitlabBaseUrl`, P5) must be absolute http(s) URLs
+     * without embedded credentials.
      */
     function validateSettings(draft) {
       const value = draft !== null && typeof draft === 'object' ? draft : {};
       const errors = {};
       const platformBaseUrlError = validatePlatformBaseUrl(value.platformBaseUrl);
       if (platformBaseUrlError !== null) errors.platformBaseUrl = platformBaseUrlError;
+      const gitlabBaseUrlError = validateGitlabBaseUrl(value.gitlabBaseUrl);
+      if (gitlabBaseUrlError !== null) errors.gitlabBaseUrl = gitlabBaseUrlError;
       const projectPath = typeof value.gitlabProjectPath === 'string'
         ? value.gitlabProjectPath.trim()
         : '';
@@ -1364,26 +1638,36 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * `platformBaseUrl` rule shared by the panel and the save path. Returns the
-     * error text, or `null` when valid. Localhost http URLs are allowed (the
-     * P2 mock platform runs there); embedded credentials are never allowed.
+     * Base-URL rule shared by the panel and the save path. Returns the error
+     * text, or `null` when valid. Localhost http URLs are allowed (the P2/P5
+     * mock servers run there); embedded credentials are never allowed. The
+     * label keeps the platform copy byte-for-byte identical to P2.
      */
-    function validatePlatformBaseUrl(value) {
+    function validateBaseUrl(value, label) {
       const text = typeof value === 'string' ? value.trim() : '';
-      if (text === '') return '平台地址不能为空';
+      if (text === '') return `${label}不能为空`;
       let url;
       try {
         url = new URL(text);
       } catch {
-        return '平台地址必须是合法的 http(s) URL';
+        return `${label}必须是合法的 http(s) URL`;
       }
       if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-        return '平台地址只支持 http(s)';
+        return `${label}只支持 http(s)`;
       }
       if (url.username !== '' || url.password !== '') {
-        return '平台地址不能内嵌账号密码';
+        return `${label}不能内嵌账号密码`;
       }
       return null;
+    }
+
+    function validatePlatformBaseUrl(value) {
+      return validateBaseUrl(value, '平台地址');
+    }
+
+    /** P5 `gitlabBaseUrl` rule (same shape as the platform base URL). */
+    function validateGitlabBaseUrl(value) {
+      return validateBaseUrl(value, 'GitLab 地址');
     }
 
     function errorCodeText(error) {
@@ -2161,15 +2445,139 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 「平台连接」 section: platform base URL, project-code prefix, the
-     * write-only token control and the P5 write-back switch.
+     * Title hint for the surfaces that share the token mutation gate: while one
+     * token card saves/clears, the other card and the settings save button are
+     * disabled but must still explain why.
+     */
+    const TOKEN_MUTATION_BUSY_HINT = '正在保存 token，请稍候';
+
+    /**
+     * Write-only token card shared by the platform and GitLab connection
+     * sections (P5 extracts it so both flow exactly the same way).
      *
-     * The token input is `type=password`, starts empty on every open, and is
-     * cleared by the board after a successful save; the status dot follows the
-     * polled `snapshot.platform.tokenPresent`, never a client copy of the value.
+     * The input is `type=password`, starts empty on every open, and is cleared
+     * by the board after a successful save; the status dot follows the polled
+     * `snapshot.<service>.tokenPresent`, never a client copy of the value.
      * Save/clear are disabled while the session has no bound workspace (the
-     * host token route is profile-global, but the panel keeps the same gate as
-     * every other write) and while another request is in flight.
+     * host token routes are profile-global, but the panel keeps the same gate
+     * as every other write) and while another request is in flight. The shared
+     * board mutation gate means a save/clear on the OTHER card (or a settings
+     * save) would silently no-op here, so `otherTokenBusy` disables this card's
+     * buttons too and names the reason in their title.
+     */
+    function TokenCard({
+      scope,
+      statusText,
+      readyHint,
+      placeholder,
+      ariaLabel,
+      tokenDraft,
+      tokenBusy,
+      otherTokenBusy,
+      tokenPresent,
+      disabled,
+      canSave,
+      onTokenChange,
+      onSaveToken,
+      onClearToken,
+    }) {
+      const tokenLocked = disabled === true || tokenBusy === true || canSave !== true;
+      const otherBusy = otherTokenBusy === true;
+      const actionLocked = tokenLocked || otherBusy;
+      const saveTokenDisabled = actionLocked || tokenDraft.trim() === '';
+      const clearTokenDisabled = actionLocked || tokenPresent !== true;
+      const gateHint = canSave === true ? readyHint : SETTINGS_UNBOUND_HINT;
+      const dotColor = tokenPresent === true ? C.success : C.textTertiary;
+
+      return h('div', {
+        'data-bug-token-card': scope,
+        style: { display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 },
+      },
+        h('div', {
+          style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', minWidth: 0 },
+        },
+          h('span', {
+            'aria-hidden': 'true',
+            style: {
+              width: 7,
+              height: 7,
+              borderRadius: '50%',
+              background: dotColor,
+              flex: '0 0 auto',
+            },
+          }),
+          h('span', {
+            role: 'status',
+            style: {
+              fontSize: 11,
+              lineHeight: '16px',
+              color: tokenPresent === true ? C.success : C.textTertiary,
+            },
+          }, statusText),
+          tokenBusy === true
+            ? h('span', {
+              style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary },
+            }, '处理中…')
+            : null),
+        h('input', {
+          type: 'password',
+          value: tokenDraft,
+          onChange: (event) => onTokenChange(event.target.value),
+          placeholder,
+          disabled: tokenLocked,
+          'aria-label': ariaLabel,
+          autoComplete: 'new-password',
+          spellCheck: false,
+          style: {
+            font: 'inherit',
+            fontSize: 12,
+            lineHeight: '18px',
+            padding: '4px 8px',
+            borderRadius: 6,
+            border: `0.5px solid ${C.borderStrong}`,
+            background: 'transparent',
+            color: C.text,
+            width: '100%',
+            minWidth: 0,
+            boxSizing: 'border-box',
+            opacity: tokenLocked ? 0.55 : 1,
+          },
+        }),
+        h('div', {
+          style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary, wordBreak: 'break-word' },
+        }, gateHint),
+        h('div', {
+          style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', minWidth: 0 },
+        },
+          h('button', {
+            type: 'button',
+            onClick: onSaveToken,
+            disabled: saveTokenDisabled,
+            'aria-busy': tokenBusy === true || undefined,
+            title: otherBusy
+              ? TOKEN_MUTATION_BUSY_HINT
+              : (canSave !== true
+                ? SETTINGS_UNBOUND_HINT
+                : (tokenDraft.trim() === '' ? '请先粘贴 token' : '保存 token')),
+            style: primaryButtonStyle(saveTokenDisabled),
+          }, tokenBusy === true ? '保存中…' : '保存 token'),
+          h('button', {
+            type: 'button',
+            onClick: onClearToken,
+            disabled: clearTokenDisabled,
+            title: otherBusy
+              ? TOKEN_MUTATION_BUSY_HINT
+              : (tokenPresent === true ? '清除已保存的 token' : '当前没有已保存的 token'),
+            style: smallButtonStyle(clearTokenDisabled),
+          }, '清除'),
+          h('span', {
+            style: { marginLeft: 'auto', fontSize: 11, lineHeight: '16px', color: C.textTertiary },
+          }, '不会回显 token')));
+    }
+
+    /**
+     * 「平台连接」 section: platform base URL, project-code prefix, the
+     * write-only platform token card and the P5 write-back switch.
      */
     function PlatformConnectionSection({
       draft,
@@ -2178,6 +2586,7 @@ window.__ModuleLoader__.load({
       canSave,
       tokenDraft,
       tokenBusy,
+      otherTokenBusy,
       tokenPresent,
       baseUrlInputRef,
       onFieldChange,
@@ -2185,13 +2594,6 @@ window.__ModuleLoader__.load({
       onSaveToken,
       onClearToken,
     }) {
-      const tokenLocked = disabled === true || tokenBusy === true || canSave !== true;
-      const saveTokenDisabled = tokenLocked || tokenDraft.trim() === '';
-      const clearTokenDisabled = tokenLocked || tokenPresent !== true;
-      const gateHint = canSave === true ? PLATFORM_TOKEN_HINT : SETTINGS_UNBOUND_HINT;
-      const dotColor = tokenPresent === true ? C.success : C.textTertiary;
-      const statusText = tokenPresent === true ? PLATFORM_TOKEN_PRESENT : PLATFORM_TOKEN_ABSENT;
-
       return h('section', {
         'data-bug-platform-connection': 'section',
         style: {
@@ -2236,91 +2638,102 @@ window.__ModuleLoader__.load({
           disabled: disabled === true,
           onChange: onFieldChange,
         }),
-        h('div', {
-          style: { display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 },
-        },
-          h('div', {
-            style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', minWidth: 0 },
-          },
-            h('span', {
-              'aria-hidden': 'true',
-              style: {
-                width: 7,
-                height: 7,
-                borderRadius: '50%',
-                background: dotColor,
-                flex: '0 0 auto',
-              },
-            }),
-            h('span', {
-              role: 'status',
-              style: {
-                fontSize: 11,
-                lineHeight: '16px',
-                color: tokenPresent === true ? C.success : C.textTertiary,
-              },
-            }, statusText),
-            tokenBusy === true
-              ? h('span', {
-                style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary },
-              }, '处理中…')
-              : null),
-          h('input', {
-            type: 'password',
-            value: tokenDraft,
-            onChange: (event) => onTokenChange(event.target.value),
-            placeholder: '粘贴平台 access-token',
-            disabled: tokenLocked,
-            'aria-label': '平台 token',
-            autoComplete: 'new-password',
-            spellCheck: false,
-            style: {
-              font: 'inherit',
-              fontSize: 12,
-              lineHeight: '18px',
-              padding: '4px 8px',
-              borderRadius: 6,
-              border: `0.5px solid ${C.borderStrong}`,
-              background: 'transparent',
-              color: C.text,
-              width: '100%',
-              minWidth: 0,
-              boxSizing: 'border-box',
-              opacity: tokenLocked ? 0.55 : 1,
-            },
-          }),
-          h('div', {
-            style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary, wordBreak: 'break-word' },
-          }, gateHint),
-          h('div', {
-            style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', minWidth: 0 },
-          },
-            h('button', {
-              type: 'button',
-              onClick: onSaveToken,
-              disabled: saveTokenDisabled,
-              'aria-busy': tokenBusy === true || undefined,
-              title: canSave !== true
-                ? SETTINGS_UNBOUND_HINT
-                : (tokenDraft.trim() === '' ? '请先粘贴 token' : '保存 token'),
-              style: primaryButtonStyle(saveTokenDisabled),
-            }, tokenBusy === true ? '保存中…' : '保存 token'),
-            h('button', {
-              type: 'button',
-              onClick: onClearToken,
-              disabled: clearTokenDisabled,
-              title: tokenPresent === true ? '清除已保存的 token' : '当前没有已保存的 token',
-              style: smallButtonStyle(clearTokenDisabled),
-            }, '清除'),
-            h('span', {
-              style: { marginLeft: 'auto', fontSize: 11, lineHeight: '16px', color: C.textTertiary },
-            }, '不会回显 token'))),
+        h(TokenCard, {
+          scope: 'platform',
+          statusText: tokenPresent === true ? PLATFORM_TOKEN_PRESENT : PLATFORM_TOKEN_ABSENT,
+          readyHint: PLATFORM_TOKEN_HINT,
+          placeholder: '粘贴平台 access-token',
+          ariaLabel: '平台 token',
+          tokenDraft,
+          tokenBusy,
+          otherTokenBusy,
+          tokenPresent,
+          disabled,
+          canSave,
+          onTokenChange,
+          onSaveToken,
+          onClearToken,
+        }),
         h(SettingsToggle, {
           label: PLATFORM_WRITEBACK_LABEL,
           hint: PLATFORM_WRITEBACK_HINT,
           checked: draft.writebackStatus === true,
           disabled: disabled === true,
           onChange: (next) => onFieldChange('writebackStatus', next),
+        }));
+    }
+
+    /**
+     * 「GitLab 连接」 section: GitLab API root and the write-only GitLab token
+     * card (P5). The token is saved through `POST /api/gitlab-token` with the
+     * same contract as the platform token: string saves, `null` clears, and the
+     * value is never echoed back.
+     */
+    function GitlabConnectionSection({
+      draft,
+      errors,
+      disabled,
+      canSave,
+      tokenDraft,
+      tokenBusy,
+      otherTokenBusy,
+      tokenPresent,
+      onFieldChange,
+      onTokenChange,
+      onSaveToken,
+      onClearToken,
+    }) {
+      return h('section', {
+        'data-bug-gitlab-connection': 'section',
+        style: {
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 8,
+          paddingBottom: 10,
+          borderBottom: `0.5px solid ${C.border}`,
+          minWidth: 0,
+        },
+      },
+        h('div', {
+          style: { display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap', minWidth: 0 },
+        },
+          h('h3', {
+            style: {
+              margin: 0,
+              fontSize: 12.5,
+              fontWeight: 600,
+              lineHeight: '18px',
+              color: C.text,
+            },
+          }, 'GitLab 连接'),
+          h('span', {
+            style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary, minWidth: 0 },
+          }, 'token 仅保存在宿主凭据服务')),
+        h('div', {
+          style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary, wordBreak: 'break-word' },
+        }, GITLAB_SECTION_HINT),
+        h(SettingsField, {
+          field: GITLAB_BASE_URL_FIELD,
+          value: draft.gitlabBaseUrl,
+          error: errors.gitlabBaseUrl,
+          disabled: disabled === true,
+          onChange: onFieldChange,
+        }),
+        h(TokenCard, {
+          scope: 'gitlab',
+          statusText: tokenPresent === true ? GITLAB_TOKEN_PRESENT : GITLAB_TOKEN_ABSENT,
+          readyHint: GITLAB_TOKEN_HINT,
+          placeholder: '粘贴 GitLab Personal Access Token',
+          ariaLabel: 'GitLab token',
+          tokenDraft,
+          tokenBusy,
+          otherTokenBusy,
+          tokenPresent,
+          disabled,
+          canSave,
+          onTokenChange,
+          onSaveToken,
+          onClearToken,
         }));
     }
 
@@ -2344,16 +2757,27 @@ window.__ModuleLoader__.load({
       tokenDraft,
       tokenBusy,
       tokenPresent,
+      gitlabTokenDraft,
+      gitlabTokenBusy,
+      gitlabTokenPresent,
       onChange,
       onTokenChange,
       onSaveToken,
       onClearToken,
+      onGitlabTokenChange,
+      onSaveGitlabToken,
+      onClearGitlabToken,
       onSave,
       onCancel,
     }) {
       const panelRef = React.useRef(null);
       const firstInputRef = React.useRef(null);
       const canSave = sessionMissing !== true && configured === true;
+      // One shared mutation gate: while either token card saves/clears, the
+      // panel's own 「保存」 button would silently no-op too. Keep it disabled
+      // and name the reason instead of dropping the click.
+      const tokenMutationBusy = tokenBusy === true || gitlabTokenBusy === true;
+      const settingsSaveDisabled = saving === true || tokenMutationBusy || !canSave;
 
       React.useEffect(() => {
         const node = firstInputRef.current;
@@ -2408,6 +2832,9 @@ window.__ModuleLoader__.load({
       const hintTone = sessionMissing === true || workspaceKnown !== true || configured !== true
         ? TONES.warn
         : TONES.neutral;
+      const settingsSaveTitle = tokenMutationBusy
+        ? TOKEN_MUTATION_BUSY_HINT
+        : (canSave ? '保存设置' : hint);
       const workspaceLine = sessionMissing === true
         ? '缺少会话上下文'
         : (workspaceKnown !== true
@@ -2510,12 +2937,29 @@ window.__ModuleLoader__.load({
             canSave,
             tokenDraft,
             tokenBusy,
+            // The shared board mutation gate also blocks this card while the
+            // GitLab card is saving/clearing.
+            otherTokenBusy: gitlabTokenBusy === true,
             tokenPresent,
             baseUrlInputRef: firstInputRef,
             onFieldChange: onChange,
             onTokenChange,
             onSaveToken,
             onClearToken,
+          }),
+          h(GitlabConnectionSection, {
+            draft,
+            errors,
+            disabled: saving === true,
+            canSave,
+            tokenDraft: gitlabTokenDraft,
+            tokenBusy: gitlabTokenBusy,
+            otherTokenBusy: tokenBusy === true,
+            tokenPresent: gitlabTokenPresent,
+            onFieldChange: onChange,
+            onTokenChange: onGitlabTokenChange,
+            onSaveToken: onSaveGitlabToken,
+            onClearToken: onClearGitlabToken,
           }),
           SETTINGS_FIELDS.map((field) => h(SettingsField, {
             key: field.key,
@@ -2567,10 +3011,10 @@ window.__ModuleLoader__.load({
             h('button', {
               type: 'button',
               onClick: onSave,
-              disabled: saving === true || !canSave,
+              disabled: settingsSaveDisabled,
               'aria-busy': saving === true || undefined,
-              title: canSave ? '保存设置' : hint,
-              style: primaryButtonStyle(saving === true || !canSave),
+              title: settingsSaveTitle,
+              style: primaryButtonStyle(settingsSaveDisabled),
             }, saving === true ? '保存中…' : '保存'))));
     }
 
@@ -3270,15 +3714,34 @@ window.__ModuleLoader__.load({
           }, '打开 MR'));
     }
 
-    function IssueList({ issues, title }) {
+    /**
+     * Bounded issue list used by the Review card and the inline `mr_open`
+     * panel.
+     *
+     * `bounded` is opt-in and only the P5 inline panel sets it: the P4
+     * `ReviewCard` keeps its pre-P5 rendering verbatim (full file/level/problem
+     * text), so the P5 clipping never changes an existing card. When
+     * `bounded:true`, every field is clipped because issue text is AI-generated
+     * (and passed through an untrusted note), so an oversized value must not
+     * blow up the sidebar layout. `limit` caps the number of rendered issues
+     * without touching the stored array.
+     */
+    function IssueList({ issues, title, limit, bounded }) {
+      const isBounded = bounded === true;
       if (!Array.isArray(issues) || issues.length === 0) return null;
+      const list = typeof limit === 'number' && Number.isFinite(limit) && limit > 0
+        ? issues.slice(0, limit)
+        : issues;
       return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 } },
         h('div', { style: fieldLabelStyle }, title),
         h('ul', {
           style: { listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: 5 },
-        }, issues.map((issue, index) => {
+        }, list.map((issue, index) => {
           const value = issue && typeof issue === 'object' ? issue : { problem: issue };
-          const heading = [textOf(value.file), textOf(value.level)].filter((part) => part !== '').join(' · ');
+          const heading = isBounded
+            ? [clip(textOf(value.file), 120), clip(textOf(value.level), 40)]
+              .filter((part) => part !== '').join(' · ')
+            : [textOf(value.file), textOf(value.level)].filter((part) => part !== '').join(' · ');
           return h('li', {
             key: `issue-${index}`,
             style: {
@@ -3293,9 +3756,20 @@ window.__ModuleLoader__.load({
             },
           },
             heading === '' ? null : h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textSecondary, wordBreak: 'break-all' } }, heading),
-            h('div', { style: { ...fieldValueStyle, fontSize: 12 } }, textOf(value.problem, '—')),
+            isBounded && typeof value.location === 'string' && value.location !== ''
+              ? h('div', { style: { fontSize: 10.5, lineHeight: '15px', color: C.textTertiary, wordBreak: 'break-all' } }, clip(value.location, 160))
+              : null,
+            h('div', {
+              style: isBounded
+                ? { ...fieldValueStyle, fontSize: 12, wordBreak: 'break-word' }
+                : { ...fieldValueStyle, fontSize: 12 },
+            }, isBounded ? clip(textOf(value.problem, '—'), 400) : textOf(value.problem, '—')),
             typeof value.suggestion === 'string' && value.suggestion !== ''
-              ? h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary } }, `建议：${clip(value.suggestion, 300)}`)
+              ? h('div', {
+                style: isBounded
+                  ? { fontSize: 11, lineHeight: '16px', color: C.textTertiary, wordBreak: 'break-word' }
+                  : { fontSize: 11, lineHeight: '16px', color: C.textTertiary },
+              }, `建议：${clip(value.suggestion, 300)}`)
               : null);
         })));
     }
@@ -3314,6 +3788,250 @@ window.__ModuleLoader__.load({
         h(IssueList, { issues: value.nonBlockingIssues, title: '非阻塞问题' }),        !Array.isArray(value.blockingIssues) || value.blockingIssues.length === 0
           ? h('p', { style: emptyTextStyle }, '当前没有阻塞问题。')
           : null);
+    }
+
+    /**
+     * P5 delivery status panel for a `submitting` ticket.
+     *
+     * The delivery flow is service-owned: 200 from `POST /api/deliver` only
+     * means the job was accepted, and the host advances `submit_mr`/
+     * `mr_created` itself after lint/test, commit, push and MR creation. The
+     * board therefore never renders demo submit_mr/mr_created buttons:
+     *   - `snapshot.delivery.running` contains the code: live progress copy plus
+     *     a local elapsed timer (kept out of the polite live region);
+     *   - otherwise: the real 「提交并创建 MR」 button plus the last static
+     *     delivery error (`snapshot.delivery.errors[code]`, the delivery-only
+     *     meta namespace) and a token-config hint.
+     */
+    function DeliveryNotice({ ticket, snapshot, busyAction, locked, onAction }) {
+      const isSubmitting = ticket.workflow === 'submitting';
+      const running = isSubmitting && deliveryRunningFor(snapshot, ticket.code);
+      const elapsed = useElapsedSeconds(running, ticket.code);
+      if (!isSubmitting) return null;
+
+      const busy = busyAction === DELIVER_DESCRIPTOR.action;
+      const disabled = busy || locked === true;
+      const serverError = deliveryErrorFor(snapshot, ticket.code);
+      const gitlabReady = snapshot !== null
+        && snapshot.gitlab !== null
+        && typeof snapshot.gitlab === 'object'
+        && snapshot.gitlab.tokenPresent === true;
+      const start = h('button', {
+        key: 'deliver-start',
+        type: 'button',
+        disabled,
+        'aria-busy': busy || undefined,
+        title: locked === true ? UNBOUND_WORKSPACE_HINT : DELIVER_DESCRIPTOR.confirm,
+        onClick: () => {
+          if (disabled) return;
+          if (typeof onAction === 'function') onAction(DELIVER_DESCRIPTOR);
+        },
+        style: primaryButtonStyle(disabled),
+      }, busy ? '处理中…' : DELIVER_DESCRIPTOR.label);
+
+      if (running) {
+        return h('div', {
+          role: 'status',
+          'aria-live': 'polite',
+          'data-bug-delivery': 'running',
+          style: {
+            border: `0.5px solid ${TONES.info.border}`,
+            background: TONES.info.background,
+            borderRadius: 8,
+            padding: '8px 10px',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 3,
+            minWidth: 0,
+          },
+        },
+          h('div', { style: { fontSize: 12, fontWeight: 600, color: TONES.info.color, lineHeight: '18px' } },
+            DELIVERY_RUNNING_HINT),
+          // The elapsed counter updates every second; keep it out of the polite
+          // live region so screen readers announce acceptance/completion, not
+          // one message per tick.
+          h('div', {
+            'aria-live': 'off',
+            style: { fontSize: 11, lineHeight: '16px', color: C.textSecondary },
+          }, `已运行 ${formatElapsed(elapsed)}`),
+          h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary } },
+            '交付在后台进行，可继续其他操作；完成后工单会进入「Review 中」。'));
+      }
+
+      return h('div', {
+        role: 'status',
+        'data-bug-delivery': 'ready',
+        style: {
+          border: `0.5px solid ${TONES.warn.border}`,
+          background: TONES.warn.background,
+          borderRadius: 8,
+          padding: '8px 10px',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 4,
+          minWidth: 0,
+        },
+      },
+        h('div', { style: { fontSize: 12, fontWeight: 600, color: TONES.warn.color, lineHeight: '18px' } },
+          DELIVERY_READY_HINT),
+        gitlabReady
+          ? null
+          : h('div', { style: { fontSize: 11, lineHeight: '16px', color: TONES.warn.color, wordBreak: 'break-word' } },
+            '未配置 GitLab token，提交会失败；请先在「设置 → GitLab 连接」保存 token。'),
+        serverError === null
+          ? null
+          : h('div', {
+            style: { fontSize: 11, lineHeight: '16px', color: C.textSecondary, wordBreak: 'break-word' },
+          }, `上次交付记录：${clip(serverError, 300)}`),
+        h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary } },
+          '提交前会先运行配置的 lint/test，再提交、推送个人分支并创建 GitLab MR；最长约 15 分钟。'),
+        h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' } }, start));
+    }
+
+    /**
+     * P5 AI Review / merge status panel for the states the timer-driven review
+     * service owns. It renders static, never-interactive copy except the
+     * existing MR card:
+     *   - `mr_open`: polling hint + the newest blocking issues (max 5, clipped)
+     *     + the live review error meta (`snapshot.review.errors[code]`; this is
+     *     the review namespace, never fix/delivery);
+     *   - `fixing_review`: a running banner with elapsed timer only while
+     *     `snapshot.review.running` contains the code; otherwise the static
+     *     "host recovers on the next poll" hint (the host owns the restart) and
+     *     the latest review round;
+     *   - `mergeable`: the human must merge in GitLab (the plugin never merges);
+     *   - `merged`: the next poll archives the ticket out of the board.
+     *
+     * The demo review_requests_changes/review_pass/review_fix_done/mr_merged/
+     * dismiss buttons are absent from `ACTION_BY_STATE`, so these states show
+     * no board actions at all.
+     */
+    function ReviewNotice({ ticket, snapshot }) {
+      const workflow = ticket.workflow;
+      const reviewState = workflow === 'mr_open'
+        || workflow === 'fixing_review'
+        || workflow === 'mergeable'
+        || workflow === 'merged';
+      const running = workflow === 'fixing_review' && reviewRunningFor(snapshot, ticket.code);
+      const elapsed = useElapsedSeconds(running, ticket.code);
+      if (!reviewState) return null;
+
+      const mr = ticket.mr !== null && typeof ticket.mr === 'object' ? ticket.mr : null;
+      const rounds = mr !== null && typeof mr.rounds === 'number' && Number.isFinite(mr.rounds)
+        ? Math.max(0, Math.trunc(mr.rounds))
+        : 0;
+      const round = latestReviewRound(ticket);
+      const reviewError = reviewErrorFor(snapshot, ticket.code);
+      // Strict `=== false`: a partial snapshot without the gitlab block must not
+      // claim the token is missing.
+      const gitlabTokenMissing = snapshot !== null
+        && typeof snapshot === 'object'
+        && snapshot.gitlab !== null
+        && typeof snapshot.gitlab === 'object'
+        && snapshot.gitlab.tokenPresent === false;
+      const tokenWarning = gitlabTokenMissing
+        ? h('div', {
+          style: { fontSize: 11, lineHeight: '16px', color: TONES.warn.color, wordBreak: 'break-word' },
+        }, `${REVIEW_TOKEN_MISSING_HINT}；请在「设置 → GitLab 连接」保存 token。`)
+        : null;
+      const styleFor = (tone) => ({
+        border: `0.5px solid ${tone.border}`,
+        background: tone.background,
+        borderRadius: 8,
+        padding: '8px 10px',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 3,
+        minWidth: 0,
+      });
+      const roundParts = [];
+      if (rounds > 0) roundParts.push(`Review 轮次：${Math.min(rounds, MAX_REVIEW_ROUNDS)} / ${MAX_REVIEW_ROUNDS}`);
+      if (round !== null) {
+        const status = reviewRoundStatusLabel(round.status);
+        if (status !== '') roundParts.push(`最近一轮：${status}`);
+        if (Array.isArray(round.changedFiles)) roundParts.push(`改动 ${round.changedFiles.length} 个文件`);
+        if (typeof round.finishedAt === 'string' && round.finishedAt !== '') {
+          roundParts.push(`完成于 ${formatTime(round.finishedAt)}`);
+        }
+      }
+      const roundInfo = roundParts.length === 0
+        ? null
+        : h('div', {
+          style: { fontSize: 11, lineHeight: '16px', color: C.textSecondary, wordBreak: 'break-word' },
+        }, roundParts.join(' · '));
+      const errorLine = reviewError === null
+        ? null
+        : h('div', {
+          style: { fontSize: 11, lineHeight: '16px', color: C.textSecondary, wordBreak: 'break-word' },
+        }, `宿主记录：${clip(reviewError, 300)}`);
+
+      if (workflow === 'merged') {
+        return h('div', { role: 'status', 'data-bug-review': 'merged', style: styleFor(TONES.success) },
+          h('div', { style: { fontSize: 12, fontWeight: 600, color: TONES.success.color, lineHeight: '18px' } },
+            REVIEW_MERGED_HINT),
+          h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary } },
+            '宿主会在下一次 60 秒轮询自动归档，看板无需手动操作。'),
+          errorLine);
+      }
+
+      if (workflow === 'mergeable') {
+        return h('div', { role: 'status', 'data-bug-review': 'mergeable', style: styleFor(TONES.success) },
+          h('div', { style: { fontSize: 12, fontWeight: 600, color: TONES.success.color, lineHeight: '18px' } },
+            REVIEW_MERGEABLE_HINT),
+          h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary } },
+            REVIEW_POLL_HINT),
+          errorLine,
+          roundInfo);
+      }
+
+      if (workflow === 'fixing_review' && running) {
+        return h('div', {
+          role: 'status',
+          'aria-live': 'polite',
+          'data-bug-review': 'running',
+          style: styleFor(TONES.info),
+        },
+          h('div', { style: { fontSize: 12, fontWeight: 600, color: TONES.info.color, lineHeight: '18px' } },
+            REVIEW_RUNNING_HINT),
+          // The counter ticks every second; keep it out of the polite region.
+          h('div', {
+            'aria-live': 'off',
+            style: { fontSize: 11, lineHeight: '16px', color: C.textSecondary },
+          }, `已运行 ${formatElapsed(elapsed)}`),
+          h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary } },
+            '修复完成后宿主会自动提交并推送，然后重新请求 AI Review。'),
+          tokenWarning,
+          roundInfo);
+      }
+
+      if (workflow === 'fixing_review') {
+        return h('div', { role: 'status', 'data-bug-review': 'not-running', style: styleFor(TONES.warn) },
+          h('div', { style: { fontSize: 12, fontWeight: 600, color: TONES.warn.color, lineHeight: '18px' } },
+            REVIEW_NOT_RUNNING_HINT),
+          h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary } },
+            '无需手动操作；若长时间未恢复，请人工检查宿主日志与 GitLab MR。'),
+          tokenWarning,
+          roundInfo,
+          errorLine);
+      }
+
+      // `mr_open`: waiting for the next AI Review note.
+      const blocking = mr !== null && Array.isArray(mr.blockingIssues) ? mr.blockingIssues : [];
+      return h('div', { role: 'status', 'data-bug-review': 'waiting', style: styleFor(TONES.info) },
+        h('div', { style: { fontSize: 12, fontWeight: 600, color: TONES.info.color, lineHeight: '18px' } },
+          '等待 AI Code Review 结论'),
+        h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textSecondary } },
+          REVIEW_POLL_HINT),
+        tokenWarning,
+        h(IssueList, {
+          issues: blocking,
+          title: blocking.length > MAX_RENDERED_REVIEW_ISSUES
+            ? `最近阻塞问题（共 ${blocking.length} 条，仅显示 ${MAX_RENDERED_REVIEW_ISSUES} 条）`
+            : '最近阻塞问题',
+          limit: MAX_RENDERED_REVIEW_ISSUES,
+          bounded: true,
+        }),
+        errorLine);
     }
 
     function Timeline({ events }) {
@@ -3342,11 +4060,17 @@ window.__ModuleLoader__.load({
         })));
     }
 
-    function BlockedNotice({ ticket }) {
+    function BlockedNotice({ ticket, snapshot }) {
       if (ticket.workflow !== 'blocked') return null;
       const from = typeof ticket.blockedFrom === 'string' && ticket.blockedFrom !== ''
         ? workflowLabel(ticket.blockedFrom)
         : null;
+      // Only a delivery block reads the delivery namespace: the persisted
+      // `delivery.error:<code>` carries the lint/test/push/MR output tail
+      // (`buildFailureMessage` in delivery-service.js). A blocked ticket keeps
+      // only the mapped reason code, so without this line the host-recorded
+      // detail would never be visible. Never fall back to `snapshot.fix.errors`.
+      const deliveryDetail = isDeliveryBlock(ticket) ? deliveryErrorFor(snapshot, ticket.code) : null;
       return h('div', {
         role: 'status',
         style: {
@@ -3363,6 +4087,11 @@ window.__ModuleLoader__.load({
         h('div', { style: { fontSize: 12, fontWeight: 600, color: C.error, lineHeight: '18px' } }, '工单已阻塞，需要人工处理'),
         h('div', { style: { ...fieldValueStyle, fontSize: 12 } },
           `原因：${blockedReasonText(ticket)}`),
+        deliveryDetail === null
+          ? null
+          : h('div', {
+            style: { fontSize: 11, lineHeight: '16px', color: C.textSecondary, wordBreak: 'break-word' },
+          }, `宿主记录：${clip(deliveryDetail, 300)}`),
         from === null
           ? null
           : h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textSecondary } }, `阻塞前状态：${from}`),
@@ -3371,7 +4100,11 @@ window.__ModuleLoader__.load({
             ? '这是 AI 分析失败导致的阻塞：点击「重新分析」会解除阻塞并重新开始分析。'
             : (isFixBlock(ticket)
               ? '这是 AI 修复失败导致的阻塞：点击「重新修复」会自动解除阻塞并重新开始修复。'
-              : '处理完成后可点击「重试」回到阻塞前状态。')));
+              : (isDeliveryBlock(ticket)
+                ? '这是提交/交付失败导致的阻塞：处理后点击「重试」回到「待提交」，再重新提交并创建 MR。'
+                : (isReviewBlock(ticket)
+                  ? '这是 AI Review/合并流程导致的阻塞：处理后点击「重试」回到阻塞前状态；若仍无法恢复，请人工检查 GitLab MR。'
+                  : '处理完成后可点击「重试」回到阻塞前状态。')))));
     }
 
     /**
@@ -3713,10 +4446,15 @@ window.__ModuleLoader__.load({
           h(Badge, { label: workflowLabel(ticket.workflow), tone: workflowTone(ticket.workflow) })),
         h(AnalysisNotice, { ticket, snapshot, busyAction, locked, onAction }),
         h(FixNotice, { ticket, snapshot, busyAction, locked, onAction }),
+        // P5: submission progress (board-only 「提交并创建 MR」) and the
+        // service-owned Review/merge status banners. Both are static after 200;
+        // no demo submit_mr/mr_created/review_*/dismiss button exists any more.
+        h(DeliveryNotice, { ticket, snapshot, busyAction, locked, onAction }),
+        h(ReviewNotice, { ticket, snapshot }),
         // FixNotice already reports the blocked-fix cause and the restart
         // action (role="alert"); the generic blocked banner would repeat the
         // same reason. Keep it for every other block (analysis, plan review…).
-        fixBlock ? null : h(BlockedNotice, { ticket }),
+        fixBlock ? null : h(BlockedNotice, { ticket, snapshot }),
         planReview ? null : actionBar,
         h(FieldsBlock, { ticket, snapshot }),
         h(PlatformCard, { ticket }),
@@ -3791,12 +4529,15 @@ window.__ModuleLoader__.load({
       const [settingsSaving, setSettingsSaving] = React.useState(false);
       const [tokenDraft, setTokenDraft] = React.useState('');
       const [tokenBusy, setTokenBusy] = React.useState(false);
+      const [gitlabTokenDraft, setGitlabTokenDraft] = React.useState('');
+      const [gitlabTokenBusy, setGitlabTokenBusy] = React.useState(false);
       const [syncing, setSyncing] = React.useState(false);
       const busyRef = React.useRef(false);
       const mutationControllerRef = React.useRef(null);
       const settingsButtonRef = React.useRef(null);
       const settingsSavingRef = React.useRef(false);
       const tokenBusyRef = React.useRef(false);
+      const gitlabTokenBusyRef = React.useRef(false);
       const syncingRef = React.useRef(false);
       const pendingSelectRef = React.useRef(null);
       const settingsTouchedRef = React.useRef(false);
@@ -3807,6 +4548,7 @@ window.__ModuleLoader__.load({
       const tickets = snapshot === null ? [] : snapshot.tickets;
       const configured = snapshot !== null && snapshot.workspace.configured === true;
       const tokenPresent = snapshot !== null && snapshot.platform.tokenPresent === true;
+      const gitlabTokenPresent = snapshot !== null && snapshot.gitlab.tokenPresent === true;
       const canWrite = sessionId !== null && configured;
       const settingsBaseline = React.useMemo(() => settingsFromSnapshot(snapshot), [snapshot]);
       const settingsDirty = settingsOpen === true && !settingsEqual(settingsDraft, settingsBaseline);
@@ -3896,17 +4638,20 @@ window.__ModuleLoader__.load({
       }, []);
 
       const closeSettings = React.useCallback(() => {
-        if (settingsSavingRef.current || tokenBusyRef.current) return;
+        if (settingsSavingRef.current || tokenBusyRef.current || gitlabTokenBusyRef.current) return;
         settingsTouchedRef.current = false;
         setSettingsOpen(false);
         setSettingsErrors({});
-        // A token typed but not saved must not outlive the panel.
+        // Tokens typed but not saved must not outlive the panel.
         setTokenDraft('');
+        setGitlabTokenDraft('');
         focusSettingsButton();
       }, [focusSettingsButton]);
 
       const openSettings = React.useCallback(() => {
-        if (busyRef.current || settingsSavingRef.current || tokenBusyRef.current) return;
+        if (busyRef.current || settingsSavingRef.current || tokenBusyRef.current || gitlabTokenBusyRef.current) {
+          return;
+        }
         const initial = settingsFromSnapshot(snapshot);
         settingsDraftRef.current = initial;
         settingsTouchedRef.current = false;
@@ -3914,6 +4659,7 @@ window.__ModuleLoader__.load({
         setSettingsDraft(initial);
         setSettingsErrors({});
         setTokenDraft('');
+        setGitlabTokenDraft('');
         setSettingsOpen(true);
       }, [snapshot]);
 
@@ -3988,27 +4734,35 @@ window.__ModuleLoader__.load({
       }, [configured, focusSettingsButton, polling, postMutation, sessionId]);
 
       /**
-       * Save the platform token. The value never enters this component's
-       * rendered output: the input is cleared on success and the status dot
-       * follows the refreshed snapshot. The request is a plain JSON POST with
+       * Shared write-only token save, used by the platform and GitLab token
+       * cards. The value never enters this component's rendered output: the
+       * input is cleared on success and the status dot follows the refreshed
+       * snapshot. The request is a plain JSON POST with
        * `Content-Type: application/json` (the host rejects anything else).
        *
        * A dirty settings draft is persisted FIRST. Closing the panel discards
-       * an unsaved draft, while sync/import would keep using the old platform
-       * base URL/token pairing — so saving a token must not silently drop the
-       * base-URL edit. Validation failure keeps the panel open and saves no
-       * token; a settings POST failure does the same. A clean draft skips the
-       * settings request entirely (token-only save keeps its old behaviour).
+       * an unsaved draft, while sync/delivery keep using the old settings
+       * pairing — so saving a token must not silently drop a base-URL edit
+       * (platform or GitLab). Validation failure keeps the panel open and saves
+       * no token; a settings POST failure does the same. A clean draft skips
+       * the settings request entirely (token-only save keeps its old behaviour).
        */
-      const savePlatformToken = React.useCallback(async () => {
-        if (tokenBusyRef.current || settingsSavingRef.current || busyRef.current) return;
+      const saveToken = React.useCallback(async ({
+        path,
+        token,
+        tokenBusyRef: busyRefForToken,
+        setTokenBusy: setBusy,
+        setTokenDraft: setDraft,
+        labels,
+      }) => {
+        if (busyRefForToken.current || settingsSavingRef.current || busyRef.current) return;
         if (sessionId === null || configured !== true) return;
 
-        const token = tokenDraft.trim();
-        if (token === '') {
+        const value = token.trim();
+        if (value === '') {
           setActionError({
             code: 'invalid-token',
-            message: '请输入平台 token',
+            message: labels.empty,
             status: null,
             stage: null,
           });
@@ -4033,10 +4787,10 @@ window.__ModuleLoader__.load({
         setActionError(null);
         setFlash(null);
         settingsSavingRef.current = true;
-        tokenBusyRef.current = true;
+        busyRefForToken.current = true;
         busyRef.current = true;
         setSettingsSaving(draftDirty);
-        setTokenBusy(true);
+        setBusy(true);
 
         try {
           if (settingsToSave !== null) {
@@ -4064,7 +4818,7 @@ window.__ModuleLoader__.load({
             setSettingsErrors({});
           }
 
-          const result = await postMutation(API.platformToken, { sessionId, token });
+          const result = await postMutation(path, { sessionId, token: value });
           if (result.aborted === true) return;
 
           if (!result.ok) {
@@ -4081,14 +4835,14 @@ window.__ModuleLoader__.load({
             return;
           }
 
-          setTokenDraft('');
+          setDraft('');
           if (settingsToSave !== null) {
             // Mirror a normal settings save: close the overlay so the combined
             // success flash (rendered behind it) is actually visible.
             setSettingsOpen(false);
             focusSettingsButton();
           }
-          setFlash(settingsToSave === null ? 'token 已保存' : '设置与 token 已保存');
+          setFlash(settingsToSave === null ? labels.saved : labels.combined);
           try {
             await polling.refresh();
           } catch {
@@ -4096,10 +4850,10 @@ window.__ModuleLoader__.load({
           }
         } finally {
           settingsSavingRef.current = false;
-          tokenBusyRef.current = false;
+          busyRefForToken.current = false;
           busyRef.current = false;
           setSettingsSaving(false);
-          setTokenBusy(false);
+          setBusy(false);
         }
       }, [
         configured,
@@ -4109,22 +4863,27 @@ window.__ModuleLoader__.load({
         sessionId,
         settingsBaseline,
         settingsOpen,
-        tokenDraft,
       ]);
 
-      /** Clear the stored platform token (`{token:null}`, never an empty string). */
-      const clearPlatformToken = React.useCallback(async () => {
-        if (tokenBusyRef.current || settingsSavingRef.current || busyRef.current) return;
+      /** Shared token clear (`{token:null}`, never an empty string). */
+      const clearToken = React.useCallback(async ({
+        path,
+        tokenBusyRef: busyRefForToken,
+        setTokenBusy: setBusy,
+        setTokenDraft: setDraft,
+        cleared,
+      }) => {
+        if (busyRefForToken.current || settingsSavingRef.current || busyRef.current) return;
         if (sessionId === null || configured !== true) return;
 
         setActionError(null);
         setFlash(null);
-        tokenBusyRef.current = true;
+        busyRefForToken.current = true;
         busyRef.current = true;
-        setTokenBusy(true);
+        setBusy(true);
 
         try {
-          const result = await postMutation(API.platformToken, { sessionId, token: null });
+          const result = await postMutation(path, { sessionId, token: null });
           if (result.aborted === true) return;
 
           if (!result.ok) {
@@ -4132,19 +4891,57 @@ window.__ModuleLoader__.load({
             return;
           }
 
-          setTokenDraft('');
-          setFlash('token 已清除');
+          setDraft('');
+          setFlash(cleared);
           try {
             await polling.refresh();
           } catch {
             // The polling banner (or the next poll) reports a failed refresh.
           }
         } finally {
-          tokenBusyRef.current = false;
+          busyRefForToken.current = false;
           busyRef.current = false;
-          setTokenBusy(false);
+          setBusy(false);
         }
       }, [configured, polling, postMutation, sessionId]);
+
+      /** Save the platform token through the shared card flow. */
+      const savePlatformToken = React.useCallback(() => saveToken({
+        path: API.platformToken,
+        token: tokenDraft,
+        tokenBusyRef,
+        setTokenBusy,
+        setTokenDraft,
+        labels: PLATFORM_TOKEN_UI,
+      }), [saveToken, tokenDraft]);
+
+      /** Clear the platform token (`{token:null}`). */
+      const clearPlatformToken = React.useCallback(() => clearToken({
+        path: API.platformToken,
+        tokenBusyRef,
+        setTokenBusy,
+        setTokenDraft,
+        cleared: PLATFORM_TOKEN_UI.cleared,
+      }), [clearToken]);
+
+      /** Save the GitLab token through the shared card flow. */
+      const saveGitlabToken = React.useCallback(() => saveToken({
+        path: API.gitlabToken,
+        token: gitlabTokenDraft,
+        tokenBusyRef: gitlabTokenBusyRef,
+        setTokenBusy: setGitlabTokenBusy,
+        setTokenDraft: setGitlabTokenDraft,
+        labels: GITLAB_TOKEN_UI,
+      }), [gitlabTokenDraft, saveToken]);
+
+      /** Clear the GitLab token (`{token:null}`). */
+      const clearGitlabToken = React.useCallback(() => clearToken({
+        path: API.gitlabToken,
+        tokenBusyRef: gitlabTokenBusyRef,
+        setTokenBusy: setGitlabTokenBusy,
+        setTokenDraft: setGitlabTokenDraft,
+        cleared: GITLAB_TOKEN_UI.cleared,
+      }), [clearToken]);
 
       /**
        * Run one platform sync. Requires a session workspace and a stored token
@@ -4194,15 +4991,17 @@ window.__ModuleLoader__.load({
         if (!descriptor || !ticket || busyRef.current || typeof ticket.code !== 'string') return;
         if (sessionId === null || configured !== true) return;
 
-        // P3/P4: `start_analysis` and the board-only `start_fix` descriptors
-        // bypass `/action` and go to their real routes. The host handles the
-        // approved start, the orphaned-`analyzing`/`fixing` restart and the
-        // blocked-from-analysis/fix retry through those routes, so the client
-        // never sends a separate `/action retry` first.
+        // P3/P4/P5: `start_analysis`, the board-only `start_fix` and the
+        // board-only `start_deliver` descriptors bypass `/action` and go to
+        // their real routes. The host handles the approved start, the
+        // orphaned-`analyzing`/`fixing` restart, the blocked-from-analysis/fix
+        // retry and the whole delivery job through those routes, so the client
+        // never sends a separate submit_mr/mr_created demo action.
         const isAnalyze = descriptor.action === 'start_analysis';
         const isFix = descriptor.action === 'start_fix';
+        const isDeliver = descriptor.action === 'start_deliver';
         let payload = {};
-        if (!isAnalyze && !isFix) {
+        if (!isAnalyze && !isFix && !isDeliver) {
           payload = descriptor.payload === undefined || descriptor.payload === null ? {} : descriptor.payload;
           if (descriptor.input === 'reason') {
             const trimmed = typeof reason === 'string' ? reason.trim() : '';
@@ -4222,6 +5021,8 @@ window.__ModuleLoader__.load({
             result = await postMutation(API.analyze, { sessionId, code: ticket.code });
           } else if (isFix) {
             result = await postMutation(API.fix, { sessionId, code: ticket.code });
+          } else if (isDeliver) {
+            result = await postMutation(API.deliver, { sessionId, code: ticket.code });
           } else {
             result = await postMutation(API.action, {
               sessionId,
@@ -4245,6 +5046,11 @@ window.__ModuleLoader__.load({
               // start, not that the work is done. Progress comes only from
               // `snapshot.fix.running` / the ticket's workflow.
               setFlash(`工单 ${ticket.code} 修复请求已受理，正在刷新…`);
+            } else if (isDeliver) {
+              // 200 only means the delivery job was accepted; lint/test,
+              // commit, push and MR creation run in the background and surface
+              // through `snapshot.delivery.running` / `snapshot.delivery.errors`.
+              setFlash(`工单 ${ticket.code} 提交请求已受理，正在创建 MR…`);
             } else {
               const next = result.data && typeof result.data === 'object' ? result.data.ticket : null;
               const nextWorkflow = next && typeof next.workflow === 'string' ? next.workflow : null;
@@ -4256,6 +5062,8 @@ window.__ModuleLoader__.load({
             setActionError(analyzeErrorView(result));
           } else if (isFix) {
             setActionError(fixErrorView(result));
+          } else if (isDeliver) {
+            setActionError(deliverErrorView(result));
           } else {
             setActionError(toErrorView(result));
           }
@@ -4669,10 +5477,16 @@ window.__ModuleLoader__.load({
               tokenDraft,
               tokenBusy,
               tokenPresent,
+              gitlabTokenDraft,
+              gitlabTokenBusy,
+              gitlabTokenPresent,
               onChange: updateSettingsField,
               onTokenChange: setTokenDraft,
               onSaveToken: savePlatformToken,
               onClearToken: clearPlatformToken,
+              onGitlabTokenChange: setGitlabTokenDraft,
+              onSaveGitlabToken: saveGitlabToken,
+              onClearGitlabToken: clearGitlabToken,
               onSave: saveSettings,
               onCancel: closeSettings,
             })

@@ -4,16 +4,23 @@
  * Routes (all exact, all JSON, all same-origin/loopback only):
  *
  *   GET  /bug-workflow/api/health          -> { ok, domainOpenedAt, tickets }
- *   GET  /bug-workflow/api/snapshot        -> { ok, workspace, settings, platform, dicts, tickets, serverTime }
+ *   GET  /bug-workflow/api/snapshot        -> { ok, workspace, settings, platform, gitlab, dicts,
+ *                                              analysis, fix, delivery, review, tickets, serverTime }
  *   POST /bug-workflow/api/action          -> { ok, ticket } | { ok:false, code, message, ticket? }
  *                                              action:'create' + payload.code imports that
- *                                              platform task by code (see `importTask`)
+ *                                              platform task by code (see `importTask`).
+ *                                              `analysis_done`/`fix_done` are refused with
+ *                                              409 `service-job-running` while that ticket's
+ *                                              real job is in the service's running set.
  *   POST /bug-workflow/api/analyze         -> { ok, workflow:'analyzing', running }
  *                                              | { ok:false, code, message } (P3 real analysis)
  *   POST /bug-workflow/api/fix             -> { ok, workflow:'fixing', running }
  *                                              | { ok:false, code, message } (P4 real fix)
+ *   POST /bug-workflow/api/deliver         -> { ok, workflow:'submitting', running }
+ *                                              | { ok:false, code, message } (P5 delivery/MR)
  *   POST /bug-workflow/api/settings        -> { ok, settings }
  *   POST /bug-workflow/api/platform-token  -> { ok, tokenPresent } (token is only written, never read back)
+ *   POST /bug-workflow/api/gitlab-token    -> { ok, tokenPresent } (P5 GitLab token, same contract)
  *   POST /bug-workflow/api/sync            -> { ok, synced, created, updated, total, filtered, lastSyncAt }
  *                                              | { ok:false, code, message }
  *
@@ -61,6 +68,23 @@
  * host failures 500. The snapshot always carries `fix:{running, errors}` with
  * the same shape as `analysis`.
  *
+ * P5 `/deliver` mapping: a missing ticket is 404; `not-submitting`,
+ * `delivery-busy`, `delivery-no-changes`, `protected-branch` and
+ * `worktree-conflict` (a personal branch checked out in another/manual
+ * worktree) are 409; missing worktree/settings and invalid branch/target input
+ * are 400; `missing-gitlab-token` and an unwired service are retryable 503;
+ * unexpected git/push/MR failures are 500. The snapshot always carries
+ * `delivery:{running, errors}` where `errors` is keyed by ticket code and read
+ * from the delivery-specific meta namespace (`delivery.error:<code>`), never
+ * from `fix.error:<code>`. The background job's lint/test/commit/push/MR
+ * failures block the ticket and never surface as a synchronous HTTP error.
+ *
+ * P5 AI Review polling is timer-driven by `createReviewService()` and exposes
+ * no HTTP route: the snapshot always carries `review:{running, errors}` (empty
+ * when the service is not wired or failed to construct), with `errors` keyed by
+ * ticket code and read from `review.error:<code>`. Polling/fix/merge failures
+ * are visible only through that block.
+ *
  * Failures are closed over: every handler is wrapped, and no handler lets an
  * exception escape into the HTTP server. The plugin loads without storage; the
  * fallback handlers are the contract for that state.
@@ -79,8 +103,10 @@ export const API_PATHS = Object.freeze({
   action: '/bug-workflow/api/action',
   analyze: '/bug-workflow/api/analyze',
   fix: '/bug-workflow/api/fix',
+  deliver: '/bug-workflow/api/deliver',
   settings: '/bug-workflow/api/settings',
   platformToken: '/bug-workflow/api/platform-token',
+  gitlabToken: '/bug-workflow/api/gitlab-token',
   sync: '/bug-workflow/api/sync',
 });
 
@@ -96,6 +122,9 @@ const MAX_ERROR_MESSAGE_CHARS = 300;
 /** 503 message for an absent/failed credential service (never mentions a token). */
 const CREDENTIALS_UNAVAILABLE_MESSAGE = '凭据服务不可用，暂时无法保存平台 token';
 
+/** 503 message for the GitLab token (same contract, token-free). */
+const GITLAB_CREDENTIALS_UNAVAILABLE_MESSAGE = '凭据服务不可用，暂时无法保存 GitLab token';
+
 /** A rejected action name is echoed back truncated to this many characters. */
 const MAX_ACTION_NAME_CHARS = 64;
 
@@ -106,8 +135,10 @@ const ROUTE_METHODS = Object.freeze({
   action: 'POST',
   analyze: 'POST',
   fix: 'POST',
+  deliver: 'POST',
   settings: 'POST',
   platformToken: 'POST',
+  gitlabToken: 'POST',
   sync: 'POST',
 });
 
@@ -221,6 +252,54 @@ const FIX_ERROR_STATUS = Object.freeze({
 /** 503 message for a host built without the fix service. */
 const FIX_UNAVAILABLE_MESSAGE = '修复服务不可用，请稍后重试';
 
+/**
+ * `POST /deliver` failure code -> HTTP status (P5 plan). A missing ticket is
+ * 404; a ticket that is not `submitting` (manual test not passed), a concurrent
+ * delivery in the same ticket/repository and a no-op commit are 409; missing
+ * branch/worktree metadata and invalid GitLab/branch configuration are 400; a
+ * missing GitLab token or an unwired service is a retryable 503; unexpected
+ * git/push/MR failures are 500. Unknown codes are programming errors -> 500.
+ *
+ * The lint/test/commit/push/MR steps run in the background AFTER the 200, so
+ * their failures block the ticket and appear in `snapshot.delivery.errors`
+ * instead of this mapping; the mapping still covers the codes a future
+ * synchronous validation could return.
+ */
+const DELIVERY_ERROR_STATUS = Object.freeze({
+  'ticket-not-found': 404,
+  'not-found': 404,
+  'not-submitting': 409,
+  'delivery-busy': 409,
+  'delivery-no-changes': 409,
+  'protected-branch': 409,
+  'worktree-conflict': 409,
+  'worktree-missing': 400,
+  'invalid-gitlab-settings': 400,
+  'invalid-branch': 400,
+  'invalid-code': 400,
+  'invalid-input': 400,
+  'unknown-workspace': 400,
+  'missing-gitlab-token': 503,
+  'delivery-unavailable': 503,
+  'git-failed': 500,
+  'push-failed': 500,
+  'mr-failed': 500,
+  internal: 500,
+});
+
+/** 503 message for a host built without the delivery service. */
+const DELIVERY_UNAVAILABLE_MESSAGE = '交付服务不可用，请稍后重试';
+
+/**
+ * 409 copy for a service-owned demo action (`analysis_done` / `fix_done`) that
+ * arrives while the corresponding real background job is still running for the
+ * same ticket. Accepting it would advance the ticket early and turn the
+ * service's own conditional state write into `stale-workflow`, losing the
+ * ledger entry; the host refuses instead (static code + copy, no detail).
+ */
+const SERVICE_JOB_RUNNING_CODE = 'service-job-running';
+const SERVICE_JOB_RUNNING_MESSAGE = '该工单的 AI 任务正在运行，已拒绝手动推进；请等待任务完成';
+
 /** Explicit allow-list of loopback Host header values (with optional port). */
 const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1']);
 
@@ -238,6 +317,9 @@ const LOOPBACK_REMOTE_ADDRESSES = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1
  * @param {{resolve: (sessionId: string) => {path: string|null, configured: boolean}}} deps.workspace
  * @param {object|null} [deps.tokenStore] `createTokenStore()` result; when null
  *   the snapshot reports `tokenPresent:false` and the token route answers 503
+ * @param {object|null} [deps.gitlabTokenStore] `createTokenStore(..., {ref})`
+ *   result for the P5 GitLab token; when null the snapshot reports
+ *   `gitlab.tokenPresent:false` and `/gitlab-token` answers 503
  * @param {object|null} [deps.sync] `createSyncService()` result; when null the
  *   sync route answers 503 and the snapshot falls back to token presence only
  * @param {((cwd: string|null, code: string) => Promise<object>)|null} [deps.importTask]
@@ -250,21 +332,32 @@ const LOOPBACK_REMOTE_ADDRESSES = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1
  *   `createFixService()` result for `POST /fix` and the snapshot `fix` block;
  *   when null `/fix` answers 503 `fix-unavailable` and the snapshot reports
  *   empty fix state
+ * @param {{service: object}|null} [deps.delivery]
+ *   `createDeliveryService()` result for `POST /deliver` and the snapshot
+ *   `delivery` block; when null `/deliver` answers 503 `delivery-unavailable`
+ *   and the snapshot reports empty delivery state
+ * @param {{service: object}|null} [deps.review]
+ *   `createReviewService()` result for the snapshot `review` block. Review is
+ *   timer-driven and exposes NO HTTP route, so only `status()` is required;
+ *   when null the snapshot reports empty review state
  * @param {() => string} [deps.clock] ISO 8601 server time for snapshots
  * @param {number|null} [deps.domainOpenedAt] domain open timestamp for health
  * @param {number} [deps.bodyTimeoutMs] POST body read deadline (default 10 s)
  * @param {((entry: {event: string, error: unknown}) => void)|null} [deps.log]
  *   optional host logger; receives full errors that are hidden from responses
- * @returns {{health: Function, snapshot: Function, action: Function, analyze: Function, fix: Function, settings: Function, platformToken: Function, sync: Function}}
+ * @returns {{health: Function, snapshot: Function, action: Function, analyze: Function, fix: Function, deliver: Function, settings: Function, platformToken: Function, gitlabToken: Function, sync: Function}}
  */
 export function createHandlers({
   store,
   workspace,
   tokenStore = null,
+  gitlabTokenStore = null,
   sync = null,
   importTask = null,
   analysis = null,
   fix = null,
+  delivery = null,
+  review = null,
   clock = defaultClock,
   domainOpenedAt = null,
   bodyTimeoutMs = BODY_TIMEOUT_MS,
@@ -282,6 +375,14 @@ export function createHandlers({
     }
   }
   const tokenStoreSafe = tokenStore === undefined ? null : tokenStore;
+  if (gitlabTokenStore !== null && gitlabTokenStore !== undefined) {
+    for (const method of ['get', 'set', 'clear', 'present']) {
+      if (typeof gitlabTokenStore[method] !== 'function') {
+        throw new TypeError(`createHandlers() gitlabTokenStore.${method} must be a function`);
+      }
+    }
+  }
+  const gitlabTokenStoreSafe = gitlabTokenStore === undefined ? null : gitlabTokenStore;
   if (sync !== null && sync !== undefined) {
     for (const method of ['run', 'status']) {
       if (typeof sync[method] !== 'function') {
@@ -314,6 +415,24 @@ export function createHandlers({
     }
   }
   const fixDeps = fix === undefined ? null : fix;
+  if (delivery !== null && delivery !== undefined) {
+    if (typeof delivery !== 'object'
+      || typeof delivery.service?.start !== 'function'
+      || typeof delivery.service?.status !== 'function') {
+      throw new TypeError(
+        'createHandlers() delivery.service must expose start(sessionId, cwd, code) and status()',
+      );
+    }
+  }
+  const deliveryDeps = delivery === undefined ? null : delivery;
+  if (review !== null && review !== undefined) {
+    if (typeof review !== 'object' || typeof review.service?.status !== 'function') {
+      throw new TypeError(
+        'createHandlers() review.service must expose status()',
+      );
+    }
+  }
+  const reviewDeps = review === undefined ? null : review;
   if (typeof clock !== 'function') {
     throw new TypeError('createHandlers() requires clock to be a function');
   }
@@ -366,12 +485,21 @@ export function createHandlers({
         // Task 4: platform status + dictionaries. Both readers degrade to
         // safe defaults so a failing sync/meta read cannot take down the board.
         platform: await readPlatformStatus(syncService, tokenStoreSafe),
+        // P5: GitLab token presence only. The value never leaves credentials,
+        // and a missing/failing store reads as false.
+        gitlab: { tokenPresent: await readTokenPresent(gitlabTokenStoreSafe) },
         dicts: readDicts(store),
         // P3: analysis progress + static per-ticket errors. Absent wiring
         // reports empty state instead of an undefined key.
         analysis: readServiceStatus(analysisDeps),
         // P4: fix progress + static per-ticket errors, same shape.
         fix: readServiceStatus(fixDeps),
+        // P5: delivery progress + static per-ticket errors from the
+        // delivery-specific meta namespace (parallel to `fix`, never shared).
+        delivery: readServiceStatus(deliveryDeps),
+        // P5: review polling/merge-detection progress + static per-ticket
+        // errors (`review.error:<code>`). Timer-driven: no HTTP route.
+        review: readServiceStatus(reviewDeps),
         tickets: snapshot.tickets,
         serverTime: clock(),
       });
@@ -422,6 +550,31 @@ export function createHandlers({
       const payload = normalizePayload(input.payload);
       if (!payload.ok) {
         sendError(res, 400, payload.code, payload.message);
+        return;
+      }
+
+      // Service-owned demo actions: `analysis_done`/`fix_done` are transition
+      // names the real background services write themselves. A board/raw POST
+      // while that job is running for the SAME code must be refused before the
+      // store write, otherwise the ticket advances early and the service's
+      // conditional patch/action becomes `stale-workflow` (the run's ledger is
+      // lost). An unwired service (or a status read that fails) keeps the
+      // legacy path: this guard only covers the live race, never a new failure.
+      //
+      // Accepted TOCTOU window: the job may settle (or start) between this
+      // `status()` read and the `store.applyAction` below. A job that finishes
+      // in that window makes the guard return 409 for a ticket whose run just
+      // completed — the safe direction, because the user simply retries; a job
+      // that starts in that window can still lose the race, but only a raw
+      // (board-hidden) POST can hit it and the window is microseconds wide.
+      // Closing it fully would need the write and the status read to share the
+      // service's lock, which is deliberately out of scope for this demo-action
+      // guard.
+      const serviceDeps = action === 'analysis_done'
+        ? analysisDeps
+        : (action === 'fix_done' ? fixDeps : null);
+      if (serviceDeps !== null && serviceJobRunningFor(serviceDeps, code)) {
+        sendError(res, 409, SERVICE_JOB_RUNNING_CODE, SERVICE_JOB_RUNNING_MESSAGE);
         return;
       }
 
@@ -615,6 +768,80 @@ export function createHandlers({
       );
     }),
 
+    /**
+     * Start the real (P5) delivery for one `submitting` ticket:
+     * `{sessionId, code}`.
+     *
+     * The service runs lint/test, commits, pushes the personal branch and
+     * creates/reuses the GitLab MR in the background; this route answers as
+     * soon as the job is launched (200). All synchronous validations (state,
+     * settings, token, branch/worktree, client factory) happen before the
+     * launch and return the static 400/404/409/503 mapping; the later steps
+     * block the ticket and surface through `snapshot.delivery.errors`.
+     */
+    deliver: safe(async (req, res) => {
+      if (!guard(req, res, ROUTE_METHODS.deliver)) return;
+      if (!guardJsonContentType(req, res)) return;
+      if (!guardOrigin(req, res)) return;
+
+      const body = await readJsonBody(req, bodyTimeoutMs);
+      if (!body.ok) {
+        sendError(res, body.status, body.code, body.message);
+        if (body.destroyRequest === true) destroyRequest(req);
+        return;
+      }
+      const input = body.value;
+
+      const sessionId = normalizeSessionId(input.sessionId);
+      if (sessionId === undefined) {
+        sendError(res, 400, 'missing-session', '缺少有效的 sessionId');
+        return;
+      }
+
+      const code = normalizeCode(input.code);
+      if (code === undefined) {
+        sendError(res, 400, 'invalid-code', '缺少有效的工单编号 code');
+        return;
+      }
+
+      if (deliveryDeps === null) {
+        sendError(res, 503, 'delivery-unavailable', DELIVERY_UNAVAILABLE_MESSAGE);
+        return;
+      }
+
+      // The worktree/branch metadata is resolved against a real repository; an
+      // unbound session would otherwise resolve it relative to the wrong cwd.
+      const resolved = normalizeWorkspace(workspace.resolve(sessionId));
+      if (resolved.path === null) {
+        sendError(res, 400, 'unknown-workspace', '无法确定工作区路径，无法提交 MR');
+        return;
+      }
+
+      const result = await deliveryDeps.service.start(sessionId, resolved.path, code);
+      if (result?.ok === true) {
+        sendJsonSafe(res, 200, {
+          ok: true,
+          workflow: 'submitting',
+          running: result.running === true,
+        });
+        return;
+      }
+
+      const failureCode = typeof result?.code === 'string' ? result.code : 'internal';
+      const status = DELIVERY_ERROR_STATUS[failureCode];
+      if (status === undefined) {
+        notifyLog(log, 'delivery-result', result);
+        sendError(res, 500, 'internal', '交付启动失败');
+        return;
+      }
+      sendError(
+        res,
+        status,
+        failureCode,
+        clipMessage(typeof result?.message === 'string' ? result.message : '交付启动失败'),
+      );
+    }),
+
     settings: safe(async (req, res) => {
       if (!guard(req, res, ROUTE_METHODS.settings)) return;
       if (!guardJsonContentType(req, res)) return;
@@ -726,59 +953,90 @@ export function createHandlers({
      * rejected, matching the action route's validation. The board still gates
      * the UI on a bound workspace.
      */
-    platformToken: safe(async (req, res) => {
-      if (!guard(req, res, ROUTE_METHODS.platformToken)) return;
-      if (!guardJsonContentType(req, res)) return;
-      if (!guardOrigin(req, res)) return;
+    platformToken: safe(writeTokenRoute(
+      ROUTE_METHODS.platformToken,
+      tokenStoreSafe,
+      CREDENTIALS_UNAVAILABLE_MESSAGE,
+      bodyTimeoutMs,
+    )),
 
-      const body = await readJsonBody(req, bodyTimeoutMs);
-      if (!body.ok) {
-        sendError(res, body.status, body.code, body.message);
-        if (body.destroyRequest === true) destroyRequest(req);
+    /**
+     * Write or clear the GitLab token (P5). Exactly the platform-token contract:
+     * `{sessionId, token}` with a string stored and `null` cleared; only
+     * `{ok, tokenPresent}` is echoed. The two credentials are independent refs,
+     * so this route never reads or changes the platform token.
+     */
+    gitlabToken: safe(writeTokenRoute(
+      ROUTE_METHODS.gitlabToken,
+      gitlabTokenStoreSafe,
+      GITLAB_CREDENTIALS_UNAVAILABLE_MESSAGE,
+      bodyTimeoutMs,
+    )),
+  };
+}
+
+/**
+ * Shared implementation of the platform/GitLab token write routes: same
+ * transport guards, JSON body contract, session check and static error mapping.
+ * `store` is the already-validated token store for that credential ref; `null`
+ * means the credentials service is unavailable (503).
+ *
+ * The response only ever carries `{ok, tokenPresent}`: the value is never read
+ * back, so it cannot be echoed.
+ */
+function writeTokenRoute(method, store, unavailableMessage, bodyTimeoutMs) {
+  return async (req, res) => {
+    if (!guard(req, res, method)) return;
+    if (!guardJsonContentType(req, res)) return;
+    if (!guardOrigin(req, res)) return;
+
+    const body = await readJsonBody(req, bodyTimeoutMs);
+    if (!body.ok) {
+      sendError(res, body.status, body.code, body.message);
+      if (body.destroyRequest === true) destroyRequest(req);
+      return;
+    }
+    const input = body.value;
+
+    const sessionId = normalizeSessionId(input.sessionId);
+    if (sessionId === undefined) {
+      sendError(res, 400, 'missing-session', '缺少有效的 sessionId');
+      return;
+    }
+
+    if (store === null) {
+      sendError(res, 503, 'credentials-unavailable', unavailableMessage);
+      return;
+    }
+
+    const clear = input.token === null;
+    if (!clear && typeof input.token !== 'string') {
+      sendError(res, 400, 'invalid-token', 'token 必须是非空字符串，或传 null 清除');
+      return;
+    }
+
+    try {
+      if (clear) {
+        await store.clear();
+        sendJsonSafe(res, 200, { ok: true, tokenPresent: false });
         return;
       }
-      const input = body.value;
-
-      const sessionId = normalizeSessionId(input.sessionId);
-      if (sessionId === undefined) {
-        sendError(res, 400, 'missing-session', '缺少有效的 sessionId');
+      await store.set(input.token);
+      // Deliberately optimistic: a successful write means the token is now
+      // present; reading it back is not needed (and must not leave the store).
+      sendJsonSafe(res, 200, { ok: true, tokenPresent: true });
+    } catch (error) {
+      const code = typeof error?.code === 'string' ? error.code : undefined;
+      if (code === 'invalid-token') {
+        sendError(res, 400, 'invalid-token', clipMessage(errorMessage(error)));
         return;
       }
-
-      if (tokenStoreSafe === null) {
-        sendError(res, 503, 'credentials-unavailable', CREDENTIALS_UNAVAILABLE_MESSAGE);
+      if (code === 'credentials-unavailable') {
+        sendError(res, 503, 'credentials-unavailable', unavailableMessage);
         return;
       }
-
-      const clear = input.token === null;
-      if (!clear && typeof input.token !== 'string') {
-        sendError(res, 400, 'invalid-token', 'token 必须是非空字符串，或传 null 清除');
-        return;
-      }
-
-      try {
-        if (clear) {
-          await tokenStoreSafe.clear();
-          sendJsonSafe(res, 200, { ok: true, tokenPresent: false });
-          return;
-        }
-        await tokenStoreSafe.set(input.token);
-        // Deliberately optimistic: a successful write means the token is now
-        // present; reading it back is not needed (and must not leave the store).
-        sendJsonSafe(res, 200, { ok: true, tokenPresent: true });
-      } catch (error) {
-        const code = typeof error?.code === 'string' ? error.code : undefined;
-        if (code === 'invalid-token') {
-          sendError(res, 400, 'invalid-token', clipMessage(errorMessage(error)));
-          return;
-        }
-        if (code === 'credentials-unavailable') {
-          sendError(res, 503, 'credentials-unavailable', CREDENTIALS_UNAVAILABLE_MESSAGE);
-          return;
-        }
-        throw error;
-      }
-    }),
+      throw error;
+    }
   };
 }
 
@@ -829,8 +1087,10 @@ export function registerUnavailableRoutes(ctx, health = {}) {
     action: unavailableHandler(ROUTE_METHODS.action, health),
     analyze: unavailableHandler(ROUTE_METHODS.analyze, health),
     fix: unavailableHandler(ROUTE_METHODS.fix, health),
+    deliver: unavailableHandler(ROUTE_METHODS.deliver, health),
     settings: unavailableHandler(ROUTE_METHODS.settings, health),
     platformToken: unavailableHandler(ROUTE_METHODS.platformToken, health),
+    gitlabToken: unavailableHandler(ROUTE_METHODS.gitlabToken, health),
     sync: unavailableHandler(ROUTE_METHODS.sync, health),
   };
   return registerHandlers(webServer, handlers);
@@ -1035,10 +1295,11 @@ function emptyDicts() {
 }
 
 /**
- * Snapshot `analysis`/`fix` object. Both services are optional (older wiring, a
- * profile without subagent services, or a failed service construction), so a
- * missing/failing `status()` degrades to empty state and the board keeps
- * rendering. Only static strings persisted by the service are exposed.
+ * Snapshot `analysis`/`fix`/`delivery`/`review` object. Every service is
+ * optional (older wiring, a profile without subagent services, or a failed
+ * service construction), so a missing/failing `status()` degrades to empty
+ * state and the board keeps rendering. Only static strings persisted by the
+ * service are exposed.
  */
 function readServiceStatus(serviceDeps) {
   const empty = { running: [], errors: {} };
@@ -1063,6 +1324,32 @@ function readServiceStatus(serviceDeps) {
     }
   }
   return { running, errors };
+}
+
+/**
+ * True when `code` is in the service's live `status().running` set.
+ *
+ * Reading the service status is best-effort and mirrors the snapshot
+ * normalizer above: an unwired dependency, a service without `status()`, a
+ * throwing `status()` or a malformed result — including a `running` array with
+ * non-string entries — all read as "not running" so the legacy `/api/action`
+ * path stays available (the guard only ever removes the specific race with a
+ * real background job; it must not turn into a new failure mode for older
+ * wiring).
+ */
+function serviceJobRunningFor(serviceDeps, code) {
+  if (serviceDeps === null || serviceDeps === undefined) return false;
+  if (typeof serviceDeps.service?.status !== 'function') return false;
+
+  let status;
+  try {
+    status = serviceDeps.service.status();
+  } catch {
+    return false;
+  }
+  if (!isPlainObject(status) || !Array.isArray(status.running)) return false;
+  if (!status.running.every((entry) => typeof entry === 'string')) return false;
+  return status.running.includes(code);
 }
 
 /** Coerce a sync stat to a non-negative integer; anything else counts as 0. */

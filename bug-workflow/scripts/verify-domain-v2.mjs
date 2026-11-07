@@ -316,14 +316,74 @@ check('branch worktree metadata accepted and bounded', () => {
   }
 });
 
-check('settings defaults platformBaseUrl/writebackStatus', () => {
+check('review round metadata accepted and bounded', () => {
+  const round = {
+    round: 1,
+    noteId: 101,
+    verdict: 'changes',
+    startedAt: '2026-11-07T00:00:00.000Z',
+    finishedAt: '2026-11-07T00:01:00.000Z',
+    changedFiles: ['src/a.js'],
+    status: 'succeeded',
+    childId: 'child-1',
+  };
+  const parsed = ticketSchema.parse(v1Ticket({ workflow: 'mr_open', reviewRounds: [round] }));
+  assert.deepEqual(parsed.reviewRounds, [round]);
+
+  const malformed = [
+    [{ ...round, round: -1 }],
+    [{ ...round, round: '1' }],
+    [{ ...round, noteId: {} }],
+    [{ ...round, verdict: 'maybe' }],
+    [{ ...round, startedAt: null }],
+    [{ ...round, changedFiles: 'src/a.js' }],
+    [{ ...round, changedFiles: [42] }],
+    [{ ...round, status: 'open' }],
+    [{ ...round, childId: 42 }],
+  ];
+  for (const candidate of malformed) {
+    const result = ticketSchema.safeParse(v1Ticket({ reviewRounds: candidate }));
+    assert.equal(
+      result.success,
+      false,
+      `malformed review round accepted: ${JSON.stringify(candidate).slice(0, 120)}`,
+    );
+  }
+});
+
+check('settings defaults platformBaseUrl/gitlabBaseUrl/writebackStatus', () => {
   const parsed = settingsSchema.parse({});
   assert.equal(parsed.platformBaseUrl, 'https://ecard.htwisdom.cn');
+  assert.equal(parsed.gitlabBaseUrl, 'https://git.htwisdom.cn');
   assert.equal(parsed.writebackStatus, false);
 
   const enabled = settingsSchema.parse({ writebackStatus: true });
   assert.equal(enabled.writebackStatus, true);
   assert.equal(enabled.platformBaseUrl, 'https://ecard.htwisdom.cn');
+  assert.equal(enabled.gitlabBaseUrl, 'https://git.htwisdom.cn');
+});
+
+check('settings legacy row without gitlabBaseUrl defaults it', () => {
+  // A record written by P1-P4 has no gitlabBaseUrl key. `looseObject` plus the
+  // schema default must fill it instead of failing the domain open.
+  const legacy = {
+    platformBaseUrl: 'https://ecard.htwisdom.cn',
+    platformProjectCode: '',
+    gitlabProjectPath: 'group/project',
+    branchUser: 'ly',
+    gitlabReviewer: '',
+    commitType: 'fix',
+    lintCommand: '',
+    testCommand: '',
+    devCommand: '',
+    previewUrl: '',
+    writebackStatus: false,
+  };
+  assert.equal(Object.hasOwn(legacy, 'gitlabBaseUrl'), false);
+  const parsed = settingsSchema.parse(legacy);
+  assert.equal(parsed.gitlabBaseUrl, 'https://git.htwisdom.cn');
+  assert.equal(parsed.gitlabProjectPath, 'group/project');
+  assert.equal(parsed.branchUser, 'ly');
 });
 
 // ---------------------------------------------------------------------------
