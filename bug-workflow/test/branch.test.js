@@ -8,12 +8,15 @@
  *   - feature tickets:   feat-<X>-<user>  -> feature-<X>
  *   - failure tickets:   hot-<X>-<user>   -> hotfix-<X>
  *   - X is `versionName` filtered to `[A-Za-z0-9._-]`, repeated `-` collapsed
- *     and edge `-` trimmed; an empty result falls back to `V0.0.0`;
+ *     and edge `-` trimmed; a missing/blank version is `invalid-version` (no
+ *     `V0.0.0` fallback);
  *   - an explicit `family` option or a `hot-`/`feat-` personal-branch override
- *     selects the family; otherwise the ticket type decides;
+ *     selects the family; an explicit family that contradicts the override
+ *     prefix is `invalid-family`; otherwise the ticket type decides (the
+ *     `FAILURE` typeKey check is a documented best-effort legacy hint);
  *   - `override.personalBranch`/`override.targetBranch` are honoured after
- *     safety validation; a personal-only override keeps the spec rule that the
- *     target is derived from the personal branch name;
+ *     safety validation; a personal-only override derives the target from the
+ *     personal branch name and must end in `-<branchUser>`;
  *   - `BranchError` carries a static `code` and a static message (never the
  *     rejected input, which may contain control characters).
  */
@@ -24,7 +27,6 @@ import test from 'node:test';
 import {
   BRANCH_LENGTH_LIMIT,
   BRANCH_USER_LENGTH_LIMIT,
-  DEFAULT_VERSION,
   VERSION_LENGTH_LIMIT,
   BranchError,
   deriveBranches,
@@ -76,7 +78,7 @@ test('failure ticket uses the hot prefix and hotfix target', () => {
   assert.equal(result.baseHint, result.targetBranch);
 });
 
-test('a FAILURE typeKey is treated as a failure ticket too', () => {
+test('a FAILURE-containing typeKey is a documented best-effort failure hint', () => {
   const result = deriveBranches({
     versionName: 'V1.0.0',
     ticketType: '缺陷',
@@ -115,6 +117,53 @@ test('explicit family option overrides ticket-type detection', () => {
   );
 });
 
+test('an explicit family that contradicts the personal override is invalid-family', () => {
+  expectBranchError(
+    () => deriveBranches({
+      versionName: 'V2.0.0',
+      ticketType: '需求',
+      branchUser: 'ly',
+      family: 'feat',
+      override: { personalBranch: 'hot-V2.0.0-ly' },
+    }),
+    'invalid-family',
+  );
+  expectBranchError(
+    () => deriveBranches({
+      versionName: 'V2.0.0',
+      ticketType: '缺陷',
+      branchUser: 'ly',
+      family: 'hot',
+      override: { personalBranch: 'feat-V2.0.0-ly' },
+    }),
+    'invalid-family',
+  );
+  // Explicit target does not make the contradictory personal branch valid.
+  expectBranchError(
+    () => deriveBranches({
+      versionName: 'V2.0.0',
+      ticketType: '需求',
+      branchUser: 'ly',
+      family: 'feat',
+      override: { personalBranch: 'hot-V2.0.0-ly', targetBranch: 'hotfix-V2.0.0' },
+    }),
+    'invalid-family',
+  );
+
+  // A matching explicit family plus override is allowed and keeps the target
+  // derivation rule.
+  const consistent = deriveBranches({
+    versionName: 'V2.0.0',
+    ticketType: '需求',
+    branchUser: 'ly',
+    family: 'hot',
+    override: { personalBranch: 'hot-custom-ly' },
+  });
+  assert.equal(consistent.family, 'hot');
+  assert.equal(consistent.personalBranch, 'hot-custom-ly');
+  assert.equal(consistent.targetBranch, 'hotfix-custom');
+});
+
 test('a personal-branch override with a hot prefix selects the hot family and target', () => {
   const result = deriveBranches({
     versionName: 'V1.6.1',
@@ -147,13 +196,17 @@ test('illegal version characters become single dashes and edge dashes are trimme
   assert.equal(result.targetBranch, 'feature-V1.6.1-20261109');
 });
 
-test('an empty or non-string version falls back to V0.0.0', () => {
-  assert.equal(DEFAULT_VERSION, 'V0.0.0');
+test('a missing or blank version is rejected as invalid-version (no fallback)', () => {
   for (const versionName of ['', '   ', '版本', null, undefined, 12]) {
-    const result = deriveBranches({ versionName, ticketType: '缺陷', branchUser: 'ly' });
-    assert.equal(result.personalBranch, 'feat-V0.0.0-ly');
-    assert.equal(result.targetBranch, 'feature-V0.0.0');
+    expectBranchError(
+      () => deriveBranches({ versionName, ticketType: '缺陷', branchUser: 'ly' }),
+      'invalid-version',
+    );
   }
+
+  // The sanitizer itself still returns ''; deriveBranches is what rejects it.
+  assert.equal(sanitizeVersion(''), '');
+  assert.equal(sanitizeVersion(undefined), '');
 });
 
 test('a version that cannot form a legal branch is rejected as invalid-version', () => {
@@ -277,6 +330,36 @@ test('explicit personal and target overrides are validated and kept', () => {
   });
   assert.equal(trimmed.personalBranch, 'feat-custom-ly');
   assert.equal(trimmed.targetBranch, 'release/feature-custom');
+});
+
+test('target derivation requires the personal branch to end with -<branchUser>', () => {
+  // A different user's suffix must not leak into the target branch.
+  for (const personalBranch of [
+    'feat-V1.6.1-lisi',
+    'hot-V1.6.1-lisi',
+    'feat-custom',
+    'release/x',
+  ]) {
+    expectBranchError(
+      () => deriveBranches({
+        versionName: 'V1.6.1',
+        ticketType: '需求',
+        branchUser: 'ly',
+        override: { personalBranch },
+      }),
+      'invalid-branch',
+    );
+  }
+
+  // Only the exact trailing `-<branchUser>` is stripped.
+  const result = deriveBranches({
+    versionName: 'V1.6.1',
+    ticketType: '需求',
+    branchUser: 'ly',
+    override: { personalBranch: 'feat-V1.6.1-lisi-ly' },
+  });
+  assert.equal(result.personalBranch, 'feat-V1.6.1-lisi-ly');
+  assert.equal(result.targetBranch, 'feature-V1.6.1-lisi');
 });
 
 test('unsafe branch overrides are rejected', () => {

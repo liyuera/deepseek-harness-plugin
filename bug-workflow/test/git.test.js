@@ -1,117 +1,191 @@
 /**
  * Contract tests for the injected git worktree executor (P4 Task 1).
  *
- * Most cases use a throwaway repository under `os.tmpdir()` and real git
- * (`init`, one commit, a `feature-V1` branch) so the argv arrays, worktree
- * bookkeeping and porcelain/diff output are exercised end to end:
+ * Every test builds its own throwaway repository under `os.tmpdir()` and runs
+ * real git (`init`, one commit, a `feature-V1` branch), so a single-test run
+ * (`node --test --test-name-pattern ...`) is self-sufficient and no test
+ * depends on mutation order. Fixtures use `git init` + `git branch -M main`
+ * (not `git init -b`, which needs git >= 2.28) and local
+ * `-c commit.gpgsign=false -c core.autocrlf=false -c user.name/email`, so the
+ * host configuration cannot influence the result. Cleanup is registered per
+ * test with `t.after`.
  *
- *   - `repoRoot` works from a subdirectory and from `createGit()`'s default
- *     `execFile` (the promisified `node:child_process` path);
- *   - `refExists` is a boolean for local refs/HEAD;
- *   - `worktreeAdd` creates branch + directory, reuses an existing matching
- *     worktree (`created:false`) and reports `worktree-conflict` for a
- *     different branch at the same path;
- *   - `status`/`diffStat`/`diff` reflect a file change made inside the
- *     worktree; `diff` clips at `maxChars` with a static marker;
- *   - `worktreeRemove` refuses a dirty worktree unless forced;
- *   - a fake `execFile` deterministically covers timeout/error normalization
- *     and proves raw child stderr/messages never reach callers and that argv is
- *     passed without a shell.
+ * Coverage:
  *
- * Every temporary directory is removed in the `after` hook; the repository is
- * created only under `os.tmpdir()` and never inside the checkout.
+ *   - `repoRoot` works from a subdirectory and from the default promisified
+ *     `execFile`;
+ *   - `refExists` returns `{ok:true, exists}` for local refs/HEAD, distinguishes
+ *     a missing ref (exit 1) from a real git failure, and keeps timeouts
+ *     visible;
+ *   - `worktreePath` builds `<repo>/.dsh-worktrees/<code>` only for a safe
+ *     ticket code;
+ *   - `worktreeAdd` creates a worktree inside the repository, reuses it
+ *     (`created:false`), conflicts on a different branch, accepts an existing
+ *     empty directory, rejects a non-empty plain directory as `git-failed`
+ *     (never `worktree-conflict`), and re-adds a retained branch after
+ *     `worktreeRemove` without `-b`;
+ *   - `status`/`diffStat`/`diff` reflect a change inside the worktree and
+ *     `diff` clips with a static marker;
+ *   - `worktreeRemove` refuses a dirty worktree unless forced and keeps the
+ *     branch;
+ *   - a fake `execFile` deterministically covers timeout, maxBuffer overflow,
+ *     error normalization and argv safety (no shell, no leaked stderr).
  */
 
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { after, before, test } from 'node:test';
+import test from 'node:test';
 
-import { DIFF_TRUNCATED_MARKER, DEFAULT_GIT_TIMEOUT_MS, createGit } from '../src/host/git.js';
+import {
+  DEFAULT_GIT_TIMEOUT_MS,
+  DIFF_TRUNCATED_MARKER,
+  WORKTREE_DIR,
+  createGit,
+  worktreePath,
+} from '../src/host/git.js';
+
+/** Local config for every fixture git command (never rely on the host). */
+const GIT_CONFIG = Object.freeze([
+  '-c',
+  'commit.gpgsign=false',
+  '-c',
+  'core.autocrlf=false',
+  '-c',
+  'user.name=P4 Test',
+  '-c',
+  'user.email=p4-test@example.invalid',
+]);
 
 /** Deterministic git for fixture setup only (the module under test is async). */
 function gitSync(cwd, args) {
-  return execFileSync('git', args, {
+  return execFileSync('git', [...GIT_CONFIG, ...args], {
     cwd,
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
   }).trim();
 }
 
-let root;
-let repo;
-let git;
-
-before(() => {
-  root = mkdtempSync(join(tmpdir(), 'dsh-bw-git-'));
-  repo = join(root, 'repo');
+/**
+ * Build an isolated repository: one commit on `main` plus `feature-V1`.
+ * The caller registers `cleanup` with `t.after`.
+ */
+function makeFixture() {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-bw-git-'));
+  const repo = join(root, 'repo');
   mkdirSync(repo);
 
-  gitSync(repo, ['init', '-q', '-b', 'main']);
-  gitSync(repo, ['config', 'user.name', 'P4 Test']);
-  gitSync(repo, ['config', 'user.email', 'p4-test@example.invalid']);
+  gitSync(repo, ['init', '-q']);
+  gitSync(repo, ['branch', '-M', 'main']);
   writeFileSync(join(repo, 'readme.md'), 'hello\n');
   gitSync(repo, ['add', 'readme.md']);
   gitSync(repo, ['commit', '-q', '-m', 'init']);
   gitSync(repo, ['branch', 'feature-V1']);
 
-  git = createGit();
-});
+  return {
+    root,
+    repo,
+    git: createGit(),
+    cleanup: () => rmSync(root, { recursive: true, force: true }),
+  };
+}
 
-after(() => {
-  if (root !== undefined) rmSync(root, { recursive: true, force: true });
-});
+/** Product path under the repository, using the tested helper. */
+function productPath(repo, code) {
+  const result = worktreePath({ repo, code });
+  assert.equal(result.ok, true);
+  return result.path;
+}
 
-test('repoRoot resolves the toplevel from the repo and a subdirectory', async () => {
-  const expected = realpathSync(repo);
-  assert.equal(realpathSync(await git.repoRoot(repo)), expected);
+test('repoRoot resolves the toplevel from the repo and a subdirectory', async (t) => {
+  const fixture = makeFixture();
+  t.after(fixture.cleanup);
 
-  const subdirectory = join(repo, 'src');
+  const expected = realpathSync(fixture.repo);
+  assert.equal(realpathSync(await fixture.git.repoRoot(fixture.repo)), expected);
+
+  const subdirectory = join(fixture.repo, 'src');
   mkdirSync(subdirectory);
-  assert.equal(realpathSync(await git.repoRoot(subdirectory)), expected);
+  assert.equal(realpathSync(await fixture.git.repoRoot(subdirectory)), expected);
 
   // The default factory path really is `promisify(node:child_process.execFile)`.
   const defaultGit = createGit();
   assert.equal(realpathSync(await defaultGit.repoRoot(subdirectory)), expected);
 });
 
-test('refExists reports local refs and HEAD, and false for unknown refs', async () => {
-  assert.equal(await git.refExists(repo, 'feature-V1'), true);
-  assert.equal(await git.refExists(repo, 'HEAD'), true);
-  assert.equal(await git.refExists(repo, 'main'), true);
-  assert.equal(await git.refExists(repo, 'feature-does-not-exist'), false);
-  assert.equal(await git.refExists(repo, 'refs/remotes/origin/nope'), false);
+test('refExists returns {ok:true, exists} and distinguishes failures from misses', async (t) => {
+  const fixture = makeFixture();
+  t.after(fixture.cleanup);
+  const { git, repo, root } = fixture;
+
+  assert.deepEqual(await git.refExists(repo, 'feature-V1'), { ok: true, exists: true });
+  assert.deepEqual(await git.refExists(repo, 'HEAD'), { ok: true, exists: true });
+  assert.deepEqual(await git.refExists(repo, 'main'), { ok: true, exists: true });
+  assert.deepEqual(await git.refExists(repo, 'feature-does-not-exist'), {
+    ok: true,
+    exists: false,
+  });
+  assert.deepEqual(await git.refExists(repo, 'refs/remotes/origin/nope'), {
+    ok: true,
+    exists: false,
+  });
+
+  // A non-repository directory is a git failure, not "the ref does not exist".
+  const plain = join(root, 'plain');
+  mkdirSync(plain);
+  const notRepo = await git.refExists(plain, 'main');
+  assert.equal(notRepo.ok, false);
+  assert.equal(notRepo.code, 'git-failed');
+  assert.equal(notRepo.command, 'git rev-parse --verify');
+
+  const invalid = await git.refExists(repo, 'bad ref');
+  assert.equal(invalid.ok, false);
+  assert.equal(invalid.code, 'git-failed');
+  assert.equal(invalid.message, 'git 命令参数不合法');
 });
 
-test('worktreeAdd creates a branch + directory and reuses the same worktree', async () => {
-  const worktreePath = join(root, 'feat-V1-ly');
+test('worktreeAdd creates <repo>/.dsh-worktrees/<code> and reuses a matching worktree', async (t) => {
+  const fixture = makeFixture();
+  t.after(fixture.cleanup);
+  const { git, repo } = fixture;
+
+  const worktree = productPath(repo, 'feat-V1-ly');
+  assert.equal(worktree, join(repo, WORKTREE_DIR, 'feat-V1-ly'));
 
   const first = await git.worktreeAdd({
     repo,
-    path: worktreePath,
+    path: worktree,
     branch: 'feat-V1-ly',
     base: 'feature-V1',
   });
   assert.deepEqual(first, { created: true });
-  assert.equal(existsSync(worktreePath), true);
-  assert.equal(gitSync(worktreePath, ['rev-parse', '--abbrev-ref', 'HEAD']), 'feat-V1-ly');
-  assert.equal(readFileSync(join(worktreePath, 'readme.md'), 'utf8'), 'hello\n');
+  assert.equal(existsSync(worktree), true);
+  assert.equal(gitSync(worktree, ['rev-parse', '--abbrev-ref', 'HEAD']), 'feat-V1-ly');
+  assert.equal(readFileSync(join(worktree, 'readme.md'), 'utf8'), 'hello\n');
 
-  // Idempotent second call: the path already carries the requested branch.
+  // Idempotent second call: registered worktree, requested branch.
   const second = await git.worktreeAdd({
     repo,
-    path: worktreePath,
+    path: worktree,
     branch: 'feat-V1-ly',
     base: 'feature-V1',
   });
   assert.deepEqual(second, { created: false });
 
-  // Same path, different branch: never checked out silently.
+  // Same registered path, different branch: conflict, never checked out silently.
   const conflict = await git.worktreeAdd({
     repo,
-    path: worktreePath,
+    path: worktree,
     branch: 'feat-V1-other',
     base: 'feature-V1',
   });
@@ -119,68 +193,136 @@ test('worktreeAdd creates a branch + directory and reuses the same worktree', as
   assert.equal(conflict.code, 'worktree-conflict');
   assert.equal(conflict.message, '工作树已存在且分支与目标分支不一致');
   assert.equal(conflict.command, 'git worktree add');
-  assert.equal(gitSync(worktreePath, ['rev-parse', '--abbrev-ref', 'HEAD']), 'feat-V1-ly');
-
-  // A pre-existing non-empty directory is not a worktree and must not be reused.
-  const blockedPath = join(root, 'blocked-path');
-  mkdirSync(blockedPath);
-  writeFileSync(join(blockedPath, 'keep.txt'), 'not a worktree\n');
-  const blocked = await git.worktreeAdd({
-    repo,
-    path: blockedPath,
-    branch: 'feat-V1-blocked',
-    base: 'feature-V1',
-  });
-  assert.equal(blocked.ok, false);
-  assert.equal(blocked.code, 'git-failed');
-  assert.equal(blocked.command, 'git worktree add');
+  assert.equal(gitSync(worktree, ['rev-parse', '--abbrev-ref', 'HEAD']), 'feat-V1-ly');
 });
 
-test('status, diffStat and diff reflect a change inside the worktree', async () => {
-  const worktreePath = join(root, 'feat-V1-ly');
-  writeFileSync(join(worktreePath, 'readme.md'), 'hello\nchanged by fix agent\n');
-  writeFileSync(join(worktreePath, 'new-file.txt'), 'new\n');
+test('a plain directory inside the repo is not mistaken for a registered worktree', async (t) => {
+  const fixture = makeFixture();
+  t.after(fixture.cleanup);
+  const { git, repo } = fixture;
 
-  const status = await git.status(worktreePath);
+  // Regression: an empty plain directory inside the repo must be created, not
+  // reported as an existing worktree (the old HEAD probe saw the repo's branch).
+  const empty = join(repo, WORKTREE_DIR, 'EMPTY-1');
+  mkdirSync(empty, { recursive: true });
+  const created = await git.worktreeAdd({
+    repo,
+    path: empty,
+    branch: 'feat-V1-empty',
+    base: 'main',
+  });
+  assert.deepEqual(created, { created: true });
+  assert.equal(gitSync(empty, ['rev-parse', '--abbrev-ref', 'HEAD']), 'feat-V1-empty');
+
+  // Regression: a non-empty plain directory inside the repo must surface the
+  // real git refusal (`git-failed`), never `worktree-conflict`.
+  const blocked = join(repo, WORKTREE_DIR, 'BLOCKED-1');
+  mkdirSync(blocked, { recursive: true });
+  writeFileSync(join(blocked, 'keep.txt'), 'not a worktree\n');
+
+  const refused = await git.worktreeAdd({
+    repo,
+    path: blocked,
+    branch: 'feat-V1-blocked',
+    base: 'main',
+  });
+  assert.equal(refused.ok, false);
+  assert.equal(refused.code, 'git-failed');
+  assert.equal(refused.message, 'git 命令执行失败');
+  assert.equal(refused.command, 'git worktree add');
+  assert.equal(existsSync(join(blocked, 'keep.txt')), true);
+  // The plain directory itself was never turned into a worktree.
+  assert.equal(gitSync(blocked, ['rev-parse', '--is-inside-work-tree']), 'true');
+  const listed = gitSync(repo, ['worktree', 'list', '--porcelain']);
+  assert.ok(!listed.includes(realpathSync(blocked)));
+  assert.ok(listed.includes(realpathSync(empty)));
+});
+
+test('worktreeAdd re-adds a retained branch after worktreeRemove', async (t) => {
+  const fixture = makeFixture();
+  t.after(fixture.cleanup);
+  const { git, repo } = fixture;
+
+  const worktree = productPath(repo, 'feat-V1-readd');
+  const input = {
+    repo,
+    path: worktree,
+    branch: 'feat-V1-readd',
+    base: 'main',
+  };
+
+  assert.deepEqual(await git.worktreeAdd(input), { created: true });
+  assert.equal(await git.worktreeRemove({ repo, path: worktree }), undefined);
+  assert.equal(existsSync(worktree), false);
+  // worktreeRemove deliberately keeps the branch for P5.
+  assert.deepEqual(await git.refExists(repo, 'feat-V1-readd'), { ok: true, exists: true });
+
+  // The branch exists now, so the add must omit `-b` and check it out.
+  assert.deepEqual(await git.worktreeAdd(input), { created: true });
+  assert.equal(gitSync(worktree, ['rev-parse', '--abbrev-ref', 'HEAD']), 'feat-V1-readd');
+  assert.equal(readFileSync(join(worktree, 'readme.md'), 'utf8'), 'hello\n');
+});
+
+test('status, diffStat and diff reflect a change inside the worktree', async (t) => {
+  const fixture = makeFixture();
+  t.after(fixture.cleanup);
+  const { git, repo } = fixture;
+
+  const worktree = productPath(repo, 'feat-V1-diff');
+  assert.deepEqual(
+    await git.worktreeAdd({ repo, path: worktree, branch: 'feat-V1-diff', base: 'main' }),
+    { created: true },
+  );
+
+  writeFileSync(join(worktree, 'readme.md'), 'hello\nchanged by fix agent\n');
+  writeFileSync(join(worktree, 'new-file.txt'), 'new\n');
+
+  const status = await git.status(worktree);
   assert.ok(status.split('\n').includes(' M readme.md'), status);
   assert.ok(status.split('\n').includes('?? new-file.txt'), status);
 
-  const diffStat = await git.diffStat(worktreePath);
+  const diffStat = await git.diffStat(worktree);
   assert.match(diffStat, /readme\.md/);
   assert.match(diffStat, /1 \+/);
 
-  const patch = await git.diff(worktreePath);
+  const patch = await git.diff(worktree);
   assert.match(patch, /\+changed by fix agent/);
 
-  const clipped = await git.diff(worktreePath, { maxChars: 20 });
+  const clipped = await git.diff(worktree, { maxChars: 20 });
   assert.ok(clipped.endsWith(DIFF_TRUNCATED_MARKER), clipped);
   assert.ok(clipped.length <= 20 + DIFF_TRUNCATED_MARKER.length);
   assert.equal(clipped.slice(0, 20), patch.slice(0, 20));
 });
 
-test('worktreeRemove refuses a dirty worktree unless forced', async () => {
-  const cleanPath = join(root, 'feat-V1-clean');
-  const created = await git.worktreeAdd({
-    repo,
-    path: cleanPath,
-    branch: 'feat-V1-clean',
-    base: 'feature-V1',
-  });
-  assert.deepEqual(created, { created: true });
-  assert.equal(await git.worktreeRemove({ repo, path: cleanPath }), undefined);
-  assert.equal(existsSync(cleanPath), false);
+test('worktreeRemove refuses a dirty worktree unless forced and keeps the branch', async (t) => {
+  const fixture = makeFixture();
+  t.after(fixture.cleanup);
+  const { git, repo } = fixture;
 
-  const dirtyPath = join(root, 'feat-V1-ly');
-  const refused = await git.worktreeRemove({ repo, path: dirtyPath });
+  const clean = productPath(repo, 'feat-V1-clean');
+  assert.deepEqual(
+    await git.worktreeAdd({ repo, path: clean, branch: 'feat-V1-clean', base: 'main' }),
+    { created: true },
+  );
+  assert.equal(await git.worktreeRemove({ repo, path: clean }), undefined);
+  assert.equal(existsSync(clean), false);
+
+  const dirty = productPath(repo, 'feat-V1-dirty');
+  assert.deepEqual(
+    await git.worktreeAdd({ repo, path: dirty, branch: 'feat-V1-dirty', base: 'main' }),
+    { created: true },
+  );
+  writeFileSync(join(dirty, 'untracked.txt'), 'dirty\n');
+
+  const refused = await git.worktreeRemove({ repo, path: dirty });
   assert.equal(refused.ok, false);
   assert.equal(refused.code, 'git-failed');
   assert.equal(refused.command, 'git worktree remove');
-  assert.equal(existsSync(dirtyPath), true);
+  assert.equal(existsSync(dirty), true);
 
-  assert.equal(await git.worktreeRemove({ repo, path: dirtyPath, force: true }), undefined);
-  assert.equal(existsSync(dirtyPath), false);
-  // Removing the worktree keeps the branch for P5 (commit/push later).
-  assert.equal(await git.refExists(repo, 'feat-V1-ly'), true);
+  assert.equal(await git.worktreeRemove({ repo, path: dirty, force: true }), undefined);
+  assert.equal(existsSync(dirty), false);
+  assert.deepEqual(await git.refExists(repo, 'feat-V1-dirty'), { ok: true, exists: true });
 });
 
 test('execFile timeout is normalized to a static git-timeout failure', async () => {
@@ -214,6 +356,53 @@ test('execFile timeout is normalized to a static git-timeout failure', async () 
   assert.equal(calls[0].options.shell, undefined);
 });
 
+test('a timeout during the registered-worktree probe stays visible', async (t) => {
+  const fixture = makeFixture();
+  t.after(fixture.cleanup);
+
+  // The path exists, so worktreeAdd lists worktrees before attempting the add.
+  const worktree = join(fixture.repo, WORKTREE_DIR, 'TIMEOUT-1');
+  mkdirSync(worktree, { recursive: true });
+
+  const timeoutGit = createGit({
+    execFile: async () => {
+      throw Object.assign(new Error('timeout'), { killed: true, signal: 'SIGTERM' });
+    },
+  });
+  const result = await timeoutGit.worktreeAdd({
+    repo: fixture.repo,
+    path: worktree,
+    branch: 'feat-V1-timeout',
+    base: 'main',
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'git-timeout');
+  assert.equal(result.command, 'git worktree add');
+});
+
+test('a maxBuffer overflow is git-failed, not git-timeout', async () => {
+  const overflowGit = createGit({
+    execFile: async () => {
+      throw Object.assign(new Error('stdout maxBuffer length exceeded'), {
+        code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER',
+        killed: true,
+        signal: 'SIGTERM',
+      });
+    },
+  });
+
+  const diff = await overflowGit.diff('/tmp/injected');
+  assert.equal(diff.ok, false);
+  assert.equal(diff.code, 'git-failed');
+  assert.equal(diff.message, 'git 命令执行失败');
+  assert.equal(diff.command, 'git diff');
+
+  // refExists must not turn an overflow into `exists:false` either.
+  const ref = await overflowGit.refExists('/tmp/injected', 'main');
+  assert.equal(ref.ok, false);
+  assert.equal(ref.code, 'git-failed');
+});
+
 test('a failing child is normalized without leaking stderr or message', async () => {
   const failingGit = createGit({
     execFile: async () => {
@@ -231,8 +420,27 @@ test('a failing child is normalized without leaking stderr or message', async ()
   assert.equal(result.command, 'git diff');
   assert.ok(!JSON.stringify(result).includes('secret-token'));
 
-  // refExists treats a missing ref (non-zero exit) as false, not as an error.
-  assert.equal(await failingGit.refExists('/tmp/injected', 'nope'), false);
+  // A general git failure (exit 128) is not a boolean "missing ref".
+  const repoError = await failingGit.refExists('/tmp/injected', 'nope');
+  assert.equal(repoError.ok, false);
+  assert.equal(repoError.code, 'git-failed');
+
+  // Exit code 1 from `rev-parse --verify --quiet` is the documented miss.
+  const missingGit = createGit({
+    execFile: async () => {
+      throw Object.assign(new Error('missing'), { code: 1, signal: null });
+    },
+  });
+  assert.deepEqual(await missingGit.refExists('/tmp/injected', 'nope'), {
+    ok: true,
+    exists: false,
+  });
+
+  const existingGit = createGit({ execFile: async () => ({ stdout: 'abc123\n', stderr: '' }) });
+  assert.deepEqual(await existingGit.refExists('/tmp/injected', 'main'), {
+    ok: true,
+    exists: true,
+  });
 
   // A timeout during refExists must stay visible instead of becoming false.
   const timeoutRef = createGit({
@@ -246,7 +454,10 @@ test('a failing child is normalized without leaking stderr or message', async ()
   assert.equal(timedOut.command, 'git rev-parse --verify');
 });
 
-test('invalid cwd/path/ref values are rejected before spawning git', async () => {
+test('invalid cwd/path/ref values are rejected before spawning git', async (t) => {
+  const fixture = makeFixture();
+  t.after(fixture.cleanup);
+
   let calls = 0;
   const strictGit = createGit({
     execFile: async () => {
@@ -264,17 +475,77 @@ test('invalid cwd/path/ref values are rejected before spawning git', async () =>
   }
 
   const badWorktree = await strictGit.worktreeAdd({
-    repo,
-    path: join(root, 'never-created'),
+    repo: fixture.repo,
+    path: join(fixture.root, 'never-created'),
     branch: '-bad-branch',
     base: 'HEAD',
   });
   assert.equal(badWorktree.ok, false);
   assert.equal(badWorktree.code, 'git-failed');
 
-  const badRef = await strictGit.refExists(repo, 'bad ref');
+  const badRef = await strictGit.refExists(fixture.repo, 'bad ref');
   assert.equal(badRef.ok, false);
   assert.equal(badRef.code, 'git-failed');
 
   assert.equal(calls, 0);
+});
+
+test('worktreePath only accepts a safe ticket code', () => {
+  const good = worktreePath({ repo: '/tmp/repo', code: 'YGFNXDJRFWDJSYJJYY-648' });
+  assert.deepEqual(good, {
+    ok: true,
+    path: join('/tmp/repo', WORKTREE_DIR, 'YGFNXDJRFWDJSYJJYY-648'),
+  });
+
+  const maxLength = 'a'.repeat(120);
+  assert.equal(worktreePath({ repo: '/tmp/repo', code: maxLength }).ok, true);
+
+  // The git object exposes the same helper for Task 2.
+  const git = createGit({
+    execFile: async () => {
+      throw new Error('must not be called');
+    },
+  });
+  assert.deepEqual(git.worktreePath({ repo: '/tmp/repo', code: 'A_1.2-3' }), {
+    ok: true,
+    path: join('/tmp/repo', WORKTREE_DIR, 'A_1.2-3'),
+  });
+
+  const invalidCodes = [
+    undefined,
+    null,
+    42,
+    '',
+    '   ',
+    '.',
+    '..',
+    '../escape',
+    'a/b',
+    'a\\b',
+    'a b',
+    'a\nb',
+    'a\u0000b',
+    '张三',
+    'a'.repeat(121),
+  ];
+
+  for (const code of invalidCodes) {
+    const result = worktreePath({ repo: '/tmp/repo', code });
+    assert.equal(result.ok, false, `expected unsafe code: ${JSON.stringify(code)}`);
+    assert.equal(result.code, 'invalid-worktree-path');
+    assert.equal(result.message, '工单号无法生成安全的工作树路径');
+    assert.equal(result.command, 'git worktree add');
+  }
+
+  for (const input of [undefined, null, [], 'x']) {
+    const result = worktreePath(input);
+    assert.equal(result.ok, false);
+    assert.equal(result.code, 'invalid-worktree-path');
+  }
+
+  for (const repo of [undefined, null, '', '   ', 'bad\nrepo']) {
+    const result = worktreePath({ repo, code: 'OK-1' });
+    assert.equal(result.ok, false);
+    assert.equal(result.code, 'invalid-worktree-path');
+  }
 });

@@ -10,13 +10,17 @@
  *     user in the board before fix starts;
  *   - the target branch follows the personal branch name:
  *     `feat-<X>-<user>` → `feature-<X>`, `hot-<X>-<user>` → `hotfix-<X>`;
+ *     a personal override that does not end in `-<branchUser>` cannot be
+ *     used to derive a target and is rejected as `invalid-branch`;
  *   - the target may be overridden explicitly as well.
  *
  * Normalization is deliberately narrow and deterministic:
  *
  *   - `X` keeps `[A-Za-z0-9._-]`, turns every other run of characters into a
- *     single `-`, collapses repeated `-` and trims `-` from both edges; an
- *     empty result falls back to `V0.0.0` (missing/blank platform version);
+ *     single `-`, collapses repeated `-` and trims `-` from both edges; a
+ *     missing/blank platform version, or one whose sanitized form cannot be a
+ *     ref component, is rejected as `invalid-version` (no `V0.0.0` fallback —
+ *     the caller must supply the ticket version explicitly);
  *   - `branchUser` is one ref component: ASCII letters/digits/`_` first, then
  *     letters/digits/`.`/`_`/`-`, with no `..` and no trailing `.`;
  *   - overrides may contain `/` (nested branches such as
@@ -31,9 +35,6 @@
  * The module has zero imports (not even `node:` builtins) so the plain-Node
  * test runner can load it directly; it does not touch git or the filesystem.
  */
-
-/** Version used when the ticket carries no usable platform version. */
-export const DEFAULT_VERSION = 'V0.0.0';
 
 /** Maximum length of any personal/target branch name (git checkpoint). */
 export const BRANCH_LENGTH_LIMIT = 200;
@@ -55,10 +56,13 @@ const MESSAGE = Object.freeze({
 /**
  * Thrown for invalid branch derivation input. `code` is one of:
  *
- *   invalid-branch        invalid arguments/override branch name
+ *   invalid-branch        invalid arguments, invalid override branch name, or
+ *                         a personal branch that cannot derive a target
+ *                         because it lacks the `-<branchUser>` suffix
  *   invalid-branch-user   missing or unsafe `branchUser`
- *   invalid-family        `family` is neither `feat` nor `hot`
- *   invalid-version       sanitized version cannot form a legal branch
+ *   invalid-family        `family` is not `feat`/`hot`, or it contradicts the
+ *                         family implied by the personal-branch override
+ *   invalid-version       missing/unsafe version (`versionName` is required)
  */
 export class BranchError extends Error {
   /**
@@ -77,9 +81,9 @@ export class BranchError extends Error {
  *
  * Keeps `[A-Za-z0-9._-]`, replaces every other run with `-`, collapses
  * repeated `-`, and trims `-` from both edges. A missing/non-string/blank
- * version returns `''`; `deriveBranches` maps that to `DEFAULT_VERSION`. Note
- * that this helper does NOT reject `..` / `.lock` — `deriveBranches` performs
- * the final ref-safety check.
+ * version returns `''`; `deriveBranches` rejects that as `invalid-version`
+ * (there is no `V0.0.0` fallback). Note that this helper does NOT reject `..` /
+ * `.lock` — `deriveBranches` performs the final ref-safety check.
  *
  * @param {unknown} versionName
  * @returns {string}
@@ -144,7 +148,9 @@ export function isSafeBranchUser(value) {
  * @param {object} input
  * @param {unknown} input.versionName ticket platform version (`X` source)
  * @param {unknown} [input.ticketType] ticket type label (`故障` = failure)
- * @param {unknown} [input.typeKey] platform type key (contains FAILURE = failure)
+ * @param {unknown} [input.typeKey] best-effort legacy hint: a type key
+ *   containing `FAILURE` is treated as a failure ticket; Task 2 should pass the
+ *   synced ticket type/type name instead
  * @param {unknown} input.branchUser workspace setting (e.g. `ly`)
  * @param {'feat'|'hot'} [input.family] explicit family override
  * @param {{personalBranch?: unknown, targetBranch?: unknown}} [input.override]
@@ -216,10 +222,12 @@ function normalizeOverrideBranch(value) {
   return name;
 }
 
-/** Sanitize + validate the version suffix; empty falls back to V0.0.0. */
+/** Sanitize + validate the version suffix; missing/empty is invalid. */
 function normalizeVersion(versionName) {
   const version = sanitizeVersion(versionName);
-  if (version === '') return DEFAULT_VERSION;
+  if (version === '') {
+    throw new BranchError('invalid-version', MESSAGE.invalidVersion);
+  }
 
   if (
     version.length > VERSION_LENGTH_LIMIT
@@ -245,21 +253,26 @@ function normalizeBranchUser(branchUser) {
 }
 
 /**
- * Family precedence: explicit `family` is validated first, then a personal
- * override whose prefix already states the family, then the ticket type
- * (`故障` / `FAILURE` / `hotfix`), defaulting to `feat`.
+ * Family precedence: explicit `family` is validated first; if the personal
+ * override states the opposite family it is a contradiction and rejected as
+ * `invalid-family`. Without an explicit family, the personal override prefix
+ * decides; otherwise a best-effort ticket-type hint decides (`故障`, or a
+ * `FAILURE`-containing `typeKey` — a legacy heuristic only, Task 2 passes the
+ * synced `ticket.type`/type name), defaulting to `feat`.
  */
 function resolveFamily({ family, ticketType, typeKey, personalOverride }) {
   if (family !== undefined && family !== null && family !== 'feat' && family !== 'hot') {
     throw new BranchError('invalid-family', MESSAGE.invalidFamily);
   }
 
-  if (typeof personalOverride === 'string') {
-    if (personalOverride.startsWith('hot-')) return 'hot';
-    if (personalOverride.startsWith('feat-')) return 'feat';
-  }
+  const overrideFamily = familyOfPersonalBranch(personalOverride);
+  const explicit = family === 'feat' || family === 'hot';
 
-  if (family === 'feat' || family === 'hot') return family;
+  if (explicit && overrideFamily !== undefined && overrideFamily !== family) {
+    throw new BranchError('invalid-family', MESSAGE.invalidFamily);
+  }
+  if (overrideFamily !== undefined) return overrideFamily;
+  if (explicit) return family;
 
   const hint = `${typeof ticketType === 'string' ? ticketType : ''} ${
     typeof typeKey === 'string' ? typeKey : ''
@@ -270,23 +283,37 @@ function resolveFamily({ family, ticketType, typeKey, personalOverride }) {
   return 'feat';
 }
 
+/** Family implied by a personal-branch prefix, or `undefined`. */
+function familyOfPersonalBranch(personalBranch) {
+  if (typeof personalBranch !== 'string') return undefined;
+  if (personalBranch.startsWith('hot-')) return 'hot';
+  if (personalBranch.startsWith('feat-')) return 'feat';
+  return undefined;
+}
+
 /**
  * Spec rule: target follows the personal branch name. The known prefix picks
- * `feature-`/`hotfix-`; the trailing `-<branchUser>` is stripped so
- * `feat-custom-ly` → `feature-custom`. Unknown custom names fall back to the
- * derived `<feature|hotfix>-<X>`.
+ * `feature-`/`hotfix-` and the required `-<branchUser>` suffix is stripped
+ * exactly (`feat-custom-ly` → `feature-custom`). A personal override that does
+ * not end with `-<branchUser>` is rejected: deriving a target from another
+ * user's branch would silently cross the team branch rule. Unknown custom
+ * prefixes fall back to the derived `<feature|hotfix>-<X>`.
  */
 function deriveTargetFromPersonal(personalBranch, family, version, branchUser) {
+  const suffix = `-${branchUser}`;
+  if (!personalBranch.endsWith(suffix)) {
+    throw new BranchError('invalid-branch', MESSAGE.invalidBranch);
+  }
+
+  const base = personalBranch.slice(0, -suffix.length);
   const rules = [
     ['hot-', 'hotfix-'],
     ['feat-', 'feature-'],
   ];
 
   for (const [prefix, targetPrefix] of rules) {
-    if (!personalBranch.startsWith(prefix)) continue;
-    let rest = personalBranch.slice(prefix.length);
-    const suffix = `-${branchUser}`;
-    if (rest.endsWith(suffix)) rest = rest.slice(0, -suffix.length);
+    if (!base.startsWith(prefix)) continue;
+    const rest = base.slice(prefix.length);
     if (rest !== '') return `${targetPrefix}${rest}`;
     break;
   }
