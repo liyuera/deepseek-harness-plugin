@@ -405,6 +405,14 @@ function analyzeBody(overrides = {}) {
   });
 }
 
+function fixBody(overrides = {}) {
+  return JSON.stringify({
+    sessionId: SESSION_ID,
+    code: 'BUG-1',
+    ...overrides,
+  });
+}
+
 function settingsBody(overrides = {}) {
   return JSON.stringify({
     sessionId: SESSION_ID,
@@ -506,8 +514,31 @@ function createFakeAnalysis({ start, status } = {}) {
   };
 }
 
-/** Fake credentials service used by the token-store integration. */
-function createFakeCredentials(initial = {}) {
+/**
+ * Fake fix service (P4). Same contract as `createFakeAnalysis`: the route only
+ * consumes `start()`'s structured result and `status()`'s snapshot block.
+ */
+function createFakeFix({ start, status } = {}) {
+  const calls = { start: [], status: 0 };
+  return {
+    calls,
+    service: {
+      async start(sessionId, cwd, code) {
+        calls.start.push({ sessionId, cwd, code });
+        if (typeof start === 'function') return start(sessionId, cwd, code);
+        return { ok: true, running: true, workflow: 'fixing' };
+      },
+      status() {
+        calls.status += 1;
+        if (typeof status === 'function') return status();
+        if (status !== undefined) return clone(status);
+        return { running: [], errors: {} };
+      },
+    },
+  };
+}
+
+/** Fake credentials service used by the token-store integration. */function createFakeCredentials(initial = {}) {
   const values = new Map(Object.entries(initial));
   const calls = { set: [], resolve: [], describe: [], unset: [] };
   return {
@@ -547,6 +578,7 @@ function handlersWith({
   sync,
   importTask,
   analysis,
+  fix,
   clock = () => SERVER_TIME,
   domainOpenedAt = OPENED_AT,
 } = {}) {
@@ -561,6 +593,8 @@ function handlersWith({
   // `analysis: undefined` wires a working fake; `analysis: null` exercises the
   // "analysis service not wired" 503 path / empty snapshot block.
   const analysisDeps = analysis === undefined ? createFakeAnalysis() : analysis;
+  // Same convention for the P4 fix service.
+  const fixDeps = fix === undefined ? createFakeFix() : fix;
   return {
     store,
     workspace,
@@ -568,6 +602,7 @@ function handlersWith({
     sync: syncService,
     importTask: importTaskFn,
     analysis: analysisDeps,
+    fix: fixDeps,
     handlers: createHandlers({
       store,
       workspace,
@@ -575,6 +610,7 @@ function handlersWith({
       sync: syncService,
       importTask: importTaskFn,
       analysis: analysisDeps,
+      fix: fixDeps,
       clock,
       domainOpenedAt,
     }),
@@ -680,6 +716,7 @@ test('GET /snapshot composes workspace, settings, tickets and serverTime', async
     platform: { tokenPresent: false, lastSyncAt: null, lastSyncError: null },
     dicts: { status: [], type: [], priority: [] },
     analysis: { running: [], errors: {} },
+    fix: { running: [], errors: {} },
     tickets: [ticket],
     serverTime: SERVER_TIME,
   });
@@ -823,6 +860,59 @@ test('GET /snapshot sanitizes malformed analysis status fields', async () => {
   assert.deepEqual(json.analysis, {
     running: ['BUG-2'],
     errors: { 'BUG-1': '分析失败' },
+  });
+});
+
+test('GET /snapshot reports the fix running set and persisted errors', async () => {
+  const fix = createFakeFix({
+    status: {
+      running: ['BUG-3'],
+      errors: { 'BUG-1': '修复超时，请重试' },
+    },
+  });
+  const { handlers } = handlersWith({ fix });
+  const { res, json } = await call(handlers.snapshot, { url: snapshotUrl() });
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(json.fix, {
+    running: ['BUG-3'],
+    errors: { 'BUG-1': '修复超时，请重试' },
+  });
+  assert.equal(fix.calls.status, 1);
+});
+
+test('GET /snapshot degrades fix to empty when unwired or failing', async () => {
+  const unwired = await call(handlersWith({ fix: null }).handlers.snapshot, {
+    url: snapshotUrl(),
+  });
+  assert.equal(unwired.res.statusCode, 200);
+  assert.deepEqual(unwired.json.fix, { running: [], errors: {} });
+
+  const failing = createFakeFix({
+    status: () => {
+      throw new Error('fix status unavailable');
+    },
+  });
+  const { res, json } = await call(handlersWith({ fix: failing }).handlers.snapshot, {
+    url: snapshotUrl(),
+  });
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(json.fix, { running: [], errors: {} });
+});
+
+test('GET /snapshot sanitizes malformed fix status fields', async () => {
+  const fix = createFakeFix({
+    status: {
+      running: ['BUG-2', '', 42],
+      errors: { 'BUG-1': '修复失败', 'BUG-3': null },
+    },
+  });
+  const { json } = await call(handlersWith({ fix }).handlers.snapshot, {
+    url: snapshotUrl(),
+  });
+  assert.deepEqual(json.fix, {
+    running: ['BUG-2'],
+    errors: { 'BUG-1': '修复失败' },
   });
 });
 
@@ -1471,6 +1561,120 @@ test('POST /analyze maps an unexpected service failure to 500 internal', async (
 });
 
 // ---------------------------------------------------------------------------
+// Fix (P4 real fix)
+// ---------------------------------------------------------------------------
+
+test('POST /fix starts the fix for the resolved workspace', async () => {
+  const fix = createFakeFix();
+  const { handlers } = handlersWith({ fix });
+  const { res, json } = await call(handlers.fix, {
+    method: 'POST',
+    url: API_PATHS.fix,
+    body: fixBody({ code: '  BUG-1  ' }),
+  });
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(json, { ok: true, workflow: 'fixing', running: true });
+  assert.deepEqual(fix.calls.start, [
+    { sessionId: SESSION_ID, cwd: WORKSPACE, code: 'BUG-1' },
+  ]);
+});
+
+test('POST /fix validates session, code and workspace before starting', async () => {
+  const fix = createFakeFix();
+  const { handlers } = handlersWith({ fix });
+
+  const missingSession = await call(handlers.fix, {
+    method: 'POST',
+    url: API_PATHS.fix,
+    body: fixBody({ sessionId: '   ' }),
+  });
+  assert.equal(missingSession.res.statusCode, 400);
+  assert.equal(missingSession.json.code, 'missing-session');
+
+  for (const code of ['', '   ', undefined]) {
+    const missingCode = await call(handlers.fix, {
+      method: 'POST',
+      url: API_PATHS.fix,
+      body: fixBody({ code }),
+    });
+    assert.equal(missingCode.res.statusCode, 400, String(code));
+    assert.equal(missingCode.json.code, 'invalid-code', String(code));
+  }
+
+  const unbound = await call(handlers.fix, {
+    method: 'POST',
+    url: API_PATHS.fix,
+    body: fixBody({ sessionId: UNBOUND_SESSION_ID }),
+  });
+  assert.equal(unbound.res.statusCode, 400);
+  assert.equal(unbound.json.code, 'unknown-workspace');
+  assert.equal(fix.calls.start.length, 0);
+});
+
+test('POST /fix maps service failures to 400/404/409/503/500', async () => {
+  const cases = [
+    ['ticket-not-found', 404],
+    ['invalid-state', 409],
+    ['plan-not-approved', 409],
+    ['invalid-version', 400],
+    ['invalid-worktree-path', 400],
+    ['worktree-conflict', 409],
+    ['fix-unavailable', 503],
+    ['git-timeout', 503],
+    ['git-failed', 500],
+    ['internal', 500],
+  ];
+  for (const [code, status] of cases) {
+    const fix = createFakeFix({
+      start: () => ({ ok: false, code, message: `失败 ${code}` }),
+    });
+    const { handlers } = handlersWith({ fix });
+    const { res, json } = await call(handlers.fix, {
+      method: 'POST',
+      url: API_PATHS.fix,
+      body: fixBody(),
+    });
+    assert.equal(res.statusCode, status, code);
+    assert.equal(json.ok, false, code);
+    assert.equal(json.code, code, code);
+    assert.equal(json.message, `失败 ${code}`, code);
+  }
+});
+
+test('POST /fix answers 503 fix-unavailable when the service is not wired', async () => {
+  const { handlers } = handlersWith({ fix: null });
+  const { res, json } = await call(handlers.fix, {
+    method: 'POST',
+    url: API_PATHS.fix,
+    body: fixBody(),
+  });
+
+  assert.equal(res.statusCode, 503);
+  assert.equal(json.ok, false);
+  assert.equal(json.code, 'fix-unavailable');
+  assert.match(json.message, /修复/);
+});
+
+test('POST /fix maps an unexpected service failure to 500 internal', async () => {
+  const failing = createFakeFix({
+    start: () => {
+      throw new Error('fix blew up');
+    },
+  });
+  const { handlers } = handlersWith({ fix: failing });
+  const { res, json } = await call(handlers.fix, {
+    method: 'POST',
+    url: API_PATHS.fix,
+    body: fixBody(),
+  });
+
+  assert.equal(res.statusCode, 500);
+  assert.equal(json.code, 'internal');
+  assert.match(json.message, /fix blew up/);
+});
+
+// ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
 
@@ -1930,6 +2134,7 @@ test('every route rejects the wrong HTTP method with 405 and an Allow header', a
 const POST_ROUTES = [
   ['action', API_PATHS.action, () => actionBody()],
   ['analyze', API_PATHS.analyze, () => analyzeBody()],
+  ['fix', API_PATHS.fix, () => fixBody()],
   ['settings', API_PATHS.settings, () => settingsBody()],
   ['platformToken', API_PATHS.platformToken, () => platformTokenBody()],
   ['sync', API_PATHS.sync, () => syncBody()],
@@ -2046,6 +2251,7 @@ test('every route rejects a non-loopback remote address with 403', async () => {
     ['snapshot', 'GET', snapshotUrl(), undefined],
     ['action', 'POST', API_PATHS.action, () => actionBody()],
     ['analyze', 'POST', API_PATHS.analyze, () => analyzeBody()],
+    ['fix', 'POST', API_PATHS.fix, () => fixBody()],
     ['settings', 'POST', API_PATHS.settings, () => settingsBody()],
     ['platformToken', 'POST', API_PATHS.platformToken, () => platformTokenBody()],
     ['sync', 'POST', API_PATHS.sync, () => syncBody()],
@@ -2119,7 +2325,7 @@ async function callRegistered(webServer, path, options) {
   return call(handler, options);
 }
 
-test('registerRoutes() mounts all seven exact routes and returns a disposer', async () => {
+test('registerRoutes() mounts every API route and returns a disposer', async () => {
   const webServer = createFakeWebServer();
   const { store, workspace } = handlersWith();
   const dispose = registerRoutes(
@@ -2136,7 +2342,7 @@ test('registerRoutes() mounts all seven exact routes and returns a disposer', as
   assert.equal(webServer.routes.size, 0);
 });
 
-test('registerUnavailableRoutes() keeps health 500/503 and other routes 503 until disposed', async () => {
+test('registerUnavailableRoutes() keeps health 500/503 and all data routes 503 until disposed', async () => {
   const webServer = createFakeWebServer();
   const health = {
     status: 'waiting-for-service',
@@ -2191,6 +2397,13 @@ test('registerUnavailableRoutes() keeps health 500/503 and other routes 503 unti
   });
   assert.equal(analyze.res.statusCode, 503);
   assert.equal(analyze.json.code, 'storage-unavailable');
+
+  const fix = await callRegistered(webServer, API_PATHS.fix, {
+    method: 'POST',
+    body: fixBody(),
+  });
+  assert.equal(fix.res.statusCode, 503);
+  assert.equal(fix.json.code, 'storage-unavailable');
 
   dispose();
   assert.equal(webServer.routes.size, 0);
