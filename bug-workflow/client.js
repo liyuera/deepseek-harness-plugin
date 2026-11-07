@@ -100,7 +100,7 @@ window.__ModuleLoader__.load({
     const h = React.createElement;
     const ID = '@liyuera/dsh-bug-workflow';
     /** Visible build tag so the running UI can be verified after a reload. */
-    const CLIENT_BUILD = 'p6-login.2026-11-08.5';
+    const CLIENT_BUILD = 'p6-login.2026-11-08.6';
 
     /** Snapshot/action endpoints (same origin as the Harness Web page). */
     const API = Object.freeze({
@@ -6289,9 +6289,34 @@ window.__ModuleLoader__.load({
       // store (a just-dismissed detail still resolves) but hide it from the
       // list and from filter options. Task 6's README should document this P1
       // archive behaviour; the host state is never deleted here.
+      // Workspace project scope: when the saved settings carry a platform
+      // project code, hide platform tickets of other projects from the board
+      // (manual/demo tickets stay). Sync already only imports matching codes;
+      // this also hides rows imported before the code was configured.
+      const savedProjectCode = snapshot === null || snapshot.settings === null || snapshot.settings === undefined
+        || typeof snapshot.settings.platformProjectCode !== 'string'
+        ? ''
+        : snapshot.settings.platformProjectCode.trim();
+      const [projectScopeAll, setProjectScopeAll] = React.useState(false);
+      const projectMatcher = React.useCallback(
+        (ticket) => savedProjectCode === ''
+          || typeof ticket.code !== 'string'
+          || ticket.code.startsWith(`${savedProjectCode}-`),
+        [savedProjectCode],
+      );
+      const scopedTickets = React.useMemo(() => {
+        if (savedProjectCode === '' || projectScopeAll === true) return tickets;
+        return tickets.filter((ticket) => ticket.source !== 'platform' || projectMatcher(ticket));
+      }, [tickets, savedProjectCode, projectScopeAll, projectMatcher]);
+      const hiddenByProject = React.useMemo(
+        () => (savedProjectCode === '' ? 0 : tickets.filter(
+          (ticket) => ticket.source === 'platform' && !projectMatcher(ticket),
+        ).length),
+        [tickets, savedProjectCode, projectMatcher],
+      );
       const activeTickets = React.useMemo(
-        () => tickets.filter((ticket) => ticket.workflow !== 'done'),
-        [tickets],
+        () => scopedTickets.filter((ticket) => ticket.workflow !== 'done'),
+        [scopedTickets],
       );
 
       // Platform dictionaries drive the filter options (labels are the dict
@@ -6370,6 +6395,13 @@ window.__ModuleLoader__.load({
           busy: polling.refreshing,
           tone: 'danger',
         });
+      } else if (activeTickets.length === 0 && hiddenByProject > 0 && projectScopeAll !== true) {
+        content = h(StateNotice, {
+          title: '当前项目编码下没有工单',
+          message: `已隐藏 ${hiddenByProject} 张非本项目工单（平台项目编码：${savedProjectCode}）。可在这里临时显示全部，或到设置里修改/清空平台项目编码。`,
+          actionLabel: '显示全部',
+          onAction: () => setProjectScopeAll(true),
+        });
       } else if (activeTickets.length === 0) {
         const archived = tickets.length > 0;
         content = h(StateNotice, {
@@ -6396,6 +6428,15 @@ window.__ModuleLoader__.load({
             style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, lineHeight: '16px', color: C.textTertiary, minWidth: 0 },
           },
             h('span', null, `共 ${activeTickets.length} 张 · 显示 ${visibleTickets.length} 张`),
+            hiddenByProject > 0
+              ? h(React.Fragment, null,
+                h('span', null, `· 已隐藏 ${hiddenByProject} 张非本项目工单`),
+                h('button', {
+                  type: 'button',
+                  onClick: () => setProjectScopeAll((current) => !current),
+                  style: { ...smallButtonStyle(false), padding: '0 6px', fontSize: 11, lineHeight: '16px' },
+                }, projectScopeAll ? '只看本项目' : '显示全部'))
+              : null,
             filtersActive
               ? h('button', {
                 type: 'button',

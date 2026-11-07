@@ -260,7 +260,7 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 - 合并：已存在的工单只更新标题/类型/状态/优先级/版本/负责人/URL/平台快照/`updatedAt`，**保留** `workflow`、`blocked*`、`plan`、`branch`、`mr`、`fixes`、`timeline`、`createdAt`；新工单从 `inbox` 开始、`source:'platform'`。
 - 元数据：`meta['platform.lastSyncAt']`、`meta['platform.lastSyncError']`、`meta['platform.dicts']`；成功同步会清空 `lastSyncError`。
 - **按编号导入不是同步**：不写 `lastSyncAt`/`lastSyncError`，失败不会污染「上次同步失败」。
-- 不做 prune：切换项目编码/平台不再返回的旧工单不会自动删除。
+- 不做 prune：切换项目编码/平台不再返回的旧工单不会自动删除；但**看板按已保存的平台项目编码只显示本项目的平台工单**（本地手工/演示工单仍显示，可点「显示全部」临时查看被隐藏的行、或清空项目编码）。
 
 ### 4. 错误含义
 
