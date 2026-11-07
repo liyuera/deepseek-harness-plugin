@@ -153,7 +153,7 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 | 合并检测/归档 | `mergeable` + MR `state=merged` → `mr_merged` → `merged`；下一 tick `dismiss(system)` → `done` 并离开看板。若在 `mr_open`/`fixing_review` 就被人工合并 → `block('review-merged-manually')`，不伪造 review pass。**插件从不调用 merge/close/approve/resolve**，合并必须由人在 GitLab 完成 |
 | 取消/恢复 | delivery/review-fix 的 `dispose()` 只取消并排水，**不写** block/错误；`fixing_review` 无运行任务时下一 tick 按持久化 findings 恢复（重启子代理 / 重推 pending commit / 不可恢复则 `block('review-recovery-unavailable')`）。迟到结果只写静态 `delivery.error`/`review.error`，绝不回退已推进的工单 |
 | 客户端 UX | `submitting` 显示「提交并创建 MR」+ 运行横幅 + 静态错误映射；`mr_open`/`fixing_review` 显示 MR 卡（!iid/URL/source→target/轮次 n/3/最近结论/轮询提示）；`fixing_review` 运行中显示「AI 正在修复 Review 问题…」（计时 `aria-live=off`）；`mergeable` 显示「等待人工在 GitLab 合并（插件不会自动合并）」；`merged` 显示「已合并，即将从看板移除」；`done` 不再出现在看板 |
-| 测试 | **570 个用例**（@`0ac209b`；P4 基线 352，P5 新增/扩充 218：`review-parser` 45、`credentials` 16、`gitlab` 27、`git` 20、`store` 42、`delivery-service` 40、`review-service` 45、`agent-access` 49、`routes` 115、`client-action-map` 14 等；另有隔离 E2E 脚本 29 条断言） |
+| 测试 | **574 个用例**（P4 基线 352，P5 新增/扩充 218、UI v2 新增 4：`review-parser` 45、`credentials` 16、`gitlab` 27、`git` 20、`store` 42、`delivery-service` 40、`review-service` 45、`agent-access` 49、`routes` 115、`client-action-map` 14、`client-stage-map` 4 等；另有隔离 E2E 脚本 29 条断言） |
 
 **P5 交付成功的前置条件（缺一不可）**
 
@@ -209,6 +209,19 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 | `blocked` | 通用阻塞面板；delivery block 优先显示 `delivery.error:<code>`，Review block 显示 `review.error:<code>` / 静态原因 |
 
 > P5 的 `submit_mr`/`mr_created`/`review_requests_changes`/`review_fix_done`/`review_pass`/`mr_merged`/`dismiss` 已从看板 `ACTION_BY_STATE` 移除，宿主状态机仍接受真实服务写这些动作；`analysis_done`/`fix_done` 仍是映射里的演示动作，但看板对所有 `analyzing`/`fixing` 工单隐藏入口，且宿主在对应真实任务运行期间对裸 `POST /api/action` 返回 **409 `service-job-running`**（真实服务写这两个动作的路径保留）。
+
+### UI · 流程泳道（v2）
+
+看板列表从「平铺列表」改为**流程泳道**（样式方案 B，见 [设计说明](../docs/superpowers/design/2026-11-07-bug-workflow-ui-redesign.md) / [轻量规格](../docs/superpowers/design/2026-11-07-b-ui-spec.md)）：
+
+- **同一份数据两种布局**：容器宽 `<720px` → 垂直阶段分组卡片流（右栏默认）；`≥720px` → 横向泳道（每泳道一列，横向滚动）。用 `ResizeObserver` 监听容器宽度，纯前端本地状态。
+- **阶段映射唯一数据源**：`STAGE_LANES`（`client.js` 的 `<client-stage-map>` 字面量）把 12 个 workflow 状态映射为 9 条展示泳道（`inbox→草稿`、`analyzing→分析中`、`plan_review→方案待审`、`fixing→修复中`、`fix_done→待人工测试`、`submitting→交付中`、`mr_open/fixing_review→Review 中`、`mergeable/merged→等你合并`、`blocked→需要处理`；`done` 归档不展示）。`test/client-stage-map.test.js` 锁定「每个非终态恰好出现一次、blocked 最后、泳道顺序」。
+- **卡片直答四件事**：卡在哪（左侧阶段色条/泳道）、等谁（`下一步` chip：等你审核/等你测试/AI 修复中/等你合并…）、等了多久（人工态 `等了 2 小时`，AI 态 `已运行`，来自 `updatedAt` 与 `snapshot.*.running`）、有问题吗（阻塞卡直接显示原因）。卡片是纯展示按钮，**不会**直接触发动作（动作仍在详情页走宿主校验）。
+- **阶段概览条**：每条泳道计数 chip，点选=筛选该阶段（与状态/类型筛选叠加，单一数据源），再点取消；「全部」清除阶段筛选。
+- **详情流程条**：详情顶部新增 9 步进度（草稿→分析→方案→修复→测试→交付→Review→合并），当前步高亮，阻塞时按 `blockedFrom` 标红。
+- **可访问性**：卡片/概览是原生 button，保留 `aria-current`/`aria-pressed`，运行态不只靠颜色（有文字「运行中」）。
+- 已完成的真实渲染预览（由真实 `client.js` + 假 React 离屏渲染，非 mock 静态页）：窄栏列表、宽屏泳道、详情流程条见 [设计目录](../docs/superpowers/design/2026-11-07-ui-styles/)（`real-lane-narrow.jpg` / `real-lane-wide.jpg` / `real-lane-detail.jpg`）。
+- **未做（P6/后续）**：拖拽推进、AI 副驾、泳道折叠/WIP 上限、真实 GUI 视觉与明暗主题验收（需要刷新页面后人工确认）。
 
 ## 平台接入
 
@@ -467,12 +480,18 @@ P2 **未对真实平台执行**同步/导入（无真实 token，用户不在场
 无构建步骤：host 是纯 ESM JavaScript，client 是自包含 React bundle（只 `require('react')`，由宿主 module table 提供）。
 
 ```sh
-# 全部单元/集成测试（在仓库根目录执行）——P5 收尾 570/570（@0ac209b）
+# 全部单元/集成测试（在仓库根目录执行）——574/574
 node --test bug-workflow/test/*.test.js
 
 # P5 隔离 E2E（临时 git 仓库 + 本地 bare origin + loopback mock GitLab；
 # 不联网、不碰真实仓库/真实 GitLab/真实工单；退出码 0/1）
 node bug-workflow/scripts/e2e-delivery.mjs
+
+# 看板 UI 真实渲染预览（假 React 离屏渲染真实 client.js，输出静态 HTML；
+# 用于改版视觉迭代，不是测试；参数：<宽度> [detail] [工单号筛选]）
+node bug-workflow/scripts/preview-client.mjs 430 > /tmp/preview-narrow.html
+node bug-workflow/scripts/preview-client.mjs 1100 > /tmp/preview-wide.html
+node bug-workflow/scripts/preview-client.mjs 430 detail YGFNXDJRFWDJSYJJYY-648 > /tmp/preview-detail.html
 
 # 语法/静态检查
 node --check bug-workflow/index.js
@@ -560,7 +579,7 @@ git worktree remove --force .dsh-worktrees/YGFNXDJRFWDJSYJJYY-648 \
 | `scripts/fixtures/platform/` | mock 工单/详情/字典/评论/附件 fixtures |
 | `scripts/cleanup-demo-tickets.mjs` | 安全清理 mock 遗留工单（dry-run 默认、0600 备份、原子写） |
 | `scripts/verify-domain-v2.mjs` | 用安装版 zod/domain 验证 v2 契约（Electron-as-node） |
-| `test/` | `node:test` 单元/集成测试（P5 新增/扩充：`review-parser`、`gitlab`、`delivery-service`、`review-service`、`credentials`、`git`、`store`、`routes`、`client-action-map`、`agent-access`；总计 **570**，@`0ac209b`） |
+| `test/` | `node:test` 单元/集成测试（P5 新增/扩充：`review-parser`、`gitlab`、`delivery-service`、`review-service`、`credentials`、`git`、`store`、`routes`、`client-action-map`、`agent-access`；UI v2：`client-stage-map`；总计 **574**） |
 
 ## 许可
 

@@ -283,6 +283,88 @@ window.__ModuleLoader__.load({
     };
     // </client-action-map>
 
+    // <client-stage-map>
+    /**
+     * Workflow state -> lane mapping for the lane board (UI only).
+     *
+     * The lane board is a pure presentation layer: the host state machine stays
+     * the authority for every transition. `states` is an exhaustive partition
+     * of the host workflow states except the terminal `done` (archived tickets
+     * are hidden exactly like before); `test/client-stage-map.test.js` extracts
+     * this literal and cross-checks it against the host state list, so a new
+     * state can never silently disappear from the board.
+     *
+     * Order is the left-to-right (wide) / top-to-bottom (narrow) lane order:
+     * human-decision lanes are kept early so they are always visible, and the
+     * blocking lane is last so it cannot push the flow off screen.
+     */
+    const STAGE_LANES = [
+      {
+        id: 'draft',
+        label: '草稿',
+        tone: 'neutral',
+        hint: '还没开始的工单，点开「开始分析」进入流程',
+        states: ['inbox'],
+      },
+      {
+        id: 'analyzing',
+        label: '分析中',
+        tone: 'info',
+        hint: 'AI 正在读代码并生成方案，你可以继续做别的',
+        states: ['analyzing'],
+      },
+      {
+        id: 'plan-review',
+        label: '方案待审',
+        tone: 'warn',
+        hint: 'AI 方案已就绪，等你审核',
+        states: ['plan_review'],
+      },
+      {
+        id: 'fixing',
+        label: '修复中',
+        tone: 'info',
+        hint: 'AI 在独立 worktree 里改代码（最长约 15 分钟）',
+        states: ['fixing'],
+      },
+      {
+        id: 'fix-done',
+        label: '待人工测试',
+        tone: 'warn',
+        hint: '修复完成，等你验证改动',
+        states: ['fix_done'],
+      },
+      {
+        id: 'delivery',
+        label: '交付中',
+        tone: 'info',
+        hint: '正在按团队模板提交并创建 MR，可继续其他操作',
+        states: ['submitting'],
+      },
+      {
+        id: 'review',
+        label: 'Review 中',
+        tone: 'info',
+        hint: '每 60 秒检查 AI Review 结论，需要修改会自动回修',
+        states: ['mr_open', 'fixing_review'],
+      },
+      {
+        id: 'mergeable',
+        label: '等你合并',
+        tone: 'success',
+        hint: 'AI Review 已通过；请在 GitLab 人工合并（插件不会自动合并）',
+        states: ['mergeable', 'merged'],
+      },
+      {
+        id: 'blocked',
+        label: '需要处理',
+        tone: 'danger',
+        hint: '流程被阻塞，点开查看原因并重试',
+        states: ['blocked'],
+      },
+    ];
+    // </client-stage-map>
+
     // <client-action-availability>
     /**
      * Availability rule for one `ACTION_BY_STATE` descriptor.
@@ -1058,6 +1140,105 @@ window.__ModuleLoader__.load({
 
     function workflowTone(workflow) {
       return WORKFLOW_TONES[workflow] ?? 'neutral';
+    }
+
+    /** Lane for one workflow state; `null` for the archived `done` state. */
+    function laneForWorkflow(workflow) {
+      for (const lane of STAGE_LANES) {
+        if (Array.isArray(lane.states) && lane.states.includes(workflow)) return lane;
+      }
+      return null;
+    }
+
+    /** Position of one workflow state in the lane order (`-1` when unknown). */
+    function laneIndexForWorkflow(workflow) {
+      for (let index = 0; index < STAGE_LANES.length; index += 1) {
+        const lane = STAGE_LANES[index];
+        if (Array.isArray(lane.states) && lane.states.includes(workflow)) return index;
+      }
+      return -1;
+    }
+
+    /**
+     * Human-readable wait/elapsed span. The host persists `updatedAt` (not a
+     * job start time), so running durations are an approximation that resets
+     * whenever the ticket changes — the same trade-off as the analysis timer.
+     */
+    function formatWait(ms) {
+      if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return '';
+      const minutes = Math.floor(ms / 60000);
+      if (minutes < 1) return '刚刚';
+      if (minutes < 60) return `${minutes} 分钟`;
+      const hours = Math.floor(minutes / 60);
+      if (hours < 24) return `${hours} 小时`;
+      return `${Math.floor(hours / 24)} 天`;
+    }
+
+    /** Milliseconds since the ticket last changed (`0` when unparseable). */
+    function sinceUpdateMs(ticket) {
+      const raw = ticket !== null && typeof ticket === 'object' ? ticket.updatedAt : null;
+      const time = typeof raw === 'number' ? raw : (typeof raw === 'string' ? Date.parse(raw) : NaN);
+      if (!Number.isFinite(time)) return 0;
+      return Math.max(0, Date.now() - time);
+    }
+
+    /** True when the state is explicitly waiting for a human decision. */
+    function laneWaitsForHuman(workflow) {
+      return workflow === 'plan_review' || workflow === 'fix_done' || workflow === 'mergeable';
+    }
+
+    /** True when a background host job should be running for this workflow. */
+    function ticketRunningFor(ticket, snapshot) {
+      if (ticket === null || typeof ticket !== 'object') return false;
+      const workflow = ticket.workflow;
+      if (workflow === 'analyzing') return analysisRunningFor(snapshot, ticket.code);
+      if (workflow === 'fixing') return fixRunningFor(snapshot, ticket.code);
+      if (workflow === 'submitting') return deliveryRunningFor(snapshot, ticket.code);
+      if (workflow === 'fixing_review') return reviewRunningFor(snapshot, ticket.code);
+      return false;
+    }
+
+    /**
+     * Card-level next-step copy: what is happening right now, or who must act.
+     * Deliberately text-only — the actual transition buttons stay in the detail
+     * view (and on the host's action map), so the lane card can never fire an
+     * action the host would refuse.
+     */
+    function nextStepText(ticket, snapshot) {
+      if (ticket === null || typeof ticket !== 'object') return '';
+      const workflow = ticket.workflow;
+      const running = ticketRunningFor(ticket, snapshot);
+      switch (workflow) {
+        case 'inbox': return '待开始分析';
+        case 'analyzing': return running ? 'AI 分析中' : '分析已中断 · 可重新分析';
+        case 'plan_review': return '等你审核方案';
+        case 'fixing': return running ? 'AI 修复中' : '修复未运行 · 可重新修复';
+        case 'fix_done': return '等你人工测试';
+        case 'submitting': return running ? '正在提交 MR' : '待提交 MR';
+        case 'mr_open': return '等 AI Review 结论';
+        case 'fixing_review': return running ? 'AI 回修中' : '等待恢复回修';
+        case 'mergeable': return '等你到 GitLab 合并';
+        case 'merged': return '即将自动移除';
+        case 'blocked': return `原因：${clip(blockedReasonText(ticket), 26)}`;
+        case 'done': return '已完成';
+        default: return workflowLabel(workflow);
+      }
+    }
+
+    /** Card meta line: waiting/elapsed span, or the last update time. */
+    function laneCardMeta(ticket, snapshot) {
+      if (ticket === null || typeof ticket !== 'object') return '';
+      const workflow = ticket.workflow;
+      const span = formatWait(sinceUpdateMs(ticket));
+      if (ticketRunningFor(ticket, snapshot)) {
+        return span === '' ? '运行中' : `已运行 ${span}`;
+      }
+      if (laneWaitsForHuman(workflow)) {
+        return span === '' ? '等待你处理' : `等了 ${span}`;
+      }
+      if (workflow === 'merged') return '已合并';
+      if (laneForWorkflow(workflow) === null) return formatTime(ticket.updatedAt);
+      return `更新 ${formatTime(ticket.updatedAt)}`;
     }
 
     function eventLabel(kind) {
@@ -3124,8 +3305,9 @@ window.__ModuleLoader__.load({
             type: 'button',
             onClick: onCreateDemo,
             disabled: disabled || !writable,
-            style: primaryButtonStyle(disabled || !writable),
-          }, busy === 'create' ? '创建中…' : '添加演示工单')),
+            title: '创建一张演示工单（验收/联调用）',
+            style: smallButtonStyle(disabled || !writable),
+          }, busy === 'create' ? '创建中…' : '演示工单')),
         snapshot !== null
           ? h('div', {
             role: 'status',
@@ -3276,6 +3458,396 @@ window.__ModuleLoader__.load({
           'aria-label': '工单动作',
         }, buttons),
         hints);
+    }
+
+    /**
+     * Observe one element's content width. The lane board degrades from
+     * horizontal lanes to stacked groups below {@link LANE_WIDE_MIN_WIDTH}, so
+     * the same tab works in the narrow right sidebar and when it is widened.
+     * ResizeObserver is used when available; otherwise the initial clientWidth
+     * is a one-shot fallback (no responsive updates, still correct at mount).
+     */
+    const LANE_WIDE_MIN_WIDTH = 720;
+
+    function useElementWidth(targetRef) {
+      const [width, setWidth] = React.useState(0);
+      React.useEffect(() => {
+        const node = targetRef === null || targetRef === undefined ? null : targetRef.current;
+        if (node === null || node === undefined) return undefined;
+        const apply = (next) => {
+          const value = typeof next === 'number' && Number.isFinite(next) && next > 0 ? Math.round(next) : 0;
+          setWidth((current) => (current === value ? current : value));
+        };
+        if (typeof ResizeObserver === 'function') {
+          const observer = new ResizeObserver((entries) => {
+            const first = Array.isArray(entries) && entries.length > 0 ? entries[0] : null;
+            if (first !== null && first.contentRect && typeof first.contentRect.width === 'number') {
+              apply(first.contentRect.width);
+            }
+          });
+          try {
+            observer.observe(node);
+          } catch {
+            apply(node.clientWidth);
+          }
+          return () => {
+            try {
+              observer.disconnect();
+            } catch {
+              // Already disconnected.
+            }
+          };
+        }
+        apply(node.clientWidth);
+        return undefined;
+      }, [targetRef]);
+      return width;
+    }
+
+    /** Palette for one lane tone (theme tokens only). */
+    function lanePalette(tone) {
+      return TONES[tone] ?? TONES.neutral;
+    }
+
+    /**
+     * Lane overview chips: one count per lane plus an "all" chip. Clicking a
+     * chip filters the board to that lane (single source of truth: `activeLane`
+     * lives in Board and also drives the status/type filters combined view).
+     */
+    function StageOverview({ lanes, activeLane, onSelectLane }) {
+      const list = Array.isArray(lanes) ? lanes : [];
+      if (list.length === 0) return null;
+      const chipStyle = (active) => ({
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 5,
+        flex: '0 0 auto',
+        padding: '2px 8px',
+        borderRadius: 999,
+        border: `0.5px solid ${active ? C.brand : C.border}`,
+        background: active ? C.selected : 'transparent',
+        color: active ? C.text : C.textSecondary,
+        fontSize: 11,
+        lineHeight: '16px',
+        font: 'inherit',
+        cursor: 'pointer',
+        whiteSpace: 'nowrap',
+      });
+      return h('div', {
+        role: 'group',
+        'aria-label': '按流程阶段筛选',
+        style: { display: 'flex', gap: 5, flexWrap: 'wrap', minWidth: 0, paddingBottom: 1 },
+      },
+        h('button', {
+          type: 'button',
+          onClick: () => onSelectLane(null),
+          'aria-pressed': activeLane === null ? 'true' : 'false',
+          style: chipStyle(activeLane === null),
+        }, '全部'),
+        list.map((item) => {
+          const lane = item.lane;
+          const count = Array.isArray(item.tickets)
+            ? item.tickets.length
+            : (typeof item.count === 'number' ? item.count : 0);
+          const palette = lanePalette(lane.tone);
+          const active = activeLane === lane.id;
+          return h('button', {
+            key: `stage-${lane.id}`,
+            type: 'button',
+            onClick: () => onSelectLane(active ? null : lane.id),
+            'aria-pressed': active ? 'true' : 'false',
+            title: lane.hint,
+            style: chipStyle(active),
+          },
+            h('span', {
+              style: { width: 6, height: 6, borderRadius: 999, background: palette.color, flex: '0 0 auto' },
+            }),
+            textOf(lane.label),
+            h('b', { style: { fontWeight: 600, color: active ? C.text : C.textTertiary } }, String(count)));
+        }));
+    }
+
+    /** One lane card: state, title, next step and wait time. */
+    function LaneCard({ lane, ticket, snapshot, selected, onSelect }) {
+      const palette = lanePalette(lane.tone);
+      const title = typeof ticket.title === 'string' && ticket.title.trim() !== '' ? ticket.title : '（无标题）';
+      const running = ticketRunningFor(ticket, snapshot);
+      const next = nextStepText(ticket, snapshot);
+      const meta = laneCardMeta(ticket, snapshot);
+      const waiting = laneWaitsForHuman(ticket.workflow);
+      return h('button', {
+        type: 'button',
+        onClick: () => onSelect(ticket.code),
+        'aria-current': selected ? 'true' : undefined,
+        'aria-label': `工单 ${ticket.code} ${title}，${textOf(lane.label)}，${next}`,
+        style: {
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'stretch',
+          gap: 5,
+          width: '100%',
+          minWidth: 0,
+          textAlign: 'left',
+          font: 'inherit',
+          padding: '9px 10px',
+          borderRadius: 10,
+          border: `0.5px solid ${selected ? C.brand : C.border}`,
+          borderLeft: `3px solid ${palette.color}`,
+          background: selected ? C.selected : C.surface,
+          color: C.text,
+          cursor: 'pointer',
+          boxSizing: 'border-box',
+        },
+      },
+        h('div', { style: { display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 } },
+          h('span', {
+            title: textOf(ticket.code),
+            style: {
+              fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+              fontSize: 10.5,
+              lineHeight: '15px',
+              color: C.textTertiary,
+              whiteSpace: 'nowrap',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              minWidth: 0,
+              flex: '1 1 auto',
+            },
+          }, textOf(ticket.code)),
+          h('span', { style: { marginLeft: 'auto', flex: '0 0 auto', display: 'inline-flex', alignItems: 'center', gap: 4 } },
+            running
+              ? h('span', {
+                title: '后台任务运行中',
+                style: { display: 'inline-flex', alignItems: 'center', gap: 3, fontSize: 10, color: palette.color },
+              },
+                h('span', { style: { width: 5, height: 5, borderRadius: 999, background: palette.color } }),
+                '运行中')
+              : null,
+            )),
+        h('div', {
+          style: {
+            fontSize: 12.5,
+            fontWeight: 600,
+            lineHeight: '18px',
+            color: C.text,
+            display: '-webkit-box',
+            WebkitLineClamp: 2,
+            WebkitBoxOrient: 'vertical',
+            overflow: 'hidden',
+            wordBreak: 'break-word',
+          },
+        }, title),
+        meta === ''
+          ? null
+          : h('div', {
+            style: {
+              fontSize: 10.5,
+              lineHeight: '15px',
+              color: waiting ? palette.color : C.textTertiary,
+              whiteSpace: 'nowrap',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+            },
+          }, `${clip(ticketTypeText(ticket, snapshot), 8)} · ${meta}`),
+        h('div', {
+          style: {
+            display: 'inline-flex',
+            alignItems: 'center',
+            alignSelf: 'flex-start',
+            gap: 4,
+            maxWidth: '100%',
+            marginTop: 1,
+            padding: '0 6px',
+            borderRadius: 999,
+            border: `0.5px solid ${palette.border}`,
+            background: palette.background,
+            color: palette.color,
+            fontSize: 10.5,
+            lineHeight: '16px',
+            minWidth: 0,
+          },
+        },
+          h('span', {
+            style: {
+              whiteSpace: 'nowrap',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+            },
+          }, next)));
+    }
+
+    /** Lane header shared by the narrow sections and the wide columns. */
+    function LaneHeader({ lane, count, needsYou }) {
+      const palette = lanePalette(lane.tone);
+      return h('div', {
+        style: { display: 'flex', alignItems: 'center', gap: 7, minWidth: 0, padding: '0 2px' },
+      },
+        h('span', { style: { width: 4, height: 13, borderRadius: 3, background: palette.color, flex: '0 0 auto' } }),
+        h('span', { style: { fontSize: 12, fontWeight: 700, lineHeight: '18px', color: C.text, whiteSpace: 'nowrap' } },
+          textOf(lane.label)),
+        h('span', {
+          style: {
+            flex: '0 0 auto',
+            fontSize: 10,
+            lineHeight: '15px',
+            color: C.textTertiary,
+            border: `0.5px solid ${C.border}`,
+            borderRadius: 999,
+            padding: '0 6px',
+            background: C.surface,
+          },
+        }, String(count)),
+        needsYou === true
+          ? h('span', {
+            style: { marginLeft: 'auto', flex: '0 0 auto', fontSize: 10, lineHeight: '15px', color: palette.color },
+          }, '等你')
+          : null);
+    }
+
+    /** One wide lane column (vertical stack of cards). */
+    function LaneColumnWide({ item, selectedCode, onSelect, snapshot }) {
+      const lane = item.lane;
+      const tickets = item.tickets;
+      return h('div', {
+        style: {
+          flex: '1 1 176px',
+          minWidth: 176,
+          maxWidth: 260,
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 6,
+          minHeight: 0,
+        },
+      },
+        h(LaneHeader, { lane, count: tickets.length, needsYou: laneWaitsForHuman(lane.states[0]) }),
+        tickets.length === 0
+          ? h('div', {
+            style: {
+              fontSize: 10.5,
+              lineHeight: '16px',
+              color: C.textTertiary,
+              padding: '10px 8px',
+              border: `0.5px dashed ${C.border}`,
+              borderRadius: 10,
+              background: C.surfaceAlt,
+            },
+          }, lane.hint)
+          : tickets.map((ticket) => h(LaneCard, {
+            key: ticket.code,
+            lane,
+            ticket,
+            snapshot,
+            selected: ticket.code === selectedCode,
+            onSelect,
+          })));
+    }
+
+    /** One narrow lane section (header + card stack). */
+    function LaneSectionNarrow({ item, selectedCode, onSelect, snapshot }) {
+      const lane = item.lane;
+      const tickets = item.tickets;
+      return h('section', {
+        'aria-label': `${lane.label}（${tickets.length} 张）`,
+        style: { display: 'flex', flexDirection: 'column', gap: 6, minWidth: 0 },
+      },
+        h(LaneHeader, { lane, count: tickets.length, needsYou: laneWaitsForHuman(lane.states[0]) }),
+        h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, minWidth: 0 } },
+          tickets.map((ticket) => h(LaneCard, {
+            key: ticket.code,
+            lane,
+            ticket,
+            snapshot,
+            selected: ticket.code === selectedCode,
+            onSelect,
+          }))));
+    }
+
+    /**
+     * The lane board itself. Two layouts over one data set:
+     *   - narrow (<720px): stacked lane sections, only non-empty lanes (plus the
+     *     filtered lane), so the right sidebar stays scannable;
+     *   - wide (>=720px): horizontal lane columns with overflow scroll, an
+     *     empty-lane hint and the same cards.
+     */
+    function LaneBoard({ lanes, mode, selectedCode, onSelect, snapshot }) {
+      const list = Array.isArray(lanes) ? lanes : [];
+      if (list.length === 0) return null;
+      const wide = mode === 'wide';
+      const children = list.map((item) => (wide
+        ? h(LaneColumnWide, {
+          key: `lane-col-${item.lane.id}`,
+          item,
+          selectedCode,
+          onSelect,
+          snapshot,
+        })
+        : h(LaneSectionNarrow, {
+          key: `lane-sec-${item.lane.id}`,
+          item,
+          selectedCode,
+          onSelect,
+          snapshot,
+        })));
+      return wide
+        ? h('div', {
+          style: {
+            display: 'flex',
+            gap: 8,
+            alignItems: 'flex-start',
+            overflowX: 'auto',
+            minHeight: 0,
+            paddingBottom: 6,
+          },
+        }, ...children)
+        : h('div', {
+          style: { display: 'flex', flexDirection: 'column', gap: 14, minWidth: 0 },
+        }, ...children);
+    }
+
+    /**
+     * Compact flow progress for the detail view: the lane order is the roadmap,
+     * the current lane is highlighted and a blocked ticket shows a red mark on
+     * the lane it was blocked from (`blockedFrom`), not on the blocked chip.
+     */
+    function StageSteps({ ticket }) {
+      const workflow = ticket !== null && typeof ticket === 'object' ? ticket.workflow : '';
+      const blockedFrom = ticket !== null && typeof ticket === 'object' && typeof ticket.blockedFrom === 'string'
+        ? ticket.blockedFrom
+        : null;
+      const currentIndex = workflow === 'blocked'
+        ? laneIndexForWorkflow(blockedFrom)
+        : laneIndexForWorkflow(workflow);
+      const isBlocked = workflow === 'blocked';
+      const doneLane = workflow === 'merged';
+      return h('div', {
+        role: 'list',
+        'aria-label': '流程进度',
+        style: { display: 'flex', flexWrap: 'wrap', gap: 4, minWidth: 0 },
+      }, STAGE_LANES.filter((lane) => lane.id !== 'blocked').map((lane, index) => {
+        const isCurrent = index === currentIndex && !doneLane;
+        const isDone = doneLane ? index <= currentIndex : index < currentIndex;
+        const palette = isCurrent && isBlocked ? TONES.danger : lanePalette(lane.tone);
+        return h('span', {
+          key: `step-${lane.id}`,
+          role: 'listitem',
+          'aria-current': isCurrent ? 'step' : undefined,
+          style: {
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 4,
+            padding: '1px 7px',
+            borderRadius: 999,
+            border: `0.5px solid ${isCurrent ? palette.border : (isDone ? palette.border : C.border)}`,
+            background: isCurrent ? palette.background : (isDone ? palette.background : 'transparent'),
+            color: isCurrent ? palette.color : (isDone ? C.textSecondary : C.textTertiary),
+            fontSize: 10.5,
+            lineHeight: '16px',
+            whiteSpace: 'nowrap',
+          },
+        },
+          isCurrent && isBlocked ? '● ' : (isDone && !isCurrent ? '✓ ' : ''),
+          textOf(lane.label));
+      }));
     }
 
     function TicketRow({ ticket, selected, onSelect, snapshot }) {
@@ -4444,6 +5016,7 @@ window.__ModuleLoader__.load({
               style: { fontSize: 14, fontWeight: 600, lineHeight: '20px', color: C.text, wordBreak: 'break-word' },
             }, typeof ticket.title === 'string' && ticket.title.trim() !== '' ? ticket.title : '（无标题）')),
           h(Badge, { label: workflowLabel(ticket.workflow), tone: workflowTone(ticket.workflow) })),
+        h(StageSteps, { ticket }),
         h(AnalysisNotice, { ticket, snapshot, busyAction, locked, onAction }),
         h(FixNotice, { ticket, snapshot, busyAction, locked, onAction }),
         // P5: submission progress (board-only 「提交并创建 MR」) and the
@@ -4518,6 +5091,7 @@ window.__ModuleLoader__.load({
       const polling = usePolling(url, POLL_INTERVAL_MS);
       const [selectedCode, setSelectedCode] = React.useState(null);
       const [filters, setFilters] = React.useState({ status: [], type: [] });
+      const [stageFilter, setStageFilter] = React.useState(null);
       const [busyAction, setBusyAction] = React.useState(null);
       const [actionError, setActionError] = React.useState(null);
       const [flash, setFlash] = React.useState(null);
@@ -4533,6 +5107,7 @@ window.__ModuleLoader__.load({
       const [gitlabTokenBusy, setGitlabTokenBusy] = React.useState(false);
       const [syncing, setSyncing] = React.useState(false);
       const busyRef = React.useRef(false);
+      const laneBodyRef = React.useRef(null);
       const mutationControllerRef = React.useRef(null);
       const settingsButtonRef = React.useRef(null);
       const settingsSavingRef = React.useRef(false);
@@ -4546,6 +5121,8 @@ window.__ModuleLoader__.load({
 
       const snapshot = polling.data;
       const tickets = snapshot === null ? [] : snapshot.tickets;
+      const laneWidth = useElementWidth(laneBodyRef);
+      const laneMode = laneWidth >= LANE_WIDE_MIN_WIDTH ? 'wide' : 'narrow';
       const configured = snapshot !== null && snapshot.workspace.configured === true;
       const tokenPresent = snapshot !== null && snapshot.platform.tokenPresent === true;
       const gitlabTokenPresent = snapshot !== null && snapshot.gitlab.tokenPresent === true;
@@ -5248,6 +5825,7 @@ window.__ModuleLoader__.load({
 
       const clearFilters = React.useCallback(() => {
         setFilters({ status: [], type: [] });
+        setStageFilter(null);
       }, []);
 
       // `dismiss` moves a ticket to the terminal `done` state; keep it in the
@@ -5273,11 +5851,32 @@ window.__ModuleLoader__.load({
         [activeTickets, dicts],
       );
 
-      const visibleTickets = React.useMemo(() => activeTickets.filter((ticket) => {
+      // Status/type filters first, then the lane (stage) filter. The lane
+      // overview counts are computed from the status/type-filtered set so a
+      // selected lane never makes the other counts collapse to zero.
+      const dimensionTickets = React.useMemo(() => activeTickets.filter((ticket) => {
         if (filters.status.length > 0 && !filters.status.includes(dimensionValue(ticket.status))) return false;
         if (filters.type.length > 0 && !filters.type.includes(dimensionValue(ticket.type))) return false;
         return true;
       }), [activeTickets, filters]);
+
+      const laneData = React.useMemo(() => STAGE_LANES.map((lane) => ({
+        lane,
+        tickets: dimensionTickets.filter((ticket) => Array.isArray(lane.states) && lane.states.includes(ticket.workflow)),
+      })).filter((item) => item.tickets.length > 0), [dimensionTickets]);
+
+      const visibleTickets = React.useMemo(() => {
+        if (stageFilter === null) return dimensionTickets;
+        return dimensionTickets.filter((ticket) => {
+          const lane = laneForWorkflow(ticket.workflow);
+          return lane !== null && lane.id === stageFilter;
+        });
+      }, [dimensionTickets, stageFilter]);
+
+      const lanesForBoard = React.useMemo(() => {
+        if (stageFilter === null) return laneData;
+        return laneData.filter((item) => item.lane.id === stageFilter);
+      }, [laneData, stageFilter]);
 
       const selectedTicket = selectedCode === null
         ? null
@@ -5288,7 +5887,7 @@ window.__ModuleLoader__.load({
         ? '刷新失败'
         : (typeof actionError.title === 'string' && actionError.title !== '' ? actionError.title : '操作失败');
       const showBanner = bannerError !== null && (snapshot !== null || actionError !== null);
-      const filtersActive = filters.status.length > 0 || filters.type.length > 0;
+      const filtersActive = filters.status.length > 0 || filters.type.length > 0 || stageFilter !== null;
 
       let content;
       if (sessionId === null) {
@@ -5335,9 +5934,9 @@ window.__ModuleLoader__.load({
           onAction: clearFilters,
         });
       } else {
-        content = h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, minWidth: 0 } },
+        content = h('div', { style: { display: 'flex', flexDirection: 'column', gap: 10, minWidth: 0 } },
           h('div', {
-            style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, lineHeight: '16px', color: C.textTertiary },
+            style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, lineHeight: '16px', color: C.textTertiary, minWidth: 0 },
           },
             h('span', null, `共 ${activeTickets.length} 张 · 显示 ${visibleTickets.length} 张`),
             filtersActive
@@ -5347,8 +5946,14 @@ window.__ModuleLoader__.load({
                 style: { ...smallButtonStyle(false), padding: '0 6px', fontSize: 11, lineHeight: '16px' },
               }, '清除筛选')
               : null),
-          h(TicketList, {
-            tickets: visibleTickets,
+          h(StageOverview, {
+            lanes: laneData,
+            activeLane: stageFilter,
+            onSelectLane: setStageFilter,
+          }),
+          h(LaneBoard, {
+            lanes: lanesForBoard,
+            mode: laneMode,
             selectedCode,
             onSelect: setSelectedCode,
             snapshot,
@@ -5358,6 +5963,7 @@ window.__ModuleLoader__.load({
       return h('div', {
         'data-bug-board': 'root',
         'data-bug-board-view': selectedTicket === null ? 'list' : 'detail',
+        'data-bug-board-lane': laneMode,
         'data-bug-board-settings-open': settingsOpen === true ? 'true' : 'false',
         style: {
           display: 'flex',
@@ -5445,6 +6051,7 @@ window.__ModuleLoader__.load({
           },
         },
           h('div', {
+            ref: laneBodyRef,
             style: {
               flex: '1 1 auto',
               minHeight: 0,
