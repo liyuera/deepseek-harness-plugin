@@ -46,6 +46,13 @@ export const MAX_CAPTCHA_IMAGE_CHARS = 400_000;
 /** Upstream JSON bodies are small envelopes; cap the trusted read. */
 export const MAX_LOGIN_RESPONSE_BYTES = 512 * 1024;
 
+/**
+ * A browser-like User-Agent. The login gateway's "platform info" check rejects
+ * requests that do not look like the login page's own XHR, so the host mirrors
+ * the browser headers the page sends (no credentials are involved).
+ */
+export const BROWSER_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
+
 /** Field length caps (defensive: the platform form accepts short values). */
 export const MAX_USERNAME_CHARS = 100;
 export const MAX_PASSWORD_CHARS = 200;
@@ -384,6 +391,10 @@ export function createPlatformLogin(options = {}) {
       code,
     }).toString();
 
+    // The platform gateway rejects non-browser callers with
+    // '登录请求缺少平台信息' unless the request looks like the login page's own
+    // XHR (same-origin headers + the frontend's Menu-Classify marker).
+    const origin = baseUrl.replace(/\/+$/, '');
     const { body, status } = await requestJson(
       `${baseUrl}api/htwisdom-auth/oauth/token`,
       {
@@ -392,6 +403,11 @@ export function createPlatformLogin(options = {}) {
           Accept: 'application/json',
           'Content-Type': 'application/x-www-form-urlencoded',
           Authorization: `Basic ${basic}`,
+          Origin: origin,
+          Referer: `${origin}/user/login`,
+          'User-Agent': BROWSER_USER_AGENT,
+          'X-Requested-With': 'XMLHttpRequest',
+          'Menu-Classify': '1',
           'Tenant-Id': resolvedTenant,
           'Captcha-key': captchaKey,
           'Captcha-code': code,
@@ -411,7 +427,7 @@ export function createPlatformLogin(options = {}) {
       if (/验证码|captcha/i.test(upstreamMsg)) {
         throw new PlatformLoginError('captcha-invalid', MESSAGE.captchaInvalid, status);
       }
-      if (/密码|账号|用户|password|username/i.test(upstreamMsg)) {
+      if (/密码|账号|用户|password|username|bad credentials|invalid_grant|unauthorized/i.test(upstreamMsg)) {
         throw new PlatformLoginError('invalid-credentials', MESSAGE.invalidCredentials, status);
       }
       throw new PlatformLoginError('login-failed', MESSAGE.loginFailed, status);

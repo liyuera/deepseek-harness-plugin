@@ -183,6 +183,12 @@ test('login() bootstraps the OAuth client, sends Basic auth + form body and retu
   assert.equal(tokenRequest.headers['captcha-code'], '8h3k');
   assert.equal(tokenRequest.headers['dept-id'], '');
   assert.equal(tokenRequest.headers['role-id'], '');
+  // The gateway's "platform info" check requires a browser-like XHR.
+  assert.equal(tokenRequest.headers['x-requested-with'], 'XMLHttpRequest');
+  assert.equal(tokenRequest.headers['menu-classify'], '1');
+  assert.equal(tokenRequest.headers.origin, 'http://127.0.0.1:' + new URL(mock.baseUrl).port);
+  assert.equal(tokenRequest.headers.referer, `${mock.baseUrl}/user/login`);
+  assert.match(tokenRequest.headers['user-agent'], /Mozilla\/5\.0/);
 
   // The token request is a querystring, not JSON (JSON is ignored upstream).
   const form = new URLSearchParams(tokenRequest.raw);
