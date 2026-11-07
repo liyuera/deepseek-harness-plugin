@@ -100,7 +100,7 @@ window.__ModuleLoader__.load({
     const h = React.createElement;
     const ID = '@liyuera/dsh-bug-workflow';
     /** Visible build tag so the running UI can be verified after a reload. */
-    const CLIENT_BUILD = 'p6-login.2026-11-08.3';
+    const CLIENT_BUILD = 'p6-login.2026-11-08.4';
 
     /** Snapshot/action endpoints (same origin as the Harness Web page). */
     const API = Object.freeze({
@@ -2749,7 +2749,9 @@ window.__ModuleLoader__.load({
         && typeof password === 'string' && password !== ''
         && typeof code === 'string' && code.trim() !== ''
         && captcha !== null && typeof captcha === 'object' && typeof captcha.key === 'string' && captcha.key !== '';
-      const submitDisabled = locked || ready !== true;
+      // Only lock while a request is in flight: clicking with missing fields
+      // shows an explicit message instead of a dead button.
+      const submitDisabled = locked;
       const inputStyle = {
         font: 'inherit',
         fontSize: 12,
@@ -5913,6 +5915,7 @@ window.__ModuleLoader__.load({
         setLoginBusy(true);
         setLoginError(null);
         let refreshCaptchaAfter = false;
+        let failureView = null;
         try {
           const result = await postMutation(API.platformLogin, {
             sessionId,
@@ -5943,7 +5946,9 @@ window.__ModuleLoader__.load({
             // itself refuses to run while a mutation is in flight).
             setLoginCaptcha(null);
             setLoginCode('');
-            setLoginError(platformLoginErrorView(result));
+            // fetchLoginCaptcha() clears the error while it refreshes, so keep
+            // the platform's reason and re-apply it after the call starts.
+            failureView = platformLoginErrorView(result);
             refreshCaptchaAfter = true;
           }
         } finally {
@@ -5951,6 +5956,9 @@ window.__ModuleLoader__.load({
           setLoginBusy(false);
           if (refreshCaptchaAfter) {
             void fetchLoginCaptcha();
+          }
+          if (failureView !== null) {
+            setLoginError(failureView);
           }
         }
       }, [configured, fetchLoginCaptcha, loginCaptcha, loginCode, loginPassword, loginUsername, polling, postMutation, sessionId]);
