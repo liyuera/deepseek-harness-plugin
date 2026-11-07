@@ -100,7 +100,7 @@ window.__ModuleLoader__.load({
     const h = React.createElement;
     const ID = '@liyuera/dsh-bug-workflow';
     /** Visible build tag so the running UI can be verified after a reload. */
-    const CLIENT_BUILD = 'p6-login.2026-11-08.7';
+    const CLIENT_BUILD = 'p6-login.2026-11-08.8';
 
     /** Snapshot/action endpoints (same origin as the Harness Web page). */
     const API = Object.freeze({
@@ -120,6 +120,8 @@ window.__ModuleLoader__.load({
     /** Poll cadence in milliseconds (P1 contract: every 3 s). */
     /** Board auto-refresh cadence (manual 刷新 stays immediate). */
     const POLL_INTERVAL_MS = 180000;
+    /** While a subagent job runs, poll fast so completion shows up promptly. */
+    const FAST_POLL_INTERVAL_MS = 3000;
     const POLL_INTERVAL_LABEL = POLL_INTERVAL_MS >= 60000 && POLL_INTERVAL_MS % 60000 === 0
       ? `${POLL_INTERVAL_MS / 60000} 分钟`
       : `${POLL_INTERVAL_MS / 1000} 秒`;
@@ -2155,7 +2157,11 @@ window.__ModuleLoader__.load({
      * Poll `url` every `intervalMs`; manual `refresh()` shares the same request
      * sequence, so a slow stale response can never overwrite a newer one.
      */
-    function usePolling(url, intervalMs) {
+    function usePolling(url, intervalMs, options = {}) {
+      const fastWhen = typeof options.fastWhen === 'function' ? options.fastWhen : null;
+      const fastIntervalMs = typeof options.fastIntervalMs === 'number' && options.fastIntervalMs > 0
+        ? options.fastIntervalMs
+        : 3000;
       const [state, setState] = useInitialState(url);
       const seqRef = React.useRef(0);
       const aliveRef = React.useRef(false);
@@ -2224,6 +2230,26 @@ window.__ModuleLoader__.load({
           controllerRef.current = null;
         };
       }, [url, intervalMs, load]);
+
+      // Fast lane: background subagent jobs (analysis/fix/delivery/review) move
+      // the ticket when they finish; polling every 3 minutes would leave the
+      // board stale. Poll quickly only while something is running.
+      React.useEffect(() => {
+        if (fastWhen === null || url === null) return undefined;
+        let fast = false;
+        try {
+          fast = fastWhen(state.data) === true;
+        } catch {
+          fast = false;
+        }
+        if (!fast) return undefined;
+        const timer = setInterval(() => {
+          void load();
+        }, fastIntervalMs);
+        return () => {
+          clearInterval(timer);
+        };
+      }, [state.data, url, fastWhen, fastIntervalMs, load]);
 
       const refresh = React.useCallback(() => load(), [load]);
       const dismissError = React.useCallback(() => {
@@ -5412,7 +5438,43 @@ window.__ModuleLoader__.load({
 
     function Board({ sessionId }) {
       const url = snapshotUrlFor(sessionId);
-      const polling = usePolling(url, POLL_INTERVAL_MS);
+      const polling = usePolling(url, POLL_INTERVAL_MS, {
+        fastIntervalMs: FAST_POLL_INTERVAL_MS,
+        fastWhen: (data) => data !== null && (
+          (Array.isArray(data.analysis.running) && data.analysis.running.length > 0)
+          || (Array.isArray(data.fix.running) && data.fix.running.length > 0)
+          || (Array.isArray(data.delivery.running) && data.delivery.running.length > 0)
+          || (Array.isArray(data.review.running) && data.review.running.length > 0)
+        ),
+      });
+
+      // Background job completion notice: the session panel shows the child,
+      // but the board should say when a job moved the ticket.
+      const previousRunningRef = React.useRef({ analysis: [], fix: [], delivery: [], review: [] });
+      React.useEffect(() => {
+        const data = polling.data;
+        if (data === null) return;
+        const kinds = [
+          ['analysis', 'AI 分析'],
+          ['fix', 'AI 修复'],
+          ['delivery', '交付'],
+          ['review', 'Review 修复'],
+        ];
+        const previous = previousRunningRef.current;
+        const next = {};
+        const finished = [];
+        for (const [kind, label] of kinds) {
+          const block = data[kind];
+          const running = block !== null && block !== undefined && Array.isArray(block.running) ? block.running : [];
+          next[kind] = running.slice();
+          const beforeList = Array.isArray(previous[kind]) ? previous[kind] : [];
+          for (const code of beforeList) {
+            if (!running.includes(code)) finished.push(`${label}完成：${code}`);
+          }
+        }
+        previousRunningRef.current = next;
+        if (finished.length > 0) setFlash(finished.join('；'));
+      }, [polling.data]);
       const [selectedCode, setSelectedCode] = React.useState(null);
       const [filters, setFilters] = React.useState({ status: [], type: [] });
       const [stageFilter, setStageFilter] = React.useState(null);
