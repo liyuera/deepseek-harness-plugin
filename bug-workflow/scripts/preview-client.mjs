@@ -569,12 +569,24 @@ if (DETAIL) {
 if (DETAIL && process.argv[5] === 'confirm') {
   // Render the inline action Popconfirm: click the first action button with a
   // fake anchor rect so the bubble positions itself like it does in the app.
-  const target = findButtonByText(tree, '开始分析') ?? findButtonByText(tree, '通过方案') ?? findButtonByText(tree, '重新分析');
+  const target = findButtonByText(tree, '开始分析')
+    ?? findButtonByText(tree, '通过方案')
+    ?? findButtonByText(tree, '重新分析')
+    ?? findButtonByText(tree, '提交并创建 MR');
   if (target !== null && typeof target.props.onClick === 'function') {
+    // PREVIEW_ANCHOR lets a visual check move the fake trigger (e.g. to the
+    // viewport bottom, where the bubble must flip above it).
+    const anchorRect = (() => {
+      try {
+        return JSON.parse(process.env.PREVIEW_ANCHOR || '')
+      } catch {
+        return { left: 40, right: 140, top: 300, bottom: 324, width: 100, height: 24 }
+      }
+    })();
     target.props.onClick({
-      currentTarget: {
-        getBoundingClientRect: () => ({ left: 40, right: 140, top: 300, bottom: 324, width: 100, height: 24 }),
-      },
+      clientX: anchorRect.left + 50,
+      clientY: anchorRect.bottom - 12,
+      currentTarget: { getBoundingClientRect: () => anchorRect },
     });
     await flush();
     tree = await render();

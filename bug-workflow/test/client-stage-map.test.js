@@ -140,6 +140,20 @@ test('destructive actions use the in-board Popconfirm, never a native dialog', (
   assert.ok(source.includes('function ActionPopConfirm'), 'the anchored confirm bubble must exist');
   assert.ok(source.includes("'data-bug-popconfirm'"), 'the bubble must expose a verification marker');
   assert.ok(source.includes('anchorRectFromEvent'), 'the bubble must anchor to the clicked button');
+  // Regression: the delivery button forgot to forward its click event, so the
+  // bubble fell back to the viewport corner instead of the button.
+  assert.ok(
+    source.includes('onAction(DELIVER_DESCRIPTOR, event)'),
+    'every confirm action must forward the click event to the anchor',
+  );
+  assert.ok(
+    source.includes('function anchorRectFromRequest'),
+    'the bubble must re-measure the stored anchor when it renders',
+  );
+  assert.ok(
+    source.includes('const flipAbove ='),
+    'the bubble must flip above a trigger that sits near the viewport bottom',
+  );
   // Native platform dialogs look foreign in the embedded board: no call sites.
   assert.equal(/window\.confirm\s*\(/.test(source), false, 'window.confirm() must not be called');
   assert.equal(/function confirmDialog\s*\(/.test(source), false, 'the native confirm wrapper must be gone');

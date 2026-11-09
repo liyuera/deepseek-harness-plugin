@@ -100,7 +100,7 @@ window.__ModuleLoader__.load({
     const h = React.createElement;
     const ID = '@liyuera/dsh-bug-workflow';
     /** Visible build tag so the running UI can be verified after a reload. */
-    const CLIENT_BUILD = 'p6-login.2026-11-08.9';
+    const CLIENT_BUILD = 'p6-login.2026-11-09.3';
 
     /** Snapshot/action endpoints (same origin as the Harness Web page). */
     const API = Object.freeze({
@@ -2496,6 +2496,61 @@ window.__ModuleLoader__.load({
      * @param {() => void} onCancel dismiss
      * @param {(reason?: string) => void} onConfirm run the action
      */
+    /**
+     * Live anchor rectangle for an open confirm request.
+     *
+     * The rect captured at click time can be missing (a button that forgot to
+     * pass the event, a re-rendered trigger) and goes stale when the board
+     * scrolls; reading the stored element at render time keeps the bubble on
+     * the button. `null` means "use the click point / viewport center".
+     */
+    /**
+     * Viewport size for fixed-positioned overlays. `window.innerWidth` can
+     * report 0 in an embedded/sandboxed host surface, which used to clamp the
+     * confirm bubble into the top-left corner; fall back to the document box.
+     */
+    function viewportSize() {
+      const number = (value) => (typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0);
+      let width = 0;
+      let height = 0;
+      try {
+        width = number(typeof window !== 'undefined' ? window.innerWidth : 0);
+        height = number(typeof window !== 'undefined' ? window.innerHeight : 0);
+      } catch {
+        width = 0;
+        height = 0;
+      }
+      if (width === 0 || height === 0) {
+        try {
+          const doc = typeof document !== 'undefined' ? document : null;
+          const root = doc && doc.documentElement ? doc.documentElement : null;
+          const body = doc && doc.body ? doc.body : null;
+          width = width || number(root && root.clientWidth) || number(body && body.clientWidth);
+          height = height || number(root && root.clientHeight) || number(body && body.clientHeight);
+        } catch {
+          // Keep the numeric defaults below.
+        }
+      }
+      return { width: width || 1024, height: height || 768 };
+    }
+
+    function anchorRectFromRequest(request) {
+      const anchor = request !== null && request !== undefined ? request.anchor : null;
+      try {
+        if (anchor !== null && anchor !== undefined && typeof anchor.getBoundingClientRect === 'function') {
+          if (anchor.isConnected === false) return null;
+          const rect = anchor.getBoundingClientRect();
+          if (rect !== null && typeof rect === 'object'
+            && Number.isFinite(rect.left) && Number.isFinite(rect.top) && Number.isFinite(rect.bottom)) {
+            return rect;
+          }
+        }
+      } catch {
+        // A detached/hostile anchor degrades to the click point.
+      }
+      return null;
+    }
+
     function ActionPopConfirm({ request, busy, onCancel, onConfirm }) {
       const bubbleRef = React.useRef(null);
       const inputRef = React.useRef(null);
@@ -2535,12 +2590,32 @@ window.__ModuleLoader__.load({
       }, [isReason, request]);
 
       if (request === null) return null;
-      const rect = request.rect;
       const width = 280;
-      const viewportWidth = typeof window !== 'undefined' && typeof window.innerWidth === 'number' ? window.innerWidth : 1024;
-      let left = rect === null || rect === undefined ? Math.max(12, (viewportWidth - width) / 2) : rect.left;
+      const viewport = viewportSize();
+      const viewportWidth = viewport.width;
+      const viewportHeight = viewport.height;
+      const anchorRect = anchorRectFromRequest(request);
+      const point = request.point !== null && request.point !== undefined
+        && Number.isFinite(request.point.x) && Number.isFinite(request.point.y)
+        ? request.point
+        : null;
+      const anchorBottom = anchorRect !== null
+        ? anchorRect.bottom
+        : (point !== null ? point.y + 12 : 0);
+      let left = anchorRect !== null
+        ? anchorRect.left
+        : (point !== null ? point.x - 12 : (viewportWidth - width) / 2);
       left = Math.max(12, Math.min(left, viewportWidth - width - 12));
-      const top = rect === null || rect === undefined ? 80 : Math.max(12, rect.bottom + 6);
+      // Below the trigger by default; flip above when it sits near the viewport
+      // bottom (the delivery/fix buttons live at the end of the detail panel).
+      const flipAbove = anchorRect !== null && viewportHeight - anchorBottom < 180;
+      const top = flipAbove ? null : Math.max(12, anchorBottom + 6);
+      const bottom = flipAbove
+        ? Math.max(12, viewportHeight - (anchorRect !== null ? anchorRect.top : anchorBottom) + 6)
+        : null;
+      const verticalStyle = bottom === null
+        ? { top: `${Math.round(top)}px` }
+        : { bottom: `${Math.round(bottom)}px` };
 
       return h('div', {
         ref: bubbleRef,
@@ -2551,7 +2626,7 @@ window.__ModuleLoader__.load({
         style: {
           position: 'fixed',
           left: `${Math.round(left)}px`,
-          top: `${Math.round(top)}px`,
+          ...verticalStyle,
           width: `${width}px`,
           maxWidth: 'calc(100vw - 24px)',
           zIndex: 2147483000,
@@ -4777,9 +4852,10 @@ window.__ModuleLoader__.load({
         disabled,
         'aria-busy': busy || undefined,
         title: locked === true ? UNBOUND_WORKSPACE_HINT : DELIVER_DESCRIPTOR.confirm,
-        onClick: () => {
+        onClick: (event) => {
           if (disabled) return;
-          if (typeof onAction === 'function') onAction(DELIVER_DESCRIPTOR);
+          // The event is what anchors the confirm bubble under this button.
+          if (typeof onAction === 'function') onAction(DELIVER_DESCRIPTOR, event);
         },
         style: primaryButtonStyle(disabled),
       }, busy ? '处理中…' : DELIVER_DESCRIPTOR.label);
@@ -6226,6 +6302,23 @@ window.__ModuleLoader__.load({
         }
       }, []);
 
+      /**
+       * Everything the confirm bubble needs to stay on the trigger: the live
+       * element (preferred, re-measured when the bubble renders), the click
+       * point (survives a re-rendered button) and the click-time rect (tests).
+       */
+      const anchorFromEvent = React.useCallback((event) => {
+        const usable = event !== null && typeof event === 'object';
+        const anchor = usable && event.currentTarget !== null && typeof event.currentTarget === 'object'
+          && typeof event.currentTarget.getBoundingClientRect === 'function'
+          ? event.currentTarget
+          : null;
+        const point = usable && Number.isFinite(event.clientX) && Number.isFinite(event.clientY)
+          ? { x: event.clientX, y: event.clientY }
+          : null;
+        return { anchor, point, rect: anchorRectFromEvent(event) };
+      }, [anchorRectFromEvent]);
+
       const requestAction = React.useCallback((descriptor, ticket, event) => {
         if (!descriptor || !ticket || busyRef.current) return;
         if (sessionId === null || configured !== true) return;
@@ -6235,9 +6328,9 @@ window.__ModuleLoader__.load({
           mode: descriptor.input === 'reason' ? 'reason' : 'confirm',
           descriptor,
           ticket,
-          rect: anchorRectFromEvent(event),
+          ...anchorFromEvent(event),
         });
-      }, [anchorRectFromEvent, configured, sessionId]);
+      }, [anchorFromEvent, configured, sessionId]);
 
       const createDemoTicket = React.useCallback(async () => {
         if (busyRef.current || sessionId === null || configured !== true) return;
@@ -6284,9 +6377,9 @@ window.__ModuleLoader__.load({
           kind: 'create-demo',
           mode: 'confirm',
           descriptor: { action: 'create', label: '添加演示工单', confirm: '创建一张 P1 演示工单？' },
-          rect: anchorRectFromEvent(event),
+          ...anchorFromEvent(event),
         });
-      }, [anchorRectFromEvent, configured, sessionId]);
+      }, [anchorFromEvent, configured, sessionId]);
 
       /**
        * Import one platform ticket by code through the existing `create`
