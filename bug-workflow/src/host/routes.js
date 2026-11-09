@@ -100,7 +100,7 @@ import { ACTIONS } from './protocol.js';
 import { PLATFORM_LOGIN_ERROR_STATUS } from './platform-login.js';
 
 /** Host build tag surfaced by `/health` so a reload can be verified. */
-export const HOST_BUILD = 'p6-login.2026-11-08.1';
+export const HOST_BUILD = 'p6-login.2026-11-09.1';
 
 /** Exact route paths; exported so index/tests/client agree on one source. */
 export const API_PATHS = Object.freeze({

@@ -221,7 +221,7 @@ export function apply(ctx) {
         // storage routes must not depend on a service the board can live
         // without. Absent credentials -> tokenPresent:false + 503 on writes.
         // One lookup backs both token stores (platform + GitLab).
-        const credentials = readCredentials(storageCtx);
+        const credentials = lazyCredentials(storageCtx);
         const tokenStore = createTokenStore(credentials);
         // P5: the GitLab token is a second, independent reference over the same
         // optional credentials service. The token value never leaves it; the
@@ -528,6 +528,38 @@ export function apply(ctx) {
  * `ctx.get()` is the seam's documented optional access; a context without the
  * service returns undefined, which the token store reports as unavailable.
  */
+/**
+ * Resolve `ctx.credentials` lazily: on some boots the credentials provider is
+ * registered after this plugin's apply() runs, and capturing the resolved
+ * `undefined` at setup time would disable token storage for the whole host
+ * (tokenPresent:false + 503 credentials-unavailable). The proxy re-resolves the
+ * service on every call, so a provider that appears later is used immediately.
+ *
+ * @param {object} context Cordis context
+ * @returns {{set: Function, resolve: Function, describe: Function, unset: Function}}
+ */
+function lazyCredentials(context) {
+  const current = () => {
+    const service = readCredentials(context);
+    if (service === null || service === undefined) throw new Error('credentials service unavailable');
+    return service;
+  };
+  return {
+    async set(...args) {
+      return current().set(...args);
+    },
+    async resolve(...args) {
+      return current().resolve(...args);
+    },
+    async describe(...args) {
+      return current().describe(...args);
+    },
+    async unset(...args) {
+      return current().unset(...args);
+    },
+  };
+}
+
 function readCredentials(context) {
   try {
     if (typeof context?.get === 'function') return context.get('credentials');
