@@ -47,7 +47,7 @@ AI 在主会话里写完代码，人往往要到提 MR 之后才第一次被审�
 ┌───────────────────── Host 插件（无 client 半边）─────────────────────┐
 │  trigger.js   门禁：origin / 开关 / 轮次 / 有无代码变更                 │
 │  collect.js   取材：ctx.workspaceChanges 优先，git diff 回退            │
-│  reviewer.js  审查：ctx.subagents.start('spawn', …) + outputSchema      │
+│  reviewer.js  审查：ctx.subagents.startActivation + outputSchema        │
 │  render.js    渲染：findings[] → 原始输出文本                           │
 │  rules.js     规范：加载并校验 principles.md / rules.yaml               │
 │  loop.js      轮次状态机：计数、封顶、失败降级                           │
@@ -60,11 +60,12 @@ AI 在主会话里写完代码，人往往要到提 MR 之后才第一次被审�
   ctx.workspaceChanges    ReviewResult（schema 校验）
 ```
 
-关键环境事实（已核对源码）：
+关键环境事实（已按运行时 0.2.2-rc.1 的产物核对，非旧源码）：
 
-- `agent/turn-stopping` 的 payload 是 `{ agent, turn, signal }`，是自然停止边界上一次 awaited 通知，监听器可调 `agent.steer(UserMessage)` 要求再走一步。
-- `ctx.subagents.start(provider, request)` 支持 `prompt`、`parent`、`outputSchema`、`toolFilter`、`persona`、`agentOptions`、`maxDepth`、`signal`；`SubagentResult.structured` 是 schema 校验后的值。
-- `toolFilter` 是**结构性**只读：被摘掉的工具既不出现在子代理提示词里，也无法执行。
+- `agent/turn-stopping` 的监听签名是 `ctx.on('agent/turn-stopping', ({ agent, turn }) => …)`，`agent.session` 可拿到会话；它是自然停止边界上一次 awaited 通知，监听器可调 `agent.steer(UserMessage)` 要求再走一步。
+- 起子代理用 `ctx.subagents.startActivation({ provider, label, request, signal, delivery })`，返回 `{ childId, messageId?, result, dispose }`；`request` 是 `SubagentStartRequest`，支持 `parent`、`prompt`、`agentPreset`、`outputSchema`、`agentOptions`、`cwd`、`maxDepth`。
+- **spawn 请求没有 `toolFilter` / `persona`**：`dsh-tool-subagent` 对这两个字段显式报错，指向 Agent Preset。只读与人格都必须在 preset 里组合。
+- 本地子代理的只读由 preset 决定：`dsh-tool-fs` 的 `read` / `write` / `edit` / `applyPatch` 是独立开关，不挂 bash 就没有 shell。
 - `ctx.workspaceChanges.summary(sessionId, seq)` / `.diff(sessionId, seq, index, signal)` 给出每轮的变更文件与逐文件 hunk（3 行上下文），覆盖未提交改动与非 git 文件。
 - 子代理会话用 `session.header.origin === 'subagent'` 识别。
 
@@ -102,23 +103,31 @@ AI 在主会话里写完代码，人往往要到提 MR 之后才第一次被审�
 - 只取 `codeExtensions` 命中的文件；跳过 `binary` / `oversized`（在 prompt 里点名告知跳过，不静默）。
 - 按文件顺序累积，超过 `maxDiffBytes` 后停止并声明「已截断，剩余 N 个文件未审」。
 - `ctx.workspaceChanges` 不可用时回退 `ctx.subprocess` 跑 `git diff --unified=3`；两者都不可用则跳过本轮并记一次警告。
+- **监听顺序依赖**：`workspace-changes` 自己也是在 `agent/turn-stopping` 里才把本轮的 `workspace/changes` 事件写进会话的，串行派发下后注册的监听器才能读到。因此本插件必须排在它之后加载（profile patch 的顺序天然满足）；拿不到本轮 seq 时按上一节回退 git diff，并记一次警告，不能假设「容器里一定有 workspace-changes」。
 
 ### 6.3 审查
 
-```
-ctx.subagents.start('spawn', {
-  parent: agent,
-  toolFilter: { allow: ['read', 'grep', 'glob'] },   // 白名单，见下
-  persona: '独立代码审查者',
-  outputSchema: ReviewResultSchema,
-  agentOptions: config.modelOverride,   // 缺省沿用主会话模型
-  signal: 带 deadline 的 AbortSignal,
-  prompt: [原则层, 规则层, 变更清单, diff 正文, 输出要求],
+```js
+const activation = await ctx.subagents.startActivation({
+  provider: 'spawn',
+  label: `review:t${turn}`,
+  delivery: 'caller',                   // 结果由插件自己等，不向父级投递完成通知
+  signal,                               // 只取消尚未发布的工作
+  request: {
+    parent: agent,
+    agentPreset: 'session-reviewer',    // 只读工具面与人格都在 preset 里
+    outputSchema: ReviewResultSchema,
+    agentOptions: config.modelOverride, // 缺省沿用主会话模型
+    prompt: [{ type: 'text', text: 组装好的审查提示 }],
+  },
 })
+const result = await activation.result   // 超时就 activation.dispose()
 ```
 
+- 只读靠 preset，不靠提示词：`session-reviewer` 这个 preset 里只挂 `read` / `grep` / `glob` 对应的工具，`dsh-tool-fs` 的 `write`、`edit`、`applyPatch` 全关，且不挂任何 bash/终端行。0.2.2 的 spawn 请求没有 `toolFilter`，preset 是唯一的结构性只读手段。
+- `delivery: 'caller'` 很关键：默认的 `parent` 投递会向父代理发一条「子代理完成」通知，白白多一轮模型调用；插件自己等 `result` 就够了。
+- 超时用 `dispose()` 而不是请求信号：请求 `signal` 只能取消尚未发布的工作，发布后的取消通道是 `dispose()`。
 - prompt 里明确：只读、不许改代码、拿不到完整文件时才用 read/grep 补上下文。
-- `toolFilter` 用 `allow` 白名单而不是 `deny`：`deny` 挡不住以后新装进来的写能力工具（MCP 工具、编辑器类工具），白名单才能保证「结构上只读」这个性质不随组合变化而漏。
 - `stopReason !== 'completed'` 或 `structured` 缺失 → 视为审查失败（§9.4）。
 - 审查者**不返回 verdict**：verdict 由插件按 `blockingSeverities` 从 findings 推导，消除模型自相矛盾的可能。
 
@@ -252,6 +261,7 @@ interface Finding {
         codeExtensions: [.ts, .tsx, .js, .jsx, .vue, .py, .go, .java, .rs, .css, .less, .scss]
         maxDiffBytes: 200000
         reviewerTimeoutMs: 120000
+        reviewerPreset: session-reviewer # 只读工具面的载体，见 §11
         # 省略 modelOverride 即沿用主会话模型；只覆盖其一视为配置非法
         # modelOverride: { provider: deepseek, model: deepseek-chat }
         rulesFile: rules/rules.yaml
@@ -265,7 +275,7 @@ interface Finding {
 ```
 session-review/
   package.json            # 无 client 半边；dsh.bundle.patch 指向 cordis.patch.yml
-  cordis.patch.yml
+  cordis.patch.yml        # 两条 insert：reviewer preset + 本插件行
   index.js                # 装配入口：读配置、加载规范、挂监听与命令
   src/host/
     trigger.js            # §6.1 门禁真值表
@@ -279,6 +289,39 @@ session-review/
     principles.md
     rules.yaml
   test/
+```
+
+`cordis.patch.yml` 里的 preset 行（只读工具面 + 人格）大致是：
+
+```yaml
+- insert:
+    - id: preset-session-reviewer
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: session-reviewer
+        name: 会话审查者
+        description: 会话内自动代码审查使用的只读子代理
+        order: 50
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: <审查者人格>
+              complete: true
+              includeRuntimeContext: false
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config: { read: true, readImage: false, write: false, edit: false, applyPatch: false }
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate: { compaction: true }
+            config:
+              - { id: compaction-basic, name: '@deepseek-ai/dsh-compaction-basic' }
+    - id: session-review
+      name: '@liyuera/dsh-session-review'
 ```
 
 模块边界约束：`trigger` / `render` / `rules` 是纯函数，不碰 ctx，可直接单测；`collect` / `reviewer` 只依赖注入进来的服务接口，用假实现测。
@@ -302,7 +345,9 @@ session-review/
 
 | 风险 | 说明与对策 |
 |---|---|
-| API 版本 | checkout 是 0.1.6，运行时是 0.2.2-rc.1。`turn-stopping` / `subagents.start` / `outputSchema` 三个签名必须在 M0 先在 0.2.2 上核准，否则不进入实现 |
+| API 版本 | 已按运行时 0.2.2-rc.1 的产物核签（见 §4 / §6.3），但只核了声明与调用形态，没跑过。M0 剩下的正是运行时行为验证 |
+| 预设可见性 | reviewer preset 是全局注册的，会出现在用户新建会话的预设选择器里。取舍：接受它（它本身也能当手动审查用），但名字要写清是「会话审查者」，避免被误当成通用编码模式 |
+| 监听顺序 | 本插件必须在 `workspace-changes` 之后加载才能读到本轮 `workspace/changes`。profile patch 顺序天然满足；隔离组合里要显式保证，否则退化为 git diff |
 | 误报 | 一次误报让主代理去「修」正确代码，比不审更糟。对策：severity 定得保守、规则必须带 bad/good、原则层写清「什么可以放过」 |
 | 成本 | 每轮一次子代理。对策：纯文档轮次不触发、maxDiffBytes 截断、失败熔断、`auto: false` 可退化为手动 |
 | diff 过大 | 大重构一轮几千行。对策：按文件累积截断并显式声明未审部分，而不是把 prompt 撑爆 |
@@ -311,7 +356,7 @@ session-review/
 
 ## 15. 里程碑
 
-- **M0 核签**：在 0.2.2-rc.1 上验证三个 API（turn-stopping 可 steer、subagents.start 带 outputSchema + toolFilter、workspaceChanges 可取本轮 diff）。任一不成立则回到设计。
+- **M0 运行时核签**：声明层面已核对完 0.2.2-rc.1。剩下三件必须真机验的：`agent.steer` 在 turn-stopping 里确实能把轮次续上；`startActivation` 的 `structured` 能按 schema 拿到；`workspaceChanges.summary` 在本插件的 turn-stopping 监听里已经能读到本轮 seq。任一不成立则回到设计。
 - **M1 骨架**：插件目录、装配、配置校验、`/review` 命令（先只渲染 diff 不审），证明能装上并触发。
 - **M2 审查链**：reviewer + schema + render + steer 闭环，用一份最小规则表（5 条）跑通。
 - **M3 规范**：补全四维度规则与原则层，用真实 diff 校准误报。
