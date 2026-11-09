@@ -115,7 +115,7 @@ const activation = await ctx.subagents.startActivation({
   signal,                               // 只取消尚未发布的工作
   request: {
     parent: agent,
-    agentPreset: 'session-reviewer',    // 只读工具面与人格都在 preset 里
+    agentPreset: 'general-code-review',  // 只读工具面与人格都在 preset 里
     outputSchema: ReviewResultSchema,
     agentOptions: config.modelOverride, // 缺省沿用主会话模型
     prompt: [{ type: 'text', text: 组装好的审查提示 }],
@@ -124,7 +124,7 @@ const activation = await ctx.subagents.startActivation({
 const result = await activation.result   // 超时就 activation.dispose()
 ```
 
-- 只读靠 preset，不靠提示词：`session-reviewer` 这个 preset 里只挂 `read` / `grep` / `glob` 对应的工具，`dsh-tool-fs` 的 `write`、`edit`、`applyPatch` 全关，且不挂任何 bash/终端行。0.2.2 的 spawn 请求没有 `toolFilter`，preset 是唯一的结构性只读手段。
+- 只读靠 preset，不靠提示词：`general-code-review` 这个 preset 里只挂 `read` / `grep` / `glob` 对应的工具，`dsh-tool-fs` 的 `write`、`edit`、`applyPatch` 全关，且不挂任何 bash/终端行。0.2.2 的 spawn 请求没有 `toolFilter`，preset 是唯一的结构性只读手段。
 - `delivery: 'caller'` 很关键：默认的 `parent` 投递会向父代理发一条「子代理完成」通知，白白多一轮模型调用；插件自己等 `result` 就够了。
 - 超时用 `dispose()` 而不是请求信号：请求 `signal` 只能取消尚未发布的工作，发布后的取消通道是 `dispose()`。
 - prompt 里明确：只读、不许改代码、拿不到完整文件时才用 read/grep 补上下文。
@@ -261,7 +261,7 @@ interface Finding {
         codeExtensions: [.ts, .tsx, .js, .jsx, .vue, .py, .go, .java, .rs, .css, .less, .scss]
         maxDiffBytes: 200000
         reviewerTimeoutMs: 120000
-        reviewerPreset: session-reviewer # 只读工具面的载体，见 §11
+        reviewerPreset: general-code-review # 只读工具面的载体，见 §11
         # 省略 modelOverride 即沿用主会话模型；只覆盖其一视为配置非法
         # modelOverride: { provider: deepseek, model: deepseek-chat }
         rulesFile: rules/rules.yaml
@@ -295,18 +295,20 @@ session-review/
 
 ```yaml
 - insert:
-    - id: preset-session-reviewer
+    - id: preset-general-code-review
       name: '@deepseek-ai/dsh-agent-preset'
       config:
-        id: session-reviewer
-        name: 会话审查者
-        description: 会话内自动代码审查使用的只读子代理
+        id: general-code-review
+        name: 通用代码审查
+        description: 通用代码审查——只读子代理，只审不改
         order: 50
         plugins:
           - id: persona
             name: '@deepseek-ai/dsh-persona'
             config:
-              prefix: <审查者人格>
+              prefix: |-
+                你是代码审查者，只做审查，不改代码。你没有写文件、改文件或执行命令的能力。
+                对给定的 diff 逐条核对规则，只报告确有把握的问题；拿不准就不报。
               complete: true
               includeRuntimeContext: false
           - id: tool-fs
@@ -346,7 +348,7 @@ session-review/
 | 风险 | 说明与对策 |
 |---|---|
 | API 版本 | 已按运行时 0.2.2-rc.1 的产物核签（见 §4 / §6.3），但只核了声明与调用形态，没跑过。M0 剩下的正是运行时行为验证 |
-| 预设可见性 | reviewer preset 是全局注册的，会出现在用户新建会话的预设选择器里。取舍：接受它（它本身也能当手动审查用），但名字要写清是「会话审查者」，避免被误当成通用编码模式 |
+| 预设可见性 | reviewer preset 是全局注册的，会出现在用户新建会话的预设选择器里。取舍：接受它（它本身也能当手动审查用），名字定为「通用代码审查」并配「只审不改」的人格，避免被误当成通用编码模式 |
 | 监听顺序 | 本插件必须在 `workspace-changes` 之后加载才能读到本轮 `workspace/changes`。profile patch 顺序天然满足；隔离组合里要显式保证，否则退化为 git diff |
 | 误报 | 一次误报让主代理去「修」正确代码，比不审更糟。对策：severity 定得保守、规则必须带 bad/good、原则层写清「什么可以放过」 |
 | 成本 | 每轮一次子代理。对策：纯文档轮次不触发、maxDiffBytes 截断、失败熔断、`auto: false` 可退化为手动 |
