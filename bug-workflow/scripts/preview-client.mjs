@@ -207,6 +207,9 @@ function baseTicket(code, title, type, workflow, minutesAgo, extra = {}) {
     source: 'platform',
     url: 'https://ecard.htwisdom.cn/HT_TEAM/',
     workflow,
+    // Realistic platform status labels so the default 待办/进行中 filter shows
+    // the board instead of an empty result in the preview.
+    status: workflow === 'inbox' ? '待办' : '进行中',
     createdAt: iso(600),
     updatedAt: iso(minutesAgo),
     plan: null,

@@ -120,6 +120,10 @@ test('lane board keeps its responsive + step-bar source guards', () => {
   assert.ok(source.includes("'data-bug-board-lane': laneMode"), 'root must expose the lane mode for verification');
   assert.ok(source.includes('LANE_WIDE_MIN_WIDTH = 720'), 'wide/narrow breakpoint must stay declared');
   assert.ok(source.includes('function useElementWidth'), 'responsive width observer is required');
+  // The board opens on the actionable subset: 待办/进行中 的缺陷.
+  assert.ok(source.includes('DEFAULT_FILTER_SELECTION'), 'the default filter selection must stay declared');
+  assert.ok(source.includes("status: Object.freeze(['待办', '进行中'])"), 'default status filter must be 待办+进行中');
+  assert.ok(source.includes("type: Object.freeze(['缺陷'])"), 'default type filter must be 缺陷');
   assert.ok(source.includes('function LaneBoard'), 'lane board renderer is required');
   assert.ok(source.includes('function LaneCard'), 'lane card renderer is required');
   assert.ok(source.includes('function StageOverview'), 'lane overview chips are required');

@@ -100,7 +100,7 @@ window.__ModuleLoader__.load({
     const h = React.createElement;
     const ID = '@liyuera/dsh-bug-workflow';
     /** Visible build tag so the running UI can be verified after a reload. */
-    const CLIENT_BUILD = 'p7-test.2026-11-09.2';
+    const CLIENT_BUILD = 'p7-test.2026-11-09.3';
 
     /** Snapshot/action endpoints (same origin as the Harness Web page). */
     const API = Object.freeze({
@@ -5710,6 +5710,23 @@ window.__ModuleLoader__.load({
     // Root board
     // ---------------------------------------------------------------------
 
+    /**
+     * Default status/type filter selection: 待办 + 进行中 的缺陷. The values are
+     * the platform dictionary labels (`dimensionValue(ticket.status/type)`), so
+     * they match the chip row without depending on key order.
+     */
+    const DEFAULT_FILTER_SELECTION = Object.freeze({
+      status: Object.freeze(['待办', '进行中']),
+      type: Object.freeze(['缺陷']),
+    });
+
+    function createDefaultFilters() {
+      return {
+        status: [...DEFAULT_FILTER_SELECTION.status],
+        type: [...DEFAULT_FILTER_SELECTION.type],
+      };
+    }
+
     function Board({ sessionId }) {
       const url = snapshotUrlFor(sessionId);
       const polling = usePolling(url, POLL_INTERVAL_MS, {
@@ -5750,7 +5767,9 @@ window.__ModuleLoader__.load({
         if (finished.length > 0) setFlash(finished.join('；'));
       }, [polling.data]);
       const [selectedCode, setSelectedCode] = React.useState(null);
-      const [filters, setFilters] = React.useState({ status: [], type: [] });
+      // Default board view: the two actionable statuses of the current defect
+      // work (待办/进行中 × 缺陷). 「清除筛选」 still clears everything.
+      const [filters, setFilters] = React.useState(createDefaultFilters);
       const [stageFilter, setStageFilter] = React.useState(null);
       const [busyAction, setBusyAction] = React.useState(null);
       const [actionError, setActionError] = React.useState(null);
