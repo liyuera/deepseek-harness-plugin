@@ -47,6 +47,7 @@ export const ACTIONS = Object.freeze([
   'reject_plan',
   'fix_done',
   'mark_test_passed',
+  'reopen_fix',
   'submit_mr',
   'mr_created',
   'review_requests_changes',

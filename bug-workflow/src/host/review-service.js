@@ -93,6 +93,7 @@ import {
   createRepoLock,
   isPathInsideRepo,
 } from './delivery-service.js';
+import { mergeWorktreeIntoDev, readMergeRecord, writeMergeRecord } from './dev-branch.js';
 import { assertPushableBranch } from './git.js';
 import { MAX_REVIEW_ROUNDS } from './protocol.js';
 import { isReviewBody, parseReview } from './review-parser.js';
@@ -661,6 +662,9 @@ export function createReviewService({
     const branch = readBranch(ticket);
     if (branch === null) return undefined;
     const record = readFixCommitRecord(code, branch);
+    // P7: after 「测试通过」 the MR source is the dev branch and the scratch
+    // branch has to be merged into it before the push.
+    const mergeRecord = readMergeRecord(store, code);
     if (record === undefined) return undefined;
 
     // Round/note binding (N1). `mr.rounds` is incremented by the transition
@@ -724,12 +728,36 @@ export function createReviewService({
     }
     try {
       if (disposed) return { transitioned: false };
+      // P7: with a dev-branch merge the review fix must land on the dev branch
+      // (the MR source), not on the scratch branch.
+      if (mergeRecord !== null) {
+        const merged = await mergeWorktreeIntoDev({
+          git,
+          repo,
+          scratchBranch: branch.name,
+          devBranch: mergeRecord.devBranch,
+          target: branch.target,
+        });
+        if (disposed) return { transitioned: false };
+        if (!isPlainObject(merged) || merged.ok !== true) {
+          // Keep the commit record: once the dev branch is clean the retry can
+          // merge the same commit instead of rerunning the child.
+          const blocked = await blockTicket(code, 'review-fix-failed', 'fixing_review');
+          return { transitioned: blocked };
+        }
+        await writeMergeRecord(store, code, {
+          ...mergeRecord,
+          devBefore: merged.devBefore,
+          devAfter: merged.devAfter,
+        }).catch(() => {});
+      }
+
       let pushed;
       try {
         pushed = await git.pushBranch({
-          root: branch.worktree,
+          root: mergeRecord !== null ? repo : branch.worktree,
           remote: 'origin',
-          branch: branch.name,
+          branch: mergeRecord !== null ? mergeRecord.devBranch : branch.name,
         });
       } catch {
         pushed = undefined;
@@ -957,17 +985,20 @@ export function createReviewService({
    * reason the client already renders) or `undefined` when the branch is
    * safe to use.
    */
-  async function fixBranchRefusal(repo, branch, ticket) {
+  async function fixBranchRefusal(repo, branch, ticket, expectedSource) {
     try {
       assertPushableBranch(branch.name);
     } catch {
       return 'review-fix-failed';
     }
     const sourceBranch = ticket.mr?.sourceBranch;
+    const expected = typeof expectedSource === 'string' && expectedSource !== ''
+      ? expectedSource
+      : branch.name;
     if (
       typeof sourceBranch === 'string'
       && sourceBranch.trim() !== ''
-      && sourceBranch !== branch.name
+      && sourceBranch !== expected
     ) {
       return 'review-fix-failed';
     }
@@ -995,11 +1026,17 @@ export function createReviewService({
         return;
       }
 
+      // P7: after 「测试通过」 the scratch worktree is removed and the MR is
+      // opened from the dev branch. The review fix then runs on a re-created
+      // scratch worktree and its commit is merged back into the dev branch.
+      const mergeRecord = readMergeRecord(store, code);
+      const expectedSource = mergeRecord === null ? branch.name : mergeRecord.devBranch;
+
       // The stored path/name are metadata, not proof: a main-worktree path, a
       // protected branch or a foreign MR source must block BEFORE the child or
       // any `git add -A`. This mirrors delivery's `isInsideRepo` +
       // `assertPushableBranch` gate (P5 final review I1).
-      const refusal = await fixBranchRefusal(repo, branch, ticket);
+      const refusal = await fixBranchRefusal(repo, branch, ticket, expectedSource);
       if (entry.cancelled || disposed) return;
       if (refusal !== undefined) {
         await failFix(code, refusal, entry);
@@ -1016,6 +1053,28 @@ export function createReviewService({
         probe = null;
       }
       if (entry.cancelled || disposed) return;
+      if ((!isPlainObject(probe) || probe.ok !== true || probe.state !== 'same')
+        && mergeRecord !== null) {
+        // The cleanup after 「测试通过」 removed the worktree: re-create it on the
+        // scratch branch so the review fix has an isolated place to edit.
+        const added = await git.worktreeAdd({
+          repo,
+          path: branch.worktree,
+          branch: branch.name,
+          base: mergeRecord.devBranch,
+        }).catch(() => undefined);
+        if (entry.cancelled || disposed) return;
+        if (!isPlainObject(added) || added.ok === false) {
+          await failFix(code, 'review-fix-failed', entry);
+          return;
+        }
+        try {
+          probe = await git.probeWorktree(repo, branch.worktree, branch.name);
+        } catch {
+          probe = null;
+        }
+        if (entry.cancelled || disposed) return;
+      }
       if (!isPlainObject(probe) || probe.ok !== true || probe.state !== 'same') {
         await failFix(code, 'review-fix-failed', entry);
         return;

@@ -51,7 +51,9 @@ const EXPECTED_ACTIONS = Object.freeze({
   analyzing: ['analysis_done'],
   plan_review: ['approve_plan', 'reject_plan'],
   fixing: ['fix_done'],
-  fix_done: ['mark_test_passed'],
+  // P7: the test step is service-owned (merge to the dev branch / revert /
+  // pass + cleanup) and rendered by TestNotice, never a state-machine button.
+  fix_done: [],
   // P5: the delivery/review flow is service-owned. The board renders the real
   // 「提交并创建 MR」 descriptor (board-only, routed to /api/deliver) and the
   // review/merge banners instead of demo write-back buttons.
@@ -80,7 +82,6 @@ const DEMO_PATH = Object.freeze([
   'analysis_done',
   'approve_plan',
   'fix_done',
-  'mark_test_passed',
 ]);
 
 /** Fields of `planSchema` in `src/host/domain.js`, in declaration order. */
@@ -258,7 +259,7 @@ test('analyzing.analysis_done ships a demo plan payload matching the host plan s
   assert.equal(plan.rejectedReason, null);
 });
 
-test('the remaining demo path applies each descriptor payload and reaches submitting with the real plan', () => {
+test('the remaining demo path applies each descriptor payload and reaches fix_done with the real plan', () => {
   const demoDescriptor = descriptorOf(ACTION_BY_STATE, 'analyzing', 'analysis_done');
   const demoPlan = demoDescriptor.payload.plan;
 
@@ -283,9 +284,9 @@ test('the remaining demo path applies each descriptor payload and reaches submit
     if (action === 'approve_plan') planAfterApprove = ticket.plan;
   }
 
-  // P5 removed the demo submit_mr/mr_created buttons, so the board-driven demo
-  // chain now stops at `submitting`; the real delivery job takes over there.
-  assert.equal(ticket.workflow, 'submitting', 'the demo chain must stop at submitting (delivery is service-owned)');
+  // P7 moved the test step into the host: the demo chain stops at fix_done and
+  // 「开始测试」/「测试通过」 are service routes, not demo write-back buttons.
+  assert.equal(ticket.workflow, 'fix_done', 'the demo chain must stop at fix_done (test step is service-owned)');
   assert.deepEqual(actionsOf(ACTION_BY_STATE, 'submitting'), [], 'submitting renders no demo write-back button');
 
   assert.ok(planBeforeApprove !== null, 'analysis_done must create a plan on the ticket');

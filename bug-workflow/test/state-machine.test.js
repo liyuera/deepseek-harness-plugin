@@ -18,7 +18,7 @@ const EXPECTED_STATES = [
 
 const EXPECTED_ACTIONS = [
   'create', 'start_analysis', 'analysis_done', 'approve_plan', 'reject_plan',
-  'fix_done', 'mark_test_passed', 'submit_mr', 'mr_created',
+  'fix_done', 'mark_test_passed', 'reopen_fix', 'submit_mr', 'mr_created',
   'review_requests_changes', 'review_fix_done', 'review_pass', 'mr_merged',
   'dismiss', 'retry', 'block',
 ];

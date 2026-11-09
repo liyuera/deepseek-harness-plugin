@@ -68,6 +68,10 @@ const TRANSITIONS = Object.freeze({
   reject_plan: { from: ['plan_review'], to: 'blocked', actor: 'user' },
   fix_done: { from: ['fixing'], to: 'fix_done', actor: 'agent' },
   mark_test_passed: { from: ['fix_done'], to: 'submitting', actor: 'user' },
+  // Re-open a finished fix (manual test failed / the user wants another AI
+  // round). The test service reverts the dev-branch merge before this is legal;
+  // fix-service refuses while a merge record still exists.
+  reopen_fix: { from: ['fix_done'], to: 'fixing', actor: 'user' },
   // submit_mr records the submit intent; mr_created confirms the MR exists and
   // is the only action that moves the ticket to mr_open.
   submit_mr: { from: ['submitting'], to: 'submitting', actor: 'user' },

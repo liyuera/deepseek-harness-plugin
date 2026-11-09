@@ -100,7 +100,7 @@ import { ACTIONS } from './protocol.js';
 import { PLATFORM_LOGIN_ERROR_STATUS } from './platform-login.js';
 
 /** Host build tag surfaced by `/health` so a reload can be verified. */
-export const HOST_BUILD = 'p6-login.2026-11-09.2';
+export const HOST_BUILD = 'p7-test.2026-11-09.1';
 
 /** Exact route paths; exported so index/tests/client agree on one source. */
 export const API_PATHS = Object.freeze({
@@ -110,6 +110,9 @@ export const API_PATHS = Object.freeze({
   analyze: '/bug-workflow/api/analyze',
   fix: '/bug-workflow/api/fix',
   deliver: '/bug-workflow/api/deliver',
+  testStart: '/bug-workflow/api/test-start',
+  testRevert: '/bug-workflow/api/test-revert',
+  testPass: '/bug-workflow/api/test-pass',
   settings: '/bug-workflow/api/settings',
   platformToken: '/bug-workflow/api/platform-token',
   platformCaptcha: '/bug-workflow/api/platform-login/captcha',
@@ -144,12 +147,37 @@ const ROUTE_METHODS = Object.freeze({
   analyze: 'POST',
   fix: 'POST',
   deliver: 'POST',
+  testStart: 'POST',
+  testRevert: 'POST',
+  testPass: 'POST',
   settings: 'POST',
   platformToken: 'POST',
   platformCaptcha: 'POST',
   platformLogin: 'POST',
   gitlabToken: 'POST',
   sync: 'POST',
+});
+
+/** `POST /api/test-*` failure code -> HTTP status. */
+const TEST_ERROR_STATUS = Object.freeze({
+  'ticket-not-found': 404,
+  'not-found': 404,
+  'not-fix-done': 409,
+  'test-merged': 409,
+  'test-not-merged': 409,
+  'test-no-changes': 409,
+  'worktree-missing': 400,
+  'invalid-workspace': 400,
+  'unknown-workspace': 400,
+  'invalid-code': 400,
+  'dev-branch-missing': 409,
+  'dev-dirty': 409,
+  'dev-ahead': 409,
+  'dev-moved': 409,
+  'merge-conflict': 409,
+  'test-unavailable': 503,
+  'git-failed': 500,
+  internal: 500,
 });
 
 /** Store failure code -> HTTP status. Unknown codes are protocol bugs -> 500. */
@@ -367,6 +395,7 @@ export function createHandlers({
   analysis = null,
   fix = null,
   delivery = null,
+  test = null,
   review = null,
   platformLogin = null,
   clock = defaultClock,
@@ -436,6 +465,18 @@ export function createHandlers({
     }
   }
   const deliveryDeps = delivery === undefined ? null : delivery;
+  if (test !== null && test !== undefined) {
+    if (typeof test !== 'object'
+      || typeof test.service?.start !== 'function'
+      || typeof test.service?.revert !== 'function'
+      || typeof test.service?.pass !== 'function'
+      || typeof test.service?.status !== 'function') {
+      throw new TypeError(
+        'createHandlers() test.service must expose start/revert/pass/status',
+      );
+    }
+  }
+  const testDeps = test === undefined ? null : test;
   if (review !== null && review !== undefined) {
     if (typeof review !== 'object' || typeof review.service?.status !== 'function') {
       throw new TypeError(
@@ -465,6 +506,72 @@ export function createHandlers({
   }
 
   const safe = (handler) => wrap(handler, log);
+
+  /**
+   * One handler for the three test-step routes (`start` / `revert` / `pass`).
+   * Same guard stack as `/api/deliver`; the service owns every git side effect.
+   */
+  function makeTestHandler(step) {
+    return safe(async (req, res) => {
+      if (!guard(req, res, ROUTE_METHODS[step === 'start' ? 'testStart' : (step === 'revert' ? 'testRevert' : 'testPass')])) return;
+      if (!guardJsonContentType(req, res)) return;
+      if (!guardOrigin(req, res)) return;
+
+      const body = await readJsonBody(req, bodyTimeoutMs);
+      if (!body.ok) {
+        sendError(res, body.status, body.code, body.message);
+        if (body.destroyRequest === true) destroyRequest(req);
+        return;
+      }
+      const input = body.value;
+
+      const sessionId = normalizeSessionId(input.sessionId);
+      if (sessionId === undefined) {
+        sendError(res, 400, 'missing-session', '缺少有效的 sessionId');
+        return;
+      }
+      const code = normalizeCode(input.code);
+      if (code === undefined) {
+        sendError(res, 400, 'invalid-code', '缺少有效的工单编号 code');
+        return;
+      }
+
+      if (testDeps === null) {
+        sendError(res, 503, 'test-unavailable', '测试服务不可用，请稍后重试');
+        return;
+      }
+
+      const resolved = normalizeWorkspace(workspace.resolve(sessionId));
+      if (resolved.path === null) {
+        sendError(res, 400, 'unknown-workspace', '无法确定工作区路径');
+        return;
+      }
+
+      const result = await testDeps.service[step](sessionId, resolved.path, code);
+      if (result?.ok === true) {
+        sendJsonSafe(res, 200, {
+          ok: true,
+          ...(result.ticket === undefined ? {} : { ticket: result.ticket }),
+          ...(result.merged === undefined ? {} : { merged: result.merged }),
+        });
+        return;
+      }
+
+      const failureCode = typeof result?.code === 'string' ? result.code : 'internal';
+      const status = TEST_ERROR_STATUS[failureCode];
+      if (status === undefined) {
+        notifyLog(log, 'test-result', result);
+        sendError(res, 500, 'internal', '测试操作失败');
+        return;
+      }
+      sendError(
+        res,
+        status,
+        failureCode,
+        clipMessage(typeof result?.message === 'string' ? result.message : '测试操作失败'),
+      );
+    });
+  }
 
   return {
     health: safe(async (req, res) => {
@@ -518,6 +625,8 @@ export function createHandlers({
         // P5: delivery progress + static per-ticket errors from the
         // delivery-specific meta namespace (parallel to `fix`, never shared).
         delivery: readServiceStatus(deliveryDeps),
+        // P7: tickets merged into the dev branch and waiting for the test verdict.
+        test: readTestStatus(testDeps),
         // P5: review polling/merge-detection progress + static per-ticket
         // errors (`review.error:<code>`). Timer-driven: no HTTP route.
         review: readServiceStatus(reviewDeps),
@@ -862,6 +971,10 @@ export function createHandlers({
         clipMessage(typeof result?.message === 'string' ? result.message : '交付启动失败'),
       );
     }),
+
+    testStart: makeTestHandler('start'),
+    testRevert: makeTestHandler('revert'),
+    testPass: makeTestHandler('pass'),
 
     settings: safe(async (req, res) => {
       if (!guard(req, res, ROUTE_METHODS.settings)) return;
@@ -1247,6 +1360,9 @@ export function registerUnavailableRoutes(ctx, health = {}) {
     analyze: unavailableHandler(ROUTE_METHODS.analyze, health),
     fix: unavailableHandler(ROUTE_METHODS.fix, health),
     deliver: unavailableHandler(ROUTE_METHODS.deliver, health),
+    testStart: unavailableHandler(ROUTE_METHODS.testStart, health),
+    testRevert: unavailableHandler(ROUTE_METHODS.testRevert, health),
+    testPass: unavailableHandler(ROUTE_METHODS.testPass, health),
     settings: unavailableHandler(ROUTE_METHODS.settings, health),
     platformToken: unavailableHandler(ROUTE_METHODS.platformToken, health),
     platformCaptcha: unavailableHandler(ROUTE_METHODS.platformCaptcha, health),
@@ -1462,6 +1578,25 @@ function emptyDicts() {
  * state and the board keeps rendering. Only static strings persisted by the
  * service are exposed.
  */
+/**
+ * Snapshot `test` block: `{merged}` from the service, empty when unwired.
+ * A failing status read must never break the board snapshot.
+ */
+function readTestStatus(serviceDeps) {
+  const empty = { merged: {} };
+  if (serviceDeps === null || serviceDeps === undefined) return empty;
+  try {
+    const status = serviceDeps.service.status();
+    if (status !== null && typeof status === 'object' && status.merged !== null
+      && typeof status.merged === 'object') {
+      return { merged: status.merged };
+    }
+  } catch {
+    // Fall through to the empty block.
+  }
+  return empty;
+}
+
 function readServiceStatus(serviceDeps) {
   const empty = { running: [], errors: {} };
   if (serviceDeps === null || serviceDeps === undefined) return empty;

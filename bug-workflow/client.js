@@ -100,7 +100,7 @@ window.__ModuleLoader__.load({
     const h = React.createElement;
     const ID = '@liyuera/dsh-bug-workflow';
     /** Visible build tag so the running UI can be verified after a reload. */
-    const CLIENT_BUILD = 'p6-login.2026-11-09.3';
+    const CLIENT_BUILD = 'p7-test.2026-11-09.1';
 
     /** Snapshot/action endpoints (same origin as the Harness Web page). */
     const API = Object.freeze({
@@ -109,6 +109,9 @@ window.__ModuleLoader__.load({
       analyze: '/bug-workflow/api/analyze',
       fix: '/bug-workflow/api/fix',
       deliver: '/bug-workflow/api/deliver',
+      testStart: '/bug-workflow/api/test-start',
+      testRevert: '/bug-workflow/api/test-revert',
+      testPass: '/bug-workflow/api/test-pass',
       settings: '/bug-workflow/api/settings',
       platformToken: '/bug-workflow/api/platform-token',
       platformCaptcha: '/bug-workflow/api/platform-login/captcha',
@@ -263,14 +266,10 @@ window.__ModuleLoader__.load({
           tone: 'primary',
         },
       ],
-      fix_done: [
-        {
-          action: 'mark_test_passed',
-          label: '标记测试通过',
-          confirm: '确认人工测试通过，准备提交 MR？',
-          tone: 'primary',
-        },
-      ],
+      // The test step is service-owned (merge into the dev branch / revert /
+      // pass + cleanup): the detail view renders `TestNotice` instead of a
+      // state-machine button so a pass can never skip the merge+cleanup.
+      fix_done: [],
       // P5 delivery/review are service-owned: the board renders the real
       // board-only 「提交并创建 MR」 descriptor (POST /api/deliver) and the
       // review/merge status banners instead of demo write-back buttons. The
@@ -645,6 +644,26 @@ window.__ModuleLoader__.load({
 
     /** Normal `submitting` copy when no delivery job is running. */
     const DELIVERY_READY_HINT = '人工测试已通过，可以提交并创建 MR';
+
+    /** Board-only test-step descriptors (POST /api/test-*). */
+    const TEST_START_DESCRIPTOR = Object.freeze({
+      action: 'test_start',
+      label: '开始测试',
+      confirm: '确认把工作树的改动合并到 feat 开发分支，并在开发目录里测试？',
+      tone: 'primary',
+    });
+    const TEST_PASS_DESCRIPTOR = Object.freeze({
+      action: 'test_pass',
+      label: '测试通过',
+      confirm: '确认测试通过？将清理工作树并进入「提交并创建 MR」。',
+      tone: 'primary',
+    });
+    const TEST_REVERT_DESCRIPTOR = Object.freeze({
+      action: 'test_revert',
+      label: '测试不通过',
+      confirm: '确认回滚 feat 开发分支上的合并？工作树里的改动会保留，可以继续修复。',
+      tone: 'danger',
+    });
 
     /**
      * Board-only delivery descriptor. It is NOT part of `ACTION_BY_STATE` (that
@@ -4920,6 +4939,96 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * P7 人工测试面板（`fix_done`）。
+     *
+     * The AI fix lives on a ticket-scoped scratch branch inside a worktree; the
+     * human tests on the developer's version branch, so this panel owns the
+     * three service actions:
+     *   - not merged yet: 「开始测试」 commits the worktree and merges it into the
+     *     dev branch; 「重新修复」 re-opens the fix (fix_done -> fixing) when the
+     *     test failed and the merge was reverted;
+     *   - merged (`snapshot.test.merged[code]`): 「测试通过」 cleans the worktree
+     *     and advances to submitting; 「测试不通过」 rolls the dev branch back and
+     *     keeps the worktree for another AI round.
+     *
+     * A merge record exists only while the ticket is in the test step; a stale
+     * one for a ticket that moved on is ignored by the workflow guard.
+     */
+    function TestNotice({ ticket, snapshot, busyAction, locked, onAction }) {
+      if (ticket.workflow !== 'fix_done') return null;
+      const merged = snapshot !== null && snapshot.test !== null && typeof snapshot.test === 'object'
+        && snapshot.test.merged !== null && typeof snapshot.test.merged === 'object'
+        ? snapshot.test.merged[ticket.code]
+        : null;
+      const isMerged = merged !== null && merged !== undefined && typeof merged === 'object';
+      const branch = ticket.branch !== null && typeof ticket.branch === 'object' ? ticket.branch : null;
+      const devBranch = isMerged && typeof merged.devBranch === 'string'
+        ? merged.devBranch
+        : (branch !== null && typeof branch.devBranch === 'string' ? branch.devBranch : 'feat 开发分支');
+
+      const busy = busyAction === TEST_START_DESCRIPTOR.action
+        || busyAction === TEST_PASS_DESCRIPTOR.action
+        || busyAction === TEST_REVERT_DESCRIPTOR.action
+        || busyAction === FIX_RETRY_DESCRIPTOR.action;
+      const disabled = busy || locked === true;
+
+      const makeButton = (descriptor, tone) => h('button', {
+        key: descriptor.action,
+        type: 'button',
+        disabled,
+        'aria-busy': busyAction === descriptor.action || undefined,
+        title: locked === true ? UNBOUND_WORKSPACE_HINT : descriptor.confirm,
+        onClick: (event) => {
+          if (disabled) return;
+          if (typeof onAction === 'function') onAction(descriptor, event);
+        },
+        style: actionButtonStyle(tone, disabled),
+      }, busy && busyAction === descriptor.action ? '处理中…' : descriptor.label);
+
+      const retry = h('button', {
+        key: 'test-refix',
+        type: 'button',
+        disabled,
+        title: locked === true ? UNBOUND_WORKSPACE_HINT : FIX_RETRY_DESCRIPTOR.confirm,
+        onClick: (event) => {
+          if (disabled) return;
+          if (typeof onAction === 'function') onAction(FIX_RETRY_DESCRIPTOR, event);
+        },
+        style: smallButtonStyle(disabled),
+      }, busyAction === FIX_RETRY_DESCRIPTOR.action ? '处理中…' : '重新修复');
+
+      return h('div', {
+        role: 'status',
+        'data-bug-test': isMerged ? 'merged' : 'ready',
+        style: {
+          border: `0.5px solid ${isMerged ? TONES.success.border : TONES.warn.border}`,
+          background: isMerged ? TONES.success.background : TONES.warn.background,
+          borderRadius: 8,
+          padding: '8px 10px',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 4,
+          minWidth: 0,
+        },
+      },
+        h('div', {
+          style: {
+            fontSize: 12,
+            fontWeight: 600,
+            lineHeight: '18px',
+            color: isMerged ? TONES.success.color : TONES.warn.color,
+          },
+        }, isMerged ? `已合并到 ${devBranch}，等待人工测试` : 'AI 修复已完成，等待人工测试'),
+        h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textSecondary, wordBreak: 'break-word' } },
+          isMerged
+            ? '在开发目录里验证改动；测试通过会清理工作树并进入提交 MR，测试不通过会回滚 feat 上的合并（工作树改动保留）。'
+            : `点「开始测试」会把工作树的改动提交并合并到 ${devBranch}，之后在开发目录里验证。`),
+        h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' } },
+          isMerged ? makeButton(TEST_PASS_DESCRIPTOR, 'primary') : makeButton(TEST_START_DESCRIPTOR, 'primary'),
+          isMerged ? makeButton(TEST_REVERT_DESCRIPTOR, 'danger') : retry));
+    }
+
+    /**
      * P5 AI Review / merge status panel for the states the timer-driven review
      * service owns. It renders static, never-interactive copy except the
      * existing MR card:
@@ -5478,6 +5587,8 @@ window.__ModuleLoader__.load({
         h(StageSteps, { ticket }),
         h(AnalysisNotice, { ticket, snapshot, busyAction, locked, onAction }),
         h(FixNotice, { ticket, snapshot, busyAction, locked, onAction }),
+        // P7: merge-to-feat / revert / pass (cleanup) of the manual test step.
+        h(TestNotice, { ticket, snapshot, busyAction, locked, onAction }),
         // P5: submission progress (board-only 「提交并创建 MR」) and the
         // service-owned Review/merge status banners. Both are static after 200;
         // no demo submit_mr/mr_created/review_*/dismiss button exists any more.
@@ -6207,8 +6318,12 @@ window.__ModuleLoader__.load({
         const isAnalyze = descriptor.action === 'start_analysis';
         const isFix = descriptor.action === 'start_fix';
         const isDeliver = descriptor.action === 'start_deliver';
+        const isTestStart = descriptor.action === 'test_start';
+        const isTestRevert = descriptor.action === 'test_revert';
+        const isTestPass = descriptor.action === 'test_pass';
+        const isTest = isTestStart || isTestRevert || isTestPass;
         let payload = {};
-        if (!isAnalyze && !isFix && !isDeliver) {
+        if (!isAnalyze && !isFix && !isDeliver && !isTest) {
           payload = descriptor.payload === undefined || descriptor.payload === null ? {} : descriptor.payload;
           if (descriptor.input === 'reason') {
             const trimmed = typeof reason === 'string' ? reason.trim() : '';
@@ -6230,6 +6345,12 @@ window.__ModuleLoader__.load({
             result = await postMutation(API.fix, { sessionId, code: ticket.code });
           } else if (isDeliver) {
             result = await postMutation(API.deliver, { sessionId, code: ticket.code });
+          } else if (isTestStart) {
+            result = await postMutation(API.testStart, { sessionId, code: ticket.code });
+          } else if (isTestRevert) {
+            result = await postMutation(API.testRevert, { sessionId, code: ticket.code });
+          } else if (isTestPass) {
+            result = await postMutation(API.testPass, { sessionId, code: ticket.code });
           } else {
             result = await postMutation(API.action, {
               sessionId,
@@ -6258,6 +6379,12 @@ window.__ModuleLoader__.load({
               // commit, push and MR creation run in the background and surface
               // through `snapshot.delivery.running` / `snapshot.delivery.errors`.
               setFlash(`工单 ${ticket.code} 提交请求已受理，正在创建 MR…`);
+            } else if (isTestStart) {
+              setFlash(`工单 ${ticket.code} 已合并到开发分支，可以在开发目录里测试了`);
+            } else if (isTestRevert) {
+              setFlash(`工单 ${ticket.code} 已回滚开发分支上的合并，工作树改动保留`);
+            } else if (isTestPass) {
+              setFlash(`工单 ${ticket.code} 测试通过，工作树已清理，进入提交 MR`);
             } else {
               const next = result.data && typeof result.data === 'object' ? result.data.ticket : null;
               const nextWorkflow = next && typeof next.workflow === 'string' ? next.workflow : null;
@@ -6271,6 +6398,8 @@ window.__ModuleLoader__.load({
             setActionError(fixErrorView(result));
           } else if (isDeliver) {
             setActionError(deliverErrorView(result));
+          } else if (isTest) {
+            setActionError({ ...toErrorView(result), title: '测试操作失败' });
           } else {
             setActionError(toErrorView(result));
           }

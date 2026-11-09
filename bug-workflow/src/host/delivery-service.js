@@ -105,6 +105,7 @@ import { realpath, stat } from 'node:fs/promises';
 import { sep } from 'node:path';
 
 import { isSafeBranchName } from './branch.js';
+import { clearMergeRecord, readMergeRecord } from './dev-branch.js';
 import { GitError, assertPushableBranch } from './git.js';
 import { createGitlabClient, normalizeProject } from './gitlab.js';
 import { TICKET_WORKSPACE_META_PREFIX } from './workspace.js';
@@ -185,6 +186,8 @@ export const DELIVERY_START_MESSAGES = Object.freeze({
   'protected-branch': '个人分支受保护，禁止推送',
   'invalid-branch': '个人分支或目标分支不合法，无法提交 MR',
   'git-failed': '无法解析工作区仓库，无法提交 MR',
+  'dev-moved': '开发分支在测试后又发生了变化，请重新测试后再提交',
+  'dev-branch-missing': '开发分支不存在，无法提交 MR',
   'delivery-unavailable': '交付服务不可用，请稍后重试',
   internal: '交付启动失败，请重试',
 });
@@ -508,9 +511,17 @@ export function createDeliveryService({
 
     const branch = readBranch(ticket);
     if (!branch.ok) return branch.failure;
+
+    // P7 flow: after 「开始测试」 the changes live on the developer's dev branch
+    // and the MR must be opened from it (not from the ticket scratch branch).
+    // Tickets that never went through the test step keep the legacy behavior.
+    const mergeRecord = readMergeRecord(store, key);
+    const merged = mergeRecord !== null;
+    const sourceBranch = merged ? mergeRecord.devBranch : branch.name;
+
     let pushableName;
     try {
-      pushableName = assertPushableBranch(branch.name);
+      pushableName = assertPushableBranch(sourceBranch);
     } catch (error) {
       const failureCode = error instanceof GitError && error.code === 'protected-branch'
         ? 'protected-branch'
@@ -525,14 +536,16 @@ export function createDeliveryService({
       return failure('invalid-branch', DELIVERY_START_MESSAGES['invalid-branch']);
     }
 
-    let worktreeStat;
-    try {
-      worktreeStat = await stat(branch.worktree);
-    } catch {
-      worktreeStat = null;
-    }
-    if (worktreeStat === null || worktreeStat.isDirectory() !== true) {
-      return failure('worktree-missing', DELIVERY_START_MESSAGES['worktree-missing']);
+    if (!merged) {
+      let worktreeStat;
+      try {
+        worktreeStat = await stat(branch.worktree);
+      } catch {
+        worktreeStat = null;
+      }
+      if (worktreeStat === null || worktreeStat.isDirectory() !== true) {
+        return failure('worktree-missing', DELIVERY_START_MESSAGES['worktree-missing']);
+      }
     }
 
     // Per-workspace client construction: the settings are read from THIS
@@ -567,24 +580,37 @@ export function createDeliveryService({
     // /private/var), so compare real paths instead of raw strings. The helper
     // is shared with the review service, which must apply the same hard gate
     // before it commits a review fix.
-    if (!(await isPathInsideRepo(repo, branch.worktree))) {
+    if (!merged && !(await isPathInsideRepo(repo, branch.worktree))) {
       return failure('worktree-missing', DELIVERY_START_MESSAGES['worktree-missing']);
     }
 
-    // The stored `branch.worktree` is persisted metadata, not proof: a plain
-    // directory below the repo would make `git -C` resolve to the MAIN
-    // worktree, and a worktree checked out on another branch would commit to
-    // the wrong ref. Require a registered worktree on exactly `branch.name`
-    // BEFORE anything is staged or committed.
-    const probe = await git.probeWorktree(repo, branch.worktree, pushableName);
-    if (probe === null || typeof probe !== 'object' || probe.ok !== true) {
-      return failure('git-failed', GIT_FAILED_MESSAGE);
-    }
-    if (probe.state === 'different') {
-      return failure('worktree-conflict', DELIVERY_START_MESSAGES['worktree-conflict']);
-    }
-    if (probe.state !== 'same') {
-      return failure('worktree-missing', DELIVERY_START_MESSAGES['worktree-missing']);
+    if (merged) {
+      // The scratch worktree was cleaned after the test passed; the dev branch
+      // is the only place that must still match the recorded merge result.
+      const current = await git.currentBranch(repo).catch(() => undefined);
+      if (current !== mergeRecord.devBranch) {
+        return failure('dev-moved', DELIVERY_START_MESSAGES['dev-moved']);
+      }
+      const head = await git.revParse(repo, 'HEAD').catch(() => undefined);
+      if (typeof head !== 'string' || head !== mergeRecord.devAfter) {
+        return failure('dev-moved', DELIVERY_START_MESSAGES['dev-moved']);
+      }
+    } else {
+      // The stored `branch.worktree` is persisted metadata, not proof: a plain
+      // directory below the repo would make `git -C` resolve to the MAIN
+      // worktree, and a worktree checked out on another branch would commit to
+      // the wrong ref. Require a registered worktree on exactly `branch.name`
+      // BEFORE anything is staged or committed.
+      const probe = await git.probeWorktree(repo, branch.worktree, pushableName);
+      if (probe === null || typeof probe !== 'object' || probe.ok !== true) {
+        return failure('git-failed', GIT_FAILED_MESSAGE);
+      }
+      if (probe.state === 'different') {
+        return failure('worktree-conflict', DELIVERY_START_MESSAGES['worktree-conflict']);
+      }
+      if (probe.state !== 'same') {
+        return failure('worktree-missing', DELIVERY_START_MESSAGES['worktree-missing']);
+      }
     }
 
     if (disposed) return failure('delivery-unavailable', UNAVAILABLE_MESSAGE);
@@ -608,6 +634,7 @@ export function createDeliveryService({
       client,
       sessionId,
       repo,
+      merge: mergeRecord,
       // Persisted review context and later rounds must resolve the same repo.
       cwd: deliveryCwd,
     });
@@ -629,17 +656,21 @@ export function createDeliveryService({
    * One background delivery. Never rejects, never writes after cancellation,
    * and releases the running/lock slots through the caller's `finally`.
    */
-  async function runDelivery({ entry, key, ticket, settings, branch, client, sessionId, repo, cwd }) {
+  async function runDelivery({ entry, key, ticket, settings, branch, client, sessionId, repo, merge, cwd }) {
+    // P7: the tested code is on the dev branch and the MR is opened from it.
+    const merged = merge !== null && merge !== undefined;
+    const sourceBranch = merged ? merge.devBranch : branch.name;
+    const checksRoot = merged ? repo : branch.worktree;
     let checks;
     try {
-      const lint = await runCheck(settings.lintCommand, entry, branch.worktree);
+      const lint = await runCheck(settings.lintCommand, entry, checksRoot);
       if (entry.cancelled || lint.status === 'cancelled') return;
       if (lint.status === 'failed') {
         await failDelivery(key, 'delivery-lint-failed', lint.output);
         return;
       }
 
-      const test = await runCheck(settings.testCommand, entry, branch.worktree);
+      const test = await runCheck(settings.testCommand, entry, checksRoot);
       if (entry.cancelled || test.status === 'cancelled') return;
       if (test.status === 'failed') {
         await failDelivery(key, 'delivery-test-failed', test.output);
@@ -648,6 +679,13 @@ export function createDeliveryService({
       checks = { lint: lint.status, test: test.status };
 
       const message = buildCommitMessage(settings, key, ticket);
+      let sha;
+      if (merged) {
+        // The test step already committed the scratch branch and merged it into
+        // the dev branch; nothing is staged here, and the sha to push is the
+        // recorded merge result (verified against HEAD below).
+        sha = merge.devAfter;
+      } else {
       const committed = await git.commitAll({ root: branch.worktree, message });
       if (entry.cancelled) return;
       if (isPlainObject(committed) === false || committed.ok !== true) {
@@ -655,7 +693,6 @@ export function createDeliveryService({
         return;
       }
 
-      let sha;
       if (committed.sha === null) {
         // The worktree is clean. That is a genuine no-op on a first delivery,
         // but the personal branch may already carry this ticket's commit:
@@ -687,11 +724,14 @@ export function createDeliveryService({
         });
         if (entry.cancelled) return;
       }
+      }
 
       // Second identity gate: the ref we are about to push must resolve to the
       // commit we just staged. This also catches a `git -C` surprise where the
       // commit landed somewhere other than the personal branch.
-      const head = await git.revParse(branch.worktree, branch.name);
+      const head = merged
+        ? await git.revParse(repo, 'HEAD')
+        : await git.revParse(branch.worktree, branch.name);
       if (entry.cancelled) return;
       if (typeof head !== 'string' || head !== sha) {
         await failDelivery(key, 'worktree-mismatch', '');
@@ -699,9 +739,9 @@ export function createDeliveryService({
       }
 
       const pushed = await git.pushBranch({
-        root: branch.worktree,
+        root: merged ? repo : branch.worktree,
         remote: 'origin',
-        branch: branch.name,
+        branch: sourceBranch,
       });
       if (entry.cancelled) return;
       if (isPlainObject(pushed) === false || pushed.ok !== true) {
@@ -713,7 +753,7 @@ export function createDeliveryService({
       try {
         const existing = await client.findOpenMergeRequest({
           project: settings.gitlabProjectPath,
-          sourceBranch: branch.name,
+          sourceBranch,
         });
         if (existing !== null && existing !== undefined) {
           if (
@@ -730,9 +770,9 @@ export function createDeliveryService({
         } else {
           mr = await client.createMergeRequest({
             project: settings.gitlabProjectPath,
-            sourceBranch: branch.name,
+            sourceBranch,
             targetBranch: branch.target,
-            title: `${branch.name} -> ${branch.target}`,
+            title: `${sourceBranch} -> ${branch.target}`,
             description: buildDescription({ ticket, sha, checks }),
           });
         }
@@ -744,6 +784,7 @@ export function createDeliveryService({
       }
       if (entry.cancelled) return;
 
+      if (merged) await clearMergeRecord(store, key);
       await persistDelivered({ key, branch, mr, checks, sha, settings, sessionId, cwd });
     } catch (error) {
       notifyLog(log, 'delivery-job', error);

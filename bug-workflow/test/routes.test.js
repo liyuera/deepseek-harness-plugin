@@ -827,6 +827,7 @@ test('GET /snapshot composes workspace, settings, tickets and serverTime', async
     analysis: { running: [], errors: {} },
     fix: { running: [], errors: {} },
     delivery: { running: [], errors: {} },
+    test: { merged: {} },
     review: { running: [], errors: {} },
     tickets: [ticket],
     serverTime: SERVER_TIME,

@@ -341,14 +341,14 @@ test('start() creates the personal worktree from origin, records metadata and ap
   assert.deepEqual(git.calls.worktreeAdd, [{
     repo: REPO,
     path: WORKTREE,
-    branch: 'feat-V1.6.1-ly',
+    branch: 'feat-V1.6.1-ly-1',
     base: 'origin/feature-V1.6.1',
   }]);
 
   // Branch metadata is persisted before the job starts.
   const started = store.get('BUG-1');
   assert.equal(started.workflow, 'fixing');
-  assert.equal(started.branch.name, 'feat-V1.6.1-ly');
+  assert.equal(started.branch.name, 'feat-V1.6.1-ly-1');
   assert.equal(started.branch.target, 'feature-V1.6.1');
   assert.equal(started.branch.baseSource, 'origin');
   assert.equal(started.branch.worktree, WORKTREE);
@@ -360,7 +360,7 @@ test('start() creates the personal worktree from origin, records metadata and ap
   const call = runner.calls[0];
   assert.equal(call.sessionId, SESSION_ID);
   assert.equal(call.worktreePath, WORKTREE);
-  assert.equal(call.branch, 'feat-V1.6.1-ly');
+  assert.equal(call.branch, 'feat-V1.6.1-ly-1');
   assert.equal(call.target, 'feature-V1.6.1');
   assert.equal(call.ticket.code, 'BUG-1');
   assert.equal(call.plan.summary, PLAN.summary);
@@ -414,10 +414,10 @@ test('start() records baseSource target when only the local target branch exists
     'feature-V1.6.1',
   ]);
   assert.equal(git.calls.worktreeAdd[0].base, 'feature-V1.6.1');
-  assert.equal(git.calls.worktreeAdd[0].branch, 'feat-V1.6.1-zz');
+  assert.equal(git.calls.worktreeAdd[0].branch, 'feat-V1.6.1-zz-1');
   const ticket = store.get('BUG-1');
   assert.equal(ticket.branch.baseSource, 'target');
-  assert.equal(ticket.branch.name, 'feat-V1.6.1-zz');
+  assert.equal(ticket.branch.name, 'feat-V1.6.1-zz-1');
 });
 
 test('start() falls back to HEAD and uses the hot family for failure tickets', async () => {
@@ -434,7 +434,7 @@ test('start() falls back to HEAD and uses the hot family for failure tickets', a
   assert.deepEqual(git.calls.worktreeAdd[0], {
     repo: REPO,
     path: WORKTREE,
-    branch: 'hot-V1.6.1-ly',
+    branch: 'hot-V1.6.1-ly-1',
     base: 'HEAD',
   });
   const ticket = store.get('BUG-1');
@@ -453,7 +453,7 @@ test('start() records the freshly resolved base when git creates a new worktree'
   const staleCreatedAt = '2026-11-01T00:00:00.000Z';
   await store.patchTicket('BUG-1', {
     branch: {
-      name: 'feat-V1.6.1-ly',
+      name: 'feat-V1.6.1-ly-1',
       target: 'feature-V1.6.1',
       baseSource: 'target',
       worktree: WORKTREE,
@@ -468,7 +468,7 @@ test('start() records the freshly resolved base when git creates a new worktree'
   const ticket = store.get('BUG-1');
   assert.equal(ticket.branch.baseSource, 'origin');
   assert.notEqual(ticket.branch.createdAt, staleCreatedAt);
-  assert.equal(ticket.branch.name, 'feat-V1.6.1-ly');
+  assert.equal(ticket.branch.name, 'feat-V1.6.1-ly-1');
   assert.equal(ticket.branch.worktree, WORKTREE);
 });
 
@@ -503,7 +503,7 @@ test('start() prefers platform.versionName over the ticket version', async () =>
   await service.start(SESSION_ID, CWD, 'BUG-1');
   await waitForIdle(service);
 
-  assert.equal(git.calls.worktreeAdd[0].branch, 'feat-V2.0.0-ly');
+  assert.equal(git.calls.worktreeAdd[0].branch, 'feat-V2.0.0-ly-1');
   assert.equal(store.get('BUG-1').branch.target, 'feature-V2.0.0');
 });
 
@@ -636,7 +636,7 @@ for (const [runnerCode, reason] of FAILURE_CASES) {
     assert.equal(ticket.blockedReason, reason);
     assert.deepEqual(ticket.fixes, []);
     assert.equal(ticket.timeline.at(-1).kind, 'blocked');
-    assert.equal(ticket.branch.name, 'feat-V1.6.1-ly', 'branch metadata is kept for the restart');
+    assert.equal(ticket.branch.name, 'feat-V1.6.1-ly-1', 'branch metadata is kept for the restart');
 
     const message = FIX_REASON_MESSAGES[reason];
     assert.equal(store.getMeta(FIX_ERROR_META_PREFIX + 'BUG-1'), message);
@@ -739,7 +739,7 @@ test('a blocked(fixing) restart reusing the worktree preserves baseSource and cr
   await seedBlockedFromFixing(store);
   // First attempt fell back to HEAD; `origin/feature-V1.6.1` appeared later.
   const branchMetadata = {
-    name: 'feat-V1.6.1-ly',
+    name: 'feat-V1.6.1-ly-1',
     target: 'feature-V1.6.1',
     baseSource: 'HEAD',
     worktree: WORKTREE,
@@ -955,7 +955,7 @@ test('a blocked(fixing) restart keeps the ticket blocked when worktree preparati
   });
   await seedBlockedFromFixing(store);
   const branchMetadata = {
-    name: 'feat-V1.6.1-ly',
+    name: 'feat-V1.6.1-ly-1',
     target: 'feature-V1.6.1',
     baseSource: 'origin',
     worktree: WORKTREE,
@@ -986,7 +986,7 @@ test('a blocked(fixing) restart keeps the ticket blocked when worktree preparati
   assert.deepEqual(git.calls.worktreeAdd, [{
     repo: REPO,
     path: WORKTREE,
-    branch: 'feat-V1.6.1-ly',
+    branch: 'feat-V1.6.1-ly-1',
     base: 'HEAD',
   }]);
 });
@@ -1031,7 +1031,7 @@ test('a successful runner result with an empty worktree blocks with fix-no-chang
   assert.equal(ticket.fixes[0].status, 'failed');
   assert.equal(ticket.fixes[0].error, 'fix-no-changes');
   assert.deepEqual(ticket.fixes[0].changedFiles, []);
-  assert.equal(ticket.branch.name, 'feat-V1.6.1-ly');
+  assert.equal(ticket.branch.name, 'feat-V1.6.1-ly-1');
   assert.equal(store.getMeta(FIX_ERROR_META_PREFIX + 'BUG-1'), FIX_REASON_MESSAGES['fix-no-changes']);
 });
 
@@ -1066,36 +1066,22 @@ test('a second ticket in the same repository is rejected with fix-busy while a f
   assert.equal(store.get('BUG-2').workflow, 'fix_done');
 });
 
-test('a personal branch already checked out by another ticket fails with fix-branch-busy', async () => {
-  const { store, git, runner, service } = setup({ gitOptions: { status: ' M src/a.js\n' } });
+test('two tickets of the same version use distinct scratch branches', async () => {
+  const { store, git, service } = setup({ gitOptions: { status: ' M src/a.js\n' } });
   await seedFixing(store, { code: 'BUG-1' });
   await seedFixing(store, { code: 'BUG-2' });
-  await store.patchTicket('BUG-2', {
-    branch: {
-      name: 'feat-V1.6.1-ly',
-      target: 'feature-V1.6.1',
-      baseSource: 'origin',
-      worktree: `${REPO}/.dsh-worktrees/BUG-2`,
-      createdAt: STORE_TIME,
-    },
-  });
 
-  const result = await service.start(SESSION_ID, CWD, 'BUG-1');
+  assert.equal((await service.start(SESSION_ID, CWD, 'BUG-1')).ok, true);
+  await waitForIdle(service);
+  assert.equal((await service.start(SESSION_ID, CWD, 'BUG-2')).ok, true);
+  await waitForIdle(service);
 
-  assert.deepEqual(result, {
-    ok: false,
-    code: 'fix-branch-busy',
-    message: FIX_REASON_MESSAGES['fix-branch-busy'],
-  });
-  assert.deepEqual(git.calls.worktreeAdd, [], 'git must not be allowed to collide');
-  assert.deepEqual(git.calls.status, [`${REPO}/.dsh-worktrees/BUG-2`]);
-  assert.equal(runner.calls.length, 0);
-  const ticket = store.get('BUG-1');
-  assert.equal(ticket.workflow, 'blocked');
-  assert.equal(ticket.blockedFrom, 'fixing');
-  assert.equal(ticket.blockedReason, 'fix-branch-busy');
-  assert.equal(ticket.branch, null);
-  assert.equal(store.getMeta(FIX_ERROR_META_PREFIX + 'BUG-1'), FIX_REASON_MESSAGES['fix-branch-busy']);
+  assert.deepEqual(
+    git.calls.worktreeAdd.map((call) => call.branch),
+    ['feat-V1.6.1-ly-1', 'feat-V1.6.1-ly-2'],
+  );
+  assert.equal(store.get('BUG-1').workflow, 'fix_done');
+  assert.equal(store.get('BUG-2').workflow, 'fix_done');
 });
 
 test('a dispose during post-run git collection performs no state write', async () => {
@@ -1228,46 +1214,35 @@ test('a dispose during the final clearError() launches no job and returns fix-un
   assert.deepEqual(service.status(), { running: [], errors: {} });
 });
 
-test('a dispose during worktree preparation writes no terminal block for fix-branch-busy', async () => {
+test('a dispose during worktree preparation writes no terminal block', async () => {
   const gate = deferred();
   const { store, git, runner, service } = setup({
-    gitOptions: { statusResult: () => gate.promise },
+    gitOptions: { worktreeAddResult: () => gate.promise },
   });
-  await seedFixing(store, { code: 'BUG-1' });
-  await seedFixing(store, { code: 'BUG-2' });
-  await store.patchTicket('BUG-2', {
-    branch: {
-      name: 'feat-V1.6.1-ly',
-      target: 'feature-V1.6.1',
-      baseSource: 'origin',
-      worktree: `${REPO}/.dsh-worktrees/BUG-2`,
-      createdAt: STORE_TIME,
-    },
-  });
+  await seedFixing(store);
   const before = store.get('BUG-1');
 
   const started = service.start(SESSION_ID, CWD, 'BUG-1');
-  for (let index = 0; index < 200 && git.calls.status.length === 0; index += 1) {
+  for (let index = 0; index < 200 && git.calls.worktreeAdd.length === 0; index += 1) {
     await new Promise((resolve) => setImmediate(resolve));
   }
-  assert.equal(git.calls.status.length, 1, 'the branch-collision probe is awaited');
+  assert.equal(git.calls.worktreeAdd.length, 1, 'worktree preparation is awaited');
 
   const disposePromise = service.dispose();
-  gate.resolve(' M src/a.js\n');
+  gate.resolve({ ok: false, code: 'git-failed', message: 'git 命令执行失败', command: 'git worktree add' });
   const result = await started;
   await disposePromise;
 
   // The structured preparation failure is still returned, but teardown is not
-  // turned into a terminal block/meta and no worktree is created.
+  // turned into a terminal block/meta and no ticket write follows.
   assert.deepEqual(result, {
     ok: false,
-    code: 'fix-branch-busy',
-    message: FIX_REASON_MESSAGES['fix-branch-busy'],
+    code: 'git-failed',
+    message: 'git 命令执行失败',
   });
   assert.deepEqual(store.get('BUG-1'), before, 'no state write may follow dispose');
   assert.equal(store.get('BUG-1').workflow, 'fixing');
   assert.equal(store.getMeta(FIX_ERROR_META_PREFIX + 'BUG-1'), undefined);
-  assert.deepEqual(git.calls.worktreeAdd, []);
   assert.equal(runner.calls.length, 0);
   assert.deepEqual(service.status(), { running: [], errors: {} });
 });
@@ -1342,24 +1317,13 @@ test('an overlong childId and changed-file path are truncated so the entry persi
 // Personal-branch and workspace recovery (P6 follow-up)
 // ---------------------------------------------------------------------------
 
-test('a personal branch checked out elsewhere falls back to the ticket-scoped branch', async () => {
+test('the fix always runs on the ticket-scoped scratch branch', async () => {
   const { store, git, runner, service } = setup({
     gitOptions: {
       refs: { 'origin/feature-V1.6.1': true },
       status: ' M src/a.js\n',
       diffStat: ' 1 file changed, 1 insertion(+)',
       diff: '+fixed',
-      // The canonical branch is the user's own version-branch checkout, so git
-      // refuses to check it out a second time; the ticket-scoped branch is free.
-      worktreeAddResult: (input) => (input.branch === 'feat-V1.6.1-ly'
-        ? {
-          ok: false,
-          code: 'worktree-conflict',
-          reason: 'branch-busy',
-          message: '个人分支已在其它工作树中检出，请先清理该工作树',
-          command: 'git worktree add',
-        }
-        : { created: true }),
     },
   });
   await seedFixing(store);
@@ -1367,9 +1331,9 @@ test('a personal branch checked out elsewhere falls back to the ticket-scoped br
   const started = await service.start(SESSION_ID, CWD, 'BUG-1');
   assert.deepEqual(started, { ok: true, running: true, workflow: 'fixing' });
 
-  // One retry, on the deterministic ticket-scoped branch, same path and base.
-  assert.equal(git.calls.worktreeAdd.length, 2);
-  assert.deepEqual(git.calls.worktreeAdd[1], {
+  // The developer's dev branch is never checked out in the worktree; the fix
+  // runs on `feat-<version>-<user>-<ticket>` so it can be merged back later.
+  assert.deepEqual(git.calls.worktreeAdd[0], {
     repo: REPO,
     path: WORKTREE,
     branch: 'feat-V1.6.1-ly-1',
@@ -1463,4 +1427,39 @@ test('a stale workspace record falls back to the requesting workspace', async ()
   assert.equal(git.calls.worktreeAdd[0].repo, REPO);
   await waitForIdle(service);
   assert.equal(store.get('BUG-1').branch.worktree, WORKTREE);
+});
+
+test('start() reopens a fix_done ticket for another AI round', async () => {
+  const { store, git, service } = setup({
+    gitOptions: { refs: { 'origin/feature-V1.6.1': true }, status: ' M src/a.js\n' },
+  });
+  await seedFixing(store);
+  const done = await store.applyAction('BUG-1', 'fix_done', { actor: 'agent' });
+  assert.equal(done.ok, true);
+  assert.equal(done.ticket.workflow, 'fix_done');
+
+  const started = await service.start(SESSION_ID, CWD, 'BUG-1');
+  assert.deepEqual(started, { ok: true, running: true, workflow: 'fixing' });
+  // The scratch worktree is reused (same branch), no second worktree.
+  assert.equal(git.calls.worktreeAdd.length, 1);
+  await waitForIdle(service);
+  assert.equal(store.get('BUG-1').workflow, 'fix_done');
+});
+
+test('start() refuses to reopen a ticket whose changes are merged into the dev branch', async () => {
+  const { store, service } = setup({ gitOptions: { refs: { 'origin/feature-V1.6.1': true } } });
+  await seedFixing(store);
+  await store.applyAction('BUG-1', 'fix_done', { actor: 'agent' });
+  await store.setMeta('test.merge:BUG-1', {
+    devBranch: 'feat-V1.6.1-ly',
+    scratchBranch: 'feat-V1.6.1-ly-1',
+    worktree: WORKTREE,
+    devBefore: 'a'.repeat(40),
+    devAfter: 'b'.repeat(40),
+  });
+
+  const started = await service.start(SESSION_ID, CWD, 'BUG-1');
+  assert.equal(started.ok, false);
+  assert.equal(started.code, 'invalid-state');
+  assert.equal(store.get('BUG-1').workflow, 'fix_done');
 });

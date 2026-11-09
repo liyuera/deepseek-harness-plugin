@@ -87,6 +87,7 @@ import { sep } from 'node:path';
 
 import { DEFAULT_FIX_TIMEOUT_MS } from './agent-access.js';
 import { BranchError, deriveBranches, ticketBranchName } from './branch.js';
+import { readMergeRecord } from './dev-branch.js';
 import { TICKET_WORKSPACE_META_PREFIX } from './workspace.js';
 
 /** `meta` key prefix of a persisted fix error. */
@@ -251,8 +252,13 @@ export function createFixService({
     // only accepts `fixing`, so without these branches a failed (or
     // crash-orphaned) fix could never be started again.
     const blockedRestart = current.workflow === 'blocked' && current.blockedFrom === 'fixing';
-    if (current.workflow !== 'fixing' && !blockedRestart) {
+    // Re-fix after a failed manual test: `fix_done` with no dev-branch merge.
+    const reopen = current.workflow === 'fix_done';
+    if (current.workflow !== 'fixing' && !blockedRestart && !reopen) {
       return failure('invalid-state', `工单状态 ${String(current.workflow)} 不能开始修复`);
+    }
+    if (reopen && readMergeRecord(store, key) !== null) {
+      return failure('invalid-state', '已合并到开发分支，请先「测试不通过」回滚后再重新修复');
     }
     if (!hasApprovedPlan(current)) {
       return failure('plan-not-approved', '方案尚未审核通过，无法开始修复');
@@ -303,6 +309,11 @@ export function createFixService({
         if (!retried.ok) return retried.failure;
         if (disposed) return disposedStart(key, entry);
       }
+      if (reopen) {
+        const reopened = await applyReopen(key);
+        if (reopened !== undefined) return reopened;
+        if (disposed) return disposedStart(key, entry);
+      }
 
       // The branch metadata is persisted only after the ticket is `fixing`.
       const branched = await persistBranch(key, prepared, current);
@@ -344,6 +355,28 @@ export function createFixService({
         unlockRepo(repo, key);
       }
     }
+  }
+
+  /**
+   * Apply `reopen_fix` to a `fix_done` ticket (re-fix after a failed manual
+   * test). A lost race is reported, never treated as success.
+   */
+  async function applyReopen(key) {
+    let applied;
+    try {
+      applied = await store.applyAction(
+        key,
+        'reopen_fix',
+        { actor: 'user' },
+        { actionId: nextActionId('fix-reopen', key) },
+      );
+    } catch {
+      return failure('internal', INTERNAL_MESSAGE);
+    }
+    if (applied?.ok !== true || applied.ticket?.workflow !== 'fixing') {
+      return failure('invalid-state', '工单状态已变化，请刷新后重试');
+    }
+    return undefined;
   }
 
   /**
@@ -411,9 +444,6 @@ export function createFixService({
     // Another ticket of the same version/type/user derives the same personal
     // branch. Letting `git worktree add` collide would surface as an opaque
     // `git-failed` 500; fail with a static, actionable reason instead.
-    const collision = await detectBranchCollision(repo, key, branches.personalBranch);
-    if (collision.ok !== true) return { ok: false, failure: collision.failure };
-
     const tree = git.worktreePath({ repo, code: key });
     if (tree?.ok !== true) {
       return {
@@ -428,36 +458,21 @@ export function createFixService({
     const base = await resolveBase(repo, branches.targetBranch);
     if (!base.ok) return { ok: false, failure: base.failure };
 
-    const canonical = branches.personalBranch;
-    let personalBranch = canonical;
-    let added = await git.worktreeAdd({
+    // The canonical personal branch is the developer's version branch: it stays
+    // checked out in the main working tree (the human tests there), so the fix
+    // always runs on a ticket-scoped scratch branch that is merged back into
+    // that dev branch after a successful test.
+    const devBranch = branches.personalBranch;
+    const personalBranch = ticketBranchName(devBranch, key) ?? devBranch;
+    if (personalBranch === devBranch) {
+      return { ok: false, failure: failure('invalid-branch', '工单号无法生成安全的工作树分支名') };
+    }
+    const added = await git.worktreeAdd({
       repo,
       path: tree.path,
-      branch: canonical,
+      branch: personalBranch,
       base: base.base,
     });
-
-    // The canonical personal branch is already checked out in another worktree.
-    // The common trigger is the user's own version-branch checkout (or their
-    // editor) sitting on `feat-<X>-<user>`, so a start from that workspace used
-    // to dead-end on a 409 the board could not resolve. Fall back to the
-    // deterministic ticket-scoped branch so the fix can still run isolated.
-    if (added?.ok === false && added.code === 'worktree-conflict' && added.reason === 'branch-busy') {
-      const fallback = ticketBranchName(canonical, key);
-      if (fallback !== undefined) {
-        const retried = await git.worktreeAdd({
-          repo,
-          path: tree.path,
-          branch: fallback,
-          base: base.base,
-        });
-        if (retried?.ok !== false) {
-          added = retried;
-          personalBranch = fallback;
-        }
-      }
-    }
-
     if (added?.ok === false) {
       // If git created the personal branch but failed to register the
       // worktree, the branch is left at the base. Retries reuse it; the
@@ -469,6 +484,7 @@ export function createFixService({
       ok: true,
       worktreePath: tree.path,
       branch: personalBranch,
+      devBranch,
       target: branches.targetBranch,
       baseSource: base.source,
       // `git worktree add` reuses an already registered worktree at `path`
@@ -507,6 +523,7 @@ export function createFixService({
         {
           branch: {
             name: prepared.branch,
+            devBranch: prepared.devBranch,
             target: prepared.target,
             baseSource: keepBase ? existing.baseSource : prepared.baseSource,
             worktree: prepared.worktreePath,
@@ -546,40 +563,6 @@ export function createFixService({
    * store read or git probe falls through to `git worktree add` (the real
    * authority) so this guard never becomes a new failure source.
    */
-  async function detectBranchCollision(repo, key, branchName) {
-    let tickets;
-    try {
-      tickets = store.list();
-    } catch {
-      return { ok: true };
-    }
-    if (!Array.isArray(tickets)) return { ok: true };
-
-    for (const other of tickets) {
-      if (!isPlainObject(other)) continue;
-      const otherKey = normalizeCode(other.code);
-      if (otherKey === undefined || otherKey === key) continue;
-      const branch = other.branch;
-      if (!isPlainObject(branch) || branch.name !== branchName) continue;
-      const worktree = branch.worktree;
-      if (typeof worktree !== 'string' || worktree === '') continue;
-      if (!isInsideRepo(repo, worktree)) continue;
-
-      let status;
-      try {
-        status = await git.status(worktree);
-      } catch {
-        continue;
-      }
-      // A readable status proves the recorded worktree still exists, so the
-      // branch is actually checked out there.
-      if (typeof status === 'string') {
-        return { ok: false, failure: failure('fix-branch-busy', FIX_REASON_MESSAGES['fix-branch-busy']) };
-      }
-    }
-    return { ok: true };
-  }
-
   /**
    * Record a static error for a start that failed before launching. A blocked
    * restart keeps its blocked state (its old reason is still valid) and only
@@ -1204,11 +1187,6 @@ function isPlainObject(value) {
 }
 
 /** True when `candidate` is strictly below `repo` (path separator aware). */
-function isInsideRepo(repo, candidate) {
-  if (typeof repo !== 'string' || typeof candidate !== 'string') return false;
-  const root = repo.endsWith(sep) ? repo.slice(0, -1) : repo;
-  return root !== '' && candidate.startsWith(root + sep);
-}
 
 /** Static message for a failed start that never reached the runner. */
 function startFailureMessage(code) {

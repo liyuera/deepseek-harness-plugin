@@ -143,6 +143,11 @@ const MESSAGE = Object.freeze({
   invalidBranch: '分支名不合法，不允许推送',
   protectedBranch: '受保护的分支不允许推送',
   invalidMessage: '提交信息不合法',
+  devDirty: '开发分支目录有未提交改动，请先提交或暂存',
+  devBranchMissing: '开发分支不存在',
+  mergeConflict: '合并到开发分支失败（可能有冲突），请手动处理后重试',
+  devMoved: '开发分支在合并后又有新提交，无法自动回滚',
+  dirtyWorktree: '工作树有未提交改动，无法清理',
 });
 
 /** Static command labels carried by failures (never include argv/paths). */
@@ -161,6 +166,12 @@ const COMMAND = Object.freeze({
   stagedCheck: 'git diff --cached --quiet',
   commit: 'git commit',
   push: 'git push -u',
+  currentBranch: 'git rev-parse --abbrev-ref',
+  checkout: 'git checkout',
+  merge: 'git merge',
+  reset: 'git reset --hard',
+  log: 'git log --format',
+  deleteBranch: 'git branch -D',
 });
 
 /**
@@ -628,6 +639,87 @@ export function createGit(options = {}) {
     return { ok: true, branch, remote };
   }
 
+  /** Current branch of `repo` (`rev-parse --abbrev-ref HEAD`). */
+  async function currentBranch(repo) {
+    if (!isSafePath(repo)) return failure('git-failed', MESSAGE.invalid, COMMAND.currentBranch);
+    const result = await run(repo, ['rev-parse', '--abbrev-ref', 'HEAD'], { command: COMMAND.currentBranch });
+    if (!result.ok) return result;
+    const name = result.stdout.trim();
+    if (name === '') return failure('git-failed', MESSAGE.failed, COMMAND.currentBranch);
+    return name;
+  }
+
+  /**
+   * Check out an existing local `branch` in `repo` (never creates one, never
+   * forces). The caller is responsible for a clean working tree.
+   */
+  async function checkoutBranch(input = {}) {
+    const { repo, branch } = input !== null && typeof input === 'object' ? input : {};
+    if (!isSafePath(repo) || !isSafeBranchName(branch)) {
+      return failure('git-failed', MESSAGE.invalid, COMMAND.checkout);
+    }
+    const result = await run(repo, ['checkout', branch], { command: COMMAND.checkout });
+    if (!result.ok) return result;
+    return undefined;
+  }
+
+  /**
+   * Merge `branch` into the checked-out branch of `repo` (fast-forward when
+   * possible, otherwise a merge commit). Never force.
+   */
+  async function mergeBranch(input = {}) {
+    const { repo, branch } = input !== null && typeof input === 'object' ? input : {};
+    if (!isSafePath(repo) || !isSafeBranchName(branch)) {
+      return failure('git-failed', MESSAGE.invalid, COMMAND.merge);
+    }
+    const result = await run(repo, ['merge', '--no-edit', branch], { command: COMMAND.merge });
+    if (!result.ok) return failure('git-failed', MESSAGE.mergeConflict, COMMAND.merge);
+    return undefined;
+  }
+
+  /** Hard reset `repo` to a full sha (destructive; caller validates safety). */
+  async function resetHard(input = {}) {
+    const { repo, sha } = input !== null && typeof input === 'object' ? input : {};
+    if (!isSafePath(repo) || typeof sha !== 'string' || !/^[0-9a-f]{40,64}$/i.test(sha)) {
+      return failure('git-failed', MESSAGE.invalid, COMMAND.reset);
+    }
+    const result = await run(repo, ['reset', '--hard', sha], { command: COMMAND.reset });
+    if (!result.ok) return result;
+    return undefined;
+  }
+
+  /**
+   * `git log --format=%h %s -n <max> <range>` as bounded lines (newest first).
+   * `range` is a caller-built rev range such as `origin/feature-V1..feat-V1-ly`
+   * (built from validated branch names only).
+   */
+  async function log(repo, range, options = {}) {
+    const { max = 20 } = options !== null && typeof options === 'object' ? options : {};
+    const limit = Math.max(1, Math.min(Number.isSafeInteger(max) ? max : 20, 200));
+    if (!isSafePath(repo) || typeof range !== 'string' || range === '' || /[\r\n\0]/.test(range)) {
+      return failure('git-failed', MESSAGE.invalid, COMMAND.log);
+    }
+    const result = await run(repo, ['log', '--format=%h %s', '-n', String(limit), range], {
+      command: COMMAND.log,
+      allowedExitCodes: [128],
+    });
+    if (!result.ok) return result;
+    return result.stdout.split('\n').map((line) => line.trim()).filter((line) => line !== '');
+  }
+
+  /** Delete one local branch (`git branch -D <branch>`; scratch branches only). */
+  async function deleteBranch(repo, branch) {
+    if (!isSafePath(repo) || !isSafeBranchName(branch)) {
+      return failure('git-failed', MESSAGE.invalid, COMMAND.deleteBranch);
+    }
+    if (isProtectedBranch(branch)) {
+      return failure('protected-branch', MESSAGE.protectedBranch, COMMAND.deleteBranch);
+    }
+    const result = await run(repo, ['branch', '-D', branch], { command: COMMAND.deleteBranch });
+    if (!result.ok) return result;
+    return undefined;
+  }
+
   return {
     repoRoot,
     refExists,
@@ -642,6 +734,12 @@ export function createGit(options = {}) {
     revParse,
     commitAll,
     pushBranch,
+    currentBranch,
+    checkoutBranch,
+    mergeBranch,
+    resetHard,
+    log,
+    deleteBranch,
   };
 }
 

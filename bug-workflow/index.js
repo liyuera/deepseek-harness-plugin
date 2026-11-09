@@ -104,6 +104,7 @@ import {
   createShellExecCommand,
 } from './src/host/delivery-service.js';
 import { createFixService } from './src/host/fix-service.js';
+import { createTestService } from './src/host/test-service.js';
 import { createGit } from './src/host/git.js';
 import { createGitlabClient } from './src/host/gitlab.js';
 import { createTokenStore, GITLAB_TOKEN_REF } from './src/host/credentials.js';
@@ -315,6 +316,19 @@ export function apply(ctx) {
         // are mutually exclusive, so two git-writing jobs can never overlap.
         const repoLock = createRepoLock();
 
+        // P7 test step: merge the ticket worktree into the dev branch, revert
+        // it when the manual test fails, clean up + advance when it passes.
+        let test = null;
+        let testService;
+        try {
+          if (gitExecutor === null) throw new Error('git executor unavailable');
+          testService = createTestService({ store, git: gitExecutor, clock });
+          test = { service: testService };
+        } catch (error) {
+          testService = undefined;
+          logWarning(storageCtx, 'bug-workflow: 测试服务初始化失败', error);
+        }
+
         let delivery = null;
         try {
           if (gitExecutor === null) throw new Error('git executor unavailable');
@@ -408,6 +422,7 @@ export function apply(ctx) {
           analysis,
           fix,
           delivery,
+          test,
           review,
           platformLogin,
           clock,
