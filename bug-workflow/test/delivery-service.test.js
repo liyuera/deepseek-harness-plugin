@@ -1348,6 +1348,31 @@ test('a commit that does not land on the personal branch blocks before push', as
 // I3: retry after a post-commit failure reuses the recorded commit
 // ---------------------------------------------------------------------------
 
+test('a manually committed worktree is pushed instead of blocking as no-changes', async (t) => {
+  const h = await createHarness(t);
+  // The user reviewed the AI changes and committed them by hand in the
+  // worktree before clicking 「提交并创建 MR」: the worktree is clean, but the
+  // personal branch is already ahead of the delivery base.
+  writeFileSync(join(h.fixture.worktree, 'fix.txt'), 'manual fix\n');
+  gitSync(h.fixture.worktree, ['add', 'fix.txt']);
+  gitSync(h.fixture.worktree, ['commit', '-q', '-m', 'fix: manual commit for the ticket']);
+  const sha = gitSync(h.fixture.worktree, ['rev-parse', 'HEAD']);
+
+  assert.deepEqual(
+    await h.service.start(SESSION_ID, h.fixture.repo, CODE),
+    { ok: true, running: true },
+  );
+  await waitForIdle(h.service);
+
+  const ticket = h.store.get(CODE);
+  assert.equal(ticket.workflow, 'mr_open');
+  assert.equal(ticket.mr.iid, 77);
+  assert.equal(bareRef(h.fixture.origin, `refs/heads/${BRANCH.name}`), sha);
+  // No extra commit was created on top of the manual one.
+  assert.equal(gitSync(h.fixture.worktree, ['rev-parse', 'HEAD']), sha);
+  assert.equal(h.store.getMeta(`${DELIVERY_COMMIT_META_PREFIX}${CODE}`), null);
+});
+
 test('a retry after push-failed reuses the recorded commit instead of delivery-no-changes', async (t) => {
   const h = await createHarness(t, { dirty: true });
   const realOrigin = h.fixture.origin;

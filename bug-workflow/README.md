@@ -154,7 +154,7 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 | 合并检测/归档 | `mergeable` + MR `state=merged` → `mr_merged` → `merged`；下一 tick `dismiss(system)` → `done` 并离开看板。若在 `mr_open`/`fixing_review` 就被人工合并 → `block('review-merged-manually')`，不伪造 review pass。**插件从不调用 merge/close/approve/resolve**，合并必须由人在 GitLab 完成 |
 | 取消/恢复 | delivery/review-fix 的 `dispose()` 只取消并排水，**不写** block/错误；`fixing_review` 无运行任务时下一 tick 按持久化 findings 恢复（重启子代理 / 重推 pending commit / 不可恢复则 `block('review-recovery-unavailable')`）。迟到结果只写静态 `delivery.error`/`review.error`，绝不回退已推进的工单 |
 | 客户端 UX | `submitting` 显示「提交并创建 MR」+ 运行横幅 + 静态错误映射；`mr_open`/`fixing_review` 显示 MR 卡（!iid/URL/source→target/轮次 n/3/最近结论/轮询提示）；`fixing_review` 运行中显示「AI 正在修复 Review 问题…」（计时 `aria-live=off`）；`mergeable` 显示「等待人工在 GitLab 合并（插件不会自动合并）」；`merged` 显示「已合并，即将从看板移除」；`done` 不再出现在看板 |
-| 测试 | **623 个用例**（P4 基线 352，P5 新增/扩充 218、UI v2 新增 4、P6 平台登录/同步/分析证据新增 39：`review-parser` 45、`credentials` 16、`gitlab` 27、`git` 20、`store` 42、`delivery-service` 40、`review-service` 45、`agent-access` 51、`analysis` 30、`sync` 31、`routes` 115、`attachments` 6、`platform-login` 14、`client-action-map` 14、`client-stage-map` 4、`client-platform-login` 4 等；另有隔离 E2E 脚本 29 条断言） |
+| 测试 | **624 个用例**（P4 基线 352，P5 新增/扩充 218、UI v2 新增 4、P6 平台登录/同步/分析证据新增 39：`review-parser` 45、`credentials` 16、`gitlab` 27、`git` 20、`store` 42、`delivery-service` 41、`review-service` 45、`agent-access` 51、`analysis` 30、`sync` 31、`routes` 115、`attachments` 6、`platform-login` 14、`client-action-map` 14、`client-stage-map` 4、`client-platform-login` 4 等；另有隔离 E2E 脚本 29 条断言） |
 
 **P5 交付成功的前置条件（缺一不可）**
 
@@ -462,7 +462,7 @@ P2 **未对真实平台执行**同步/导入（无真实 token，用户不在场
 - **demo 动作仍保留在 `ACTION_BY_STATE`**：`analysis_done`/`fix_done` 仍在映射里，但看板对所有 `analyzing`/`fixing` 隐藏入口，且宿主在对应真实任务运行期间对裸 `POST /api/action` 返回 409 `service-job-running`；服务完成与裸 POST 的 TOCTOU 窗口仍有微秒级残余（review 记录在 `routes.js` 注释）。
 - **lint/test 只在 delivery 执行**：Review 修复轮的宿主 commit/push **不重跑** lint/test；如果 Review 修复引入 lint/test 回归，只能靠下一轮 delivery（或人工）发现。P6 待补。
 - **Review 修复有宿主硬门禁（P5 终审 I1 已修）**：review-fix 在启动子代理或任何 git 写之前，宿主校验 `branch.worktree` 的 realpath **严格位于**仓库内（仓库根/主工作树、`..`/symlink 逃逸一律拒绝）、`branch.name` 可通过 `assertPushableBranch`（受保护分支拒绝）、`mr.sourceBranch` 非空时必须等于 `branch.name`；不满足直接 `block('review-fix-failed')`，不跑子代理、不 `git add -A`/commit/push，`review.fix-commit` 的恢复/重放走同一门。这是 prompt 之外的第二道宿主门，但仍不替代子代理工具沙箱（见「P4/P3 重点」第一条）。
-- **delivery commit→记录崩溃窗口（P5 终审 M1 residual）**：commit 已落地但 `meta['delivery.commit:<code>']` 记录尚未写入时宿主崩溃/`dispose` 失败，重试会因工作树已干净而得到 `sha:null` → `block('delivery-no-changes')`；需要重新造改动或人工 push。窗口很窄，当前不修（P6 可把记录写在取消检查之前，或用远端 ref 对账恢复）。
+- **工作树已提交时交付不再死锁（原 M1 residual）**：commit 已落地但 `meta['delivery.commit:<code>']` 没写成（宿主崩溃/`dispose`），或用户在评审后自己在工作树里手提交，重试时会得到 `sha:null`。现在交付会把个人分支 HEAD 与交付基线（`origin/<target>`，其次本地 `<target>`）对比：HEAD 已经领先就按该 sha 继续 push + 建 MR，只有分支确实还在基线上才 `block('delivery-no-changes')`。
 - **旧工单没有 delivery context 会卡住**：P4 遗留的 `submitting` 工单没有 `delivery.context:<code>`；Review 轮询会写静态 `review.error` 提示「缺少交付上下文，需人工检查（P4/P5 交接）」，不会自动伪造上下文。需要在 P5 重新交付一次，或人工检查/补数据。
 - **`fixes`/`reviewRounds` 历史不修剪**：每次修复最多存 4,000 字符 diff 摘要与最多 2,000 个 `changedFiles`；成功交付/Review 轮次会持续追加，snapshot 轮询成本随历史增长（客户端只渲染最近 10 条 `fixes`）；没有分页/detail 端点或归档。
 - **无提交级 client 行为测试**：仓库内仍只有 `client-action-map.test.js` 的静态映射/源码守卫；P5 的 delivery/review UI 渲染与交互没有提交的 DOM/行为测试（渲染 smoke 只在未提交的 `/tmp` fake-React harness 里做过）。

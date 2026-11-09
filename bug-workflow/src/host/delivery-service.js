@@ -52,6 +52,11 @@
  *     wrong branch. After the commit, the branch ref must resolve to the new
  *     sha (`git.revParse`) before the push, otherwise the ticket blocks with
  *     `worktree-mismatch`.
+ *   - The personal branch may already carry the ticket's commit: on a retry
+ *     the delivery commit is recorded in `meta['delivery.commit:<code>']`, and
+ *     a commit made by hand in the worktree is detected by comparing the
+ *     branch HEAD with the delivery base. Both resume from that sha (verified
+ *     below) instead of blocking as `delivery-no-changes`.
  *   - The commit message is exactly
  *     `<commitType>: 【jira单号】：<code>，【开发内容】：<summary>`
  *     (`commitType` defaults to `fix`; the summary is `plan.summary`, clipped
@@ -602,6 +607,7 @@ export function createDeliveryService({
       branch,
       client,
       sessionId,
+      repo,
       // Persisted review context and later rounds must resolve the same repo.
       cwd: deliveryCwd,
     });
@@ -623,7 +629,7 @@ export function createDeliveryService({
    * One background delivery. Never rejects, never writes after cancellation,
    * and releases the running/lock slots through the caller's `finally`.
    */
-  async function runDelivery({ entry, key, ticket, settings, branch, client, sessionId, cwd }) {
+  async function runDelivery({ entry, key, ticket, settings, branch, client, sessionId, repo, cwd }) {
     let checks;
     try {
       const lint = await runCheck(settings.lintCommand, entry, branch.worktree);
@@ -652,15 +658,23 @@ export function createDeliveryService({
       let sha;
       if (committed.sha === null) {
         // The worktree is clean. That is a genuine no-op on a first delivery,
-        // but on a retry after `push-failed`/`mr-failed` the commit already
-        // exists: resume from the recorded sha (the branch ref is verified
-        // below) instead of blocking before the push/MR can be retried.
+        // but the personal branch may already carry this ticket's commit:
+        //  - a retry after `push-failed`/`mr-failed` recorded it, or
+        //  - the user committed the reviewed changes by hand in the worktree
+        //    (a common manual-test habit).
+        // Both resume from the existing commit instead of blocking before the
+        // push/MR can run; the branch ref is verified below.
         const recorded = readRecordedCommit(key, branch);
-        if (recorded === undefined) {
+        const existing = recorded === undefined
+          ? await readBranchHeadCommit(repo, branch)
+          : undefined;
+        if (recorded === undefined && existing === undefined) {
           await failDelivery(key, 'delivery-no-changes', '');
           return;
         }
-        sha = recorded.sha;
+        sha = recorded === undefined ? existing.sha : recorded.sha;
+        if (existing !== undefined) await rememberCommit(key, existing);
+        if (entry.cancelled) return;
       } else {
         sha = committed.sha;
         // Persist BEFORE the push: if the push/MR fails, the retry must find
@@ -1000,6 +1014,47 @@ export function createDeliveryService({
    * staged for THIS worktree and THIS personal branch. A corrupt/foreign
    * record is ignored (falls back to `delivery-no-changes`).
    */
+  /**
+   * The personal branch's own HEAD when it already sits ahead of the delivery
+   * base (`origin/<target>` or the local target). Used when the worktree is
+   * clean and no delivery commit was recorded — i.e. the user committed the
+   * reviewed changes manually — so the delivery can still push and open the MR
+   * instead of dead-ending on `delivery-no-changes`.
+   */
+  async function readBranchHeadCommit(repo, branch) {
+    let head;
+    try {
+      head = await git.revParse(branch.worktree, branch.name);
+    } catch {
+      return undefined;
+    }
+    if (typeof head !== 'string' || head.trim() === '') return undefined;
+    const sha = head.trim();
+
+    for (const ref of [`origin/${branch.target}`, branch.target]) {
+      let exists;
+      try {
+        exists = await git.refExists(repo, ref);
+      } catch {
+        exists = undefined;
+      }
+      if (exists === null || typeof exists !== 'object' || exists.ok !== true || exists.exists !== true) {
+        continue;
+      }
+      let base;
+      try {
+        base = await git.revParse(repo, ref);
+      } catch {
+        continue;
+      }
+      if (typeof base !== 'string' || base.trim() === '') continue;
+      if (base.trim() !== sha) {
+        return { sha, worktree: branch.worktree, branch: branch.name, message: '' };
+      }
+    }
+    return undefined;
+  }
+
   function readRecordedCommit(key, branch) {
     let value;
     try {
