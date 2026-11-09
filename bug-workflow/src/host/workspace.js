@@ -17,6 +17,15 @@
  */
 
 /**
+ * `meta` key prefix recording which workspace (session cwd) a ticket belongs
+ * to. The analysis service writes `ticket.workspace:<code>` when a fresh
+ * analysis starts; the fix service reads it so a click made from another
+ * workspace still prepares the worktree in the repository that actually
+ * contains the ticket's code (instead of creating a stray worktree there).
+ */
+export const TICKET_WORKSPACE_META_PREFIX = 'ticket.workspace:';
+
+/**
  * Resolve the workspace of one session.
  *
  * Never throws: a missing/blank session id, a session without `header.cwd`, or

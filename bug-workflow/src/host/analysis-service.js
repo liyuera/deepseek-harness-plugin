@@ -54,6 +54,7 @@
 
 import { DEFAULT_ANALYSIS_TIMEOUT_MS } from './agent-access.js';
 import { canApply } from './state-machine.js';
+import { TICKET_WORKSPACE_META_PREFIX } from './workspace.js';
 
 /** `meta` key prefix of a persisted analysis error. */
 export const ANALYSIS_ERROR_META_PREFIX = 'analysis.error:';
@@ -232,6 +233,7 @@ export function createAnalysisService({
     if (disposed) return disposedStart(key, entry);
 
     await clearError(key);
+    await rememberWorkspace(key, cwd, true);
     // Re-check AFTER every await: dispose() may have aborted the reserved
     // entry while the write above was in flight. No job may launch then.
     if (disposed) return disposedStart(key, entry);
@@ -249,6 +251,7 @@ export function createAnalysisService({
   async function restartAnalyzing({ key, sessionId, cwd, ticket }) {
     const entry = reserve(key);
     await clearError(key);
+    await rememberWorkspace(key, cwd, false);
     if (disposed) return disposedStart(key, entry);
 
     launchJob({ entry, key, sessionId, cwd, ticket });
@@ -289,10 +292,33 @@ export function createAnalysisService({
     if (disposed) return disposedStart(key, entry);
 
     await clearError(key);
+    await rememberWorkspace(key, cwd, false);
     if (disposed) return disposedStart(key, entry);
 
     launchJob({ entry, key, sessionId, cwd, ticket: applied.ticket });
     return { ok: true, running: true, workflow: 'analyzing' };
+  }
+
+  /**
+   * Best-effort record of the workspace this analysis runs in
+   * (`meta['ticket.workspace:<code>']`), read later by the fix service so a
+   * click from another board prepares the worktree in the right repository.
+   * A failing meta write must never fail the analysis: it only disables the
+   * cross-workspace fallback.
+   *
+   * `overwrite:false` keeps an existing record untouched (orphan/blocked
+   * restarts, which may be triggered from a different board).
+   */
+  async function rememberWorkspace(key, cwd, overwrite) {
+    if (typeof cwd !== 'string' || cwd.trim() === '') return;
+    try {
+      if (overwrite !== true && typeof store.getMeta(TICKET_WORKSPACE_META_PREFIX + key) === 'string') {
+        return;
+      }
+      await store.setMeta(TICKET_WORKSPACE_META_PREFIX + key, cwd);
+    } catch {
+      // Meta is an optimization, never a precondition for an analysis.
+    }
   }
 
   /**

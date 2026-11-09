@@ -195,6 +195,7 @@ test('worktreeAdd creates <repo>/.dsh-worktrees/<code> and reuses a matching wor
   assert.equal(conflict.ok, false);
   assert.equal(conflict.code, 'worktree-conflict');
   assert.equal(conflict.message, '工作树已存在且分支与目标分支不一致');
+  assert.equal(conflict.reason, 'path-busy');
   assert.equal(conflict.command, 'git worktree add');
   assert.equal(gitSync(worktree, ['rev-parse', '--abbrev-ref', 'HEAD']), 'feat-V1-ly');
 });
@@ -265,6 +266,7 @@ test('an external worktree on the same branch maps to worktree-conflict, not git
   assert.equal(result.ok, false);
   assert.equal(result.code, 'worktree-conflict');
   assert.equal(result.message, '个人分支已在其它工作树中检出，请先清理该工作树');
+  assert.equal(result.reason, 'branch-busy');
   assert.equal(result.command, 'git worktree add');
   assert.equal(existsSync(second), false);
   assert.deepEqual(await git.probeWorktree(repo, second, 'feat-V1-shared'), {

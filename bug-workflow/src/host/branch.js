@@ -39,6 +39,9 @@
 /** Maximum length of any personal/target branch name (git checkpoint). */
 export const BRANCH_LENGTH_LIMIT = 200;
 
+/** Maximum length of the ticket-code suffix of a fallback branch. */
+export const TICKET_BRANCH_SUFFIX_LIMIT = 24;
+
 /** Maximum length of the personal-branch suffix (`branchUser`). */
 export const BRANCH_USER_LENGTH_LIMIT = 64;
 
@@ -193,9 +196,54 @@ export function deriveBranches(input = {}) {
   };
 }
 
+/**
+ * Derive the ticket-scoped fallback personal branch used when the canonical
+ * `feat|hot-<X>-<user>` branch cannot host a new worktree because it is
+ * already checked out in another worktree (typically the user's own checkout
+ * of the version branch). The fallback is deterministic and stays inside the
+ * team naming convention: `<personalBranch>-<ticketNumber>`, e.g.
+ * `feat-V1.6.1.20261109-ly-648`.
+ *
+ * Pure: returns `undefined` instead of throwing when either part cannot
+ * produce a legal ref, so the caller keeps its existing error path.
+ *
+ * @param {unknown} personalBranch canonical personal branch
+ * @param {unknown} code ticket code (only its trailing alphanumeric segment is used)
+ * @returns {string|undefined}
+ */
+export function ticketBranchName(personalBranch, code) {
+  if (typeof personalBranch !== 'string') return undefined;
+  const base = personalBranch.trim();
+  if (!isSafeBranchName(base)) return undefined;
+
+  const suffix = ticketBranchSuffix(code);
+  if (suffix === undefined) return undefined;
+
+  const name = `${base}-${suffix}`;
+  if (name.length > BRANCH_LENGTH_LIMIT) return undefined;
+  if (!isSafeBranchName(name)) return undefined;
+  return name;
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/** Trailing alphanumeric segment of a ticket code, e.g. `648` for `A-648`. */
+function ticketBranchSuffix(code) {
+  if (typeof code !== 'string') return undefined;
+  const trimmed = code.trim();
+  if (trimmed === '') return undefined;
+
+  const parts = trimmed.split(/[^A-Za-z0-9]+/).filter((part) => part !== '');
+  const last = parts[parts.length - 1];
+  if (last === undefined) return undefined;
+
+  const suffix = last.length > TICKET_BRANCH_SUFFIX_LIMIT
+    ? last.slice(-TICKET_BRANCH_SUFFIX_LIMIT)
+    : last;
+  return suffix === '' ? undefined : suffix;
+}
 
 /** Normalize + validate the override object; absent means `{}`. */
 function normalizeOverride(override) {

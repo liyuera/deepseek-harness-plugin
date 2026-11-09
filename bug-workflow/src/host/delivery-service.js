@@ -102,6 +102,7 @@ import { sep } from 'node:path';
 import { isSafeBranchName } from './branch.js';
 import { GitError, assertPushableBranch } from './git.js';
 import { createGitlabClient, normalizeProject } from './gitlab.js';
+import { TICKET_WORKSPACE_META_PREFIX } from './workspace.js';
 
 /** `meta` key prefix of a persisted delivery error (suffix = ticket code). */
 export const DELIVERY_ERROR_META_PREFIX = 'delivery.error:';
@@ -465,9 +466,14 @@ export function createDeliveryService({
       return failure('not-submitting', DELIVERY_START_MESSAGES['not-submitting']);
     }
 
+    // The ticket may be delivered from a different workspace than the one the
+    // fix ran in. Resolve the owning workspace recorded at analysis/fix time so
+    // settings, repository and the registered-worktree check all agree.
+    const deliveryCwd = await resolveTicketWorkspace(key, cwd);
+
     let settings;
     try {
-      settings = store.getSettings(cwd);
+      settings = store.getSettings(deliveryCwd);
     } catch {
       return failure('invalid-gitlab-settings', DELIVERY_START_MESSAGES['invalid-gitlab-settings']);
     }
@@ -544,7 +550,7 @@ export function createDeliveryService({
     // worktree resolves to itself, so lock through the session cwd instead).
     let repo;
     try {
-      repo = await git.repoRoot(cwd);
+      repo = await git.repoRoot(deliveryCwd);
     } catch {
       repo = undefined;
     }
@@ -596,7 +602,8 @@ export function createDeliveryService({
       branch,
       client,
       sessionId,
-      cwd,
+      // Persisted review context and later rounds must resolve the same repo.
+      cwd: deliveryCwd,
     });
     jobs.add(job);
     void job
@@ -1032,6 +1039,31 @@ export function createDeliveryService({
     }
     usedActionIds.add(actionId);
     return actionId;
+  }
+
+  /**
+   * Resolve the workspace that owns `key`: the record written by the analysis
+   * (and refreshed by the fix) service. A missing/stale record degrades to the
+   * requesting workspace, so single-workspace use keeps today's behavior.
+   */
+  async function resolveTicketWorkspace(key, cwd) {
+    let stored;
+    try {
+      stored = store.getMeta(TICKET_WORKSPACE_META_PREFIX + key);
+    } catch {
+      return cwd;
+    }
+    if (typeof stored !== 'string') return cwd;
+    const path = stored.trim();
+    if (path === '' || path === cwd) return cwd;
+
+    try {
+      const repo = await git.repoRoot(path);
+      if (typeof repo === 'string' && repo.trim() !== '') return path;
+    } catch {
+      // A stale record must never block a delivery.
+    }
+    return cwd;
   }
 
   function readTicket(key) {

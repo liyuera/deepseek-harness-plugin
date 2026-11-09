@@ -21,6 +21,7 @@ import {
 } from '../src/host/analysis-service.js';
 import { createStore } from '../src/host/store.js';
 import { initialTicket } from '../src/host/state-machine.js';
+import { TICKET_WORKSPACE_META_PREFIX } from '../src/host/workspace.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -970,4 +971,42 @@ test('dispose() during start() prevents the background job from launching', asyn
   await drained;
   // The held write was never followed by a launch, so the ticket stays inbox.
   assert.equal(store.get('BUG-1').workflow, 'inbox');
+});
+
+// ---------------------------------------------------------------------------
+// Owned-workspace record (P6 follow-up)
+// ---------------------------------------------------------------------------
+
+test('a fresh analysis records its workspace for the fix service', async () => {
+  const { store, service } = setup();
+  await createTicket(store);
+
+  const result = await service.start(SESSION_ID, CWD, 'BUG-1');
+  assert.deepEqual(result, { ok: true, running: true, workflow: 'analyzing' });
+  assert.equal(store.getMeta(TICKET_WORKSPACE_META_PREFIX + 'BUG-1'), CWD);
+
+  await waitForIdle(service);
+  assert.equal(store.getMeta(TICKET_WORKSPACE_META_PREFIX + 'BUG-1'), CWD);
+  assert.equal(store.get('BUG-1').workflow, 'plan_review');
+});
+
+test('restarting an orphaned analysis keeps the recorded workspace', async () => {
+  const OTHER = '/tmp/bug-workflow-original-workspace';
+  const { domain, store, service } = setup();
+  await seedTicket(domain, 'BUG-1', {
+    workflow: 'analyzing',
+    timeline: [
+      { at: T1, kind: 'created', actor: 'system', message: '工单已创建' },
+      { at: T1, kind: 'start_analysis', actor: 'user', message: '开始分析工单' },
+    ],
+  });
+  await store.setMeta(TICKET_WORKSPACE_META_PREFIX + 'BUG-1', OTHER);
+
+  // The orphan restart may be clicked from another board: it must not steal
+  // the ticket's owning workspace.
+  const result = await service.start(SESSION_ID, CWD, 'BUG-1');
+  assert.deepEqual(result, { ok: true, running: true, workflow: 'analyzing' });
+  assert.equal(store.getMeta(TICKET_WORKSPACE_META_PREFIX + 'BUG-1'), OTHER);
+
+  await waitForIdle(service);
 });

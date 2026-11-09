@@ -101,13 +101,14 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 | 开始修复 | `fixing` 且方案已批准 → 详情页「开始修复」→ `POST /bug-workflow/api/fix`。宿主先按团队规则建个人分支/worktree 并落 `branch` 元数据，再在后台启动写权限修复子代理；路由 200 只表示「已受理」，不是修复完成 |
 | 真子代理 | 宿主经 `ctx.subagents.startActivation({ provider:'spawn', delivery:'caller', ... })` 启动修复子代理，**cwd 是 worktree**；子代理继承父会话 provider/model，按已批准 plan 直接改代码。单工单只跑一个修复，重复点击不重复起子代理 |
 | 写范围（**prompt-only**） | prompt 把工单/方案放进 nonce 数据块，声明：只改 worktree、不得改主工作区、不得 commit/push/checkout/reset/merge/rebase、不得读凭据/`~/.dsh`、不得联网。**宿主没有工具白名单或权限收窄**，子代理继承父 Agent 工具权限——与 P3 只读约束同级，是提示词约束，不是强制沙箱 |
-| 分支规则 | 普通工单个人分支 `feat-<versionName>-<branchUser>`、目标 `feature-<versionName>`；故障工单（类型「故障」）个人分支 `hot-<versionName>-<branchUser>`、目标 `hotfix-<versionName>`。`versionName` 取 `platform.versionName ?? version`，只保留 `[A-Za-z0-9._-]`；`branchUser` 来自工作区设置（默认 `ly`）。目标分支由个人分支名推导；P4 看板未提供覆盖入口（`branch.js` 支持 override，`fix-service` 未接） |
+| 分支规则 | 普通工单个人分支 `feat-<versionName>-<branchUser>`、目标 `feature-<versionName>`；故障工单（类型「故障」）个人分支 `hot-<versionName>-<branchUser>`、目标 `hotfix-<versionName>`。`versionName` 取 `platform.versionName ?? version`，只保留 `[A-Za-z0-9._-]`；`branchUser` 来自工作区设置（默认 `ly`）。目标分支由个人分支名推导；P4 看板未提供覆盖入口（`branch.js` 支持 override，`fix-service` 未接）。**个人分支被占用时自动回退**：当 `feat-<X>-<user>` 已在其它 worktree（最常见的是用户自己检出着版本分支的主工作树）里检出，`git worktree add` 会拒绝，插件改用工单号后缀的 `feat-<X>-<user>-<工单号>`（如 `feat-V1.6.1.20261109-ly-648`，目标分支不变），并在 `branch.name` 记录实际分支，不再 409 死锁 |
 | 基线与 baseSource | 依次尝试 `origin/<目标分支>`（`branch.baseSource:'origin'`）→ 本地 `<目标分支>`（`'target'`）→ `HEAD`（`'HEAD'`，本地/演示仓库；本机没有集成分支时走这一档），并写入 `branch.baseSource` |
 | 工作树 | `<repo>/.dsh-worktrees/<code>`（`git.worktreePath` 只接受 `[A-Za-z0-9._-]{1,120}` 的 code）；本仓库已把 `.dsh-worktrees/` 加入 `.gitignore`。P4 **不 commit、不 push**，改动以未提交状态留在 worktree，供人工测试与 P5 提交 |
 | 结果回填 | 子代理只输出一个 JSON；宿主以 `git status --porcelain`（含 `??` 未跟踪文件）为准收集 `changedFiles`，`diffStat`/`diff` 来自 git（`diff` 只持久化最多 4,000 字符的摘要），连同 summary/testResult/耗时写入 `fixes`，再以 `expectedWorkflow:'fixing'` 条件写 `fix_done`。成功 status 但 **0 改动** → 不进入 `fix_done`，改为 `blocked`（`fix-no-changes`） |
 | 失败/重试 | 子代理失败/超时/坏输出/无 live Agent → `blocked`（`blockedFrom:'fixing'`）+ 静态原因 `fix-timeout`/`fix-bad-output`/`no-live-agent`/`fix-failed`；看板显示静态文案 +「重新修复」，再次 POST `/api/fix` 由宿主自动 `retry`（客户端不需要先发 `/action retry`） |
 | 取消/重启 | `dispose()`（插件卸载/app 退出）先标 `cancelled` 再 abort：**不写** `block`/错误 meta，工单保持 `fixing`；下次加载按孤儿路径重启并复用已有 worktree/分支。`blocked(fixing)` 重启时先完成 git 准备再 `retry`；准备失败保持原 `blocked` 状态，只把新原因写入 `meta['fix.error:<code>']` |
 | 并发 | 同仓库同一时间只允许 1 个修复（`fix-service` 进程内锁）：第二张工单 `fix-busy` 409，且在任何状态写之前拒绝；个人分支已被本插件记录的其它工单工作树占用 → `fix-branch-busy` 409。不同仓库可并行 |
+| 工单归属工作区 | 分析开始时把会话工作区写入 `meta['ticket.workspace:<code>']`；之后从**任意**工作区点「开始修复」「提交并创建 MR」，宿主优先用这个工作区解析仓库、设置、工作树与 Review 上下文，避免在错误仓库里建 worktree、白跑一次修复。记录缺失/失效（目录或 git 仓库不可读）时回退到当前会话工作区；修复启动成功后也会补写该记录 |
 | 人工测试 | `fix_done` 详情展示 branch/target/worktree、`changedFiles`、`diffStat`、summary、`testResult` 与修复记录；人工测试后点「标记测试通过」→ `mark_test_passed` → `submitting`。真实人工测试由用户完成；P4 live 验收中的该点击是模拟动作 |
 | 客户端 UX | `fixing` 且从未启动（无 `branch.worktree`、无 `fixes`、无错误）→「开始修复」；有 branch/修复记录/错误但无运行任务 →「上次修复已中断，可重新修复」；运行中 →「AI 修复中…（最长约 15 分钟）」+ 本地计时（计时行 `aria-live=off`）；blocked(fixing) → 静态原因 +「重新修复」；`fix_done` → 修复记录卡（摘要/改动文件/`diffStat`/耗时）+ 测试卡（`testResult`）+「标记测试通过」。所有按钮二次确认，demo「修复完成」按钮隐藏 |
 | 超时/成本 | 单次修复预算 **15 分钟**（`DEFAULT_FIX_TIMEOUT_MS=900000`，代码级默认，无 host setting）；真子代理消耗模型 token 与真实时间 |
@@ -127,8 +128,8 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 | `ticket-not-found` | 404 | 工单不存在 |
 | `invalid-state` / `plan-not-approved` | 409 | 当前状态不能修复 / 方案未通过 |
 | `fix-busy` | 409 | 同仓库已有修复在执行 |
-| `fix-branch-busy` | 409 | 个人分支已被其它工单工作树占用 |
-| `worktree-conflict` | 409 | 工作树路径已存在且分支不一致（git 返回冲突，未覆盖既有工作树） |
+| `fix-branch-busy` | 409 | 个人分支已被其它工单工作树占用（同一工单重试会走自动回退，不再命中） |
+| `worktree-conflict` | 409 | 工作树路径已存在且分支不一致（git 返回冲突，未覆盖既有工作树）；`reason:'branch-busy'` 时 fix-service 已自动回退到工单号后缀分支，`reason:'path-busy'` 仍报 409 |
 | `missing-session` | 400 | 请求缺少有效 `sessionId`（路由层校验） |
 | `invalid-code` / `unknown-workspace` / `invalid-branch` / `invalid-branch-user` / `invalid-family` / `invalid-version` / `invalid-worktree-path` / `invalid-payload` | 400 | 参数/分支/工作树输入错误 |
 | `fix-unavailable` / `git-timeout` | 503 | 修复服务/子代理服务未接线或不可用（缺 `subagents`/`agents` 服务）；git 准备超时 |
@@ -153,7 +154,7 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 | 合并检测/归档 | `mergeable` + MR `state=merged` → `mr_merged` → `merged`；下一 tick `dismiss(system)` → `done` 并离开看板。若在 `mr_open`/`fixing_review` 就被人工合并 → `block('review-merged-manually')`，不伪造 review pass。**插件从不调用 merge/close/approve/resolve**，合并必须由人在 GitLab 完成 |
 | 取消/恢复 | delivery/review-fix 的 `dispose()` 只取消并排水，**不写** block/错误；`fixing_review` 无运行任务时下一 tick 按持久化 findings 恢复（重启子代理 / 重推 pending commit / 不可恢复则 `block('review-recovery-unavailable')`）。迟到结果只写静态 `delivery.error`/`review.error`，绝不回退已推进的工单 |
 | 客户端 UX | `submitting` 显示「提交并创建 MR」+ 运行横幅 + 静态错误映射；`mr_open`/`fixing_review` 显示 MR 卡（!iid/URL/source→target/轮次 n/3/最近结论/轮询提示）；`fixing_review` 运行中显示「AI 正在修复 Review 问题…」（计时 `aria-live=off`）；`mergeable` 显示「等待人工在 GitLab 合并（插件不会自动合并）」；`merged` 显示「已合并，即将从看板移除」；`done` 不再出现在看板 |
-| 测试 | **614 个用例**（P4 基线 352，P5 新增/扩充 218、UI v2 新增 4、P6 平台登录/同步/分析证据新增 39：`review-parser` 45、`credentials` 16、`gitlab` 27、`git` 20、`store` 42、`delivery-service` 40、`review-service` 45、`agent-access` 51、`analysis` 30、`sync` 31、`routes` 115、`attachments` 6、`platform-login` 14、`client-action-map` 14、`client-stage-map` 4、`client-platform-login` 4 等；另有隔离 E2E 脚本 29 条断言） |
+| 测试 | **623 个用例**（P4 基线 352，P5 新增/扩充 218、UI v2 新增 4、P6 平台登录/同步/分析证据新增 39：`review-parser` 45、`credentials` 16、`gitlab` 27、`git` 20、`store` 42、`delivery-service` 40、`review-service` 45、`agent-access` 51、`analysis` 30、`sync` 31、`routes` 115、`attachments` 6、`platform-login` 14、`client-action-map` 14、`client-stage-map` 4、`client-platform-login` 4 等；另有隔离 E2E 脚本 29 条断言） |
 
 **P5 交付成功的前置条件（缺一不可）**
 

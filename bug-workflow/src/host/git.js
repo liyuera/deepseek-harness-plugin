@@ -42,7 +42,14 @@
  *
  *   { ok:false, code:'git-failed'|'git-timeout'|'worktree-conflict'
  *                     |'invalid-worktree-path',
- *     message:<static Chinese>, command:<static command label> }
+ *     message:<static Chinese>, command:<static command label>,
+ *     reason?:'path-busy'|'branch-busy' }
+ *
+ * `reason` refines `worktree-conflict` without changing its code/status:
+ * `'path-busy'` means the worktree path is registered on another branch,
+ * `'branch-busy'` means the personal branch is checked out in another (possibly
+ * the main) worktree. The fix service uses `'branch-busy'` to fall back to a
+ * ticket-scoped branch instead of dead-ending the user on a 409.
  *
  * `refExists` wraps its boolean in `{ok:true, exists}` so a failure object can
  * never be coerced into "the ref exists". A `rev-parse --verify --quiet` exit
@@ -424,7 +431,7 @@ export function createGit(options = {}) {
     }
     if (probe.state === 'same') return { created: false };
     if (probe.state === 'different') {
-      return failure('worktree-conflict', MESSAGE.conflict, COMMAND.worktreeAdd);
+      return failure('worktree-conflict', MESSAGE.conflict, COMMAND.worktreeAdd, 'path-busy');
     }
 
     // Re-adding a branch whose worktree was removed must not pass `-b` again;
@@ -450,14 +457,14 @@ export function createGit(options = {}) {
     if (raced.ok === false) return added;
     if (raced.state === 'same') return { created: false };
     if (raced.state === 'different') {
-      return failure('worktree-conflict', MESSAGE.conflict, COMMAND.worktreeAdd);
+      return failure('worktree-conflict', MESSAGE.conflict, COMMAND.worktreeAdd, 'path-busy');
     }
     // The add can also fail because `branch` is already checked out in a
     // DIFFERENT registered worktree (the user ran `git worktree add` manually);
     // the target path itself is still absent, so re-probing it cannot see that.
     const elsewhere = await branchCheckedOutElsewhere(repo, path, branch);
     if (elsewhere === true) {
-      return failure('worktree-conflict', MESSAGE.branchBusy, COMMAND.worktreeAdd);
+      return failure('worktree-conflict', MESSAGE.branchBusy, COMMAND.worktreeAdd, 'branch-busy');
     }
     return added;
   }
@@ -642,8 +649,17 @@ export function createGit(options = {}) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function failure(code, message, command) {
-  return { ok: false, code, message, command };
+/**
+ * Structured git failure. `reason` is an optional, static refinement of `code`
+ * for `worktree-conflict` (`'path-busy'`: the worktree path belongs to another
+ * branch; `'branch-busy'`: the personal branch is already checked out in
+ * another registered worktree). Callers use it to pick a recovery path (e.g.
+ * derive a ticket-scoped branch) instead of parsing a localized message.
+ */
+function failure(code, message, command, reason) {
+  const result = { ok: false, code, message, command };
+  if (typeof reason === 'string' && reason !== '') result.reason = reason;
+  return result;
 }
 
 /** Parse `git worktree list --porcelain` blocks into `{path, branch}` entries. */

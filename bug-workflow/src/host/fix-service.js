@@ -86,7 +86,8 @@
 import { sep } from 'node:path';
 
 import { DEFAULT_FIX_TIMEOUT_MS } from './agent-access.js';
-import { BranchError, deriveBranches } from './branch.js';
+import { BranchError, deriveBranches, ticketBranchName } from './branch.js';
+import { TICKET_WORKSPACE_META_PREFIX } from './workspace.js';
 
 /** `meta` key prefix of a persisted fix error. */
 export const FIX_ERROR_META_PREFIX = 'fix.error:';
@@ -270,7 +271,12 @@ export function createFixService({
     // lock is keyed by the real repository (the session cwd can be a
     // subdirectory), and the single-flight check must be repeated after this
     // await so two same-tick requests for the same ticket still collapse.
-    const repo = await git.repoRoot(cwd);
+    // Recorded owning workspace (written by the analysis service). A fix may be
+    // started from another workspace's board; the worktree must still be
+    // prepared in the repository that holds the ticket's code, otherwise the
+    // AI edits an unrelated repository (a stray worktree in the wrong repo).
+    const fixCwd = await resolveTicketWorkspace(key, cwd);
+    const repo = await git.repoRoot(fixCwd);
     if (typeof repo !== 'string' || repo.trim() === '') return gitFailure(repo);
     if (disposed) return failure('fix-unavailable', UNAVAILABLE_MESSAGE);
     if (running.has(key)) return { ok: true, running: true, workflow: 'fixing' };
@@ -285,7 +291,7 @@ export function createFixService({
       // Git preparation happens BEFORE the blocked restart's `retry` write:
       // a failing preparation must leave the ticket in its previous state
       // instead of stranding it in `fixing` with no job, branch or error.
-      const prepared = await prepareWorktree(key, current, cwd, repo);
+      const prepared = await prepareWorktree(key, current, fixCwd, repo);
       if (!prepared.ok) {
         await reportStartFailure(key, blockedRestart, prepared.failure);
         return prepared.failure;
@@ -311,6 +317,10 @@ export function createFixService({
       if (disposed) return disposedStart(key, entry);
 
       await clearError(key);
+      // Remember where this fix actually runs so a later start from another
+      // board reuses the same repository even when the ticket predates the
+      // analysis-side workspace record.
+      await rememberWorkspace(key, fixCwd);
       // Final re-check before activation: a dispose can land while the error
       // meta is cleared. Teardown must never launch a job (or return 200).
       if (disposed) return disposedStart(key, entry);
@@ -418,12 +428,36 @@ export function createFixService({
     const base = await resolveBase(repo, branches.targetBranch);
     if (!base.ok) return { ok: false, failure: base.failure };
 
-    const added = await git.worktreeAdd({
+    const canonical = branches.personalBranch;
+    let personalBranch = canonical;
+    let added = await git.worktreeAdd({
       repo,
       path: tree.path,
-      branch: branches.personalBranch,
+      branch: canonical,
       base: base.base,
     });
+
+    // The canonical personal branch is already checked out in another worktree.
+    // The common trigger is the user's own version-branch checkout (or their
+    // editor) sitting on `feat-<X>-<user>`, so a start from that workspace used
+    // to dead-end on a 409 the board could not resolve. Fall back to the
+    // deterministic ticket-scoped branch so the fix can still run isolated.
+    if (added?.ok === false && added.code === 'worktree-conflict' && added.reason === 'branch-busy') {
+      const fallback = ticketBranchName(canonical, key);
+      if (fallback !== undefined) {
+        const retried = await git.worktreeAdd({
+          repo,
+          path: tree.path,
+          branch: fallback,
+          base: base.base,
+        });
+        if (retried?.ok !== false) {
+          added = retried;
+          personalBranch = fallback;
+        }
+      }
+    }
+
     if (added?.ok === false) {
       // If git created the personal branch but failed to register the
       // worktree, the branch is left at the base. Retries reuse it; the
@@ -434,7 +468,7 @@ export function createFixService({
     return {
       ok: true,
       worktreePath: tree.path,
-      branch: branches.personalBranch,
+      branch: personalBranch,
       target: branches.targetBranch,
       baseSource: base.source,
       // `git worktree add` reuses an already registered worktree at `path`
@@ -951,6 +985,45 @@ export function createFixService({
     if (typeof value !== 'string' || value === '') return undefined;
     errorCodes.add(key);
     return value;
+  }
+
+  /**
+   * Resolve the workspace whose repository owns `key`.
+   *
+   * The analysis service records the workspace a fresh analysis ran in
+   * (`meta['ticket.workspace:<code>']`). When the board is open in a different
+   * workspace, that record wins so the worktree is prepared in the right
+   * repository. A missing/invalid/stale record always degrades to the caller's
+   * session workspace, so old tickets keep their previous behavior.
+   */
+  async function resolveTicketWorkspace(key, cwd) {
+    let stored;
+    try {
+      stored = store.getMeta(TICKET_WORKSPACE_META_PREFIX + key);
+    } catch {
+      return cwd;
+    }
+    if (typeof stored !== 'string') return cwd;
+    const path = stored.trim();
+    if (path === '' || path === cwd) return cwd;
+
+    try {
+      const repo = await git.repoRoot(path);
+      if (typeof repo === 'string' && repo.trim() !== '') return path;
+    } catch {
+      // Fall through: an unreadable record must never block the fix.
+    }
+    return cwd;
+  }
+
+  /** Best-effort record of the workspace a fix actually used. */
+  async function rememberWorkspace(key, cwd) {
+    if (typeof cwd !== 'string' || cwd.trim() === '') return;
+    try {
+      await store.setMeta(TICKET_WORKSPACE_META_PREFIX + key, cwd);
+    } catch {
+      // Meta is an optimization, never a precondition for a fix.
+    }
   }
 
   function clearRunning(key, entry) {

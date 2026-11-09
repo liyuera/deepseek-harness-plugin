@@ -32,6 +32,7 @@ import {
   deriveBranches,
   isSafeBranchName,
   sanitizeVersion,
+  ticketBranchName,
 } from '../src/host/branch.js';
 
 /** Assert that `fn` throws a `BranchError` with the expected static code. */
@@ -430,4 +431,23 @@ test('deriveBranches does not mutate its input', () => {
   deriveBranches(input);
 
   assert.deepEqual(input, snapshot);
+});
+
+test('ticketBranchName derives the deterministic ticket-scoped fallback', () => {
+  assert.equal(
+    ticketBranchName('feat-V1.6.1.20261109-ly', 'YGFNXDJRFWDJSYJJYY-648'),
+    'feat-V1.6.1.20261109-ly-648',
+  );
+  assert.equal(ticketBranchName('hot-V1.0.0-zhangsan', 'BUG-1'), 'hot-V1.0.0-zhangsan-1');
+  assert.equal(ticketBranchName('feat-x', '  BUG-007  '), 'feat-x-007');
+});
+
+test('ticketBranchName refuses input that cannot form a legal ref', () => {
+  assert.equal(ticketBranchName('feat-x', ''), undefined);
+  assert.equal(ticketBranchName('feat-x', '---'), undefined);
+  assert.equal(ticketBranchName('', '648'), undefined);
+  assert.equal(ticketBranchName(undefined, '648'), undefined);
+  assert.equal(ticketBranchName('feat-..', '648'), undefined);
+  // A branch over the git limit must not be produced by the fallback.
+  assert.equal(ticketBranchName(`feat-${'a'.repeat(200)}`, '648'), undefined);
 });

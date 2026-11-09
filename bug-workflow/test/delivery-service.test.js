@@ -50,6 +50,7 @@ import { createGit } from '../src/host/git.js';
 import { createGitlabClient } from '../src/host/gitlab.js';
 import { createStore } from '../src/host/store.js';
 import { initialTicket } from '../src/host/state-machine.js';
+import { TICKET_WORKSPACE_META_PREFIX } from '../src/host/workspace.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -1625,4 +1626,39 @@ test('dispose() aborts a real lint command promptly and leaves no writes', async
   assert.equal(h.mock.requests.length, 0);
   assert.equal(lock.owners.size, 0);
   assert.equal(lock.releases.length, 1);
+});
+
+test('a delivery started from another workspace uses the owning workspace', async (t) => {
+  const OWNING = '/tmp/bug-workflow-owning-workspace';
+  const CLICKED = '/tmp/bug-workflow-clicked-workspace';
+  const repoRootCalls = [];
+  const real = createGit();
+  let fixtureRepo;
+  const wrapped = {
+    ...real,
+    async repoRoot(cwd) {
+      repoRootCalls.push(cwd);
+      if (cwd === OWNING) return fixtureRepo;
+      // Proves the service did not fall back to the requesting workspace.
+      if (cwd === CLICKED) throw new Error('wrong workspace');
+      return real.repoRoot(cwd);
+    },
+  };
+
+  const h = await createHarness(t, { git: wrapped, dirty: true });
+  fixtureRepo = h.fixture.repo;
+  await h.store.putSettings(OWNING, {
+    gitlabBaseUrl: h.mock.url,
+    gitlabProjectPath: PROJECT,
+    lintCommand: 'npm run lint',
+    testCommand: 'npm test',
+    commitType: 'fix',
+    branchUser: 'ly',
+  });
+  await h.store.setMeta(TICKET_WORKSPACE_META_PREFIX + CODE, OWNING);
+
+  const started = await h.service.start(SESSION_ID, CLICKED, CODE);
+  assert.deepEqual(started, { ok: true, running: true });
+  assert.deepEqual(repoRootCalls.slice(0, 2), [OWNING, OWNING]);
+  assert.ok(!repoRootCalls.includes(CLICKED));
 });
