@@ -20,7 +20,7 @@ const EXPECTED_ACTIONS = [
   'create', 'start_analysis', 'analysis_done', 'approve_plan', 'reject_plan',
   'fix_done', 'mark_test_passed', 'reopen_fix', 'submit_mr', 'mr_created',
   'review_requests_changes', 'review_fix_done', 'review_pass', 'mr_merged',
-  'dismiss', 'retry', 'block',
+  'dismiss', 'terminate', 'retry', 'block',
 ];
 
 const PLAN = {
@@ -463,4 +463,26 @@ test('StateError 支持对象构造并暴露 code/name', () => {
   assert.equal(error.name, 'StateError');
   assert.equal(error.code, 'demo');
   assert.equal(error.message, '演示错误');
+});
+
+test('terminate archives a ticket from any non-terminal state', () => {
+  for (const workflow of ['inbox', 'analyzing', 'plan_review', 'fixing', 'fix_done', 'submitting', 'mr_open', 'mergeable', 'merged', 'blocked']) {
+    const ticket = ticketAt(workflow);
+    const next = apply(ticket, 'terminate', { actor: 'user', message: '人工终结：重复工单' }, AT);
+    assert.equal(next.workflow, 'done', `${workflow} -> terminate must archive`);
+    assert.equal(next.timeline.at(-1).kind, 'terminate');
+    assert.equal(next.timeline.at(-1).actor, 'user');
+    assert.equal(next.timeline.at(-1).message, '人工终结：重复工单');
+    assert.equal(next.timeline.at(-1).at, AT);
+  }
+});
+
+test('terminate uses the default message when no reason is given and refuses done', () => {
+  const done = apply(ticketAt('inbox'), 'terminate', { actor: 'user' }, AT);
+  assert.equal(done.workflow, 'done');
+  assert.equal(done.timeline.at(-1).message, '人工终结，工单完成');
+
+  const again = canApply(done, 'terminate');
+  assert.equal(again.ok, false);
+  assert.equal(again.code, 'invalid-transition');
 });

@@ -57,6 +57,15 @@ const BLOCKABLE_STATES = Object.freeze(
 );
 
 /**
+ * States from which a human may terminate the ticket: every non-terminal
+ * workflow, including `blocked` (the escape hatch when the automated flow can
+ * not continue and a person decides the ticket is done/abandoned).
+ */
+const TERMINATABLE_STATES = Object.freeze(
+  STATES.filter((state) => state !== TERMINAL_STATE),
+);
+
+/**
  * Transition table. `to: null` means the target is computed by the reducer
  * (only `retry`: back to `blockedFrom` when set, else back to plan_review when
  * a plan exists, otherwise inbox).
@@ -81,6 +90,8 @@ const TRANSITIONS = Object.freeze({
   review_pass: { from: ['mr_open'], to: 'mergeable', actor: 'system' },
   mr_merged: { from: ['mergeable'], to: 'merged', actor: 'system' },
   dismiss: { from: ['merged'], to: 'done', actor: 'user' },
+  // Manual termination (human decision): archive from any non-terminal state.
+  terminate: { from: TERMINATABLE_STATES, to: 'done', actor: 'user' },
   retry: { from: ['blocked'], to: null, actor: 'user' },
   block: { from: BLOCKABLE_STATES, to: 'blocked', actor: 'system' },
 });
@@ -98,6 +109,7 @@ const ACTION_MESSAGES = Object.freeze({
   review_pass: 'AI review 通过，可合并',
   mr_merged: 'MR 已合并',
   dismiss: '已归档，工单完成',
+  terminate: '人工终结，工单完成',
   retry: '解除阻塞，继续流程',
   block: '工单已阻塞',
 });

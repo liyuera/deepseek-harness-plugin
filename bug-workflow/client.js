@@ -100,7 +100,7 @@ window.__ModuleLoader__.load({
     const h = React.createElement;
     const ID = '@liyuera/dsh-bug-workflow';
     /** Visible build tag so the running UI can be verified after a reload. */
-    const CLIENT_BUILD = 'p7-test.2026-11-09.1';
+    const CLIENT_BUILD = 'p7-test.2026-11-09.2';
 
     /** Snapshot/action endpoints (same origin as the Harness Web page). */
     const API = Object.freeze({
@@ -658,6 +658,20 @@ window.__ModuleLoader__.load({
       confirm: '确认测试通过？将清理工作树并进入「提交并创建 MR」。',
       tone: 'primary',
     });
+    /**
+     * Manual termination: available in every non-terminal state (including
+     * `blocked`) so a ticket whose automated flow cannot continue can still be
+     * closed by a human. Routed through the state machine (`terminate ->
+     * done`) like every other board action.
+     */
+    const TERMINATE_DESCRIPTOR = Object.freeze({
+      action: 'terminate',
+      label: '标记完成',
+      confirm: '确认把这张工单标记为完成并归档？归档后不再出现在看板（可填原因）。',
+      input: 'reason',
+      tone: 'danger',
+    });
+
     const TEST_REVERT_DESCRIPTOR = Object.freeze({
       action: 'test_revert',
       label: '测试不通过',
@@ -4954,6 +4968,45 @@ window.__ModuleLoader__.load({
      * A merge record exists only while the ticket is in the test step; a stale
      * one for a ticket that moved on is ignored by the workflow guard.
      */
+    /**
+     * 人工终结入口（任意非终态）。
+     *
+     * Some tickets cannot continue automatically (blocked with a cause only a
+     * person can resolve, a fix that turns out unnecessary, an MR handled
+     * outside the plugin…). This footer keeps a single, always-available
+     * escape hatch: confirm + optional reason -> `terminate` -> `done` (archived,
+     * hidden from the board). The reason is written to the timeline by the
+     * state machine, so the ledger keeps why it was closed.
+     */
+    function TerminateNotice({ ticket, busyAction, locked, onAction }) {
+      if (ticket.workflow === 'done') return null;
+      const busy = busyAction === TERMINATE_DESCRIPTOR.action;
+      const disabled = busy || locked === true;
+      return h('div', {
+        'data-bug-terminate': 'ready',
+        style: {
+          display: 'flex',
+          flexWrap: 'wrap',
+          alignItems: 'center',
+          gap: 8,
+          paddingTop: 2,
+          minWidth: 0,
+        },
+      },
+        h('span', { style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary, minWidth: 0 } },
+          '流程走不下去？可以人工终结这张工单（归档，不再出现在看板）。'),
+        h('button', {
+          type: 'button',
+          disabled,
+          title: locked === true ? UNBOUND_WORKSPACE_HINT : TERMINATE_DESCRIPTOR.confirm,
+          onClick: (event) => {
+            if (disabled) return;
+            if (typeof onAction === 'function') onAction(TERMINATE_DESCRIPTOR, event);
+          },
+          style: smallButtonStyle(disabled),
+        }, busy ? '处理中…' : TERMINATE_DESCRIPTOR.label));
+    }
+
     function TestNotice({ ticket, snapshot, busyAction, locked, onAction }) {
       if (ticket.workflow !== 'fix_done') return null;
       const merged = snapshot !== null && snapshot.test !== null && typeof snapshot.test === 'object'
@@ -5589,6 +5642,7 @@ window.__ModuleLoader__.load({
         h(FixNotice, { ticket, snapshot, busyAction, locked, onAction }),
         // P7: merge-to-feat / revert / pass (cleanup) of the manual test step.
         h(TestNotice, { ticket, snapshot, busyAction, locked, onAction }),
+        h(TerminateNotice, { ticket, busyAction, locked, onAction }),
         // P5: submission progress (board-only 「提交并创建 MR」) and the
         // service-owned Review/merge status banners. Both are static after 200;
         // no demo submit_mr/mr_created/review_*/dismiss button exists any more.
@@ -6327,7 +6381,12 @@ window.__ModuleLoader__.load({
           payload = descriptor.payload === undefined || descriptor.payload === null ? {} : descriptor.payload;
           if (descriptor.input === 'reason') {
             const trimmed = typeof reason === 'string' ? reason.trim() : '';
-            payload = { ...payload, reason: trimmed === '' ? '未填写驳回原因' : trimmed };
+            if (descriptor.action === 'terminate') {
+              // The state machine writes `message` into the timeline event.
+              payload = { message: trimmed === '' ? '人工终结，工单完成' : `人工终结：${trimmed}` };
+            } else {
+              payload = { ...payload, reason: trimmed === '' ? '未填写驳回原因' : trimmed };
+            }
           }
         }
 

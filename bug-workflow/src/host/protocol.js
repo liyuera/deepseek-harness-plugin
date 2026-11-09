@@ -55,6 +55,7 @@ export const ACTIONS = Object.freeze([
   'review_pass',
   'mr_merged',
   'dismiss',
+  'terminate',
   'retry',
   'block',
 ]);

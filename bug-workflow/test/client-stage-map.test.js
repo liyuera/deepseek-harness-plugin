@@ -159,5 +159,11 @@ test('destructive actions use the in-board Popconfirm, never a native dialog', (
   assert.equal(/function confirmDialog\s*\(/.test(source), false, 'the native confirm wrapper must be gone');
   // Confirm flows still run through the single host-guarded action path.
   assert.ok(source.includes('confirmPendingAction'));
+  // Manual termination is available from any non-terminal state.
+  assert.ok(source.includes("'data-bug-terminate'"), 'the manual terminate entry must exist');
+  assert.ok(
+    source.includes("descriptor.action === 'terminate'"),
+    'the termination reason must be forwarded as the timeline message',
+  );
   assert.ok(source.includes('executeAction(request.descriptor, request.ticket, reason)'));
 });
