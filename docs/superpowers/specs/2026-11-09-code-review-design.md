@@ -380,7 +380,7 @@ code-review/
 - **M2 审查链（已完成）**：reviewer + schema + render + steer 闭环，用一份最小规则表（5 条）跑通。
 - **M3 规范（已完成）**：补全四维度规则（24 条）与原则层。
 - **M4 打磨（已完成）**：熔断（可恢复）、取消语义、只读硬门禁、截断、可观测性、测试补齐（68 个用例）。
-- **M5 端到端验收（Task 7 收尾）**：真实安装到 profile + 真实会话跑通自动审查/复审/`/review` 三条路径。
+- **M5 端到端验收（2026-11-10 已完成）**：`dsh --profile headless --patch` + 真实模型跑通三态——首轮 blocking 注入「结论: 需修改…修完会再复审一次」、修复后复审干净注入「结论: 通过…可以收尾了」、`maxRounds: 1` 时文案改为「不会再自动复审」；审查者子代理不回触发审查，运行后仓库只有主代理改动。`dsh plugin add link:` 安装与 bundle 登记已验证（精简 headless profile 缺 `workspaceChanges`，插件会 pending——README 已写明要求桌面/Web profile）。剩 `/review` 的 GUI 人工验收。
 
 ## 16. M0 核签记录（2026-11-10）
 
