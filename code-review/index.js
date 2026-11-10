@@ -102,11 +102,17 @@ export function apply(ctx, config) {
       ctx.logger.debug?.(`[code-review] skip: ${decision.reason}`)
       return
     }
+
+    // 先确认摘要属于本 turn 且确有改动，避免消费轮次后才发现无可审内容。
+    const summary = ctx.workspaceChanges.summary(sessionId, seq)
+    if (summary === undefined || summary.turn !== turn || summary.files.length === 0) {
+      ctx.logger.debug?.(`[code-review] skip: stale-summary turn=${turn}`)
+      return
+    }
     if (!tracker.begin(sessionId, turn)) return
 
     try {
       const rules = await getRules()
-      const summary = ctx.workspaceChanges.summary(sessionId, seq)
       const collected = await collect({
         workspaceChanges: ctx.workspaceChanges,
         sessionId,
@@ -129,6 +135,7 @@ export function apply(ctx, config) {
       })
 
       if (!reviewed.ok) {
+        if (signal?.aborted) return
         if (tracker.recordFailure(sessionId)) {
           ctx.logger.warn('[code-review] 连续失败，已暂停本会话的自动审查')
         }
@@ -144,8 +151,9 @@ export function apply(ctx, config) {
         summary: scope,
         mode: 'steer',
       })
-      const hadBlocking = previousBlocking.get(sessionId) === true
-      previousBlocking.set(sessionId, text !== '')
+      const previous = previousBlocking.get(sessionId)
+      const hadBlocking = previous?.turn === turn && previous.blocking === true
+      previousBlocking.set(sessionId, { turn, blocking: text !== '' })
 
       if (text !== '') {
         agent.steer(message(`${text}\n\n请按上面每条 finding 修复；修完会再复审一次。如与用户新指令冲突，以用户指令为准。`))
@@ -153,6 +161,7 @@ export function apply(ctx, config) {
         agent.steer(message(`${renderPass({ summary: scope })}\n\n可以收尾了。`))
       }
     } catch (error) {
+      if (signal?.aborted) return
       ctx.logger.warn(`[code-review] review failed: ${error.message}`)
       tracker.recordFailure(sessionId)
     } finally {
