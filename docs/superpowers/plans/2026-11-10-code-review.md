@@ -372,7 +372,7 @@ Run:
 cd /tmp && DEEPSEEK_API_KEY=$(python3 -c "import re;s=open('$HOME/.dsh/.credentials.yaml').read();print(re.search(r'DEEPSEEK_API_KEY:\s*(\S+)',s).group(1))") \
   dsh --profile headless --patch /Users/liyu/Documents/www/DeepSeek/deepseek-harness/deepseek-harness-plugin/code-review/patch-dev.yml "回复 OK"
 ```
-Expected: stdout 出现 `[code-review] loaded preset=code-review maxRounds=2`
+Expected: 进程正常结束、加载无报错。注意：headless 0.2.2-rc.1 没有为 `ctx.logger` 装 console exporter，这行日志不会出现在 stdout（Task 1 实测）。要确认加载，用临时 `console.error` 探针，或故意传非法配置看 `unknown config key` 报错。
 
 - [ ] **Step 9: 提交**
 
