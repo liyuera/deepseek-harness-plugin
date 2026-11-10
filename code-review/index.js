@@ -2,12 +2,11 @@
  * Host half of `@liyuera/dsh-code-review`.
  * @module @liyuera/dsh-code-review
  */
-import { readFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { resolveConfig } from './src/host/config.js'
 import { collect } from './src/host/collect.js'
-import { loadRules, renderRulesPrompt } from './src/host/rules.js'
+import { loadRulesResilient } from './src/host/rules.js'
 import { renderFindings, renderPass } from './src/host/render.js'
 import { buildPrompt, runReview } from './src/host/reviewer.js'
 import { shouldReview } from './src/host/trigger.js'
@@ -19,36 +18,14 @@ export const name = 'code-review'
 export const inject = ['commands', 'subagents', 'workspaceChanges', 'tools']
 
 const PACKAGE_ROOT = dirname(fileURLToPath(import.meta.url))
-const PRINCIPLE_IDS = [
-  'PRINCIPLE-correctness',
-  'PRINCIPLE-security',
-  'PRINCIPLE-performance',
-  'PRINCIPLE-maintainability',
-]
 
 /** 构造一条可被 steer 注入的用户消息。source 必填，漏了渲染时会崩。 */
 function message(text) {
   return { id: crypto.randomUUID(), role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text }] }
 }
 
-/** 加载规范；失败时降级为只用原则层，不阻塞会话。 */
-async function loadRulesOrFallback(logger, config) {
-  const rulesPath = join(PACKAGE_ROOT, config.rulesFile)
-  const principlesPath = join(PACKAGE_ROOT, config.principlesFile)
-  try {
-    const loaded = await loadRules({ rulesPath, principlesPath })
-    return {
-      prompt: renderRulesPrompt(loaded),
-      allowedRuleIds: new Set([...loaded.rules.map((rule) => rule.id), ...PRINCIPLE_IDS]),
-    }
-  } catch (error) {
-    logger.warn(`[code-review] 规则文件不可用，降级为只用原则层：${error.message}`)
-    return { prompt: await readFile(principlesPath, 'utf8'), allowedRuleIds: new Set(PRINCIPLE_IDS) }
-  }
-}
-
 /**
- * 挂载插件。规范按需加载并记忆，避免在 apply 里做异步初始化。
+ * 挂载插件。规范每轮审查前从包目录读盘，改完下一轮即生效；不做缓存。
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @param {object} [config]
  */
@@ -58,15 +35,19 @@ export function apply(ctx, config) {
   const tracker = createTracker()
   const latestSeq = new Map()
   const previousBlocking = new Map()
-  let rulesPromise
+  let warned = false
 
-  const getRules = () => {
-    rulesPromise ??= loadRulesOrFallback(ctx.logger, resolved).catch((error) => {
-      rulesPromise = undefined
-      throw error
-    })
-    return rulesPromise
+  const warnOnce = (text) => {
+    if (warned) return
+    warned = true
+    ctx.logger.warn(text)
   }
+
+  const getRules = () => loadRulesResilient({
+    rulesPath: join(PACKAGE_ROOT, resolved.rulesFile),
+    principlesPath: join(PACKAGE_ROOT, resolved.principlesFile),
+    warn: warnOnce,
+  })
 
   ctx.commands.register(createReviewCommand({
     config: resolved,

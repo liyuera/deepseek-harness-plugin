@@ -13,6 +13,14 @@ const PREFIX_BY_DIMENSION = Object.freeze({
 const SEVERITIES = new Set(['high', 'medium', 'low', 'nit'])
 const FIELDS = ['id', 'dimension', 'severity', 'title', 'check', 'bad', 'good']
 
+/** 原则层没有硬规则 id，finding 可引用这组固定 id。 */
+export const PRINCIPLE_IDS = Object.freeze([
+  'PRINCIPLE-correctness',
+  'PRINCIPLE-security',
+  'PRINCIPLE-performance',
+  'PRINCIPLE-maintainability',
+])
+
 /**
  * 校验规则表。任何不合法都抛错——规范是产品的一部分，不静默降级。
  * @param {readonly object[]} rules
@@ -87,4 +95,23 @@ export function renderRulesPrompt({ rules, principles }) {
     '## 硬规则（逐条核对，finding 必须引用下列 id 之一）',
     table,
   ].join('\n')
+}
+
+/**
+ * 每轮从磁盘加载规范；规则文件不可用时降级为只用原则层（fail-open）。
+ * 原则文件也读不到时抛错，由调用方决定如何记录。
+ * @param {{rulesPath:string, principlesPath:string, warn?:Function, readFile?:Function}} input
+ * @returns {Promise<{prompt: string, allowedRuleIds: Set<string>}>}
+ */
+export async function loadRulesResilient({ rulesPath, principlesPath, warn, readFile = readFileDefault }) {
+  try {
+    const loaded = await loadRules({ rulesPath, principlesPath, readFile })
+    return {
+      prompt: renderRulesPrompt(loaded),
+      allowedRuleIds: new Set([...loaded.rules.map((rule) => rule.id), ...PRINCIPLE_IDS]),
+    }
+  } catch (error) {
+    warn?.(`[code-review] 规则文件不可用，降级为只用原则层：${error.message}`)
+    return { prompt: await readFile(principlesPath, 'utf8'), allowedRuleIds: new Set(PRINCIPLE_IDS) }
+  }
 }

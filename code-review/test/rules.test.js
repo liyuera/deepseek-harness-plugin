@@ -1,6 +1,12 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { validateRules, loadRules, renderRulesPrompt } from '../src/host/rules.js'
+import {
+  validateRules,
+  loadRules,
+  renderRulesPrompt,
+  loadRulesResilient,
+  PRINCIPLE_IDS,
+} from '../src/host/rules.js'
 
 const valid = [{
   id: 'SEC-002', dimension: 'security', severity: 'high', title: '敏感信息不得入日志',
@@ -52,4 +58,94 @@ test('renderRulesPrompt 带 id 与正反例', () => {
   assert.match(text, /SEC-002/)
   assert.match(text, /logger\.info\(token\)/)
   assert.match(text, /# 原则/)
+})
+
+const principles = '# 原则\n不要吞异常。'
+
+/** 按路径分发的 readFile 假实现；rulesBody 为 undefined 时表示规则文件读取失败。 */
+function makeReader(rulesBody) {
+  return async (path) => {
+    if (path.endsWith('rules.json')) {
+      if (rulesBody === undefined) throw new Error(`ENOENT: no such file, open '${path}'`)
+      return rulesBody
+    }
+    if (path.endsWith('principles.md')) return principles
+    throw new Error(`unexpected path: ${path}`)
+  }
+}
+
+const options = (readFile, warn) => ({
+  rulesPath: 'rules/rules.json',
+  principlesPath: 'rules/principles.md',
+  readFile,
+  warn,
+})
+
+test('loadRulesResilient 正常路径返回双层 prompt 与规则白名单', async () => {
+  const warnings = []
+  const result = await loadRulesResilient(options(makeReader(JSON.stringify(valid)), (m) => warnings.push(m)))
+  assert.match(result.prompt, /## 原则/)
+  assert.match(result.prompt, /## 硬规则/)
+  assert.match(result.prompt, /SEC-002/)
+  assert.match(result.prompt, /不要吞异常/)
+  assert.deepEqual(warnings, [])
+  assert.deepEqual([...result.allowedRuleIds], [
+    'SEC-002',
+    'PRINCIPLE-correctness',
+    'PRINCIPLE-security',
+    'PRINCIPLE-performance',
+    'PRINCIPLE-maintainability',
+  ])
+})
+
+test('loadRulesResilient 规则文件缺失时降级为只用原则层', async () => {
+  const warnings = []
+  const result = await loadRulesResilient(options(makeReader(undefined), (m) => warnings.push(m)))
+  assert.equal(result.prompt, principles)
+  assert.deepEqual([...result.allowedRuleIds], [...PRINCIPLE_IDS])
+  assert.equal(warnings.length, 1)
+  assert.match(warnings[0], /降级为只用原则层/)
+  assert.match(warnings[0], /rules\.json/)
+})
+
+test('loadRulesResilient 规则 JSON 非法时降级为只用原则层', async () => {
+  const warnings = []
+  const result = await loadRulesResilient(options(makeReader('not json'), (m) => warnings.push(m)))
+  assert.equal(result.prompt, principles)
+  assert.deepEqual([...result.allowedRuleIds], [...PRINCIPLE_IDS])
+  assert.equal(warnings.length, 1)
+  assert.match(warnings[0], /降级为只用原则层/)
+  assert.match(warnings[0], /not valid JSON/)
+})
+
+test('loadRulesResilient 原则文件也不可读时抛错', async () => {
+  const warnings = []
+  const readFile = async (path) => {
+    throw new Error(`EACCES: permission denied, open '${path}'`)
+  }
+  await assert.rejects(
+    () => loadRulesResilient(options(readFile, (m) => warnings.push(m))),
+    /principles\.md/,
+  )
+  assert.equal(warnings.length, 1)
+  assert.match(warnings[0], /降级为只用原则层/)
+})
+
+test('loadRulesResilient 每次调用都重新读盘，不缓存', async () => {
+  let rulesReads = 0
+  const readFile = async (path) => {
+    if (path.endsWith('rules.json')) {
+      rulesReads += 1
+      const title = rulesReads === 1 ? '标题 A' : '标题 B'
+      return JSON.stringify([{ ...valid[0], title }])
+    }
+    return principles
+  }
+  const first = await loadRulesResilient(options(readFile))
+  const second = await loadRulesResilient(options(readFile))
+  assert.match(first.prompt, /标题 A/)
+  assert.doesNotMatch(first.prompt, /标题 B/)
+  assert.match(second.prompt, /标题 B/)
+  assert.doesNotMatch(second.prompt, /标题 A/)
+  assert.equal(rulesReads, 2)
 })
