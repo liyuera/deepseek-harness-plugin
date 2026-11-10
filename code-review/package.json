@@ -10,5 +10,6 @@
     "./package.json": "./package.json"
   },
   "files": ["index.js", "cordis.patch.yml", "src", "rules", "test"],
+  "engines": { "dsh": ">=0.2.2-rc.1" },
   "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
 }

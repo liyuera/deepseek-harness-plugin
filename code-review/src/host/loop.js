@@ -37,6 +37,17 @@ export function createTracker(options = {}) {
     end(sessionId) {
       reviewing.delete(sessionId)
     },
+    /**
+     * 回滚「已 begin 但最终没有真正审查」的一轮计数（最低 0）。
+     *
+     * 用于取材为空、内容指纹与同一 turn 上一轮重复等跳过场景：这些跳过不该消耗轮次，
+     * 也不触碰 `reviewing` 锁与 failures/breaker。调用方仍需在 finally 里 end() 释放锁。
+     */
+    abandonRound(sessionId, turn) {
+      const slot = key(sessionId, turn)
+      const count = rounds.get(slot) ?? 0
+      if (count > 0) rounds.set(slot, count - 1)
+    },
     roundsOf(sessionId, turn) {
       return rounds.get(key(sessionId, turn)) ?? 0
     },

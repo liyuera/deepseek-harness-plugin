@@ -3,6 +3,8 @@
  * @module @liyuera/dsh-code-review/host/collect
  */
 
+import { createHash } from 'node:crypto'
+
 /**
  * 判断路径是否属于待审代码。
  * @param {string} path
@@ -26,10 +28,31 @@ export function renderHunks(hunks) {
 }
 
 /**
+ * 计算一次取材结果的内容指纹（路径 + 渲染文本），用于同一 turn 内去重。
+ * @param {readonly {path: string, text: string}[]} files
+ * @returns {string} sha256 十六进制摘要；空数组返回空串摘要
+ */
+export function fingerprint(files) {
+  const hash = createHash('sha256')
+  for (const file of files) {
+    hash.update(file.path)
+    hash.update('\0')
+    hash.update(file.text)
+    hash.update('\0')
+  }
+  return hash.digest('hex')
+}
+
+/**
  * 收集本轮可审的 diff。
  *
- * `skipped[].reason` 为 `'not-code' | 'budget' | 'unavailable'` 之一，或服务 `diff.kind`
- * 原值（如 `'binary' | 'oversized' | 'refusal'`）；`bytes` 为已收录 `files[].text` 的 UTF-8 字节数。
+ * `files[].added/deleted` 取自 `summary.files[].added/deleted`（`WorkspaceChangedFile`），
+ * 因为运行时 `WorkspaceFileDiff` 只有 hunks、没有行数字段；缺失时回退 0。
+ *
+ * `skipped[].reason` 为 `'not-code' | 'budget' | 'unavailable' | 'coarse'` 之一，或服务
+ * `diff.kind` 原值（如 `'binary' | 'oversized' | 'refusal'`）。`coarse` 表示 diff 服务超时后
+ * 返回的整文件替换形态，不能当普通 diff 送审（否则旧行会被误认为新增）。
+ * `bytes` 为已收录 `files[].text` 的 UTF-8 字节数。
  *
  * @param {object} input
  * @param {{summary:Function,diff:Function}} input.workspaceChanges 服务（可为假实现）
@@ -67,6 +90,10 @@ export async function collect({ workspaceChanges, sessionId, seq, config, signal
       skipped.push({ path: file.path, reason: diff.kind })
       continue
     }
+    if (diff.coarse === true) {
+      skipped.push({ path: file.path, reason: 'coarse' })
+      continue
+    }
     const text = renderHunks(diff.hunks)
     const size = Buffer.byteLength(text, 'utf8')
     if (bytes + size > config.maxDiffBytes) {
@@ -80,8 +107,8 @@ export async function collect({ workspaceChanges, sessionId, seq, config, signal
       display: file.display ?? file.path,
       hunks: diff.hunks,
       text,
-      added: diff.added,
-      deleted: diff.deleted,
+      added: file.added ?? 0,
+      deleted: file.deleted ?? 0,
     })
   }
 
