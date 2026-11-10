@@ -1,0 +1,14 @@
+{
+  "name": "@liyuera/dsh-code-review",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./src/*": "./src/*",
+    "./package.json": "./package.json"
+  },
+  "files": ["index.js", "cordis.patch.yml", "src", "rules", "test"],
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
+}

@@ -1,0 +1,32 @@
+# 两条 insert：审查者 preset（只读工具面 + 人格）与本插件。
+- insert:
+    - id: preset-code-review
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: code-review
+        name: 通用代码审查
+        description: 通用代码审查——只读子代理，只审不改
+        order: 50
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: |-
+                你是代码审查者，只做审查，不改代码。你没有写文件、改文件或执行命令的能力。
+                对给定的 diff 逐条核对规则，只报告确有把握的问题；拿不准就不报。
+              complete: true
+              includeRuntimeContext: false
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              read: true
+              readImage: false
+              write: false
+              edit: false
+              applyPatch: false
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+    - id: code-review
+      name: '@liyuera/dsh-code-review'
