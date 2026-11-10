@@ -1,29 +1,29 @@
-/** Tools that can mutate the workspace, run commands, or delegate work; the reviewer must never get them. */
-export const MUTATING_TOOLS = new Set([
-  'write',
-  'edit',
-  'apply_patch',
-  'applyPatch',
-  'str_replace_editor',
-  'bash',
-  'pwsh',
-  'subagent',
-  'subagent_fork',
-  'workflow',
-  'create_worktree',
-  'jobs',
+/**
+ * Tools the reviewer may call: read-only inspection plus structured result submission.
+ * This is an allowlist on purpose: any tool not listed here is denied for reviewer
+ * agents, so new tools (shell, terminal, plugin management, scheduling, delegation,
+ * messaging, persistence) fail closed instead of silently reaching the reviewer.
+ */
+export const READONLY_TOOLS = new Set([
+  'read',
+  'read_image',
+  'glob',
+  'grep',
+  'structured_output',
 ])
 
 /**
- * Deny mutating tools for agents composed from the reviewer preset.
+ * Allow only read-only tools for agents composed from the reviewer preset.
+ * Non-reviewer agents, and calls with no exec/agent/preset, abstain (undefined).
+ * Reviewer calls not in the allowlist are denied, including a missing tool name.
  * @param {string} reviewerPreset preset id used for reviewer children
- * @returns {(exec: {name: string, agent?: {session?: {header?: {agentPreset?: string}}}}) => string | undefined}
+ * @returns {(exec?: {name?: string, agent?: {session?: {header?: {agentPreset?: string}}}}) => string | undefined}
  */
 export function createReviewerGuard(reviewerPreset) {
   return (exec) => {
     const preset = exec?.agent?.session?.header?.agentPreset
     if (preset !== reviewerPreset) return undefined
-    if (!MUTATING_TOOLS.has(exec.name)) return undefined
-    return `code-review: 审查者（${reviewerPreset}）只读，${exec.name} 被拒绝`
+    if (READONLY_TOOLS.has(exec?.name)) return undefined
+    return `code-review: 审查者（${reviewerPreset}）只读，${String(exec?.name)} 不在只读白名单内，已拒绝`
   }
 }
