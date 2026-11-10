@@ -37,7 +37,7 @@ AI 在主会话里写完代码，人往往要到提 MR 之后才第一次被审�
 | 主会话 | 用户正在对话、AI 正在写代码的那个 Session |
 | 审查轮 | 一次「审查 → 回注 → 修复」的循环，同一 turn 内可有多次 |
 | 原则层 | `principles.md`，散文式判断标准，决定召回 |
-| 规则层 | `rules.yaml`，带 id/severity/正反例的可枚举检查项，决定标签稳定性 |
+| 规则层 | `rules.json`，带 id/severity/正反例的可枚举检查项，决定标签稳定性 |
 | 变更轮 | `workspace/changes` 事件宣告的、有文件改动的顶层轮次 |
 | blocking | `severity` 命中 `blockingSeverities` 集合的 finding（默认 `[high, medium]`） |
 
@@ -46,11 +46,12 @@ AI 在主会话里写完代码，人往往要到提 MR 之后才第一次被审�
 ```
 ┌───────────────────── Host 插件（无 client 半边）─────────────────────┐
 │  trigger.js   门禁：origin / 开关 / 轮次 / 有无代码变更                 │
-│  collect.js   取材：ctx.workspaceChanges 优先，git diff 回退            │
+│  collect.js   取材：ctx.workspaceChanges（硬依赖，无 git 回退）          │
 │  reviewer.js  审查：ctx.subagents.startActivation + outputSchema        │
 │  render.js    渲染：findings[] → 原始输出文本                           │
-│  rules.js     规范：加载并校验 principles.md / rules.yaml               │
-│  loop.js      轮次状态机：计数、封顶、失败降级                           │
+│  rules.js     规范：加载并校验 principles.md / rules.json               │
+│  loop.js      轮次状态机：计数、封顶、失败熔断                           │
+│  guard.js     只读兜底：按 preset id 拒绝改工作区/执行命令/派活的工具     │
 └───────┬──────────────────────┬───────────────────────┬────────────────┘
         │ 监听                  │ 起子代理               │ steer
         ▼                      ▼                       ▼
@@ -65,9 +66,12 @@ AI 在主会话里写完代码，人往往要到提 MR 之后才第一次被审�
 - `agent/turn-stopping` 的监听签名是 `ctx.on('agent/turn-stopping', ({ agent, turn }) => …)`，`agent.session` 可拿到会话；它是自然停止边界上一次 awaited 通知，监听器可调 `agent.steer(UserMessage)` 要求再走一步。
 - 起子代理用 `ctx.subagents.startActivation({ provider, label, request, signal, delivery })`，返回 `{ childId, messageId?, result, dispose }`；`request` 是 `SubagentStartRequest`，支持 `parent`、`prompt`、`agentPreset`、`outputSchema`、`agentOptions`、`cwd`、`maxDepth`。
 - **spawn 请求没有 `toolFilter` / `persona`**：`dsh-tool-subagent` 对这两个字段显式报错，指向 Agent Preset。只读与人格都必须在 preset 里组合。
-- 本地子代理的只读由 preset 决定：`dsh-tool-fs` 的 `read` / `write` / `edit` / `applyPatch` 是独立开关，不挂 bash 就没有 shell。
+- 本地子代理的工具由 preset 组合：`dsh-tool-fs` 的 `read` / `write` / `edit` / `applyPatch` 是独立开关。但 preset 里的 `write: false` 只控制该行挂载的工具，**移除不了继承自 profile 根层的同名工具**——只读必须另有 `ctx.tools.guard` 兜底（§6.3）。
 - `ctx.workspaceChanges.summary(sessionId, seq)` / `.diff(sessionId, seq, index, signal)` 给出每轮的变更文件与逐文件 hunk（3 行上下文），覆盖未提交改动与非 git 文件。
 - 子代理会话用 `session.header.origin === 'subagent'` 识别；主会话该字段是空，所以判据必须是「等于 subagent」而不是「等于 main」。
+- `agent/turn-stopping` 由 agent loop 以 **串行** dispatch（`dispatch.serial`）派发：前一个异步监听器 await 完成才轮到下一个。`workspace-changes` 正是在自己的 turn-stopping 监听里 append 本轮 `workspace/changes`，所以本插件的监听必须注册在它之后，才能同步读到本轮 seq。
+- `ctx.workspaceChanges.diff(...)` 内部用 `AbortSignal.any([signal, lifetime.signal])`，传 `undefined` 会抛 `TypeError`；turn-stopping 给的 `signal` 必须原样透传给 `collect` 与 `runReview`。
+- 审查者 preset 的人格若设 `complete: true`，宿主会认为系统提示已完整，从而不再追加「用 `structured_output` 工具回传结构化结果」的指令；此时 prompt 必须自己写明这一步，否则模型会把 JSON 当普通文本返回、`structured` 缺失（见 §6.3）。
 
 ## 5. 与既有能力的关系
 
@@ -91,19 +95,21 @@ AI 在主会话里写完代码，人往往要到提 MR 之后才第一次被审�
 2. `agent.session.header.origin !== 'subagent'`——否则审查者自己的轮次会再触发审查。
 3. 该会话不在审查中（`reviewing` 集合，按 sessionId）。
 4. 本 turn 的审查轮数 < `maxRounds`。
-5. 存在可用的变更来源：本会话最新的 `workspace/changes` 事件（优先），或 `ctx.subprocess` 可用的 git 回退（§6.2）；且变更文件里至少一个匹配 `codeExtensions`。
+5. 本会话存在 `workspace/changes` 事件（`ctx.workspaceChanges` 是硬依赖，v1 没有 git 回退，见 §6.2）。
 6. 未因连续失败被本会话熔断（§9.4）。
+
+通过门禁后还有一道**预检**：用门禁算出的 seq 读 `ctx.workspaceChanges.summary(sessionId, seq)`，要求摘要存在、`summary.turn === turn`、`summary.files.length > 0`，才占用轮次（`begin()`）并开始取 diff。否则按 `stale-summary` 跳过并记 debug 日志。这道预检的两个作用：不把上一 turn 的旧摘要当成本轮改动来审；不为了一个空的/陈旧的 turn 消耗 `maxRounds`。
 
 任一条不满足即跳过，不写任何会话事件。
 
 ### 6.2 取材
 
 - 从 `session/event` 订阅里缓存每个 session 最新的 `workspace/changes` seq。
-- `ctx.workspaceChanges.summary(sessionId, seq)` 取文件列表；`diff(...)` 逐文件取 hunk。
-- 只取 `codeExtensions` 命中的文件；跳过 `binary` / `oversized`（在 prompt 里点名告知跳过，不静默）。
-- 按文件顺序累积，超过 `maxDiffBytes` 后停止并声明「已截断，剩余 N 个文件未审」。
-- `ctx.workspaceChanges` 不可用时回退 `ctx.subprocess` 跑 `git diff --unified=3`；两者都不可用则跳过本轮并记一次警告。
-- **监听顺序依赖**：`workspace-changes` 自己也是在 `agent/turn-stopping` 里才把本轮的 `workspace/changes` 事件写进会话的，串行派发下后注册的监听器才能读到。因此本插件必须排在它之后加载（profile patch 的顺序天然满足）；拿不到本轮 seq 时按上一节回退 git diff，并记一次警告，不能假设「容器里一定有 workspace-changes」。
+- `ctx.workspaceChanges.summary(sessionId, seq)` 取文件列表；`diff(sessionId, seq, index, signal)` 逐文件取 hunk（`signal` 必须是真的 `AbortSignal`）。
+- 只取 `codeExtensions` 命中的文件；跳过 `binary` / `oversized` / 服务读不到的项，并在 prompt 里点名告知跳过，不静默。
+- 按文件顺序累积，按 UTF-8 字节数（`Buffer.byteLength`）计，超过 `maxDiffBytes` 后停止并声明「已截断，剩余 N 个文件未审」。
+- **`ctx.workspaceChanges` 是硬依赖**：`inject` 里声明它，组合缺少该插件时本插件不加载。v1 刻意不做 `ctx.subprocess` + `git diff` 回退——回退会引入两套取材语义（未提交 vs 相对基线）和两套测试面，留到 v2。
+- **监听顺序依赖**：见 §4 的串行 dispatch 说明。本插件靠 profile patch 的顺序排在 `workspace-changes` 之后；顺序不满足时预检会因 `summary.turn !== turn` 跳过（debug 日志可见），不会误审上一轮的 diff。
 
 ### 6.3 审查
 
@@ -124,24 +130,25 @@ const activation = await ctx.subagents.startActivation({
 const result = await activation.result   // 超时就 activation.dispose()
 ```
 
-- 只读靠 preset，不靠提示词：`code-review` 这个 preset 里只挂 `read` / `grep` / `glob` 对应的工具，`dsh-tool-fs` 的 `write`、`edit`、`applyPatch` 全关，且不挂任何 bash/终端行。0.2.2 的 spawn 请求没有 `toolFilter`，preset 是唯一的结构性只读手段。
+- 只读靠两层，不靠提示词：① `code-review` preset 里只挂 `read` / 搜索工具，`dsh-tool-fs` 的 `write`、`edit`、`applyPatch` 全关；② 宿主 `ctx.tools.guard` 按 `reviewerPreset` 全名拒绝一切会改工作区、执行命令、委派子代理、装插件的工具（名单见 `src/host/guard.js`）。第二层是必须的：0.2.2 的 spawn 请求没有 `toolFilter`，而 preset 里的 `write: false` **移除不了继承自 profile 根层的工具**，只靠 preset 的「结构性只读」并不成立。
 - `delivery: 'caller'` 很关键：默认的 `parent` 投递会向父代理发一条「子代理完成」通知，白白多一轮模型调用；插件自己等 `result` 就够了。
-- 超时用 `dispose()` 而不是请求信号：请求 `signal` 只能取消尚未发布的工作，发布后的取消通道是 `dispose()`。
-- prompt 里明确：只读、不许改代码、拿不到完整文件时才用 read/grep 补上下文。
+- `signal` 从 turn-stopping 透传，但只覆盖「尚未发布的工作」；发布后的取消通道是 `dispose()`。实现上用一个整体 deadline 同时兜住 `startActivation`、`result` 与 `dispose` 三条路径（见 `runReview`），而不是分开设两个超时。
+- prompt 里明确：只读、不许改代码、拿不到完整文件时才用 read/grep 补上下文；并显式要求用 `structured_output` 工具回传结果（理由见 §4 最后一条）。
 - `stopReason !== 'completed'` 或 `structured` 缺失 → 视为审查失败（§9.4）。
+- 结果要过插件侧二次校验：`ruleId` 必须是本次注入的规则 id 或 `PRINCIPLE-<dimension>`，`location` 必须落在本次 diff 的文件内，`path:line` / `path:start-end` 两种形态；不合法的 finding 丢弃并记日志。
 - 审查者**不返回 verdict**：verdict 由插件按 `blockingSeverities` 从 findings 推导，消除模型自相矛盾的可能。
 
 ### 6.4 回注
 
 - 存在 blocking findings：`agent.steer({ id, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 渲染结果 + 修复要求 }] })`。修复要求里注明「修完会再复审一次」。`source` 是必填，漏了会在渲染时炸（`Cannot read properties of undefined (reading 'kind')`）。
-- 无 blocking：本轮不注入。例外——若上一轮审查有 blocking 且本轮已清零，注入一行「复审通过」，让主代理知道可以收尾。这一行同样走 `steer`，代价是多走一个步骤；换来的是模型不会在「改完了吗」的不确定里反复试探。
-- 达到 `maxRounds` 仍有 blocking：注入最终报告并声明「不再自动复审，请人工确认」，本 turn 停止自动审查。
+- 无 blocking：本轮不注入。例外——若同一 turn 的上一轮审查有 blocking 且本轮已清零，注入一行「复审通过」，让主代理知道可以收尾。这一行同样走 `steer`，代价是多走一个步骤；换来的是模型不会在「改完了吗」的不确定里反复试探。跨轮状态按 turn 记录，避免上一 turn 的阻塞历史泄漏到新 turn。
+- 达到 `maxRounds` 后门禁不再放行，不额外注入「终报告」——最后一轮已注入的那份报告就是终报告，此时主代理手上已有完整 findings 清单。
 
 ### 6.5 手动触发
 
 `/review` 是人在场时的入口，语义刻意与自动路径不同：
 
-- 忽略 `auto`、`maxRounds`、diff 去重，但仍然过 `origin !== 'subagent'` 和熔断检查。
+- 忽略 `enabled`、`auto`、`maxRounds`、diff 去重与熔断：`/review` 是人的显式动作，永远可用；`enabled` / `auto` / 熔断只作用于自动路径（`enabled: false` = 自动审查总开关关闭，手动入口保留）。
 - **只把报告作为命令结果输出到 UI，不回注、不 steer**。人在看着，由人决定是否让主代理动手。
 - v1 只支持无参数形式，审查范围固定为本轮变更；`/review <ref>` 这类范围参数留到 v2。
 
@@ -200,25 +207,29 @@ interface Finding {
 - 死代码与残留：未使用的导入/变量、调试日志、TODO 占位实现。
 - 边界缺失：空数组/空串/0/并发/超时路径未考虑。
 
-### 8.2 规则层 `rules/rules.yaml`
+### 8.2 规则层 `rules/rules.json`
 
-```yaml
-- id: SEC-002
-  dimension: security
-  severity: high
-  title: 敏感信息不得进入日志
-  check: logger/console 的参数里不得出现 token|password|secret|cookie 变量或字面量
-  bad: logger.info(`token=${token}`)
-  good: logger.info('token refreshed')
+用 JSON 而不是 YAML：规则是纯数据，JSON 用 `JSON.parse` 即可，为一个已知结构引一个 YAML 解析器不划算。每条：
+
+```json
+{
+  "id": "SEC-001",
+  "dimension": "security",
+  "severity": "high",
+  "title": "敏感信息不得进入日志",
+  "check": "日志调用的参数里不得出现凭据值：token、password、secret、cookie 等变量或字面量",
+  "bad": "logger.info(`token=${token}`)",
+  "good": "logger.info('session refreshed')"
+}
 ```
 
-- `id` 前缀按维度：`COR` / `SEC` / `PRF` / `MNT`，全局唯一，加载时校验，重复即启动失败（不静默）。
-- `severity` 取值固定四档；`check` 是一句话判断条件，`bad`/`good` 是判定锚点。
-- 首版交付 20~25 条，覆盖四个维度；后续按真实误报迭代。
+- 七个字段全部必填且为非空字符串，缺一个即加载失败（不静默）；`id` 前缀按维度：`COR` / `SEC` / `PRF` / `MNT`，全局唯一。
+- `severity` 取值固定四档；`check` 是一句话判断条件，`bad`/`good` 是判定锚点——**`good` 自身必须能通过 `check`**（早期草稿在这里翻过车）。
+- 首版交付 **24 条**（correctness 7 / security 6 / performance 4 / maintainability 7），覆盖四个维度；后续按真实误报迭代。
 
 ### 8.3 生命周期
 
-两个文件都在运行时从包目录读盘，改完下一轮审查即生效，不需要重新构建或重启。读取失败（文件缺失/Schema 非法）→ 插件降级为「只用原则层」并记一次警告，不阻塞会话。
+两个文件都在**每轮审查前**从包目录读盘，不缓存：改完下一轮审查即生效，不需要重新构建、重启或重载插件。读取失败（文件缺失/Schema 非法）→ 插件降级为「只用原则层」并记一次警告，不阻塞会话（fail-open 见 §9.4）。
 
 ## 9. 策略
 
@@ -232,14 +243,17 @@ interface Finding {
 
 ### 9.3 超时
 
-审查者整体 deadline 默认 120s，由插件侧 AbortSignal 控制；超时按失败处理。
+审查者整体 deadline 默认 120s（`reviewerTimeoutMs`），由插件侧一个 deadline 信号同时兜住 `startActivation`、`result` 与 `dispose` 三条路径；超时按失败处理。turn-stopping 的 `signal` 原样透传给 `collect` 与 `runReview`（`AbortSignal.any` 需要真实信号，不能传 `undefined`）。
 
 ### 9.4 失败与熔断
 
 - 单次失败（超时、stopReason 非 completed、schema 不合法、服务不可用）→ **fail-open 且静默**：放行本轮，不注入、不 steer、不阻塞。理由见下。
+- **取消不算失败**：turn 被 abort（用户中断、会话关闭）时不记失败、不注入；`finally` 仍释放 `reviewing` 锁。
 - 失败不占用 diff 去重位，下一轮 turn-stopping 会自然重试一次。
-- 同一会话连续 2 次失败 → 本会话熔断，关闭自动审查（不进会话，只记日志）；`/review` 仍可手动重试并看到失败原因。
-- 熔断状态只在内存，会话重开即恢复。
+- 同一会话连续 2 次失败 → 本会话熔断，关闭**自动**审查（不进会话，只记日志）。
+- 熔断可恢复：连续失败达到阈值后进入 **5 分钟冷却**（`DEFAULT_COOLDOWN_MS`），冷却期内自动路径跳过；冷却结束后**半开**放行一次——再失败立即重开冷却，成功则计数清零。熔断不会把会话永久锁死。
+- 熔断只关自动审查：`/review` 仍可手动重试并看到失败原因（§6.5）。
+- 熔断状态只在内存，会话释放或进程重启即恢复。
 
 为什么静默而不是往会话里报一句：失败注入要走 `steer`，而 `steer` 会让轮次继续——审查失败 → steer → 下一轮再失败，正是最不需要的循环。审查是质量辅助，不该用自身的失败去打断用户的工作；代价是用户不会被告知，这一点由 `/review` 的手动可见性补偿。
 
@@ -254,17 +268,17 @@ interface Finding {
     - id: code-review
       name: '@liyuera/dsh-code-review'
       config:
-        enabled: true
-        auto: true                       # false 时只保留 /review
+        enabled: true                     # false = 自动审查总开关关闭（/review 仍可用）
+        auto: true                        # false 时只保留 /review
         maxRounds: 2
         blockingSeverities: [high, medium]
-        codeExtensions: [.ts, .tsx, .js, .jsx, .vue, .py, .go, .java, .rs, .css, .less, .scss]
+        codeExtensions: [.js, .jsx, .ts, .tsx, .vue, .py, .go, .java, .rs, .css, .less, .scss]
         maxDiffBytes: 200000
         reviewerTimeoutMs: 120000
         reviewerPreset: code-review # 只读工具面的载体，见 §11
         # 省略 modelOverride 即沿用主会话模型；只覆盖其一视为配置非法
         # modelOverride: { provider: deepseek, model: deepseek-chat }
-        rulesFile: rules/rules.yaml
+        rulesFile: rules/rules.json
         principlesFile: rules/principles.md
 ```
 
@@ -282,12 +296,13 @@ code-review/
     collect.js            # §6.2 取材与截断
     reviewer.js           # §6.3 子代理调用与结果校验
     render.js             # §7.2 渲染
-    rules.js              # §8 加载、校验、合并
+    rules.js              # §8 加载、校验、渲染成 prompt 片段
     loop.js               # §9 轮次/熔断状态机
+    guard.js              # §6.3 只读兜底（ctx.tools.guard）
     command.js            # /review 处理器（复用 collect/reviewer/render）
   rules/
     principles.md
-    rules.yaml
+    rules.json
   test/
 ```
 
@@ -332,7 +347,7 @@ code-review/
 
 ## 12. 可观测性
 
-- 每次跳过记录原因（`disabled` / `subagent` / `no-changes` / `rounds-exhausted` / `breaker-open`），仅在 debug 级，不写会话事件。
+- 每次跳过记录原因（`disabled` / `manual-only` / `subagent` / `reviewing` / `rounds-exhausted` / `no-changes` / `breaker-open` / `stale-summary`），仅在 debug 级，不写会话事件。
 - 每次审查记录：轮次、文件数、diff 字节、耗时、findings 数、是否被截断。
 - 失败记录：原因分类（timeout / provider-error / schema-invalid / service-missing）。
 - 不记录 diff 正文与 finding 全文到日志（仓库代码可能含敏感串）。
@@ -341,17 +356,17 @@ code-review/
 
 | 层 | 内容 |
 |---|---|
-| 单测 | §6.1 门禁真值表（6 个条件逐条 false）；`rules.js` 重复 id / 非法 severity / 缺字段的拒绝；`render.js` 快照（含截断、跳过、通过三种）；`collect.js` 的字节截断与扩展名过滤；schema 校验拒绝非法 finding |
+| 单测 | §6.1 门禁真值表（7 个条件逐条 false）；`rules.js` 重复 id / 非法 severity / 缺字段 / 前缀不匹配的拒绝；`render.js` 快照（含截断、跳过、通过三种）；`collect.js` 的 UTF-8 字节截断与扩展名过滤；`reviewer.js` 的 schema 校验与非法 finding 拒绝；`loop.js` 的轮次计数、熔断冷却与半开（注入时钟）；`guard.js` 的逐工具拒绝与 non-reviewer 放行 |
 | 集成 | 假 subagent provider + 假 workspaceChanges，验证「turn-stopping → 取材 → 起子代理 → steer」全链路、轮次封顶、连续失败熔断 |
-| 手动 | 在本仓库改一个 `.js` 文件，确认触发、输出可读、修完复审通过；再故意写一处 `catch {}` 确认能报出来 |
+| 手动 | 在真实仓库改一个 `.js` 文件，确认触发、输出可读、修完复审通过；再故意写一处 `catch {}` 确认能报出来；`/review` 报告只进 UI |
 
 ## 14. 风险与未决
 
 | 风险 | 说明与对策 |
 |---|---|
-| API 版本 | 已按运行时 0.2.2-rc.1 的产物核签（见 §4 / §6.3），但只核了声明与调用形态，没跑过。M0 剩下的正是运行时行为验证 |
+| API 版本 | 已按运行时 0.2.2-rc.1 的产物核签（见 §4 / §6.3），并已用 `dsh --profile headless --patch` 跑通真实链路（M0 + Task 6 联调），核心 API 形态均已实测 |
 | 预设可见性 | reviewer preset 是全局注册的，会出现在用户新建会话的预设选择器里。取舍：接受它（它本身也能当手动审查用），显示名定为「通用代码审查」并配「只审不改」的人格，避免被误当成通用编码模式。另一面：preset id `code-review` 与第三方 `dsh-code-review` 可能撞车——重复 id 会让声明加载失败，真撞了就把 id 改成 `general-code-review`，显示名不用动 |
-| 监听顺序 | 本插件必须在 `workspace-changes` 之后加载才能读到本轮 `workspace/changes`。profile patch 顺序天然满足；隔离组合里要显式保证，否则退化为 git diff |
+| 监听顺序 | 本插件必须在 `workspace-changes` 之后注册才能读到本轮 `workspace/changes`（serial dispatch）。profile patch 顺序天然满足；顺序不满足时预检按 `stale-summary` 跳过（不误审旧 diff，但自动审查会静默失效），排查时看 debug 日志 |
 | 误报 | 一次误报让主代理去「修」正确代码，比不审更糟。对策：severity 定得保守、规则必须带 bad/good、原则层写清「什么可以放过」 |
 | 成本 | 每轮一次子代理。对策：纯文档轮次不触发、maxDiffBytes 截断、失败熔断、`auto: false` 可退化为手动 |
 | diff 过大 | 大重构一轮几千行。对策：按文件累积截断并显式声明未审部分，而不是把 prompt 撑爆 |
@@ -361,11 +376,11 @@ code-review/
 ## 15. 里程碑
 
 - **M0 运行时核签（2026-11-10 已通过）**：用一次性探针插件 + `dsh --profile headless --patch` 在临时仓库跑了一轮真实会话，四项都成立——见 §16 记录。
-- **M1 骨架**：插件目录、装配、配置校验、`/review` 命令（先只渲染 diff 不审），证明能装上并触发。
-- **M2 审查链**：reviewer + schema + render + steer 闭环，用一份最小规则表（5 条）跑通。
-- **M3 规范**：补全四维度规则与原则层，用真实 diff 校准误报。
-- **M4 打磨**：熔断、截断、可观测性、测试补齐。
-
+- **M1 骨架（已完成）**：插件目录、装配、配置校验、`/review` 命令（先只渲染 diff 不审），证明能装上并触发。
+- **M2 审查链（已完成）**：reviewer + schema + render + steer 闭环，用一份最小规则表（5 条）跑通。
+- **M3 规范（已完成）**：补全四维度规则（24 条）与原则层。
+- **M4 打磨（已完成）**：熔断（可恢复）、取消语义、只读硬门禁、截断、可观测性、测试补齐（68 个用例）。
+- **M5 端到端验收（Task 7 收尾）**：真实安装到 profile + 真实会话跑通自动审查/复审/`/review` 三条路径。
 
 ## 16. M0 核签记录（2026-11-10）
 
