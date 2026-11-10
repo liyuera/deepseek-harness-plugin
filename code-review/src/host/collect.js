@@ -27,13 +27,17 @@ export function renderHunks(hunks) {
 
 /**
  * 收集本轮可审的 diff。
+ *
+ * `skipped[].reason` 为 `'not-code' | 'budget' | 'unavailable'` 之一，或服务 `diff.kind`
+ * 原值（如 `'binary' | 'oversized' | 'refusal'`）；`bytes` 为已收录 `files[].text` 的 UTF-8 字节数。
+ *
  * @param {object} input
  * @param {{summary:Function,diff:Function}} input.workspaceChanges 服务（可为假实现）
  * @param {string} input.sessionId
  * @param {number} input.seq `workspace/changes` 事件序号
  * @param {object} input.config 已解析配置
  * @param {AbortSignal} [input.signal]
- * @returns {Promise<{files: Array<object>, skipped: Array<{path:string,reason:string}>, bytes: number}>}
+ * @returns {Promise<{files: Array<object>, skipped: Array<{path: string, reason: string}>, bytes: number}>}
  */
 export async function collect({ workspaceChanges, sessionId, seq, config, signal }) {
   const summary = workspaceChanges?.summary(sessionId, seq)
@@ -64,12 +68,13 @@ export async function collect({ workspaceChanges, sessionId, seq, config, signal
       continue
     }
     const text = renderHunks(diff.hunks)
-    if (bytes + text.length > config.maxDiffBytes) {
+    const size = Buffer.byteLength(text, 'utf8')
+    if (bytes + size > config.maxDiffBytes) {
       exhausted = true
       skipped.push({ path: file.path, reason: 'budget' })
       continue
     }
-    bytes += text.length
+    bytes += size
     files.push({
       path: file.path,
       display: file.display ?? file.path,

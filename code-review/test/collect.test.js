@@ -70,3 +70,32 @@ test('summary 缺失时返回空结果而不是抛错', async () => {
   })
   assert.deepEqual(result, { files: [], skipped: [], bytes: 0 })
 })
+
+test('预算按 UTF-8 字节计，而非 UTF-16 code unit', async () => {
+  const cjk = '汉'.repeat(30)
+  const workspaceChanges = {
+    summary: () => ({ files: [{ path: 'a.js' }], total: 1, added: 0, deleted: 0 }),
+    diff: async () => ({
+      kind: 'text',
+      path: 'a.js',
+      display: 'a.js',
+      hunks: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: [`+${cjk}`] }],
+      added: 1,
+      deleted: 0,
+    }),
+  }
+  const result = await collect({ workspaceChanges, sessionId: 's', seq: 7, config, signal: undefined })
+  assert.deepEqual(result.files, [])
+  assert.deepEqual(result.skipped, [{ path: 'a.js', reason: 'budget' }])
+  assert.equal(result.bytes, 0)
+})
+
+test('服务返回 refusal 时原样记为 skipped reason', async () => {
+  const workspaceChanges = {
+    summary: () => ({ files: [{ path: 'a.js', display: 'a.js' }], total: 1, added: 0, deleted: 0 }),
+    diff: async () => ({ kind: 'refusal', path: 'a.js', display: 'a.js' }),
+  }
+  const result = await collect({ workspaceChanges, sessionId: 's', seq: 7, config, signal: undefined })
+  assert.deepEqual(result.files, [])
+  assert.deepEqual(result.skipped, [{ path: 'a.js', reason: 'refusal' }])
+})
