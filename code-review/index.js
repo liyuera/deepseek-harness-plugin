@@ -36,6 +36,7 @@ export function apply(ctx, config) {
   const latestSeq = new Map()
   const previousBlocking = new Map()
   let warned = false
+  let summaryWarned = false
 
   const warnOnce = (text) => {
     if (warned) return
@@ -56,6 +57,7 @@ export function apply(ctx, config) {
     getRules,
     logger: ctx.logger,
     latestSeq: (sessionId) => latestSeq.get(sessionId),
+    isReviewing: (sessionId) => tracker.isReviewing(sessionId),
   }))
 
   ctx.on('session/event', (session, event) => {
@@ -85,12 +87,25 @@ export function apply(ctx, config) {
     }
 
     // 先确认摘要属于本 turn 且确有改动，避免消费轮次后才发现无可审内容。
-    const summary = ctx.workspaceChanges.summary(sessionId, seq)
+    // 第三方 summary 实现抛错时 fail-open：记一次警告后跳过，不把 turn 变成错误。
+    let summary
+    try {
+      summary = ctx.workspaceChanges.summary(sessionId, seq)
+    } catch (error) {
+      if (!summaryWarned) {
+        summaryWarned = true
+        ctx.logger.warn(`[code-review] 无法读取变更摘要，跳过自动审查：${error.message}`)
+      }
+      return
+    }
     if (summary === undefined || summary.turn !== turn || summary.files.length === 0) {
       ctx.logger.debug?.(`[code-review] skip: stale-summary turn=${turn}`)
       return
     }
     if (!tracker.begin(sessionId, turn)) return
+    const rounds = tracker.roundsOf(sessionId, turn)
+    const lastRound = rounds >= resolved.maxRounds
+    const startedAt = Date.now()
 
     try {
       const rules = await getRules()
@@ -113,6 +128,7 @@ export function apply(ctx, config) {
         signal,
         allowedRuleIds: rules.allowedRuleIds,
         allowedPaths: new Set(collected.files.map((file) => file.path)),
+        logger: ctx.logger,
       })
 
       if (!reviewed.ok) {
@@ -124,7 +140,22 @@ export function apply(ctx, config) {
       }
       tracker.recordSuccess(sessionId)
 
-      const scope = { files: summary.files.length, added: summary.added, deleted: summary.deleted }
+      const elapsed = Date.now() - startedAt
+      const totalFiles = summary.total ?? summary.files.length
+      ctx.logger.debug?.(
+        '[code-review] reviewed turn=%d files=%d findings=%d skipped=%d elapsed=%dms',
+        turn,
+        totalFiles,
+        reviewed.findings.length,
+        collected.skipped.length,
+        elapsed,
+      )
+      if (totalFiles > summary.files.length) {
+        ctx.logger.debug?.('[code-review] truncated files=%d kept=%d', totalFiles, summary.files.length)
+      }
+      if (signal?.aborted) return
+
+      const scope = { files: totalFiles, added: summary.added, deleted: summary.deleted }
       const text = renderFindings({
         findings: reviewed.findings,
         skipped: collected.skipped,
@@ -137,7 +168,10 @@ export function apply(ctx, config) {
       previousBlocking.set(sessionId, { turn, blocking: text !== '' })
 
       if (text !== '') {
-        agent.steer(message(`${text}\n\n请按上面每条 finding 修复；修完会再复审一次。如与用户新指令冲突，以用户指令为准。`))
+        const repair = lastRound
+          ? '请按上面每条 finding 修复。本轮已达到自动复审上限，修完不会再自动复审，请人工确认。如与用户新指令冲突，以用户指令为准。'
+          : '请按上面每条 finding 修复；修完会再复审一次。如与用户新指令冲突，以用户指令为准。'
+        agent.steer(message(`${text}\n\n${repair}`))
       } else if (hadBlocking) {
         agent.steer(message(`${renderPass({ summary: scope })}\n\n可以收尾了。`))
       }

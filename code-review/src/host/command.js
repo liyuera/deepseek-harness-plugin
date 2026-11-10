@@ -11,23 +11,34 @@ import { buildPrompt, runReview } from './reviewer.js'
  * @param {object} deps
  * @returns {object} CommandDefinition
  */
-export function createReviewCommand({ config, workspaceChanges, subagents, getRules, logger, latestSeq }) {
+export function createReviewCommand({ config, workspaceChanges, subagents, getRules, logger, latestSeq, isReviewing }) {
   return {
     name: 'review',
     description: '通用代码审查：审查本轮改动并输出报告',
     async handler({ agent, signal }) {
-      const rules = await getRules()
       const sessionId = agent.session.id
+      if (isReviewing?.(sessionId)) {
+        return { kind: 'error', text: '已有审查在进行中，请稍后再试。' }
+      }
       const seq = latestSeq(sessionId)
       if (seq === undefined) return { kind: 'error', text: '本轮没有可审查的改动。' }
 
+      const summary = workspaceChanges?.summary?.(sessionId, seq)
+      if (summary === undefined) {
+        return { kind: 'error', text: '本轮没有可审查的改动。' }
+      }
+
+      const rules = await getRules()
       const collected = await collect({ workspaceChanges, sessionId, seq, config, signal })
       if (collected.files.length === 0) {
         return { kind: 'error', text: '本轮没有可审查的代码文件（可能是二进制或已超预算）。' }
       }
 
-      const summary = workspaceChanges.summary(sessionId, seq)
-      const scope = { files: summary.files.length, added: summary.added, deleted: summary.deleted }
+      const scope = {
+        files: summary.total ?? summary.files.length,
+        added: summary.added,
+        deleted: summary.deleted,
+      }
       const reviewed = await runReview({
         subagents,
         agent,
@@ -38,6 +49,7 @@ export function createReviewCommand({ config, workspaceChanges, subagents, getRu
         signal,
         allowedRuleIds: rules.allowedRuleIds,
         allowedPaths: new Set(collected.files.map((file) => file.path)),
+        logger,
       })
 
       if (!reviewed.ok) {

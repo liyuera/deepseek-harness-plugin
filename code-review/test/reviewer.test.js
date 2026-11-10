@@ -238,3 +238,73 @@ test('buildPrompt 允许只读工具补充上下文、禁止修改文件', () =>
   assert.ok(prompt.includes('不要修改任何文件；缺少上下文时可以只用只读工具补充'))
   assert.equal(prompt.includes('不要调用任何工具'), false)
 })
+
+test('signal 已 abort 时不启动子代理，直接返回 aborted', async () => {
+  let started = false
+  const subagents = {
+    async startActivation() {
+      started = true
+      return { childId: 'c', result: new Promise(() => {}) }
+    },
+  }
+  const controller = new AbortController()
+  controller.abort()
+  const startedAt = Date.now()
+  const result = await runReview({
+    subagents, agent: {}, preset: 'code-review', prompt: 'P', timeoutMs: 60000,
+    signal: controller.signal, allowedRuleIds: new Set(), allowedPaths: new Set(),
+  })
+  assert.deepEqual(result, { ok: false, reason: 'aborted' })
+  assert.equal(started, false, '已取消时不应启动子代理')
+  assert.ok(Date.now() - startedAt < 500)
+})
+
+test('审查中取消立即返回 aborted 并 dispose 已发布的 activation', async () => {
+  let disposed = false
+  let spec
+  const subagents = {
+    async startActivation(request) {
+      spec = request
+      return {
+        childId: 'c',
+        result: new Promise(() => {}),
+        dispose: async () => { disposed = true },
+      }
+    },
+  }
+  const controller = new AbortController()
+  const pending = runReview({
+    subagents, agent: {}, preset: 'code-review', prompt: 'P', timeoutMs: 120000,
+    signal: controller.signal, allowedRuleIds: new Set(), allowedPaths: new Set(),
+  })
+  await new Promise((resolve) => setImmediate(resolve))
+  const abortedAt = Date.now()
+  controller.abort()
+  const result = await Promise.race([
+    pending,
+    new Promise((resolve) => setTimeout(() => resolve({ timedOut: true }), 1000)),
+  ])
+  assert.deepEqual(result, { ok: false, reason: 'aborted' })
+  assert.ok(Date.now() - abortedAt < 1000, '取消应立即返回，不等 120s 超时')
+  assert.equal(disposed, true)
+  assert.equal(spec.signal.aborted, true, '发布时的 signal 应被中止')
+})
+
+test('丢弃非法 finding 时记录 warn 日志，不记录正文', async () => {
+  const warned = []
+  const subagents = fakeSubagents({
+    stopReason: 'completed',
+    structured: { findings: [validFinding, { ...validFinding, ruleId: 'SEC-999' }] },
+  })
+  const result = await runReview({
+    subagents, agent: {}, preset: 'code-review', prompt: 'P', timeoutMs: 1000,
+    signal: new AbortController().signal,
+    allowedRuleIds: new Set(['SEC-001']), allowedPaths: new Set(['src/a.ts']),
+    logger: { warn: (message) => warned.push(message) },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.findings.length, 1)
+  assert.equal(warned.length, 1)
+  assert.match(warned[0], /丢弃 1 条非法 finding/)
+  assert.equal(warned[0].includes('SEC-999'), false, '日志不应带 finding 正文')
+})

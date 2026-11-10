@@ -90,20 +90,37 @@ function normalizeFinding(finding, allowedRuleIds, allowedPaths) {
  * 整体 deadline：计时器在 `startActivation` 之前创建，启动与结果两段都跟同一个
  * deadline 赛跑；超时立即返回 `timeout`，不等待 `dispose()` 兑现（同步或异步均可）。
  *
+ * 取消：调用方 `signal` 一旦 abort，启动与结果两段同样立即返回 `aborted`，并对已经
+ * 拿到的 activation 调 `dispose()`；已 abort 的信号不会启动子代理。
+ *
  * @param {object} input
  * @returns {Promise<{ok:true, findings: object[]} | {ok:false, reason: string}>}
  */
 export async function runReview({
-  subagents, agent, preset, prompt, timeoutMs, modelOverride, signal, allowedRuleIds, allowedPaths,
+  subagents, agent, preset, prompt, timeoutMs, modelOverride, signal, allowedRuleIds, allowedPaths, logger,
 }) {
+  if (signal?.aborted) return { ok: false, reason: 'aborted' }
+
   const controller = new AbortController()
-  const onAbort = () => controller.abort()
-  signal?.addEventListener('abort', onAbort, { once: true })
 
   const deadlineSymbol = { timedOut: true }
+  const abortSymbol = { aborted: true }
   let activation
   let timedOut = false
+  let aborted = false
   let timer
+
+  let notifyAbort
+  const abortPromise = new Promise((resolve) => {
+    notifyAbort = resolve
+  })
+  const onAbort = () => {
+    aborted = true
+    controller.abort()
+    notifyAbort(abortSymbol)
+  }
+  signal?.addEventListener('abort', onAbort, { once: true })
+
   const deadline = new Promise((resolve) => {
     timer = setTimeout(() => resolve(deadlineSymbol), timeoutMs)
   })
@@ -124,20 +141,28 @@ export async function runReview({
         },
       })),
       deadline,
+      abortPromise,
     ])
     if (started === deadlineSymbol) {
       timedOut = true
       return { ok: false, reason: 'timeout' }
+    }
+    if (started === abortSymbol) {
+      return { ok: false, reason: 'aborted' }
     }
     activation = started
 
     const settled = await Promise.race([
       Promise.resolve(activation.result).then((value) => ({ value })),
       deadline,
+      abortPromise,
     ])
     if (settled === deadlineSymbol) {
       timedOut = true
       return { ok: false, reason: 'timeout' }
+    }
+    if (settled === abortSymbol) {
+      return { ok: false, reason: 'aborted' }
     }
 
     const result = settled.value
@@ -148,16 +173,20 @@ export async function runReview({
     if (typeof raw !== 'object' || raw === null || !Array.isArray(raw.findings)) {
       return { ok: false, reason: 'invalid-result' }
     }
-    const findings = raw.findings
+    const rawFindings = raw.findings
+    const findings = rawFindings
       .map((finding) => normalizeFinding(finding, allowedRuleIds, allowedPaths))
       .filter((finding) => finding !== undefined)
+    const dropped = rawFindings.length - findings.length
+    if (dropped > 0) logger?.warn?.(`[code-review] 丢弃 ${dropped} 条非法 finding`)
     return { ok: true, findings }
   } catch {
+    if (aborted || signal?.aborted) return { ok: false, reason: 'aborted' }
     return { ok: false, reason: 'provider-error' }
   } finally {
     clearTimeout(timer)
     signal?.removeEventListener('abort', onAbort)
-    if (timedOut) {
+    if (timedOut || aborted) {
       controller.abort()
       try {
         void Promise.resolve(activation?.dispose?.()).catch(() => {})
