@@ -5,7 +5,7 @@
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { resolveConfig } from './src/host/config.js'
-import { collect } from './src/host/collect.js'
+import { collect, fingerprint } from './src/host/collect.js'
 import { loadRulesResilient } from './src/host/rules.js'
 import { renderFindings, renderPass } from './src/host/render.js'
 import { buildPrompt, runReview } from './src/host/reviewer.js'
@@ -15,7 +15,7 @@ import { createReviewCommand } from './src/host/command.js'
 import { createReviewerGuard } from './src/host/guard.js'
 
 export const name = 'code-review'
-export const inject = ['commands', 'subagents', 'workspaceChanges', 'tools']
+export const inject = ['commands', 'subagents', 'workspaceChanges', 'tools', 'agentPresets']
 
 const PACKAGE_ROOT = dirname(fileURLToPath(import.meta.url))
 
@@ -35,6 +35,8 @@ export function apply(ctx, config) {
   const tracker = createTracker()
   const latestSeq = new Map()
   const previousBlocking = new Map()
+  // 同一 turn 内已成功审查过的内容指纹：`${sessionId}:${turn}` → fingerprint。
+  const reviewedFingerprint = new Map()
   let warned = false
   let summaryWarned = false
 
@@ -44,21 +46,35 @@ export function apply(ctx, config) {
     ctx.logger.warn(text)
   }
 
+  /** steer 失败只告警：审查本身已成功，不能当成审查失败去动熔断。 */
+  const steerSafely = (target, text) => {
+    try {
+      target.steer(message(text))
+    } catch (error) {
+      ctx.logger.warn(`[code-review] steer 失败：${error.message}`)
+    }
+  }
+
   const getRules = () => loadRulesResilient({
     rulesPath: join(PACKAGE_ROOT, resolved.rulesFile),
     principlesPath: join(PACKAGE_ROOT, resolved.principlesFile),
     warn: warnOnce,
   })
 
-  ctx.commands.register(createReviewCommand({
-    config: resolved,
-    workspaceChanges: ctx.workspaceChanges,
-    subagents: ctx.subagents,
-    getRules,
-    logger: ctx.logger,
-    latestSeq: (sessionId) => latestSeq.get(sessionId),
-    isReviewing: (sessionId) => tracker.isReviewing(sessionId),
-  }))
+  try {
+    ctx.commands.register(createReviewCommand({
+      config: resolved,
+      workspaceChanges: ctx.workspaceChanges,
+      subagents: ctx.subagents,
+      getRules,
+      logger: ctx.logger,
+      latestSeq: (sessionId) => latestSeq.get(sessionId),
+      isReviewing: (sessionId) => tracker.isReviewing(sessionId),
+    }))
+  } catch (error) {
+    // 命令重名只影响手动入口，自动审查仍应可用。
+    ctx.logger.warn(`[code-review] /review 命令注册失败（可能与其他插件重名）：${error.message}`)
+  }
 
   ctx.on('session/event', (session, event) => {
     if (event?.type === 'workspace/changes') latestSeq.set(session.id, event.seq)
@@ -67,6 +83,9 @@ export function apply(ctx, config) {
   ctx.on('session/disposed', (session) => {
     latestSeq.delete(session.id)
     previousBlocking.delete(session.id)
+    for (const key of reviewedFingerprint.keys()) {
+      if (key.startsWith(`${session.id}:`)) reviewedFingerprint.delete(key)
+    }
     tracker.forget(session.id)
   })
 
@@ -91,15 +110,21 @@ export function apply(ctx, config) {
     let summary
     try {
       summary = ctx.workspaceChanges.summary(sessionId, seq)
+      // 形状校验也放在 try 内：第三方 summary 实现缺字段时按 stale 跳过，而不是把 turn 变 error。
+      if (
+        summary === undefined
+        || !Array.isArray(summary.files)
+        || summary.files.length === 0
+        || summary.turn !== turn
+      ) {
+        ctx.logger.debug?.(`[code-review] skip: stale-summary turn=${turn}`)
+        return
+      }
     } catch (error) {
       if (!summaryWarned) {
         summaryWarned = true
         ctx.logger.warn(`[code-review] 无法读取变更摘要，跳过自动审查：${error.message}`)
       }
-      return
-    }
-    if (summary === undefined || summary.turn !== turn || summary.files.length === 0) {
-      ctx.logger.debug?.(`[code-review] skip: stale-summary turn=${turn}`)
       return
     }
     if (!tracker.begin(sessionId, turn)) return
@@ -116,7 +141,21 @@ export function apply(ctx, config) {
         config: resolved,
         signal,
       })
-      if (collected.files.length === 0) return
+      if (collected.files.length === 0) {
+        // 没有可审内容，回滚本轮：不能白烧 maxRounds。
+        ctx.logger.debug?.('[code-review] skip: empty-collect turn=%d', turn)
+        tracker.abandonRound(sessionId, turn)
+        return
+      }
+      // workspace-changes 每个 turn-stopping 都会以新 seq 重新宣告同一份未变 diff，
+      // 用内容指纹去重，避免同一 turn 内重复审查/重复注入。
+      const dedupKey = `${sessionId}:${turn}`
+      const hash = fingerprint(collected.files)
+      if (reviewedFingerprint.get(dedupKey) === hash) {
+        ctx.logger.debug?.('[code-review] skip: duplicate-diff turn=%d', turn)
+        tracker.abandonRound(sessionId, turn)
+        return
+      }
 
       const reviewed = await runReview({
         subagents: ctx.subagents,
@@ -128,10 +167,12 @@ export function apply(ctx, config) {
         signal,
         allowedRuleIds: rules.allowedRuleIds,
         allowedPaths: new Set(collected.files.map((file) => file.path)),
+        ruleSeverities: rules.ruleSeverities,
         logger: ctx.logger,
       })
 
       if (!reviewed.ok) {
+        ctx.logger.debug?.('[code-review] review failed: %s', reviewed.reason)
         if (signal?.aborted) return
         if (tracker.recordFailure(sessionId)) {
           ctx.logger.warn('[code-review] 连续失败，已暂停本会话的自动审查')
@@ -139,6 +180,8 @@ export function apply(ctx, config) {
         return
       }
       tracker.recordSuccess(sessionId)
+      // 只有成功审查才占去重位；失败时允许同一 diff 重试。
+      reviewedFingerprint.set(dedupKey, hash)
 
       const elapsed = Date.now() - startedAt
       const totalFiles = summary.total ?? summary.files.length
@@ -171,9 +214,9 @@ export function apply(ctx, config) {
         const repair = lastRound
           ? '请按上面每条 finding 修复。本轮已达到自动复审上限，修完不会再自动复审，请人工确认。如与用户新指令冲突，以用户指令为准。'
           : '请按上面每条 finding 修复；修完会再复审一次。如与用户新指令冲突，以用户指令为准。'
-        agent.steer(message(`${text}\n\n${repair}`))
+        steerSafely(agent, `${text}\n\n${repair}`)
       } else if (hadBlocking) {
-        agent.steer(message(`${renderPass({ summary: scope })}\n\n可以收尾了。`))
+        steerSafely(agent, `${renderPass({ summary: scope, skipped: collected.skipped })}\n\n可以收尾了。`)
       }
     } catch (error) {
       if (signal?.aborted) return

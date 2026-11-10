@@ -9,6 +9,16 @@ const DIMENSION_LABEL = Object.freeze({
   maintainability: '可维护性',
 })
 
+/** 严重度排名：数字越小越严重。用于渲染前的稳定排序。 */
+const SEVERITY_RANK = Object.freeze({ high: 0, medium: 1, low: 2, nit: 3 })
+
+function bySeverity(findings) {
+  return [...findings].sort(
+    (left, right) => (SEVERITY_RANK[left.severity] ?? Number.MAX_SAFE_INTEGER)
+      - (SEVERITY_RANK[right.severity] ?? Number.MAX_SAFE_INTEGER),
+  )
+}
+
 /**
  * 按阻塞阈值切分 findings。
  * @param {readonly object[]} findings
@@ -39,13 +49,15 @@ function findingLines(finding) {
  */
 export function renderFindings({ findings, skipped, blockingSeverities, summary, mode = 'report' }) {
   if (findings.length === 0) return ''
-  const { blocking, passive } = partition(findings, blockingSeverities)
+  const partitioned = partition(findings, blockingSeverities)
+  const blocking = bySeverity(partitioned.blocking)
+  const passive = bySeverity(partitioned.passive)
   if (mode === 'steer' && blocking.length === 0) return ''
   const scope = `本次 ${summary.files} 文件 / ${summary.added + summary.deleted} 行变更`
   const advise = mode === 'report' && passive.length > 0
   const head = blocking.length > 0
     ? `结论: 需修改（${blocking.length} 处阻塞${advise ? `，${passive.length} 处建议` : ''}）`
-    : `结论: 需修改（0 处阻塞，${passive.length} 处建议）`
+    : `结论: 通过（${passive.length} 处建议）`
   const sections = []
   if (blocking.length > 0) sections.push(blocking.map(findingLines).join('\n'))
   if (advise) sections.push(`非阻塞建议:\n${passive.map(findingLines).join('\n')}`)
@@ -55,9 +67,11 @@ export function renderFindings({ findings, skipped, blockingSeverities, summary,
 
 /**
  * 复审通过时的一行结果。
- * @param {{summary: {files:number,added:number,deleted:number}}} input
+ * @param {{summary: {files:number,added:number,deleted:number}, skipped?: readonly {path:string,reason:string}[]}} input
  * @returns {string}
  */
-export function renderPass({ summary }) {
-  return `结论: 通过（本次 ${summary.files} 文件 / ${summary.added + summary.deleted} 行变更）`
+export function renderPass({ summary, skipped = [] }) {
+  const head = `结论: 通过（本次 ${summary.files} 文件 / ${summary.added + summary.deleted} 行变更）`
+  if (skipped.length === 0) return head
+  return `${head}\n未审: ${skipped.map((item) => `${item.path}（${item.reason}）`).join('、')}`
 }

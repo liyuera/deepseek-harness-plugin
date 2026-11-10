@@ -108,11 +108,11 @@ test('服务抛错返回 provider-error', async () => {
   assert.deepEqual(result, { ok: false, reason: 'provider-error' })
 })
 
-async function reviewFindings(findings, { allowedRuleIds, allowedPaths = new Set(['src/a.ts']) }) {
+async function reviewFindings(findings, { allowedRuleIds, allowedPaths = new Set(['src/a.ts']), ruleSeverities }) {
   const subagents = fakeSubagents({ stopReason: 'completed', structured: { findings } })
   return runReview({
     subagents, agent: {}, preset: 'code-review', prompt: 'P', timeoutMs: 1000,
-    signal: new AbortController().signal, allowedRuleIds, allowedPaths,
+    signal: new AbortController().signal, allowedRuleIds, allowedPaths, ruleSeverities,
   })
 }
 
@@ -136,20 +136,20 @@ test('display 与 path 分叉时，prompt 渲染 path 且 path:42 的 finding �
   assert.deepEqual(result.findings, [finding])
 })
 
-test('PRINCIPLE-bogus 与 dimension 不对应，即使已在白名单也丢弃', async () => {
+test('PRINCIPLE-bogus 与 dimension 不对应，即使已在白名单也丢弃，且全丢视为 invalid-result', async () => {
   const result = await reviewFindings(
     [{ ...validFinding, ruleId: 'PRINCIPLE-bogus', dimension: 'security' }],
     { allowedRuleIds: new Set(['PRINCIPLE-security', 'PRINCIPLE-bogus']) },
   )
-  assert.deepEqual(result, { ok: true, findings: [] })
+  assert.deepEqual(result, { ok: false, reason: 'invalid-result' })
 })
 
-test('PRINCIPLE-correctness 声称 dimension security 时丢弃', async () => {
+test('PRINCIPLE-correctness 声称 dimension security 时丢弃，且全丢视为 invalid-result', async () => {
   const result = await reviewFindings(
     [{ ...validFinding, ruleId: 'PRINCIPLE-correctness', dimension: 'security' }],
     { allowedRuleIds: new Set(['PRINCIPLE-correctness', 'PRINCIPLE-security']) },
   )
-  assert.deepEqual(result, { ok: true, findings: [] })
+  assert.deepEqual(result, { ok: false, reason: 'invalid-result' })
 })
 
 test('PRINCIPLE-security 与 dimension security 匹配时通过', async () => {
@@ -157,6 +157,39 @@ test('PRINCIPLE-security 与 dimension security 匹配时通过', async () => {
   const result = await reviewFindings([finding], { allowedRuleIds: new Set(['PRINCIPLE-security']) })
   assert.equal(result.ok, true)
   assert.deepEqual(result.findings, [finding])
+})
+
+test('硬规则 severity 以规则表为准，覆盖模型给的偏低值', async () => {
+  const result = await reviewFindings(
+    [{ ...validFinding, severity: 'low' }],
+    {
+      allowedRuleIds: new Set(['SEC-001']),
+      ruleSeverities: new Map([['SEC-001', 'high']]),
+    },
+  )
+  assert.equal(result.ok, true)
+  assert.equal(result.findings[0].severity, 'high')
+})
+
+test('PRINCIPLE finding 保留模型给出的 severity，不被规则表覆盖', async () => {
+  const finding = { ...validFinding, ruleId: 'PRINCIPLE-security', severity: 'nit' }
+  const result = await reviewFindings([finding], {
+    allowedRuleIds: new Set(['PRINCIPLE-security']),
+    ruleSeverities: new Map([['SEC-001', 'high']]),
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.findings[0].severity, 'nit')
+})
+
+test('全部 finding 被丢弃时返回 invalid-result 而非空结果', async () => {
+  const result = await reviewFindings(
+    [
+      { ...validFinding, ruleId: 'SEC-999' },
+      { ...validFinding, location: 'src/other.ts:1' },
+    ],
+    { allowedRuleIds: new Set(['SEC-001']) },
+  )
+  assert.deepEqual(result, { ok: false, reason: 'invalid-result' })
 })
 
 test('location 必须是 path:line 或 path:start-end', async () => {

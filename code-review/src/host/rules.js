@@ -100,8 +100,11 @@ export function renderRulesPrompt({ rules, principles }) {
 /**
  * 每轮从磁盘加载规范；规则文件不可用时降级为只用原则层（fail-open）。
  * 原则文件也读不到时抛错，由调用方决定如何记录。
+ *
+ * `ruleSeverities` 是硬规则 severity 的权威表：审查者的 finding severity 以它为准，
+ * 防止模型把 high 规则报成 low 而静默不阻塞。
  * @param {{rulesPath:string, principlesPath:string, warn?:Function, readFile?:Function}} input
- * @returns {Promise<{prompt: string, allowedRuleIds: Set<string>}>}
+ * @returns {Promise<{prompt: string, allowedRuleIds: Set<string>, ruleSeverities: Map<string, string>}>}
  */
 export async function loadRulesResilient({ rulesPath, principlesPath, warn, readFile = readFileDefault }) {
   try {
@@ -109,9 +112,14 @@ export async function loadRulesResilient({ rulesPath, principlesPath, warn, read
     return {
       prompt: renderRulesPrompt(loaded),
       allowedRuleIds: new Set([...loaded.rules.map((rule) => rule.id), ...PRINCIPLE_IDS]),
+      ruleSeverities: new Map(loaded.rules.map((rule) => [rule.id, rule.severity])),
     }
   } catch (error) {
     warn?.(`[code-review] 规则文件不可用，降级为只用原则层：${error.message}`)
-    return { prompt: await readFile(principlesPath, 'utf8'), allowedRuleIds: new Set(PRINCIPLE_IDS) }
+    return {
+      prompt: await readFile(principlesPath, 'utf8'),
+      allowedRuleIds: new Set(PRINCIPLE_IDS),
+      ruleSeverities: new Map(),
+    }
   }
 }

@@ -149,3 +149,67 @@ test('/review 把 logger 传给 reviewer，丢弃非法 finding 时有日志', a
   assert.equal(result.kind, 'success')
   assert.ok(harness.state.warns.some((args) => String(args[0]).includes('丢弃 1 条非法 finding')))
 })
+
+test('summary 抛错时返回中文错误文案而不是把异常抛给命令层', async () => {
+  const harness = createCommand({
+    workspaceChanges: {
+      summary() {
+        throw new Error('summary-boom')
+      },
+    },
+  })
+
+  const result = await harness.command.handler({ agent, signal: signal() })
+
+  assert.equal(result.kind, 'error')
+  assert.match(result.text, /审查失败：summary-boom/)
+  assert.equal(harness.state.starts, 0)
+  assert.ok(harness.state.warns.some((args) => String(args[0]).includes('/review 失败')))
+})
+
+test('通过报告带未审清单与原因', async () => {
+  const harness = createCommand({
+    result: { stopReason: 'completed', structured: { findings: [] } },
+    workspaceChanges: {
+      summary() {
+        return {
+          turn: 1,
+          files: [
+            { path: 'a.js', display: 'a.js' },
+            { path: 'notes.md', display: 'notes.md' },
+          ],
+          total: 2,
+          added: 1,
+          deleted: 0,
+        }
+      },
+    },
+  })
+
+  const result = await harness.command.handler({ agent, signal: signal() })
+
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /结论: 通过/)
+  assert.match(result.text, /未审: notes\.md（not-code）/)
+})
+
+test('/review 透传规则表 severity 覆盖模型输出', async () => {
+  const harness = createCommand({
+    result: {
+      stopReason: 'completed',
+      structured: { findings: [{ ...FINDING, severity: 'low' }] },
+    },
+    deps: {
+      getRules: async () => ({
+        prompt: 'RULES',
+        allowedRuleIds: new Set(['COR-001']),
+        ruleSeverities: new Map([['COR-001', 'high']]),
+      }),
+    },
+  })
+
+  const result = await harness.command.handler({ agent, signal: signal() })
+
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /\[COR-001\] 正确性\/high/)
+})

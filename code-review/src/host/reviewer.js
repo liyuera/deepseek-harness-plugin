@@ -67,7 +67,7 @@ export function buildPrompt({ rulesPrompt, files, skipped }) {
   ].join('\n')
 }
 
-function normalizeFinding(finding, allowedRuleIds, allowedPaths) {
+function normalizeFinding(finding, allowedRuleIds, allowedPaths, ruleSeverities) {
   if (typeof finding !== 'object' || finding === null) return undefined
   const { ruleId, dimension, severity, location, problem, suggestion } = finding
   const strings = [ruleId, dimension, severity, location, problem, suggestion]
@@ -81,7 +81,9 @@ function normalizeFinding(finding, allowedRuleIds, allowedPaths) {
   const path = location.slice(0, separator)
   if (!LOCATION_SUFFIX.test(location.slice(separator + 1))) return undefined
   if (!allowedPaths.has(path)) return undefined
-  return { ruleId, dimension, severity, location, problem, suggestion }
+  // 硬规则的 severity 以规则表为权威；PRINCIPLE-* 不在表里，保留模型判断。
+  const authoritative = ruleSeverities?.has(ruleId) ? ruleSeverities.get(ruleId) : severity
+  return { ruleId, dimension, severity: authoritative, location, problem, suggestion }
 }
 
 /**
@@ -97,7 +99,8 @@ function normalizeFinding(finding, allowedRuleIds, allowedPaths) {
  * @returns {Promise<{ok:true, findings: object[]} | {ok:false, reason: string}>}
  */
 export async function runReview({
-  subagents, agent, preset, prompt, timeoutMs, modelOverride, signal, allowedRuleIds, allowedPaths, logger,
+  subagents, agent, preset, prompt, timeoutMs, modelOverride, signal, allowedRuleIds, allowedPaths,
+  ruleSeverities, logger,
 }) {
   if (signal?.aborted) return { ok: false, reason: 'aborted' }
 
@@ -175,10 +178,12 @@ export async function runReview({
     }
     const rawFindings = raw.findings
     const findings = rawFindings
-      .map((finding) => normalizeFinding(finding, allowedRuleIds, allowedPaths))
+      .map((finding) => normalizeFinding(finding, allowedRuleIds, allowedPaths, ruleSeverities))
       .filter((finding) => finding !== undefined)
     const dropped = rawFindings.length - findings.length
     if (dropped > 0) logger?.warn?.(`[code-review] 丢弃 ${dropped} 条非法 finding`)
+    // 全被丢弃说明模型输出不可用（规则/路径/格式全不合规），不能当成「没有问题」。
+    if (rawFindings.length > 0 && findings.length === 0) return { ok: false, reason: 'invalid-result' }
     return { ok: true, findings }
   } catch {
     if (aborted || signal?.aborted) return { ok: false, reason: 'aborted' }

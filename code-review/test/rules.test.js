@@ -96,6 +96,18 @@ test('loadRulesResilient 正常路径返回双层 prompt 与规则白名单', as
     'PRINCIPLE-performance',
     'PRINCIPLE-maintainability',
   ])
+  assert.ok(result.ruleSeverities instanceof Map, '应返回 ruleSeverities Map')
+  assert.equal(result.ruleSeverities.size, 1)
+  assert.equal(result.ruleSeverities.get('SEC-002'), 'high')
+})
+
+test('loadRulesResilient 从真实规则表返回全部 24 条 severity 映射', async () => {
+  const rulesPath = new URL('../rules/rules.json', import.meta.url)
+  const principlesPath = new URL('../rules/principles.md', import.meta.url)
+  const result = await loadRulesResilient({ rulesPath, principlesPath })
+  assert.equal(result.ruleSeverities.size, 24)
+  assert.equal(result.ruleSeverities.get('COR-001'), 'high')
+  assert.equal(result.ruleSeverities.get('MNT-006'), 'nit')
 })
 
 test('loadRulesResilient 规则文件缺失时降级为只用原则层', async () => {
@@ -103,6 +115,7 @@ test('loadRulesResilient 规则文件缺失时降级为只用原则层', async (
   const result = await loadRulesResilient(options(makeReader(undefined), (m) => warnings.push(m)))
   assert.equal(result.prompt, principles)
   assert.deepEqual([...result.allowedRuleIds], [...PRINCIPLE_IDS])
+  assert.equal(result.ruleSeverities.size, 0, '降级时应为空 Map')
   assert.equal(warnings.length, 1)
   assert.match(warnings[0], /降级为只用原则层/)
   assert.match(warnings[0], /rules\.json/)
@@ -113,6 +126,7 @@ test('loadRulesResilient 规则 JSON 非法时降级为只用原则层', async (
   const result = await loadRulesResilient(options(makeReader('not json'), (m) => warnings.push(m)))
   assert.equal(result.prompt, principles)
   assert.deepEqual([...result.allowedRuleIds], [...PRINCIPLE_IDS])
+  assert.equal(result.ruleSeverities.size, 0, '降级时应为空 Map')
   assert.equal(warnings.length, 1)
   assert.match(warnings[0], /降级为只用原则层/)
   assert.match(warnings[0], /not valid JSON/)
