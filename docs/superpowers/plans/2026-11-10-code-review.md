@@ -1761,7 +1761,7 @@ DEEPSEEK_API_KEY=$(python3 -c "import re;s=open('$HOME/.dsh/.credentials.yaml').
   dsh --profile headless --patch /Users/liyu/Documents/www/DeepSeek/deepseek-harness/deepseek-harness-plugin/code-review/patch-dev.yml \
   "把 m.js 里的 add 改成用 try/catch 包住，catch 留空。"
 ```
-Expected: 主代理改完后，stdout 里出现一条以 `结论:` 开头的注入消息；审查者没有修改任何文件（`git status` 只显示主代理的改动）。
+Expected: headless 不打印注入的用户消息、也不打印 `ctx.logger`（Task 1 实测），所以要临时加一行 `console.error` 探针：在 `agent.steer` 前打印注入文本前 80 字，跑完后确认探针输出以 `结论:` 开头、且主代理随后按 findings 修改；确认完删掉探针再提交，`git diff` 里不得残留。审查者不得修改任何文件。
 
 - [ ] **Step 9: 提交**
 
