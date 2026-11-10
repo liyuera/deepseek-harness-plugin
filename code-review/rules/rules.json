@@ -1,14 +1,5 @@
 [
   {
-    "id": "SEC-001",
-    "dimension": "security",
-    "severity": "high",
-    "title": "敏感信息不得进入日志",
-    "check": "日志调用的参数里不得出现 token、password、secret、cookie 等变量或字面量",
-    "bad": "logger.info(`token=${token}`)",
-    "good": "logger.info('token refreshed')"
-  },
-  {
     "id": "COR-001",
     "dimension": "correctness",
     "severity": "high",
@@ -27,6 +18,141 @@
     "good": "void fetchData().catch(onError)"
   },
   {
+    "id": "COR-003",
+    "dimension": "correctness",
+    "severity": "medium",
+    "title": "边界输入必须有处理",
+    "check": "处理数组、字符串或数值入口时，不得漏掉空数组、空串、0、负数等边界；边界分支不得返回会被当作成功结果的默认值",
+    "bad": "function first(items) { return items[0].id }",
+    "good": "function first(items) { return items.length === 0 ? undefined : items[0].id }"
+  },
+  {
+    "id": "COR-004",
+    "dimension": "correctness",
+    "severity": "medium",
+    "title": "共享状态更新不得跨 await 竞态",
+    "check": "对共享可变状态（计数、缓存、文件）的「读取-修改-写回」不得跨 await 拆分；并发入口必须使用原子操作、锁或串行队列",
+    "bad": "const n = counter.get(key)\nawait save(key, n + 1)",
+    "good": "await withLock(key, async () => {\n  const n = counter.get(key)\n  await save(key, n + 1)\n})"
+  },
+  {
+    "id": "COR-005",
+    "dimension": "correctness",
+    "severity": "low",
+    "title": "不得使用宽松相等",
+    "check": "新增比较不得使用 == 或 !=；与 null 或 undefined 同时比较时，也须显式写成 === null || === undefined",
+    "bad": "if (status == 1) return",
+    "good": "if (status === 1) return"
+  },
+  {
+    "id": "COR-006",
+    "dimension": "correctness",
+    "severity": "medium",
+    "title": "日期计算不得依赖本地时区",
+    "check": "日期解析或格式化不得依赖运行机器的本地时区；跨时区计算必须显式指定时区，并统一使用 UTC 或带偏移的时间戳",
+    "bad": "const day = new Date('2026-11-10').getDate()",
+    "good": "const day = new Date('2026-11-10T00:00:00Z').getUTCDate()"
+  },
+  {
+    "id": "COR-007",
+    "dimension": "correctness",
+    "severity": "low",
+    "title": "浮点与 NaN 必须按值语义比较",
+    "check": "浮点结果不得直接用 === 比较，须使用误差阈值；NaN 不得用 === 判断，须使用 Number.isNaN",
+    "bad": "if (total === 0.3) return\nif (value === NaN) return",
+    "good": "if (Math.abs(total - 0.3) < 1e-9) return\nif (Number.isNaN(value)) return"
+  },
+  {
+    "id": "SEC-001",
+    "dimension": "security",
+    "severity": "high",
+    "title": "敏感信息不得进入日志",
+    "check": "日志或错误消息的参数不得输出凭据值：token、password、secret、cookie 等变量的值，以及包含这些值的对象或请求体",
+    "bad": "logger.info('auth ' + token)",
+    "good": "logger.info('session refreshed')"
+  },
+  {
+    "id": "SEC-002",
+    "dimension": "security",
+    "severity": "high",
+    "title": "SQL 与命令不得拼接外部输入",
+    "check": "SQL 语句或 shell 命令不得用字符串拼接、模板插值嵌入外部输入；必须使用参数化查询或参数数组",
+    "bad": "db.query(`SELECT * FROM users WHERE id = ${id}`)",
+    "good": "db.query('SELECT * FROM users WHERE id = ?', [id])"
+  },
+  {
+    "id": "SEC-003",
+    "dimension": "security",
+    "severity": "high",
+    "title": "外部路径必须限制在根目录内",
+    "check": "由外部输入拼出的文件路径必须先解析为绝对路径并校验仍位于允许根目录内，不得直接 join 后读写",
+    "bad": "readFile(join(root, req.query.name))",
+    "good": "const target = resolve(root, name)\nif (relative(root, target).startsWith('..')) throw new Error('outside root')"
+  },
+  {
+    "id": "SEC-004",
+    "dimension": "security",
+    "severity": "high",
+    "title": "不得动态执行字符串",
+    "check": "不得新增 eval、new Function、vm.runInNewContext 等执行外部字符串的调用",
+    "bad": "eval(userInput)",
+    "good": "const data = JSON.parse(userInput)"
+  },
+  {
+    "id": "SEC-005",
+    "dimension": "security",
+    "severity": "medium",
+    "title": "CORS 不得放开任意来源",
+    "check": "CORS 响应不得将 Access-Control-Allow-Origin 设为 * 或回显任意 Origin；必须使用固定白名单，携带凭据时更不得通配",
+    "bad": "res.setHeader('Access-Control-Allow-Origin', '*')\nres.setHeader('Access-Control-Allow-Credentials', 'true')",
+    "good": "res.setHeader('Access-Control-Allow-Origin', 'https://app.example.com')"
+  },
+  {
+    "id": "SEC-006",
+    "dimension": "security",
+    "severity": "high",
+    "title": "不得关闭 TLS 证书校验",
+    "check": "不得设置 rejectUnauthorized:false、NODE_TLS_REJECT_UNAUTHORIZED=0 或 verify:false 关闭证书校验；自定义 CA 须显式传入 ca",
+    "bad": "https.request(url, { rejectUnauthorized: false })",
+    "good": "https.request(url, { ca: trustedCa })"
+  },
+  {
+    "id": "PRF-001",
+    "dimension": "performance",
+    "severity": "medium",
+    "title": "循环内不得逐项 I/O",
+    "check": "循环体内不得逐项执行文件、网络或数据库 I/O；应先批量收集再一次性调用，或使用并发上限明确的批处理",
+    "bad": "for (const id of ids) await fetch(`/api/items/${id}`)",
+    "good": "const items = await fetchBatch(ids)"
+  },
+  {
+    "id": "PRF-002",
+    "dimension": "performance",
+    "severity": "medium",
+    "title": "列表路径不得 N+1 查询",
+    "check": "列表、序列化或渲染路径中不得对每个条目单独查询数据库；必须使用批量查询、join 或预加载",
+    "bad": "for (const post of posts) post.author = await db.user(post.authorId)",
+    "good": "const authors = await db.usersByIds(posts.map((post) => post.authorId))"
+  },
+  {
+    "id": "PRF-003",
+    "dimension": "performance",
+    "severity": "low",
+    "title": "外部数组不得无上限遍历",
+    "check": "外部来源的数组不得无上限地 map、filter 或 sort 后整体持有；必须分页、截断或流式处理，并说明上限",
+    "bad": "const all = (await fetchAll()).map(transform)",
+    "good": "for await (const page of fetchPages()) process(page)"
+  },
+  {
+    "id": "PRF-004",
+    "dimension": "performance",
+    "severity": "medium",
+    "title": "大文件不得同步读取",
+    "check": "主线程不得用 readFileSync、readdirSync 等同步 API 读取可能很大的文件或目录；必须使用异步 API",
+    "bad": "const buf = readFileSync(path)",
+    "good": "const buf = await readFile(path)"
+  },
+  {
     "id": "MNT-001",
     "dimension": "maintainability",
     "severity": "medium",
@@ -43,5 +169,50 @@
     "check": "不得提交 console.log、debugger、TODO 占位实现",
     "bad": "console.log('here')",
     "good": "（删除）"
+  },
+  {
+    "id": "MNT-003",
+    "dimension": "maintainability",
+    "severity": "low",
+    "title": "不得复制粘贴近似代码块",
+    "check": "同一变更里不得新增两段只差少量字面量的近似逻辑；必须抽成一个函数或参数化，避免改一处漏一处",
+    "bad": "async function saveUser(u) { await validate(u); return db.save('user', u) }\nasync function saveTeam(t) { await validate(t); return db.save('team', t) }",
+    "good": "async function save(kind, value) { await validate(value); return db.save(kind, value) }"
+  },
+  {
+    "id": "MNT-004",
+    "dimension": "maintainability",
+    "severity": "low",
+    "title": "注释必须与代码一致",
+    "check": "新增或修改的注释必须描述代码实际行为；行为已变而注释未变，或注释承诺代码未做的事，视为问题",
+    "bad": "// 返回全部用户\nconst users = await db.users({ limit: 100 })",
+    "good": "// 返回前 100 个用户\nconst users = await db.users({ limit: 100 })"
+  },
+  {
+    "id": "MNT-005",
+    "dimension": "maintainability",
+    "severity": "low",
+    "title": "不得留下死代码与未使用导入",
+    "check": "不得新增未被引用的导入、变量、函数或不可达分支",
+    "bad": "import { unused } from './x.js'",
+    "good": "import { format } from './x.js'\nconst value = format(input)"
+  },
+  {
+    "id": "MNT-006",
+    "dimension": "maintainability",
+    "severity": "nit",
+    "title": "魔法数字必须命名",
+    "check": "带业务含义的数字字面量不得直接散落在条件和计算里；必须提取为有名字的常量（0、1 等结构性数字除外）",
+    "bad": "if (retry > 3) return",
+    "good": "const MAX_RETRIES = 3\nif (retry > MAX_RETRIES) return"
+  },
+  {
+    "id": "MNT-007",
+    "dimension": "maintainability",
+    "severity": "low",
+    "title": "巨型函数必须拆分",
+    "check": "新增或实质修改的函数不得同时承担参数校验、业务计算与 I/O 三类职责；超过 80 行必须拆分",
+    "bad": "async function handle(req) {\n  const data = validate(req)\n  const total = calculate(data)\n  await db.save(total)\n  await mail.send(total)\n}",
+    "good": "async function handle(req) {\n  const order = parseOrder(req)\n  await saveOrder(order)\n}"
   }
 ]
