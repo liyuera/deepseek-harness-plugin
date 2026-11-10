@@ -13,9 +13,10 @@ import { buildPrompt, runReview } from './src/host/reviewer.js'
 import { shouldReview } from './src/host/trigger.js'
 import { createTracker } from './src/host/loop.js'
 import { createReviewCommand } from './src/host/command.js'
+import { createReviewerGuard } from './src/host/guard.js'
 
 export const name = 'code-review'
-export const inject = ['commands', 'subagents', 'workspaceChanges']
+export const inject = ['commands', 'subagents', 'workspaceChanges', 'tools']
 
 const PACKAGE_ROOT = dirname(fileURLToPath(import.meta.url))
 const PRINCIPLE_IDS = [
@@ -53,12 +54,19 @@ async function loadRulesOrFallback(logger, config) {
  */
 export function apply(ctx, config) {
   const resolved = resolveConfig(config)
+  ctx.tools.guard(createReviewerGuard(resolved.reviewerPreset))
   const tracker = createTracker()
   const latestSeq = new Map()
   const previousBlocking = new Map()
   let rulesPromise
 
-  const getRules = () => (rulesPromise ??= loadRulesOrFallback(ctx.logger, resolved))
+  const getRules = () => {
+    rulesPromise ??= loadRulesOrFallback(ctx.logger, resolved).catch((error) => {
+      rulesPromise = undefined
+      throw error
+    })
+    return rulesPromise
+  }
 
   ctx.commands.register(createReviewCommand({
     config: resolved,
