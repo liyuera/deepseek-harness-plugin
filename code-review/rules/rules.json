@@ -1,0 +1,47 @@
+[
+  {
+    "id": "SEC-001",
+    "dimension": "security",
+    "severity": "high",
+    "title": "敏感信息不得进入日志",
+    "check": "日志调用的参数里不得出现 token、password、secret、cookie 等变量或字面量",
+    "bad": "logger.info(`token=${token}`)",
+    "good": "logger.info('token refreshed')"
+  },
+  {
+    "id": "COR-001",
+    "dimension": "correctness",
+    "severity": "high",
+    "title": "不得吞掉异常",
+    "check": "catch 块不得为空，也不得只打日志后继续返回看似成功的结果",
+    "bad": "try { await save() } catch {}",
+    "good": "try { await save() } catch (e) { throw new SaveError('save failed', { cause: e }) }"
+  },
+  {
+    "id": "COR-002",
+    "dimension": "correctness",
+    "severity": "medium",
+    "title": "Promise 必须有处置",
+    "check": "每个返回 Promise 的调用要么 await、要么 return、要么显式 void 并带失败处理",
+    "bad": "fetchData()",
+    "good": "void fetchData().catch(onError)"
+  },
+  {
+    "id": "MNT-001",
+    "dimension": "maintainability",
+    "severity": "medium",
+    "title": "不得用类型断言掩盖错误",
+    "check": "不得新增 as any、@ts-ignore、as unknown as",
+    "bad": "const user = data as any",
+    "good": "const parsed = userSchema.safeParse(data)"
+  },
+  {
+    "id": "MNT-002",
+    "dimension": "maintainability",
+    "severity": "low",
+    "title": "不得留下调试残留",
+    "check": "不得提交 console.log、debugger、TODO 占位实现",
+    "bad": "console.log('here')",
+    "good": "（删除）"
+  }
+]
