@@ -55,6 +55,8 @@ dsh plugin --profile web add link:/绝对路径/deepseek-harness-plugin/code-rev
 
 安装会把它登记进 profile 的 `dsh.profile.bundles`。宿主半边只在应用启动时装配，装完要**重启应用**（源码启动则重启 `dsh web`）；只刷新页面不够。本包未发布 npm，不能按包名从 registry 安装。
 
+**profile 要求**：本插件依赖宿主提供的 `workspaceChanges` 与 `agentPresets` 服务。桌面/Web profile（`dsh-base` + `dsh-web-app`）默认都有；精简的 `headless` profile 没有这两个服务，插件会停在 `pending (waiting for service: …)` 且不生效——本插件不是为 headless 设计的使用形态。启动日志里看到这两条 pending 就是 profile 选错了。
+
 卸载：
 
 ```sh
