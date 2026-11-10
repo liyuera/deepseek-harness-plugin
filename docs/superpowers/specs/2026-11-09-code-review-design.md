@@ -67,7 +67,7 @@ AI 在主会话里写完代码，人往往要到提 MR 之后才第一次被审�
 - **spawn 请求没有 `toolFilter` / `persona`**：`dsh-tool-subagent` 对这两个字段显式报错，指向 Agent Preset。只读与人格都必须在 preset 里组合。
 - 本地子代理的只读由 preset 决定：`dsh-tool-fs` 的 `read` / `write` / `edit` / `applyPatch` 是独立开关，不挂 bash 就没有 shell。
 - `ctx.workspaceChanges.summary(sessionId, seq)` / `.diff(sessionId, seq, index, signal)` 给出每轮的变更文件与逐文件 hunk（3 行上下文），覆盖未提交改动与非 git 文件。
-- 子代理会话用 `session.header.origin === 'subagent'` 识别。
+- 子代理会话用 `session.header.origin === 'subagent'` 识别；主会话该字段是空，所以判据必须是「等于 subagent」而不是「等于 main」。
 
 ## 5. 与既有能力的关系
 
@@ -133,7 +133,7 @@ const result = await activation.result   // 超时就 activation.dispose()
 
 ### 6.4 回注
 
-- 存在 blocking findings：`agent.steer(createUserMessage({ content: [{ type: 'text', text: 渲染结果 + 修复要求 }] }))`。修复要求里注明「修完会再复审一次」。
+- 存在 blocking findings：`agent.steer({ id, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 渲染结果 + 修复要求 }] })`。修复要求里注明「修完会再复审一次」。`source` 是必填，漏了会在渲染时炸（`Cannot read properties of undefined (reading 'kind')`）。
 - 无 blocking：本轮不注入。例外——若上一轮审查有 blocking 且本轮已清零，注入一行「复审通过」，让主代理知道可以收尾。这一行同样走 `steer`，代价是多走一个步骤；换来的是模型不会在「改完了吗」的不确定里反复试探。
 - 达到 `maxRounds` 仍有 blocking：注入最终报告并声明「不再自动复审，请人工确认」，本 turn 停止自动审查。
 
@@ -316,6 +316,8 @@ code-review/
             config: { read: true, readImage: false, write: false, edit: false, applyPatch: false }
           - id: tool-fs-search
             name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false   # 字段必填，漏了 preset 挂不上去
           - id: compaction
             name: cordis:group
             group: true
@@ -358,8 +360,29 @@ code-review/
 
 ## 15. 里程碑
 
-- **M0 运行时核签**：声明层面已核对完 0.2.2-rc.1。剩下三件必须真机验的：`agent.steer` 在 turn-stopping 里确实能把轮次续上；`startActivation` 的 `structured` 能按 schema 拿到；`workspaceChanges.summary` 在本插件的 turn-stopping 监听里已经能读到本轮 seq。任一不成立则回到设计。
+- **M0 运行时核签（2026-11-10 已通过）**：用一次性探针插件 + `dsh --profile headless --patch` 在临时仓库跑了一轮真实会话，四项都成立——见 §16 记录。
 - **M1 骨架**：插件目录、装配、配置校验、`/review` 命令（先只渲染 diff 不审），证明能装上并触发。
 - **M2 审查链**：reviewer + schema + render + steer 闭环，用一份最小规则表（5 条）跑通。
 - **M3 规范**：补全四维度规则与原则层，用真实 diff 校准误报。
 - **M4 打磨**：熔断、截断、可观测性、测试补齐。
+
+
+## 16. M0 核签记录（2026-11-10）
+
+做法：不装任何 profile，用 `dsh --profile headless --patch /tmp/m0probe/patch.yml` 叠加一次性探针插件，在临时 git 仓库跑一轮真实任务（「把 a.js 里的 a 改成 2」），探针在 `agent/turn-stopping` 里依次做四件事并把结果写到文件。
+
+| 待验证 | 结果 | 证据 |
+|---|---|---|
+| turn-stopping 在主会话自然停止时触发 | ✅ | `STOPPING turn 1 origin <空> sid session-…` |
+| 同一时刻能读到本轮 `workspaceChanges.summary` | ✅ | `SUMMARY seq 46 shape [turn,cwd,files,total,added,deleted,snapshot] files 1 total 1` |
+| `startActivation` + `agentPreset` + `outputSchema` | ✅ | `RESULT stopReason completed structured {"ok":true,"note":"m0"}` |
+| 子代理不会被误审（递归门禁） | ✅ | `STOPPING turn 1 origin subagent` → `SKIP subagent` |
+| `steer` 能把轮次续上 | ✅ | steer 后模型回复 `PROBE_STEERED`，同一 turn 内再次触发 stopping（`turn 1`，新 seq 55） |
+
+顺带钉实了三件会踩坑的事：
+
+1. `dsh-tool-fs-search` 的 `sampleOverCapGlobResults` 是必填字段，漏了 preset 直接挂载失败（`invalid config: $.sampleOverCapGlobResults missing required value`）。
+2. `steer` 的消息必须带 `source`，否则渲染时 `Cannot read properties of undefined (reading 'kind')`。
+3. `steer` 之后 turn 号不变，同一 turn 会再次触发 turn-stopping——这正是 §9.1 要用 `(sessionId, turn)` 计数而不能拿 turn 当轮数的原因。
+
+未验证的部分：`/review` 命令路径、真实 diff 的审查质量、熔断与截断。它们属于 M1–M3。
