@@ -3,8 +3,8 @@
 - 日期：2026-11-09
 - 状态：v1 待评审
 - 目标运行环境：DSH 0.2.2-rc.1（desktop profile）
-- 包名：`@liyuera/dsh-session-review`
-- 目录：`deepseek-harness-plugin/session-review/`
+- 包名：`@liyuera/dsh-code-review`
+- 目录：`deepseek-harness-plugin/code-review/`
 
 ## 1. 背景与目标
 
@@ -71,7 +71,7 @@ AI 在主会话里写完代码，人往往要到提 MR 之后才第一次被审�
 
 ## 5. 与既有能力的关系
 
-| | bug-workflow 的 GitLab 审查 | 已发布的 `dsh-code-review` preset | 本插件 |
+| | bug-workflow 的 GitLab 审查 | 第三方的 `dsh-code-review` preset | 本插件 |
 |---|---|---|---|
 | 时机 | webhook / MR 事件，远端 | 用户切到「代码审查模式」会话 | `agent/turn-stopping`，本地会话内 |
 | 对象 | 提了 MR 的那批提交 | 用户指名的代码 | 本轮 AI 刚写的改动 |
@@ -115,7 +115,7 @@ const activation = await ctx.subagents.startActivation({
   signal,                               // 只取消尚未发布的工作
   request: {
     parent: agent,
-    agentPreset: 'general-code-review',  // 只读工具面与人格都在 preset 里
+    agentPreset: 'code-review',  // 只读工具面与人格都在 preset 里
     outputSchema: ReviewResultSchema,
     agentOptions: config.modelOverride, // 缺省沿用主会话模型
     prompt: [{ type: 'text', text: 组装好的审查提示 }],
@@ -124,7 +124,7 @@ const activation = await ctx.subagents.startActivation({
 const result = await activation.result   // 超时就 activation.dispose()
 ```
 
-- 只读靠 preset，不靠提示词：`general-code-review` 这个 preset 里只挂 `read` / `grep` / `glob` 对应的工具，`dsh-tool-fs` 的 `write`、`edit`、`applyPatch` 全关，且不挂任何 bash/终端行。0.2.2 的 spawn 请求没有 `toolFilter`，preset 是唯一的结构性只读手段。
+- 只读靠 preset，不靠提示词：`code-review` 这个 preset 里只挂 `read` / `grep` / `glob` 对应的工具，`dsh-tool-fs` 的 `write`、`edit`、`applyPatch` 全关，且不挂任何 bash/终端行。0.2.2 的 spawn 请求没有 `toolFilter`，preset 是唯一的结构性只读手段。
 - `delivery: 'caller'` 很关键：默认的 `parent` 投递会向父代理发一条「子代理完成」通知，白白多一轮模型调用；插件自己等 `result` 就够了。
 - 超时用 `dispose()` 而不是请求信号：请求 `signal` 只能取消尚未发布的工作，发布后的取消通道是 `dispose()`。
 - prompt 里明确：只读、不许改代码、拿不到完整文件时才用 read/grep 补上下文。
@@ -251,8 +251,8 @@ interface Finding {
 
 ```yaml
 - insert:
-    - id: session-review
-      name: '@liyuera/dsh-session-review'
+    - id: code-review
+      name: '@liyuera/dsh-code-review'
       config:
         enabled: true
         auto: true                       # false 时只保留 /review
@@ -261,7 +261,7 @@ interface Finding {
         codeExtensions: [.ts, .tsx, .js, .jsx, .vue, .py, .go, .java, .rs, .css, .less, .scss]
         maxDiffBytes: 200000
         reviewerTimeoutMs: 120000
-        reviewerPreset: general-code-review # 只读工具面的载体，见 §11
+        reviewerPreset: code-review # 只读工具面的载体，见 §11
         # 省略 modelOverride 即沿用主会话模型；只覆盖其一视为配置非法
         # modelOverride: { provider: deepseek, model: deepseek-chat }
         rulesFile: rules/rules.yaml
@@ -273,7 +273,7 @@ interface Finding {
 ## 11. 模块与文件
 
 ```
-session-review/
+code-review/
   package.json            # 无 client 半边；dsh.bundle.patch 指向 cordis.patch.yml
   cordis.patch.yml        # 两条 insert：reviewer preset + 本插件行
   index.js                # 装配入口：读配置、加载规范、挂监听与命令
@@ -295,10 +295,10 @@ session-review/
 
 ```yaml
 - insert:
-    - id: preset-general-code-review
+    - id: preset-code-review
       name: '@deepseek-ai/dsh-agent-preset'
       config:
-        id: general-code-review
+        id: code-review
         name: 通用代码审查
         description: 通用代码审查——只读子代理，只审不改
         order: 50
@@ -322,8 +322,8 @@ session-review/
             isolate: { compaction: true }
             config:
               - { id: compaction-basic, name: '@deepseek-ai/dsh-compaction-basic' }
-    - id: session-review
-      name: '@liyuera/dsh-session-review'
+    - id: code-review
+      name: '@liyuera/dsh-code-review'
 ```
 
 模块边界约束：`trigger` / `render` / `rules` 是纯函数，不碰 ctx，可直接单测；`collect` / `reviewer` 只依赖注入进来的服务接口，用假实现测。
@@ -348,7 +348,7 @@ session-review/
 | 风险 | 说明与对策 |
 |---|---|
 | API 版本 | 已按运行时 0.2.2-rc.1 的产物核签（见 §4 / §6.3），但只核了声明与调用形态，没跑过。M0 剩下的正是运行时行为验证 |
-| 预设可见性 | reviewer preset 是全局注册的，会出现在用户新建会话的预设选择器里。取舍：接受它（它本身也能当手动审查用），名字定为「通用代码审查」并配「只审不改」的人格，避免被误当成通用编码模式 |
+| 预设可见性 | reviewer preset 是全局注册的，会出现在用户新建会话的预设选择器里。取舍：接受它（它本身也能当手动审查用），显示名定为「通用代码审查」并配「只审不改」的人格，避免被误当成通用编码模式。另一面：preset id `code-review` 与第三方 `dsh-code-review` 可能撞车——重复 id 会让声明加载失败，真撞了就把 id 改成 `general-code-review`，显示名不用动 |
 | 监听顺序 | 本插件必须在 `workspace-changes` 之后加载才能读到本轮 `workspace/changes`。profile patch 顺序天然满足；隔离组合里要显式保证，否则退化为 git diff |
 | 误报 | 一次误报让主代理去「修」正确代码，比不审更糟。对策：severity 定得保守、规则必须带 bad/good、原则层写清「什么可以放过」 |
 | 成本 | 每轮一次子代理。对策：纯文档轮次不触发、maxDiffBytes 截断、失败熔断、`auto: false` 可退化为手动 |
