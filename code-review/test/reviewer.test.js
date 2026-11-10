@@ -11,6 +11,7 @@ test('buildPrompt 带变更清单与 diff', () => {
   assert.match(prompt, /@@ -1,1 \+1,1 @@/)
   assert.match(prompt, /x\.png（binary）/)
   assert.match(prompt, /只返回 JSON/)
+  assert.match(prompt, /structured_output/)
 })
 
 test('schema 要求 findings 数组', () => {
