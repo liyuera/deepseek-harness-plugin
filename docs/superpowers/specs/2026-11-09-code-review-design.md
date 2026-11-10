@@ -107,7 +107,9 @@ AI 在主会话里写完代码，人往往要到提 MR 之后才第一次被审�
 - 从 `session/event` 订阅里缓存每个 session 最新的 `workspace/changes` seq。
 - `ctx.workspaceChanges.summary(sessionId, seq)` 取文件列表；`diff(sessionId, seq, index, signal)` 逐文件取 hunk（`signal` 必须是真的 `AbortSignal`）。
 - 只取 `codeExtensions` 命中的文件；跳过 `binary` / `oversized` / 服务读不到的项，并在 prompt 里点名告知跳过，不静默。
-- 按文件顺序累积，按 UTF-8 字节数（`Buffer.byteLength`）计，超过 `maxDiffBytes` 后停止并声明「已截断，剩余 N 个文件未审」。
+- 按文件顺序累积，按 UTF-8 字节数（`Buffer.byteLength`）计，超过 `maxDiffBytes` 后剩余文件记 `budget` 跳过。
+- 跳过原因统一在报告里以 `未审:` 行列出（`not-code` / `budget` / `binary` / `oversized` / `unavailable` / `coarse`），不单独声明「已截断 N 个」计数。
+- `diff.coarse === true`（两侧文本比较超时、退化成整文件替换）的文件按 `coarse` 跳过：这种 diff 会让审查者把旧行当新增，宁可不审。
 - **`ctx.workspaceChanges` 是硬依赖**：`inject` 里声明它，组合缺少该插件时本插件不加载。v1 刻意不做 `ctx.subprocess` + `git diff` 回退——回退会引入两套取材语义（未提交 vs 相对基线）和两套测试面，留到 v2。
 - **监听顺序依赖**：见 §4 的串行 dispatch 说明。本插件靠 profile patch 的顺序排在 `workspace-changes` 之后；顺序不满足时预检会因 `summary.turn !== turn` 跳过（debug 日志可见），不会误审上一轮的 diff。
 
@@ -130,7 +132,7 @@ const activation = await ctx.subagents.startActivation({
 const result = await activation.result   // 超时就 activation.dispose()
 ```
 
-- 只读靠两层，不靠提示词：① `code-review` preset 里只挂 `read` / 搜索工具，`dsh-tool-fs` 的 `write`、`edit`、`applyPatch` 全关；② 宿主 `ctx.tools.guard` 按 `reviewerPreset` 全名拒绝一切会改工作区、执行命令、委派子代理、装插件的工具（名单见 `src/host/guard.js`）。第二层是必须的：0.2.2 的 spawn 请求没有 `toolFilter`，而 preset 里的 `write: false` **移除不了继承自 profile 根层的工具**，只靠 preset 的「结构性只读」并不成立。
+- 只读靠两层，不靠提示词：① `code-review` preset 里只挂 `read` / 搜索工具，`dsh-tool-fs` 的 `write`、`edit`、`applyPatch` 全关；② 宿主 `ctx.tools.guard` 对 `agentPreset === reviewerPreset` 的子代理走**只读白名单**（fail-closed）：只放行 `read` / `read_image` / `glob` / `grep` / `structured_output`，其余（含宿主将来新增的未知工具）一律拒绝。`structured_output` 必须在白名单里，否则审查结果无法回传、每次审查都 incomplete。第二层是必须的：0.2.2 的 spawn 请求没有 `toolFilter`，而 preset 里的 `write: false` **移除不了继承自 profile 根层的工具**，只靠 preset 的「结构性只读」并不成立。
 - `delivery: 'caller'` 很关键：默认的 `parent` 投递会向父代理发一条「子代理完成」通知，白白多一轮模型调用；插件自己等 `result` 就够了。
 - `signal` 从 turn-stopping 透传，但只覆盖「尚未发布的工作」；发布后的取消通道是 `dispose()`。实现上用一个整体 deadline 同时兜住 `startActivation`、`result` 与 `dispose` 三条路径（见 `runReview`），而不是分开设两个超时。
 - prompt 里明确：只读、不许改代码、拿不到完整文件时才用 read/grep 补上下文；并显式要求用 `structured_output` 工具回传结果（理由见 §4 最后一条）。
@@ -140,7 +142,7 @@ const result = await activation.result   // 超时就 activation.dispose()
 
 ### 6.4 回注
 
-- 存在 blocking findings：`agent.steer({ id, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 渲染结果 + 修复要求 }] })`。修复要求里注明「修完会再复审一次」。`source` 是必填，漏了会在渲染时炸（`Cannot read properties of undefined (reading 'kind')`）。
+- 存在 blocking findings：`agent.steer({ id, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 渲染结果 + 修复要求 }] })`。非末轮的修复要求写「修完会再复审一次」；**最后一轮**（`rounds >= maxRounds`）改写为「本轮已达到自动复审上限，修完不会再自动复审，请人工确认」，不承诺不会发生的复审。`source` 是必填，漏了会在渲染时炸（`Cannot read properties of undefined (reading 'kind')`）。
 - 无 blocking：本轮不注入。例外——若同一 turn 的上一轮审查有 blocking 且本轮已清零，注入一行「复审通过」，让主代理知道可以收尾。这一行同样走 `steer`，代价是多走一个步骤；换来的是模型不会在「改完了吗」的不确定里反复试探。跨轮状态按 turn 记录，避免上一 turn 的阻塞历史泄漏到新 turn。
 - 达到 `maxRounds` 后门禁不再放行，不额外注入「终报告」——最后一轮已注入的那份报告就是终报告，此时主代理手上已有完整 findings 清单。
 
@@ -164,7 +166,7 @@ interface ReviewResult {
 }
 
 interface Finding {
-  ruleId: string        // SEC-002 / COR-011 / PRF-003 / MNT-004 / PRINCIPLE-correctness
+  ruleId: string        // SEC-002 / COR-003 / PRF-003 / MNT-004 / PRINCIPLE-correctness
   dimension: 'correctness' | 'security' | 'performance' | 'maintainability'
   severity: 'high' | 'medium' | 'low' | 'nit'
   location: string      // src/auth/session.ts:42 或 :88-96
@@ -184,7 +186,7 @@ interface Finding {
 [SEC-002] 安全/high      src/auth/session.ts:42
   问题: 令牌以明文写入日志，且未标注有效期
   建议: 记录 tokenId 或脱敏占位符，日志字段显式声明 TTL
-[COR-011] 正确性/medium  src/auth/session.ts:88-96
+[COR-003] 正确性/medium  src/auth/session.ts:88-96
   问题: refresh 失败分支未处理，Promise rejection 会静默丢失
   建议: 补 catch 并走登出路径，或显式 void 并在日志里记为已知失败
 未审: src/vendor.min.js（二进制/超限）
@@ -225,6 +227,7 @@ interface Finding {
 
 - 七个字段全部必填且为非空字符串，缺一个即加载失败（不静默）；`id` 前缀按维度：`COR` / `SEC` / `PRF` / `MNT`，全局唯一。
 - `severity` 取值固定四档；`check` 是一句话判断条件，`bad`/`good` 是判定锚点——**`good` 自身必须能通过 `check`**（早期草稿在这里翻过车）。
+- **硬规则的 severity 以规则表为准**：命中规则 id 的 finding，插件用规则表的 `severity` 覆盖审查者给的值（避免模型把 high 规则降成 low 变成不阻塞）；`PRINCIPLE-*` 长尾问题没有规则表条目，保留审查者的判断。
 - 首版交付 **24 条**（correctness 7 / security 6 / performance 4 / maintainability 7），覆盖四个维度；后续按真实误报迭代。
 
 ### 8.3 生命周期
@@ -239,7 +242,7 @@ interface Finding {
 
 ### 9.2 幂等
 
-同一 turn 的同一份 diff 只审一次（按 `workspace/changes` 的 seq 记），复审必须是因为 diff 变了。`reviewing` 集合防止并发重入。
+同一 turn 的同一份 diff 只审一次，复审必须是因为 diff 变了。`workspace-changes` 每次 turn-stopping 都会用**新 seq 重新宣告同一份未变 diff**（它对比的是 turn 起始 baseline），所以不能按 seq 去重：取材后对 `path + 渲染文本` 做 SHA-256 内容指纹，按 `(sessionId, turn)` 记住**上一次成功审查**的指纹，命中即跳过且不消耗轮次（`abandonRound`）；失败不占去重位。不能用 summary 的 added/deleted 当指纹——一行内容替换会让计数不变。`reviewing` 集合防止并发重入。
 
 ### 9.3 超时
 
@@ -333,23 +336,19 @@ code-review/
             name: '@deepseek-ai/dsh-tool-fs-search'
             config:
               sampleOverCapGlobResults: false   # 字段必填，漏了 preset 挂不上去
-          - id: compaction
-            name: cordis:group
-            group: true
-            isolate: { compaction: true }
-            config:
-              - { id: compaction-basic, name: '@deepseek-ai/dsh-compaction-basic' }
     - id: code-review
       name: '@liyuera/dsh-code-review'
 ```
+
+（上面是实际交付的 preset 草图；早期草稿里还挂过一个 `compaction` isolate group，交付时没有挂——审查输入是插件渲染好的 diff，不需要长会话压缩。）
 
 模块边界约束：`trigger` / `render` / `rules` 是纯函数，不碰 ctx，可直接单测；`collect` / `reviewer` 只依赖注入进来的服务接口，用假实现测。
 
 ## 12. 可观测性
 
 - 每次跳过记录原因（`disabled` / `manual-only` / `subagent` / `reviewing` / `rounds-exhausted` / `no-changes` / `breaker-open` / `stale-summary`），仅在 debug 级，不写会话事件。
-- 每次审查记录：轮次、文件数、diff 字节、耗时、findings 数、是否被截断。
-- 失败记录：原因分类（timeout / provider-error / schema-invalid / service-missing）。
+- 每次审查记录：turn、文件数（用 `summary.total`，含被 `maxFiles` 截断前的总数）、跳过数、耗时、findings 数、是否截断（截断时另记一条）。
+- 失败记录原因分类：`timeout` / `incomplete` / `invalid-result` / `aborted` / `provider-error`（debug 级；`incomplete` 覆盖结构化结果缺失，`invalid-result` 覆盖 schema 不合法与全部 finding 被二次校验丢弃）。
 - 不记录 diff 正文与 finding 全文到日志（仓库代码可能含敏感串）。
 
 ## 13. 测试策略
@@ -365,7 +364,7 @@ code-review/
 | 风险 | 说明与对策 |
 |---|---|
 | API 版本 | 已按运行时 0.2.2-rc.1 的产物核签（见 §4 / §6.3），并已用 `dsh --profile headless --patch` 跑通真实链路（M0 + Task 6 联调），核心 API 形态均已实测 |
-| 预设可见性 | reviewer preset 是全局注册的，会出现在用户新建会话的预设选择器里。取舍：接受它（它本身也能当手动审查用），显示名定为「通用代码审查」并配「只审不改」的人格，避免被误当成通用编码模式。另一面：preset id `code-review` 与第三方 `dsh-code-review` 可能撞车——重复 id 会让声明加载失败，真撞了就把 id 改成 `general-code-review`，显示名不用动 |
+| 预设可见性 | reviewer preset 是全局注册的，会出现在用户新建会话的预设选择器里。取舍：接受它（它本身也能当手动审查用），显示名定为「通用代码审查」并配「只审不改」的人格，避免被误当成通用编码模式。代价：手动选用该 preset 的会话同样受只读白名单约束（只有 read/read_image/glob/grep/structured_output 五个工具），不能用来写代码。另一面：preset id `code-review` 与第三方 `dsh-code-review` 可能撞车——重复 id 会让声明加载失败，真撞了就把 id 改成 `general-code-review`，显示名不用动 |
 | 监听顺序 | 本插件必须在 `workspace-changes` 之后注册才能读到本轮 `workspace/changes`（serial dispatch）。profile patch 顺序天然满足；顺序不满足时预检按 `stale-summary` 跳过（不误审旧 diff，但自动审查会静默失效），排查时看 debug 日志 |
 | 误报 | 一次误报让主代理去「修」正确代码，比不审更糟。对策：severity 定得保守、规则必须带 bad/good、原则层写清「什么可以放过」 |
 | 成本 | 每轮一次子代理。对策：纯文档轮次不触发、maxDiffBytes 截断、失败熔断、`auto: false` 可退化为手动 |
