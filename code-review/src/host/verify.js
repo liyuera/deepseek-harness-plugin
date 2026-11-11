@@ -33,7 +33,8 @@ export function buildVerifyPrompt({ finding, files }) {
     : finding.evidence
   return [
     '## 任务：证伪一条代码审查 finding',
-    '有人报告了下面的问题。你的任务是尝试**推翻它**，不是附和。默认 confirmed:false，只有尝试证伪失败后才确认。',
+    '有人报告了下面的问题。你的任务是尝试**推翻它**，不是附和。'
+      + '默认 confirmed:false，只有尝试证伪失败后才确认。',
     '',
     '## 待复核 finding',
     `- ruleId: ${finding.ruleId}`,
@@ -46,10 +47,12 @@ export function buildVerifyPrompt({ finding, files }) {
     ...files.map((file) => `- ${file.path}`),
     '',
     '## 判定要求',
-    '- 检查：引用的代码是否真实存在且可达？声称的输入/状态是否真的会发生？是否已有别的保护阻止故障？',
+    '- 检查：引用的代码是否真实存在且可达？声称的输入/状态是否真的会发生？'
+      + '是否已有别的保护阻止故障？',
     '- 能复现就复现；不能复现时必须给出具体反驳理由（代码/行号/保护逻辑）。',
     '- 不得提出修复方案，不得修改文件。',
-    '只返回 JSON：{"confirmed":true|false,"reason":"...","witnesses":["..."]}；不要在最终文本里输出 JSON。',
+    '只返回 JSON：{"confirmed":true|false,"reason":"...","witnesses":["..."]}；'
+      + '不要在最终文本里输出 JSON。',
   ].join('\n')
 }
 
@@ -77,6 +80,7 @@ async function runVerdict({
   let activation
   let timedOut = false
   let aborted = false
+  const deadlineSymbol = { timedOut: true }
   const abortSymbol = { aborted: true }
   let notifyAbort
   const abortPromise = new Promise((resolve) => { notifyAbort = resolve })
@@ -88,7 +92,7 @@ async function runVerdict({
   signal?.addEventListener('abort', onAbort, { once: true })
   let timer
   const deadline = new Promise((resolve) => {
-    timer = setTimeout(() => resolve(abortSymbol), timeoutMs)
+    timer = setTimeout(() => resolve(deadlineSymbol), timeoutMs)
   })
   try {
     const started = await Promise.race([
@@ -106,18 +110,28 @@ async function runVerdict({
         },
       })),
       deadline,
+      abortPromise,
     ])
+    if (started === deadlineSymbol) {
+      timedOut = true
+      return undefined
+    }
     if (started === abortSymbol) {
-      timedOut = !aborted
+      aborted = true
       return undefined
     }
     activation = started
     const settled = await Promise.race([
       Promise.resolve(activation.result).then((value) => ({ value })),
       deadline,
+      abortPromise,
     ])
+    if (settled === deadlineSymbol) {
+      timedOut = true
+      return undefined
+    }
     if (settled === abortSymbol) {
-      timedOut = !aborted
+      aborted = true
       return undefined
     }
     if (settled.value?.stopReason !== 'completed') return undefined

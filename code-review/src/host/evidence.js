@@ -116,10 +116,12 @@ export function validateFindingEvidence(finding, file) {
   if (index === undefined) return { status: 'unreadable' }
   const line = locationLine(finding.location)
   if (!lineInRanges(line, index.ranges)) return { status: 'outside' }
-  // 片段每一行都必须来自该文件；且至少一行来自变更行（防止只引用上下文/旧代码）。
-  if (!lines.every((text) => index.all.has(text))) return { status: 'mismatch' }
+  // 模型可能照抄 diff 的 `+`/`-` 前缀；两种写法都接受，但至少一行要来自变更行。
+  const stripped = lines.map((text) => text.replace(/^[+-]/, '').trim())
+  const contains = (set) => lines.every((text, position) => set.has(text) || set.has(stripped[position]))
+  if (!contains(index.all)) return { status: 'mismatch' }
   const hasChanged = index.ranges.length === 0
     ? true
-    : lines.some((text) => index.changed.has(text))
+    : lines.some((text, position) => index.changed.has(text) || index.changed.has(stripped[position]))
   return hasChanged ? { status: 'ok' } : { status: 'mismatch' }
 }

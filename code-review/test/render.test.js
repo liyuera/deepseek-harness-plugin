@@ -231,3 +231,16 @@ test('respectFixPolicy=false 时 manual 项回到自动修复桶', () => {
   assert.match(text, /结论: 需修改（1 处阻塞）/)
   assert.doesNotMatch(text, /人工确认/)
 })
+
+test('只有未复验项时结论为「仅报告」，不伪装成通过或需修改', () => {
+  const text = renderFindings({
+    findings: [finding({ severity: 'medium', verified: 'unverified' })],
+    skipped: [],
+    blockingSeverities: ['high', 'medium'],
+    summary: { files: 1, added: 1, deleted: 0 },
+    mode: 'manual',
+  })
+  assert.match(text, /结论: 仅报告（1 处未复验\/证据不足，需人工确认）/)
+  assert.match(text, /仅报告（未复验\/证据不足，不要据此修复）:/)
+  assert.doesNotMatch(text, /需修改/)
+})

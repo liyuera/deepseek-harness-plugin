@@ -123,3 +123,14 @@ test('片段被反引号/代码块包裹时仍可匹配', () => {
     { status: 'ok' },
   )
 })
+
+test('片段照抄 diff 的 +/- 前缀时也能命中变更行', () => {
+  assert.deepEqual(
+    validateFindingEvidence(finding({ evidence: { snippet: '+const value = next + 1' } }), FILE),
+    { status: 'ok' },
+  )
+  assert.deepEqual(
+    validateFindingEvidence(finding({ evidence: { snippet: '-const old = 1' } }), FILE),
+    { status: 'ok' },
+  )
+})

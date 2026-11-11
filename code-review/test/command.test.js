@@ -468,6 +468,6 @@ test('/review 证据片段伪造（warn）：finding 仅报告，不阻塞', asy
   const result = await harness.command.handler({ agent, signal: signal() })
 
   assert.equal(result.kind, 'success')
-  assert.match(result.text, /结论: 需人工确认/)
+  assert.match(result.text, /结论: 仅报告/)
   assert.match(result.text, /未复验\/证据不足/)
 })

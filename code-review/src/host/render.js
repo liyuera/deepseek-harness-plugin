@@ -125,21 +125,28 @@ export function renderFindings({
   }
 
   const scope = `本次 ${summary.files} 文件 / ${summary.added + summary.deleted} 行变更`
+  const manualPart = manual.length > 0 ? `，${manual.length} 处人工确认` : ''
+  const unverifiedPart = unverified.length > 0 ? `，${unverified.length} 处未复验` : ''
+  const advisePart = adviseList.length > 0 ? `，${adviseList.length} 处建议` : ''
   let head
   if (auto.length > 0) {
-    head = `结论: 需修改（${auto.length} 处阻塞${manual.length > 0 ? `，${manual.length} 处人工确认` : ''}${adviseList.length > 0 ? `，${adviseList.length} 处建议` : ''}）`
-  } else if (manual.length > 0 || unverified.length > 0) {
-    head = `结论: 需人工确认（${manual.length} 处人工确认${unverified.length > 0 ? `，${unverified.length} 处未复验` : ''}）`
+    head = `结论: 需修改（${auto.length} 处阻塞${manualPart}${advisePart}）`
+  } else if (manual.length > 0) {
+    head = `结论: 需人工确认（${manual.length} 处人工确认${unverifiedPart}）`
+  } else if (unverified.length > 0) {
+    head = `结论: 仅报告（${unverified.length} 处未复验/证据不足，需人工确认）`
   } else {
     head = `结论: 通过（${mode === 'report' ? passive.length : notified.length} 处建议）`
   }
   const sections = []
   if (auto.length > 0) sections.push(auto.map((finding) => findingLines(finding)).join('\n'))
   if (manual.length > 0) {
-    sections.push(`需人工确认（不要自动修改）:\n${manual.map((finding) => findingLines(finding, '人工')).join('\n')}`)
+    const lines = manual.map((finding) => findingLines(finding, '人工')).join('\n')
+    sections.push(`需人工确认（不要自动修改）:\n${lines}`)
   }
   if (unverified.length > 0) {
-    sections.push(`仅报告（未复验/证据不足，不要据此修复）:\n${unverified.map((finding) => findingLines(finding, '未复验')).join('\n')}`)
+    const lines = unverified.map((finding) => findingLines(finding, '未复验')).join('\n')
+    sections.push(`仅报告（未复验/证据不足，不要据此修复）:\n${lines}`)
   }
   if (adviseList.length > 0) sections.push(`非阻塞建议:\n${adviseList.map((finding) => findingLines(finding)).join('\n')}`)
   if (skipped.length > 0) sections.push(`未审: ${skipped.map((item) => `${item.path}（${item.reason}）`).join('、')}`)

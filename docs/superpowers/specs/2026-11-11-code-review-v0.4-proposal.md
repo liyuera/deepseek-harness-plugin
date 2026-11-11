@@ -320,7 +320,7 @@ R3：
 
 ## 11. R1 实施记录（2026-11-11，0.4.0）
 
-R1 已完成并合入 0.4.0；全部 311 个用例通过。实施时对方案做了以下收敛（以代码为准）：
+R1 已完成并合入 0.4.0；全部 314 个用例通过。实施时对方案做了以下收敛（以代码为准）：
 
 1. **证据语义分三档**（`src/host/evidence.js` + `reviewer.js`）：
    - `location` 不在本轮 hunk 新侧范围 → **总是丢弃**（旧代码冒充新问题）；
@@ -332,7 +332,17 @@ R1 已完成并合入 0.4.0；全部 311 个用例通过。实施时对方案做
 3. **manual-only 不再承诺「修完会再复审」**：不触发修复轮，文案只要求人工确认/勿自动修改。
 4. **full 模式的证据校验需要宿主持有文件内容**：新增 `src/host/readfile.js`，从 `agent.session.header.cwd` 读取链内文件（每文件 256KB 上限、realpath 越界拒绝）；读不到按不可读处理。
 5. **journal 只记复验统计**（checked/confirmed/rejected/unverified + coverage + suppressed 数）；逐条 verifier 的 witnesses 与 finding 级跨重启账本留给 R2。
-6. **实现文件**：新增 `evidence.js`、`readfile.js`、`verify.js`、`fixmode.js`、`suppress.js`、`finalize.js`；修改 `reviewer.js`/`config.js`/`rules.js`/`render.js`/`journal.js`/`command.js`/`index.js`；规则包调整 MNT-011/MNT-016 并新增 BEH-009/BEH-010。
+6. **实现文件**：新增 `evidence.js`、`readfile.js`、`verify.js`、`fixmode.js`、`suppress.js`、`finalize.js`、`structured.js`；修改 `reviewer.js`/`config.js`/`rules.js`/`render.js`/`journal.js`/`command.js`/`index.js`；规则包调整 MNT-011/MNT-016 并新增 BEH-009/BEH-010。
 7. **默认值**：`evidenceMode: warn`、`coverageMode: warn`、`verify: blocking`、`maxVerifiedFindings: 3`、`verifyTimeoutMs: 180000`、`respectFixPolicy: true`；真实使用一段时间、观察「因证据被降级/丢弃」的比例后再把前两项切到 `enforce`。
 
 R2（journal 账本/`/review` 分区/评测语料）与 R3（`--range`/`--patch`/分块/超时自适应）尚未开始。
+
+### 11.1 自审修复（2026-11-11）
+
+0.4.0 提交后插件对本次 diff 的自动审查报出 3 条阻塞，均已修复并补回归用例：
+
+1. **未复验项被静默丢弃**（`index.js`）：只有 `unverified` 时原来落到默认静默分支；现在进入「仅报告」通知，文案为「未通过复验/证据不足，仅作报告；请人工确认」，既不伪装通过也不要求修复。
+2. **复验窗口内的旧链结果回灌**：复验把结算窗口拉长到分钟级，人类消息可能已重置链；现在结算后先校验 `meta.epoch === tracker.epochOf(sessionId)`，旧链结果只记留痕、不回灌、不污染新链指纹。
+3. **diff 前缀导致证据误判**：模型照抄 `+const x = 1` 时片段对不上；`evidence.js` 现在同时接受带/不带 `+`/`-` 前缀的写法。
+
+同时按自审建议：拆出 `structured.js` 让 `reviewer.js` 回到 500 行内；补齐 verifier 的 abortPromise（取消立即返回并 dispose）；拆分若干超长行。

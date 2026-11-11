@@ -151,3 +151,33 @@ test('signal 已取消时不启动复验', async () => {
   assert.equal(result.unverified, 1)
   assert.equal(subagents.calls, 0)
 })
+
+test('父 signal 取消时立即返回未证实并 dispose，不等 verifier 结算', async () => {
+  let disposed = 0
+  const subagents = {
+    async startActivation() {
+      return { childId: 'v', result: new Promise(() => {}), dispose: async () => { disposed += 1 } }
+    },
+  }
+  const controller = new AbortController()
+  const startedAt = Date.now()
+  const pending = verifyFindings({
+    subagents,
+    agent: {},
+    preset: 'code-review',
+    findings: [finding()],
+    files: [],
+    blockingSeverities: ['high'],
+    timeoutMs: 120000,
+    signal: controller.signal,
+  })
+  await new Promise((resolve) => setImmediate(resolve))
+  controller.abort()
+  const result = await Promise.race([
+    pending,
+    new Promise((resolve) => setTimeout(() => resolve({ timedOut: true }), 1000)),
+  ])
+  assert.ok(Date.now() - startedAt < 1000)
+  assert.equal(result.unverified, 1)
+  assert.equal(disposed, 1)
+})

@@ -219,15 +219,18 @@ export function apply(ctx, config) {
         })
       }
 
-      tracker.recordSuccess(sessionId)
-      // 只有成功审查才写指纹（失败/取消允许同一份 diff 重试）；人类消息可能在
-      // 审查在途时重置了链，旧链结果不得污染新链的去重指纹/全量状态/已报问题。
+      // 复验把收口窗口拉长到分钟级：期间人类消息可能已开启新链，
+      // 旧链结果不得回灌，也不得污染新链的去重指纹/全量状态/已报问题。
       const sameChain = meta.epoch === tracker.epochOf(sessionId)
-      if (sameChain) {
-        lastFingerprint.set(sessionId, meta.hash)
-        if (meta.fullRound) chain.markFull(sessionId, meta.epoch)
-        lastFindings.set(sessionId, findings.slice(0, 20))
+      if (!sameChain) {
+        ctx.logger.debug?.(`[code-review] drop: session ${sessionId} 的审查结果属于已重置的旧链`)
+        recordCompleted(false)
+        return
       }
+      tracker.recordSuccess(sessionId)
+      lastFingerprint.set(sessionId, meta.hash)
+      if (meta.fullRound) chain.markFull(sessionId, meta.epoch)
+      lastFindings.set(sessionId, findings.slice(0, 20))
       const elapsed = Date.now() - meta.startedAt
       const totalFiles = meta.summary.total ?? meta.summary.files.length
       ctx.logger.debug?.(
@@ -268,14 +271,20 @@ export function apply(ctx, config) {
         const hints = []
         if (buckets.manual.length > 0) hints.push('标注[人工]的问题需人工确认，不要自动修改')
         if (buckets.unverified.length > 0) hints.push('标注[未复验]的问题仅作报告，不要据此修复')
-        payload = `${blockingText}\n\n请按上面每条阻塞 finding 修复${suggest}。${hints.length > 0 ? `${hints.join('；')}。` : ''}${note}如与用户新指令冲突，以用户指令为准。`
-      } else if (buckets.manual.length > 0) {
+        const hintText = hints.length > 0 ? `${hints.join('；')}。` : ''
+        const instruction = `请按上面每条阻塞 finding 修复${suggest}。${hintText}${note}`
+        payload = [blockingText, '', `${instruction}如与用户新指令冲突，以用户指令为准。`].join('\n')
+      } else if (buckets.manual.length > 0 || buckets.unverified.length > 0) {
         const manualText = renderFindings({ ...baseRender, mode: 'manual' })
         if (manualText === '') {
           recordCompleted(false)
           return
         }
-        payload = `${manualText}\n\n以上问题需人工确认，请勿自动修改。如与用户新指令冲突，以用户指令为准。`
+        const action = buckets.manual.length > 0
+          ? '以上问题需人工确认，请勿自动修改。'
+          : '以上问题未通过复验/证据不足，仅作报告；请人工确认，不要据此自动修改。'
+        const actionLine = `${action}如与用户新指令冲突，以用户指令为准。`
+        payload = [manualText, '', actionLine].join('\n')
       } else if (resolved.notifySeverities.length > 0) {
         const notifyText = renderFindings({ ...baseRender, mode: 'notify' })
         // 没有命中 notifySeverities 的建议（或本轮干净）：仍然静默。
@@ -283,7 +292,12 @@ export function apply(ctx, config) {
           recordCompleted(false)
           return
         }
-        payload = `${notifyText}\n\n以上为非阻塞建议，可选择不改；若认同可顺手修复。${note}如与用户新指令冲突，以用户指令为准。`
+        const suffix = '如与用户新指令冲突，以用户指令为准。'
+        payload = [
+          notifyText,
+          '',
+          `以上为非阻塞建议，可选择不改；若认同可顺手修复。${note}${suffix}`,
+        ].join('\n')
       } else {
         // v2 默认行为：通过/只有非阻塞建议时静默，不注入「结论: 通过」。
         recordCompleted(false)

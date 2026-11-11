@@ -462,12 +462,11 @@ test('在途审查跨人类重置：结算按当前链口径，旧链结果不�
   // 审查在途时人类发消息：轮次归零、epoch +1、指纹清空。
   await harness.userMessage({ source: { kind: 'user' } })
 
-  // 旧链的结果照常回灌，但文案必须按新链（rounds=0）判断，不能再说不会再复审。
+  // 旧链结果在人类消息之后才结算：不得回灌到新链（复验会放大这段窗口）。
   harness.resolveNext(completed([FINDING]))
   await tick()
-  assert.equal(harness.state.follows.length, 2, '两次审查各回灌一次')
-  assert.match(followText(harness.state, 1), /修完会再复审一次/)
-  assert.doesNotMatch(followText(harness.state, 1), /不会再自动复审/)
+  assert.equal(harness.state.follows.length, 1, '旧链结果不得再回灌')
+  assert.ok(debugHas(harness.state, '属于已重置的旧链'))
 
   // 旧链结果不得写指纹：同一份 diff 再 stopping 应能重新发起。
   await harness.stop(agent, { seq: 9, turn: 3, diff: '+const a = 2' })
@@ -1399,15 +1398,18 @@ test('配置抑制命中：finding 不回灌；/review 脚注显示抑制数', a
   assert.match(result.text, /抑制 1/)
 })
 
-test('证据片段不符（warn）：finding 降级为仅报告，不触发修复轮', async () => {
+test('证据片段不符（warn）：降级为仅报告，但仍注入可见提示', async () => {
   const harness = createHarness({ maxRounds: 2, verify: 'off' })
   const agent = makeAgent(harness)
 
   await harness.stop(agent, { seq: 7, turn: 1, diff: '+const a = 1' })
   harness.resolveNext(completed([{ ...FINDING_EVIDENCE, evidence: { snippet: 'const fake = 1' } }]))
-  await tick()
+  await waitFor(() => harness.state.follows.length === 1, { timeout: 1000 })
 
-  assert.equal(harness.state.follows.length, 0)
+  const text = followText(harness.state, 0)
+  assert.match(text, /结论: 仅报告/)
+  assert.match(text, /未复验\/证据不足/)
+  assert.doesNotMatch(text, /请按上面每条阻塞 finding 修复/)
   assert.ok(warnHas(harness.state, '证据片段不符'))
 })
 
