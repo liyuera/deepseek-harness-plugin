@@ -7,21 +7,29 @@ import { fileURLToPath } from 'node:url'
 import { resolveConfig } from './src/host/config.js'
 import { collect, fingerprint } from './src/host/collect.js'
 import { loadRulesResilient } from './src/host/rules.js'
-import { renderFindings, renderPass } from './src/host/render.js'
-import { buildPrompt, runReview } from './src/host/reviewer.js'
+import { renderFindings } from './src/host/render.js'
+import { buildPrompt, startReview } from './src/host/reviewer.js'
 import { shouldReview } from './src/host/trigger.js'
 import { createTracker } from './src/host/loop.js'
 import { createReviewCommand } from './src/host/command.js'
 import { createReviewerGuard } from './src/host/guard.js'
 
 export const name = 'code-review'
-export const inject = ['commands', 'subagents', 'workspaceChanges', 'tools', 'agentPresets']
+export const inject = ['commands', 'subagents', 'workspaceChanges', 'tools', 'agentPresets', 'agents']
 
 const PACKAGE_ROOT = dirname(fileURLToPath(import.meta.url))
 
-/** 构造一条可被 steer 注入的用户消息。source 必填，漏了渲染时会崩。 */
+/**
+ * 构造一条插件来源的消息。`plugin` 来源不会重置链预算，也不会被当成人类输入。
+ * source 必填，漏了渲染时会崩。
+ */
 function message(text) {
-  return { id: crypto.randomUUID(), role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text }] }
+  return {
+    id: crypto.randomUUID(),
+    role: 'user',
+    source: { kind: 'plugin', plugin: 'code-review' },
+    content: [{ type: 'text', text }],
+  }
 }
 
 /**
@@ -34,9 +42,14 @@ export function apply(ctx, config) {
   ctx.tools.guard(createReviewerGuard(resolved.reviewerPreset))
   const tracker = createTracker()
   const latestSeq = new Map()
-  const previousBlocking = new Map()
-  // 同一 turn 内已成功审查过的内容指纹：`${sessionId}:${turn}` → fingerprint。
-  const reviewedFingerprint = new Map()
+  // 同一条链内上一次成功审查的 diff 指纹：`sessionId` → fingerprint。
+  const lastFingerprint = new Map()
+  // 在途审查：`sessionId` → { result, cancel }。一个会话同时只允许一个。
+  const inflight = new Map()
+  // 会话代次：disposed 时 +1，用于识别启动过程中被关闭的会话。
+  const generations = new Map()
+  // 后台审查的生命周期信号：不随 turn 结束/取消而中断。
+  const lifetime = new AbortController()
   let warned = false
   let summaryWarned = false
 
@@ -46,14 +59,11 @@ export function apply(ctx, config) {
     ctx.logger.warn(text)
   }
 
-  /** steer 失败只告警：审查本身已成功，不能当成审查失败去动熔断。 */
-  const steerSafely = (target, text) => {
-    try {
-      target.steer(message(text))
-    } catch (error) {
-      ctx.logger.warn(`[code-review] steer 失败：${error.message}`)
-    }
-  }
+  ctx.effect(() => () => {
+    lifetime.abort()
+    for (const handle of inflight.values()) handle.cancel('plugin-disposed')
+    inflight.clear()
+  }, 'code-review: dispose in-flight reviews')
 
   const getRules = () => loadRulesResilient({
     rulesPath: join(PACKAGE_ROOT, resolved.rulesFile),
@@ -76,27 +86,114 @@ export function apply(ctx, config) {
     ctx.logger.warn(`[code-review] /review 命令注册失败（可能与其他插件重名）：${error.message}`)
   }
 
+  /**
+   * 后台审查结算：先释放资源，再按结果回灌或静默丢弃。
+   * 自己吞掉所有异常，绝不让后台 promise 变成 unhandled rejection。
+   */
+  const settle = async (sessionId, handle, meta, outcome) => {
+    clearTimeout(meta.timer)
+    const active = inflight.get(sessionId) === handle
+    if (active) {
+      inflight.delete(sessionId)
+      tracker.end(sessionId)
+    }
+
+    // 会话关闭/插件卸载时句柄已被摘除：结果一律丢弃，也不计失败。
+    if (!active || lifetime.signal.aborted) {
+      ctx.logger.debug?.(`[code-review] drop: session ${sessionId} 的审查结果已失效`)
+      return
+    }
+
+    try {
+      if (outcome.ok !== true) {
+        ctx.logger.debug?.(`[code-review] review failed: ${outcome.reason}`)
+        if (tracker.recordFailure(sessionId)) {
+          ctx.logger.warn('[code-review] 连续失败，已暂停本会话的自动审查')
+        }
+        return
+      }
+
+      tracker.recordSuccess(sessionId)
+      // 只有成功审查才写指纹；失败/取消允许同一份 diff 重试。
+      lastFingerprint.set(sessionId, meta.hash)
+      const elapsed = Date.now() - meta.startedAt
+      const totalFiles = meta.summary.total ?? meta.summary.files.length
+      ctx.logger.debug?.(
+        '[code-review] reviewed rounds=%d files=%d findings=%d skipped=%d elapsed=%dms',
+        meta.rounds,
+        totalFiles,
+        outcome.findings.length,
+        meta.collected.skipped.length,
+        elapsed,
+      )
+      if (totalFiles > meta.summary.files.length) {
+        ctx.logger.debug?.('[code-review] truncated files=%d kept=%d', totalFiles, meta.summary.files.length)
+      }
+
+      const scope = { files: totalFiles, added: meta.summary.added, deleted: meta.summary.deleted }
+      const text = renderFindings({
+        findings: outcome.findings,
+        skipped: meta.collected.skipped,
+        blockingSeverities: resolved.blockingSeverities,
+        summary: scope,
+        mode: 'steer',
+      })
+      // v2：通过/只有非阻塞建议时静默，不再注入「结论: 通过」。
+      if (text === '') return
+
+      // 会话已关闭或同 id 换了一个 agent：丢弃结果，不抛。
+      const live = ctx.get?.('agents')?.get(sessionId)
+      if (live !== meta.agent) {
+        ctx.logger.debug?.(`[code-review] drop: session ${sessionId} 的 agent 已关闭或更换`)
+        return
+      }
+
+      const repair = meta.lastRound
+        ? '请按上面每条 finding 修复。本轮已达到自动复审上限，修完不会再自动复审，请人工确认。如与用户新指令冲突，以用户指令为准。'
+        : '请按上面每条 finding 修复；修完会再复审一次。如与用户新指令冲突，以用户指令为准。'
+      try {
+        live.followup(message(`${text}\n\n${repair}`))
+      } catch (error) {
+        ctx.logger.warn(`[code-review] followup 失败：${error.message}`)
+      }
+    } catch (error) {
+      ctx.logger.warn(`[code-review] settle failed: ${error.message}`)
+    }
+  }
+
   ctx.on('session/event', (session, event) => {
-    if (event?.type === 'workspace/changes') latestSeq.set(session.id, event.seq)
+    if (event?.type === 'workspace/changes') {
+      latestSeq.set(session.id, event.seq)
+      return
+    }
+    // 只有人类消息开启新链；插件注入的 followup 是 plugin 来源，不得重置。
+    if (event?.type === 'user/message' && event.data?.source?.kind === 'user') {
+      tracker.resetRounds(session.id)
+      lastFingerprint.delete(session.id)
+    }
   })
 
   ctx.on('session/disposed', (session) => {
-    latestSeq.delete(session.id)
-    previousBlocking.delete(session.id)
-    for (const key of reviewedFingerprint.keys()) {
-      if (key.startsWith(`${session.id}:`)) reviewedFingerprint.delete(key)
+    generations.set(session.id, (generations.get(session.id) ?? 0) + 1)
+    const handle = inflight.get(session.id)
+    if (handle !== undefined) {
+      handle.cancel('session-disposed')
+      inflight.delete(session.id)
     }
+    latestSeq.delete(session.id)
+    lastFingerprint.delete(session.id)
     tracker.forget(session.id)
   })
 
   ctx.on('agent/turn-stopping', async ({ agent, turn, signal }) => {
     const sessionId = agent.session.id
+    const generation = generations.get(sessionId) ?? 0
     const seq = latestSeq.get(sessionId)
     const decision = shouldReview({
       config: resolved,
       origin: agent.session.header?.origin,
       reviewing: tracker.isReviewing(sessionId),
-      rounds: tracker.roundsOf(sessionId, turn),
+      rounds: tracker.roundsOf(sessionId),
       hasChanges: seq !== undefined,
       breakerOpen: tracker.isBreakerOpen(sessionId),
     })
@@ -127,104 +224,86 @@ export function apply(ctx, config) {
       }
       return
     }
-    if (!tracker.begin(sessionId, turn)) return
-    const rounds = tracker.roundsOf(sessionId, turn)
-    const lastRound = rounds >= resolved.maxRounds
-    const startedAt = Date.now()
 
+    const startedAt = Date.now()
+    let collected
     try {
-      const rules = await getRules()
-      const collected = await collect({
+      collected = await collect({
         workspaceChanges: ctx.workspaceChanges,
         sessionId,
         seq,
         config: resolved,
         signal,
       })
-      if (collected.files.length === 0) {
-        // 没有可审内容，回滚本轮：不能白烧 maxRounds。
-        ctx.logger.debug?.('[code-review] skip: empty-collect turn=%d', turn)
-        tracker.abandonRound(sessionId, turn)
-        return
-      }
-      // workspace-changes 每个 turn-stopping 都会以新 seq 重新宣告同一份未变 diff，
-      // 用内容指纹去重，避免同一 turn 内重复审查/重复注入。
-      const dedupKey = `${sessionId}:${turn}`
-      const hash = fingerprint(collected.files)
-      if (reviewedFingerprint.get(dedupKey) === hash) {
-        ctx.logger.debug?.('[code-review] skip: duplicate-diff turn=%d', turn)
-        tracker.abandonRound(sessionId, turn)
-        return
-      }
+    } catch (error) {
+      ctx.logger.warn(`[code-review] collect failed: ${error.message}`)
+      return
+    }
+    if (collected.files.length === 0) {
+      // 没有可审内容：还没占用轮次，直接跳过。
+      ctx.logger.debug?.('[code-review] skip: empty-collect')
+      return
+    }
 
-      const reviewed = await runReview({
+    // workspace-changes 每个 turn-stopping 都会以新 seq 重新宣告同一份未变 diff，
+    // 用内容指纹去重，避免同一份 diff 重复审查/重复注入；去重不消耗轮次。
+    const hash = fingerprint(collected.files)
+    if (lastFingerprint.get(sessionId) === hash) {
+      ctx.logger.debug?.('[code-review] skip: duplicate-diff')
+      return
+    }
+
+    // 取材期间会话被释放：不再占轮次，也不发起审查。
+    if ((generations.get(sessionId) ?? 0) !== generation) return
+
+    if (!tracker.begin(sessionId)) {
+      // 与门禁之间的竞态兜底：另一个 turn-stopping 已经拿到锁。
+      ctx.logger.debug?.('[code-review] skip: reviewing')
+      return
+    }
+    const rounds = tracker.roundsOf(sessionId)
+    const lastRound = rounds >= resolved.maxRounds
+
+    let handle
+    try {
+      const rules = await getRules()
+      handle = await startReview({
         subagents: ctx.subagents,
         agent,
         preset: resolved.reviewerPreset,
         prompt: buildPrompt({ rulesPrompt: rules.prompt, files: collected.files, skipped: collected.skipped }),
-        timeoutMs: resolved.reviewerTimeoutMs,
+        signal: lifetime.signal,
         modelOverride: resolved.modelOverride,
-        signal,
         allowedRuleIds: rules.allowedRuleIds,
         allowedPaths: new Set(collected.files.map((file) => file.path)),
         ruleSeverities: rules.ruleSeverities,
         logger: ctx.logger,
       })
-
-      if (!reviewed.ok) {
-        ctx.logger.debug?.('[code-review] review failed: %s', reviewed.reason)
-        if (signal?.aborted) return
-        if (tracker.recordFailure(sessionId)) {
-          ctx.logger.warn('[code-review] 连续失败，已暂停本会话的自动审查')
-        }
-        return
-      }
-      tracker.recordSuccess(sessionId)
-      // 只有成功审查才占去重位；失败时允许同一 diff 重试。
-      reviewedFingerprint.set(dedupKey, hash)
-
-      const elapsed = Date.now() - startedAt
-      const totalFiles = summary.total ?? summary.files.length
-      ctx.logger.debug?.(
-        '[code-review] reviewed turn=%d files=%d findings=%d skipped=%d elapsed=%dms',
-        turn,
-        totalFiles,
-        reviewed.findings.length,
-        collected.skipped.length,
-        elapsed,
-      )
-      if (totalFiles > summary.files.length) {
-        ctx.logger.debug?.('[code-review] truncated files=%d kept=%d', totalFiles, summary.files.length)
-      }
-      if (signal?.aborted) return
-
-      const scope = { files: totalFiles, added: summary.added, deleted: summary.deleted }
-      const text = renderFindings({
-        findings: reviewed.findings,
-        skipped: collected.skipped,
-        blockingSeverities: resolved.blockingSeverities,
-        summary: scope,
-        mode: 'steer',
-      })
-      const previous = previousBlocking.get(sessionId)
-      const hadBlocking = previous?.turn === turn && previous.blocking === true
-      previousBlocking.set(sessionId, { turn, blocking: text !== '' })
-
-      if (text !== '') {
-        const repair = lastRound
-          ? '请按上面每条 finding 修复。本轮已达到自动复审上限，修完不会再自动复审，请人工确认。如与用户新指令冲突，以用户指令为准。'
-          : '请按上面每条 finding 修复；修完会再复审一次。如与用户新指令冲突，以用户指令为准。'
-        steerSafely(agent, `${text}\n\n${repair}`)
-      } else if (hadBlocking) {
-        steerSafely(agent, `${renderPass({ summary: scope, skipped: collected.skipped })}\n\n可以收尾了。`)
-      }
     } catch (error) {
-      if (signal?.aborted) return
-      ctx.logger.warn(`[code-review] review failed: ${error.message}`)
-      tracker.recordFailure(sessionId)
-    } finally {
+      // 启动失败由这里记一次失败并释放锁；不占用 inflight 表。
+      ctx.logger.debug?.(`[code-review] start failed: ${error.message}`)
+      if (tracker.recordFailure(sessionId)) {
+        ctx.logger.warn('[code-review] 连续失败，已暂停本会话的自动审查')
+      }
       tracker.end(sessionId)
+      return
     }
+
+    // 启动期间会话被释放：拿到 activation 后立刻取消，不留下 10 分钟定时器。
+    if ((generations.get(sessionId) ?? 0) !== generation) {
+      handle.cancel('session-disposed')
+      tracker.end(sessionId)
+      return
+    }
+
+    inflight.set(sessionId, handle)
+    const timer = setTimeout(() => handle.cancel('timeout'), resolved.asyncReviewerTimeoutMs)
+    const meta = { agent, summary, collected, hash, rounds, lastRound, startedAt, timer }
+
+    // 后台结算：handler 到这里就返回，不等待审查结果。
+    void handle.result
+      .then((outcome) => settle(sessionId, handle, meta, outcome))
+      .catch((error) => ctx.logger.warn(`[code-review] settle crashed: ${error.message}`))
   })
 
   ctx.logger.info(`[code-review] loaded preset=${resolved.reviewerPreset} maxRounds=${resolved.maxRounds}`)

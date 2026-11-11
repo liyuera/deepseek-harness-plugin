@@ -13,27 +13,49 @@ const FINDING = {
   suggestion: '补异常处理',
 }
 
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms))
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0))
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+const signal = () => new AbortController().signal
+
+/** 轮询等待异步副作用出现，避免用固定 sleep 猜时序。 */
+async function waitFor(predicate, { timeout = 2000, interval = 5 } = {}) {
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < timeout) {
+    if (predicate()) return
+    await delay(interval)
+  }
+  throw new Error('waitFor timeout')
 }
+
+/** 一次成功的 activation 结算。 */
+const completed = (findings = []) => ({ stopReason: 'completed', structured: { findings } })
 
 /**
  * 自包含运行时：只实现 index.js 依赖的表面，避免引入外部 mock 库。
+ *
+ * `startActivation` 返回的 result 由测试手动 resolve/reject，用来观察
+ * 「先返回、后结算」的异步行为；每次 activation 的 dispose 单独计数。
  */
 function createHarness(config = {}, options = {}) {
   const state = {
+    follows: [],
     steers: [],
     starts: [],
+    pending: [],
     disposed: 0,
     debug: [],
     warns: [],
     infos: [],
     commands: [],
     handlers: {},
+    effects: [],
     guard: undefined,
     summaries: new Map(),
+    agents: new Map(),
     diffLine: '+const a = 1',
-    activation: () => ({ result: Promise.resolve({ stopReason: 'completed', structured: { findings: [] } }) }),
+    startError: undefined,
+    startGate: undefined,
+    onStart: undefined,
   }
 
   const ctx = {
@@ -62,6 +84,15 @@ function createHarness(config = {}, options = {}) {
     on(event, handler) {
       ;(state.handlers[event] ??= []).push(handler)
     },
+    effect(execute, label) {
+      const disposer = execute()
+      state.effects.push({ disposer, label })
+      return disposer
+    },
+    get(service) {
+      if (service !== 'agents') return undefined
+      return { get: (sessionId) => state.agents.get(sessionId) }
+    },
     workspaceChanges: {
       summary(sessionId, seq) {
         return state.summaries.get(`${sessionId}:${seq}`)
@@ -78,24 +109,35 @@ function createHarness(config = {}, options = {}) {
     subagents: {
       async startActivation(request) {
         state.starts.push(request)
-        const activation = state.activation(request) ?? {}
-        return {
+        state.onStart?.(request)
+        if (state.startError !== undefined) throw state.startError
+        // 允许测试把「startActivation 尚未返回」的窗口拉长，观察会话释放竞态。
+        if (state.startGate !== undefined) await state.startGate
+        const entry = { request, disposed: 0, settled: false }
+        const result = new Promise((resolve, reject) => {
+          entry.resolve = resolve
+          entry.reject = reject
+        })
+        entry.activation = {
           childId: `child-${state.starts.length}`,
-          get result() {
-            return activation.result
-          },
+          result,
           dispose() {
             state.disposed += 1
-            return activation.dispose?.()
+            entry.disposed += 1
+            // 被取消的 activation 不再参与 resolveNext 的选择。
+            entry.settled = true
           },
         }
+        state.pending.push(entry)
+        return entry.activation
       },
     },
   }
 
   apply(ctx, config)
 
-  const emit = (event, ...args) => Promise.all((state.handlers[event] ?? []).map((handler) => handler(...args)))
+  const emit = (event, ...args) =>
+    Promise.all((state.handlers[event] ?? []).map((handler) => handler(...args)))
 
   const addSummary = ({
     sessionId = 's1',
@@ -110,257 +152,430 @@ function createHarness(config = {}, options = {}) {
   }
 
   const markChanges = (seq, sessionId = 's1') =>
-    emit('session/event', { id: sessionId, header: { origin: 'user' } }, { type: 'workspace/changes', seq })
+    emit(
+      'session/event',
+      { id: sessionId, header: { origin: 'user' } },
+      { type: 'workspace/changes', seq },
+    )
 
-  return { state, ctx, emit, addSummary, markChanges }
-}
+  const userMessage = ({ sessionId = 's1', source = { kind: 'user' } } = {}) =>
+    emit(
+      'session/event',
+      { id: sessionId, header: { origin: 'user' } },
+      { type: 'user/message', data: { source, content: [] } },
+    )
 
-function makeAgent(state, sessionId = 's1') {
+  /** 驱动一轮 turn-stopping。diff 变化时调用方需要显式传 `diff`。 */
+  const stop = async (agent, {
+    turn = 1, seq, diff, files, total, signal: turnSignal,
+  } = {}) => {
+    assert.notEqual(seq, undefined, 'stop 需要 seq')
+    if (diff !== undefined) state.diffLine = diff
+    addSummary({
+      seq,
+      turn,
+      ...(files === undefined ? {} : { files }),
+      ...(total === undefined ? {} : { total }),
+    })
+    await markChanges(seq)
+    return emit('agent/turn-stopping', {
+      agent,
+      turn,
+      signal: turnSignal ?? signal(),
+    })
+  }
+
+  /** 结算最早的未结算 activation：多次发起时按顺序手动 resolve。 */
+  const resolveNext = (value) => {
+    const entry = state.pending.find((item) => item.settled !== true)
+    assert.ok(entry, '没有在途 activation 可结算')
+    entry.settled = true
+    entry.resolve(value)
+    return entry
+  }
+
+  /** 调用 ctx.effect 的 disposer，模拟插件卸载。 */
+  const dispose = async () => {
+    for (const { disposer } of state.effects) await disposer()
+    await tick()
+  }
+
   return {
-    session: { id: sessionId, header: { origin: undefined } },
-    steer(message) {
-      state.steers.push(message.content[0].text)
-    },
+    state, ctx, emit, addSummary, markChanges, userMessage, stop, resolveNext, dispose,
   }
 }
 
-function signal() {
-  return new AbortController().signal
+function makeAgent(harness, sessionId = 's1') {
+  const agent = {
+    session: { id: sessionId, header: { origin: undefined } },
+    followup(message) {
+      harness.state.follows.push(message)
+    },
+    steer(message) {
+      harness.state.steers.push(message.content[0].text)
+    },
+  }
+  harness.state.agents.set(sessionId, agent)
+  return agent
 }
+
+const followText = (state, index) => state.follows[index]?.content[0]?.text
 
 function warnHas(state, text) {
   return state.warns.some((args) => String(args[0]).includes(text))
 }
 
 function debugHas(state, text) {
-  return state.debug.some((args) => String(args[0]).includes(text))
+  return state.debug.some((args) => args.some((arg) => String(arg).includes(text)))
 }
 
-test('正常阻塞注入：首轮 steer 提醒还会复审', async () => {
-  const harness = createHarness({ maxRounds: 2 })
-  harness.state.activation = () => ({
-    result: Promise.resolve({ stopReason: 'completed', structured: { findings: [FINDING] } }),
-  })
-  harness.addSummary({ seq: 7, turn: 1 })
-  await harness.markChanges(7)
-  const agent = makeAgent(harness.state)
+function metric(state) {
+  return state.debug.find((args) => String(args[0]).startsWith('[code-review] reviewed'))
+}
 
-  await harness.emit('agent/turn-stopping', { agent, turn: 1, signal: signal() })
+// —— 接口与异步发起 ——
+
+test('inject 声明 agents 与 agentPresets', () => {
+  assert.ok(inject.includes('agents'), `inject=${inject.join(',')}`)
+  assert.ok(inject.includes('agentPresets'), `inject=${inject.join(',')}`)
+})
+
+test('turn-stopping 立即返回：不等待审查结果、不注入', async () => {
+  const harness = createHarness({ maxRounds: 2 })
+  const agent = makeAgent(harness)
+  const turnSignal = signal()
+
+  await harness.stop(agent, { seq: 7, turn: 1, signal: turnSignal })
 
   assert.equal(harness.state.starts.length, 1)
-  assert.equal(harness.state.steers.length, 1)
-  assert.match(harness.state.steers[0], /结论: 需修改/)
-  assert.match(harness.state.steers[0], /修完会再复审一次/)
+  assert.equal(harness.state.pending.length, 1, '结果应仍在等待，证明没有阻塞')
+  assert.equal(harness.state.follows.length, 0)
+  assert.equal(harness.state.steers.length, 0)
+  assert.equal(harness.state.starts[0].delivery, 'caller')
+  // 后台审查必须挂在插件生命周期信号上，而不是 turn 信号。
+  assert.notEqual(harness.state.starts[0].signal, turnSignal)
+  assert.equal(harness.state.starts[0].signal.aborted, false)
 
-  const metric = harness.state.debug.find((args) => String(args[0]).startsWith('[code-review] reviewed'))
-  assert.ok(metric, '成功后应有指标日志')
-  assert.equal(metric[1], 1, '指标日志应记录 turn')
-  assert.equal(metric[2], 1, '指标日志应记录文件数')
-  assert.equal(metric[3], 1, '指标日志应记录 findings 数')
+  harness.resolveNext(completed())
+  await tick()
 })
 
-test('末轮文案不再承诺复审', async () => {
+test('结果回灌：followup 带 plugin 来源、结论与修复要求', async () => {
+  const harness = createHarness({ maxRounds: 2 })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, { seq: 7, turn: 1 })
+  harness.resolveNext(completed([FINDING]))
+  await tick()
+
+  assert.equal(harness.state.follows.length, 1)
+  const message = harness.state.follows[0]
+  assert.deepEqual(message.source, { kind: 'plugin', plugin: 'code-review' })
+  assert.equal(message.role, 'user')
+  assert.equal(typeof message.id, 'string')
+  assert.match(followText(harness.state, 0), /结论: 需修改/)
+  assert.match(followText(harness.state, 0), /修完会再复审一次/)
+  assert.doesNotMatch(followText(harness.state, 0), /不会再自动复审/)
+  assert.equal(harness.state.steers.length, 0, 'v2 不再 steer')
+  assert.ok(metric(harness.state), '成功结算应记录 reviewed 指标')
+})
+
+test('审查通过时静默：无 followup、无 steer', async () => {
+  const harness = createHarness({ maxRounds: 2 })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, { seq: 7, turn: 1 })
+  harness.resolveNext(completed([]))
+  await tick()
+
+  assert.equal(harness.state.follows.length, 0)
+  assert.equal(harness.state.steers.length, 0)
+  assert.ok(metric(harness.state), '通过也应记录 reviewed 指标')
+})
+
+test('链预算：maxRounds=2 只发起两次，第二次注入末轮文案，第三次 rounds-exhausted', async () => {
+  const harness = createHarness({ maxRounds: 2 })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, { seq: 7, turn: 1, diff: '+const a = 1' })
+  harness.resolveNext(completed([FINDING]))
+  await tick()
+
+  await harness.stop(agent, { seq: 8, turn: 2, diff: '+const a = 2' })
+  harness.resolveNext(completed([FINDING]))
+  await tick()
+
+  assert.equal(harness.state.starts.length, 2)
+  assert.equal(harness.state.follows.length, 2)
+  assert.match(followText(harness.state, 0), /修完会再复审一次/)
+  assert.match(followText(harness.state, 1), /不会再自动复审/)
+  assert.doesNotMatch(followText(harness.state, 1), /修完会再复审一次/)
+
+  await harness.stop(agent, { seq: 9, turn: 3, diff: '+const a = 3' })
+
+  assert.equal(harness.state.starts.length, 2, '链预算用尽后不应再发起')
+  assert.equal(harness.state.follows.length, 2)
+  assert.ok(debugHas(harness.state, 'rounds-exhausted'))
+})
+
+test('人类消息重置链：轮次与指纹一起清空，同 diff 可再发起', async () => {
   const harness = createHarness({ maxRounds: 1 })
-  harness.state.activation = () => ({
-    result: Promise.resolve({ stopReason: 'completed', structured: { findings: [FINDING] } }),
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, { seq: 7, turn: 1, diff: '+const a = 1' })
+  harness.resolveNext(completed([FINDING]))
+  await tick()
+  assert.equal(harness.state.starts.length, 1)
+
+  // 同一份 diff、新 seq：预算已尽，先被门禁拦下。
+  await harness.stop(agent, { seq: 8, turn: 2, diff: '+const a = 1' })
+  assert.equal(harness.state.starts.length, 1)
+  assert.ok(debugHas(harness.state, 'rounds-exhausted'))
+
+  await harness.userMessage({ source: { kind: 'user' } })
+
+  // 同 diff 再次 stopping：轮次与指纹都重置了，应该重新发起。
+  await harness.stop(agent, { seq: 9, turn: 3, diff: '+const a = 1' })
+  assert.equal(harness.state.starts.length, 2)
+  assert.equal(harness.state.follows.length, 1)
+
+  harness.resolveNext(completed([]))
+  await tick()
+})
+
+test('非人类来源消息不重置链，杜绝自激循环', async () => {
+  const harness = createHarness({ maxRounds: 1 })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, { seq: 7, turn: 1, diff: '+const a = 1' })
+  harness.resolveNext(completed([FINDING]))
+  await tick()
+
+  await harness.userMessage({ source: { kind: 'plugin', plugin: 'code-review' } })
+  await harness.stop(agent, { seq: 8, turn: 2, diff: '+const a = 2' })
+
+  assert.equal(harness.state.starts.length, 1, '插件消息不得重置链预算')
+  assert.ok(debugHas(harness.state, 'rounds-exhausted'))
+})
+
+test('同 diff 指纹去重不占轮：diff 变化后仍能使用剩余预算', async () => {
+  const harness = createHarness({ maxRounds: 2 })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, { seq: 7, turn: 1, diff: '+const a = 1' })
+  harness.resolveNext(completed([FINDING]))
+  await tick()
+  assert.equal(harness.state.starts.length, 1)
+
+  // 同一份未变 diff 以新 seq 再次宣告：跳过且不占轮。
+  await harness.stop(agent, { seq: 8, turn: 2, diff: '+const a = 1' })
+  assert.equal(harness.state.starts.length, 1)
+  assert.equal(harness.state.follows.length, 1)
+  assert.ok(debugHas(harness.state, 'duplicate-diff'))
+
+  // 若去重占了一轮，这里 round=2 会撞 maxRounds 而不再发起。
+  await harness.stop(agent, { seq: 9, turn: 3, diff: '+const a = 2' })
+  assert.equal(harness.state.starts.length, 2, '去重不得消耗轮次')
+
+  harness.resolveNext(completed([]))
+  await tick()
+})
+
+test('失败熔断：连续两次失败后第三次门禁 breaker-open', async () => {
+  const harness = createHarness({ maxRounds: 5 })
+  const agent = makeAgent(harness)
+
+  for (const [index, seq] of [7, 8].entries()) {
+    await harness.stop(agent, { seq, turn: index + 1, diff: `+const a = ${index + 1}` })
+    harness.resolveNext({ stopReason: 'error', structured: undefined })
+    await tick()
+  }
+
+  assert.equal(harness.state.starts.length, 2)
+  assert.ok(warnHas(harness.state, '连续失败'), '第二次失败应告警熔断')
+  assert.ok(debugHas(harness.state, 'review failed: incomplete'))
+
+  await harness.stop(agent, { seq: 9, turn: 3, diff: '+const a = 9' })
+
+  assert.equal(harness.state.starts.length, 2, '熔断后不应再发起')
+  assert.ok(debugHas(harness.state, 'breaker-open'))
+})
+
+test('agent 已关闭：成功结果被丢弃，不 followup、不抛错', async () => {
+  const harness = createHarness({ maxRounds: 2 })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, { seq: 7, turn: 1 })
+  harness.state.agents.delete('s1')
+  harness.resolveNext(completed([FINDING]))
+  await tick()
+
+  assert.equal(harness.state.follows.length, 0)
+  assert.equal(harness.state.steers.length, 0)
+  assert.ok(debugHas(harness.state, 'drop'))
+  assert.equal(warnHas(harness.state, '连续失败'), false)
+})
+
+test('session/disposed 取消在途审查并释放锁与轮次', async () => {
+  const harness = createHarness({ maxRounds: 2 })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, { seq: 7, turn: 1, diff: '+const a = 1' })
+  assert.equal(harness.state.pending.length, 1)
+  assert.equal(harness.state.disposed, 0)
+
+  await harness.emit('session/disposed', { id: 's1' })
+  await tick()
+
+  assert.equal(harness.state.disposed, 1, '在途 activation 必须 dispose')
+  assert.equal(harness.state.follows.length, 0)
+  assert.equal(debugHas(harness.state, 'review failed'), false, '会话关闭的取消不计失败')
+
+  // 同 id 重建（tests 里的假会话）：锁与轮次应已清空，可以重新发起。
+  await harness.stop(agent, { seq: 8, turn: 1, diff: '+const a = 2' })
+  assert.equal(harness.state.starts.length, 2)
+
+  harness.resolveNext(completed([]))
+  await tick()
+})
+
+test('session/disposed 撞上 startActivation 等待：返回后立刻取消，不留下定时器', async () => {
+  const harness = createHarness({ maxRounds: 2 })
+  const agent = makeAgent(harness)
+  let release
+  harness.state.startGate = new Promise((resolve) => {
+    release = resolve
   })
+  let markStarted
+  const startCalled = new Promise((resolve) => {
+    markStarted = resolve
+  })
+  harness.state.onStart = markStarted
+
   harness.addSummary({ seq: 7, turn: 1 })
   await harness.markChanges(7)
-  const agent = makeAgent(harness.state)
+  const stopping = harness.emit('agent/turn-stopping', { agent, turn: 1, signal: signal() })
+  await startCalled
+  assert.equal(harness.state.starts.length, 1, 'startActivation 应已进入但未返回')
+  assert.equal(harness.state.pending.length, 0)
 
-  await harness.emit('agent/turn-stopping', { agent, turn: 1, signal: signal() })
+  await harness.emit('session/disposed', { id: 's1' })
+  release()
+  await stopping
+  await tick()
 
-  assert.equal(harness.state.steers.length, 1)
-  assert.match(harness.state.steers[0], /不会再自动复审/)
-  assert.equal(harness.state.steers[0].includes('修完会再复审一次'), false)
+  assert.equal(harness.state.pending.length, 1)
+  assert.equal(harness.state.disposed, 1, 'startActivation 返回后必须立刻 dispose')
+  assert.equal(harness.state.follows.length, 0)
+
+  // 同 id 重建：锁与轮次已清空，可以重新发起。
+  harness.state.startGate = undefined
+  await harness.stop(agent, { seq: 8, turn: 1, diff: '+const a = 2' })
+  assert.equal(harness.state.starts.length, 2)
+
+  harness.resolveNext(completed())
+  await tick()
 })
 
-test('同 turn 复审通过：第二次 steer 报告通过', async () => {
-  const harness = createHarness({ maxRounds: 2 })
-  let calls = 0
-  harness.state.activation = () => {
-    calls += 1
-    return {
-      result: Promise.resolve({
-        stopReason: 'completed',
-        structured: { findings: calls === 1 ? [FINDING] : [] },
-      }),
-    }
-  }
-  harness.addSummary({ seq: 7, turn: 1 })
-  await harness.markChanges(7)
-  const agent = makeAgent(harness.state)
+test('异步超时：asyncReviewerTimeoutMs 到点 dispose 且不注入，记一次失败', async () => {
+  const harness = createHarness({ maxRounds: 2, asyncReviewerTimeoutMs: 20 })
+  const agent = makeAgent(harness)
 
-  await harness.emit('agent/turn-stopping', { agent, turn: 1, signal: signal() })
-  // 修完后的 diff 必须变化，否则会被同 diff 去重拦下。
-  harness.state.diffLine = '+const a = 2'
-  harness.addSummary({ seq: 8, turn: 1 })
-  await harness.markChanges(8)
-  await harness.emit('agent/turn-stopping', { agent, turn: 1, signal: signal() })
+  await harness.stop(agent, { seq: 7, turn: 1 })
+  await waitFor(() => harness.state.disposed === 1)
+  await tick()
 
-  assert.equal(harness.state.steers.length, 2)
-  assert.match(harness.state.steers[1], /结论: 通过/)
-  assert.match(harness.state.steers[1], /可以收尾了/)
+  assert.equal(harness.state.disposed, 1, '超时应 dispose activation')
+  assert.equal(harness.state.follows.length, 0)
+  assert.ok(debugHas(harness.state, 'review failed: timeout'))
+  assert.equal(warnHas(harness.state, '连续失败'), false, '单次超时不应告警熔断')
 })
 
-test('跨 turn 不泄漏上一轮的阻塞历史', async () => {
-  const harness = createHarness({ maxRounds: 2 })
-  let calls = 0
-  harness.state.activation = () => {
-    calls += 1
-    return {
-      result: Promise.resolve({
-        stopReason: 'completed',
-        structured: { findings: calls === 1 ? [FINDING] : [] },
-      }),
-    }
-  }
-  harness.addSummary({ seq: 7, turn: 1 })
-  await harness.markChanges(7)
-  const agent = makeAgent(harness.state)
-  await harness.emit('agent/turn-stopping', { agent, turn: 1, signal: signal() })
-  assert.equal(harness.state.steers.length, 1)
+test('末轮文案（maxRounds=1）不再承诺复审', async () => {
+  const harness = createHarness({ maxRounds: 1 })
+  const agent = makeAgent(harness)
 
-  harness.addSummary({ seq: 8, turn: 2 })
-  await harness.markChanges(8)
-  await harness.emit('agent/turn-stopping', { agent, turn: 2, signal: signal() })
+  await harness.stop(agent, { seq: 7, turn: 1 })
+  harness.resolveNext(completed([FINDING]))
+  await tick()
 
-  assert.equal(harness.state.steers.length, 1, '新 turn 干净不应注入通过')
+  assert.equal(harness.state.follows.length, 1)
+  assert.match(followText(harness.state, 0), /不会再自动复审/)
+  assert.doesNotMatch(followText(harness.state, 0), /修完会再复审一次/)
 })
 
-test('stale summary 不消费轮次', async () => {
+test('成功结算的指标：rounds/files/findings/skipped/elapsed 与截断提示', async () => {
   const harness = createHarness({ maxRounds: 2 })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, {
+    seq: 7,
+    turn: 1,
+    files: [
+      { path: 'a.js', display: 'a.js' },
+      { path: 'notes.md', display: 'notes.md' },
+    ],
+    total: 5,
+    added: 2,
+    deleted: 1,
+  })
+  harness.resolveNext(completed([{ ...FINDING, location: 'a.js:1' }]))
+  await tick()
+
+  const logged = metric(harness.state)
+  assert.ok(logged, '应有 reviewed 指标')
+  assert.equal(logged[1], 1, '指标应记录链轮次')
+  assert.equal(logged[2], 5, '文件数应使用 summary.total')
+  assert.equal(logged[3], 1, '指标应记录 findings 数')
+  assert.equal(logged[4], 1, '指标应记录 skipped 数')
+  assert.equal(typeof logged[5], 'number', '指标应记录 elapsed')
+  assert.ok(harness.state.debug.some((args) => String(args[0]).includes('truncated') && args[1] === 5 && args[2] === 2))
+  assert.match(followText(harness.state, 0), /本次 5 文件/)
+  assert.match(followText(harness.state, 0), /未审: notes\.md（not-code）/)
+})
+
+test('失败不写指纹：同一份 diff 可以重试', async () => {
+  const harness = createHarness({ maxRounds: 3 })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, { seq: 7, turn: 1, diff: '+const a = 1' })
+  harness.resolveNext({ stopReason: 'error', structured: undefined })
+  await tick()
+  assert.equal(harness.state.starts.length, 1)
+
+  await harness.stop(agent, { seq: 8, turn: 2, diff: '+const a = 1' })
+  assert.equal(harness.state.starts.length, 2, '失败后同 diff 不应被去重')
+
+  harness.resolveNext(completed([]))
+  await tick()
+  assert.equal(harness.state.follows.length, 0)
+})
+
+// —— 预检、取材与预检失败路径 ——
+
+test('stale summary 与缺 files 都不消费轮次', async () => {
+  const harness = createHarness({ maxRounds: 2 })
+  const agent = makeAgent(harness)
+
   harness.addSummary({ seq: 7, turn: 0 })
   await harness.markChanges(7)
-  const agent = makeAgent(harness.state)
+  await harness.emit('agent/turn-stopping', { agent, turn: 1, signal: signal() })
 
+  harness.state.summaries.set('s1:8', { turn: 1 })
+  await harness.markChanges(8)
   await harness.emit('agent/turn-stopping', { agent, turn: 1, signal: signal() })
 
   assert.equal(harness.state.starts.length, 0)
-  assert.equal(harness.state.steers.length, 0)
-  assert.ok(harness.state.debug.some((args) => String(args[0]).includes('stale-summary')))
+  assert.ok(debugHas(harness.state, 'stale-summary'))
 
-  harness.addSummary({ seq: 8, turn: 1 })
-  await harness.markChanges(8)
+  harness.addSummary({ seq: 9, turn: 1 })
+  await harness.markChanges(9)
   await harness.emit('agent/turn-stopping', { agent, turn: 1, signal: signal() })
 
-  assert.equal(harness.state.starts.length, 1, 'stale 跳过后轮次应仍可用')
-})
+  assert.equal(harness.state.starts.length, 1, 'stale 跳过后轮次仍可用')
 
-test('取消不计失败：两次中断后第三次仍能审查', async () => {
-  const harness = createHarness({ maxRounds: 2 })
-  harness.state.activation = () => ({
-    result: Promise.resolve({ stopReason: 'incomplete', structured: undefined }),
-  })
-  const aborted = new AbortController()
-  aborted.abort()
-  const agent = makeAgent(harness.state)
-
-  for (const turn of [1, 2]) {
-    harness.addSummary({ seq: 6 + turn, turn })
-    await harness.markChanges(6 + turn)
-    await harness.emit('agent/turn-stopping', { agent, turn, signal: aborted.signal })
-  }
-
-  assert.equal(harness.state.starts.length, 0, '已取消的 turn 不应启动子代理')
-  assert.equal(warnHas(harness.state, '连续失败'), false, '取消不应打开熔断')
-
-  harness.state.activation = () => ({
-    result: Promise.resolve({ stopReason: 'completed', structured: { findings: [] } }),
-  })
-  harness.addSummary({ seq: 9, turn: 3 })
-  await harness.markChanges(9)
-  await harness.emit('agent/turn-stopping', { agent, turn: 3, signal: signal() })
-
-  assert.equal(harness.state.starts.length, 1, '取消后第三次应正常审查')
-})
-
-test('两次真实失败打开熔断，第三次跳过', async () => {
-  const harness = createHarness({ maxRounds: 2 })
-  harness.state.activation = () => ({
-    result: Promise.resolve({ stopReason: 'error', structured: undefined }),
-  })
-  const agent = makeAgent(harness.state)
-
-  for (const turn of [1, 2]) {
-    harness.addSummary({ seq: 6 + turn, turn })
-    await harness.markChanges(6 + turn)
-    await harness.emit('agent/turn-stopping', { agent, turn, signal: signal() })
-  }
-  assert.equal(harness.state.starts.length, 2)
-  assert.equal(warnHas(harness.state, '连续失败'), true)
-
-  harness.addSummary({ seq: 9, turn: 3 })
-  await harness.markChanges(9)
-  await harness.emit('agent/turn-stopping', { agent, turn: 3, signal: signal() })
-
-  assert.equal(harness.state.starts.length, 2, '熔断后不应再起子代理')
-  assert.ok(harness.state.debug.some((args) => String(args[0]).includes('breaker-open')))
-})
-
-test('取消会中断已发布的审查（不等 120s 超时）', async () => {
-  const harness = createHarness({ maxRounds: 2, reviewerTimeoutMs: 3000 })
-  let publish
-  const published = new Promise((resolve) => {
-    publish = resolve
-  })
-  harness.state.activation = () => {
-    const never = new Promise(() => {})
-    return {
-      get result() {
-        publish()
-        return never
-      },
-    }
-  }
-  harness.addSummary({ seq: 7, turn: 1 })
-  await harness.markChanges(7)
-  const agent = makeAgent(harness.state)
-  const controller = new AbortController()
-
-  const stopping = harness.emit('agent/turn-stopping', { agent, turn: 1, signal: controller.signal })
-  await published
-  const abortedAt = Date.now()
-  controller.abort()
-  const outcome = await Promise.race([stopping.then(() => 'done'), delay(1000).then(() => 'timeout')])
-
-  assert.equal(outcome, 'done', '取消后 handler 必须很快返回')
-  assert.ok(Date.now() - abortedAt < 1000)
-  assert.equal(harness.state.disposed, 1, '已发布的 activation 必须 dispose')
-  assert.equal(harness.state.steers.length, 0)
-  assert.equal(warnHas(harness.state, '连续失败'), false)
-
-  harness.state.activation = () => ({
-    result: Promise.resolve({ stopReason: 'completed', structured: { findings: [] } }),
-  })
-  harness.addSummary({ seq: 8, turn: 2 })
-  await harness.markChanges(8)
-  await harness.emit('agent/turn-stopping', { agent, turn: 2, signal: signal() })
-  assert.equal(harness.state.starts.length, 2, '取消后熔断未打开，下一次应继续审查')
-})
-
-// —— 以下三条覆盖 B3/B4/B5：成功竞态取消、摘要读取 fail-open、截断文件计数 ——
-
-test('成功结果到达时已取消则不再 steer', async () => {
-  const harness = createHarness({ maxRounds: 2 })
-  harness.state.activation = () => ({
-    result: Promise.resolve({ stopReason: 'completed', structured: { findings: [FINDING] } }),
-  })
-  const controller = new AbortController()
-  const originalDebug = harness.ctx.logger.debug
-  harness.ctx.logger.debug = (...args) => {
-    originalDebug(...args)
-    if (String(args[0]).startsWith('[code-review] reviewed')) controller.abort()
-  }
-  harness.addSummary({ seq: 7, turn: 1 })
-  await harness.markChanges(7)
-  const agent = makeAgent(harness.state)
-
-  await harness.emit('agent/turn-stopping', { agent, turn: 1, signal: controller.signal })
-
-  assert.equal(harness.state.starts.length, 1)
-  assert.equal(harness.state.steers.length, 0, '取消后成功结果不应唤醒 turn')
-  assert.equal(warnHas(harness.state, '连续失败'), false)
+  harness.resolveNext(completed())
+  await tick()
 })
 
 test('summary 读取抛错时 fail-open，不冒泡且只警告一次', async () => {
@@ -370,282 +585,184 @@ test('summary 读取抛错时 fail-open，不冒泡且只警告一次', async ()
   harness.ctx.workspaceChanges.summary = () => {
     throw new Error('summary-boom')
   }
-  const agent = makeAgent(harness.state)
+  const agent = makeAgent(harness)
 
   await harness.emit('agent/turn-stopping', { agent, turn: 1, signal: signal() })
   await harness.emit('agent/turn-stopping', { agent, turn: 1, signal: signal() })
 
   assert.equal(harness.state.starts.length, 0)
-  assert.equal(harness.state.steers.length, 0)
-  const summaryWarns = harness.state.warns.filter((args) => String(args[0]).includes('无法读取变更摘要'))
-  assert.equal(summaryWarns.length, 1, '摘要读取失败只记一次警告')
+  assert.equal(harness.state.follows.length, 0)
+  assert.equal(
+    harness.state.warns.filter((args) => String(args[0]).includes('无法读取变更摘要')).length,
+    1,
+    '摘要读取失败只记一次警告',
+  )
 })
 
-test('报告文件数使用 summary.total 而不是截断后的 files.length', async () => {
+test('取材为空不启动子代理、不消耗轮次，之后正常 diff 仍能审', async () => {
   const harness = createHarness({ maxRounds: 2 })
-  harness.state.activation = () => ({
-    result: Promise.resolve({
-      stopReason: 'completed',
-      structured: { findings: [{ ...FINDING, location: 'a.js:1' }] },
-    }),
-  })
-  harness.addSummary({
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, {
     seq: 7,
     turn: 1,
-    files: [
-      { path: 'a.js', display: 'a.js' },
-      { path: 'b.js', display: 'b.js' },
-    ],
-    total: 5,
+    files: [{ path: 'README.md', display: 'README.md' }],
   })
-  await harness.markChanges(7)
-  const agent = makeAgent(harness.state)
-
-  await harness.emit('agent/turn-stopping', { agent, turn: 1, signal: signal() })
-
-  assert.equal(harness.state.steers.length, 1)
-  assert.match(harness.state.steers[0], /本次 5 文件/)
-  assert.ok(harness.state.debug.some((args) => String(args[0]).includes('truncated')))
-})
-
-// —— 终审 D 批：同 diff 去重、通过判定、失败可观测、命令/渲染健壮性 ——
-
-test('inject 声明 agentPresets，审查者 preset 可由 preset registry 提供', () => {
-  assert.ok(inject.includes('agentPresets'), `inject=${inject.join(',')}`)
-})
-
-test('同一 turn 同一 diff 重复 stopping 只审一次，diff 变化后再审且未多耗轮次', async () => {
-  const harness = createHarness({ maxRounds: 2 })
-  harness.state.activation = () => ({
-    result: Promise.resolve({ stopReason: 'completed', structured: { findings: [FINDING] } }),
-  })
-  harness.addSummary({ seq: 7, turn: 1 })
-  await harness.markChanges(7)
-  const agent = makeAgent(harness.state)
-
-  await harness.emit('agent/turn-stopping', { agent, turn: 1, signal: signal() })
-  assert.equal(harness.state.starts.length, 1)
-  assert.equal(harness.state.steers.length, 1)
-
-  // 同一份未变 diff 以新 seq 再次宣告：内容指纹相同，应跳过。
-  harness.addSummary({ seq: 8, turn: 1 })
-  await harness.markChanges(8)
-  await harness.emit('agent/turn-stopping', { agent, turn: 1, signal: signal() })
-
-  assert.equal(harness.state.starts.length, 1, '重复 diff 不应再起子代理')
-  assert.equal(harness.state.steers.length, 1, '重复 diff 不应重复注入')
-  assert.ok(debugHas(harness.state, 'duplicate-diff'), '应记录 duplicate-diff')
-
-  // 去重跳过回滚了轮次：maxRounds=2，第三次仍能审查（第二次真实审查取第 2 轮）。
-  harness.state.diffLine = '+const a = 2'
-  harness.addSummary({ seq: 9, turn: 1 })
-  await harness.markChanges(9)
-  await harness.emit('agent/turn-stopping', { agent, turn: 1, signal: signal() })
-
-  assert.equal(harness.state.starts.length, 2, 'diff 变化后应能再次审查')
-  assert.equal(harness.state.steers.length, 2)
-})
-
-test('session/disposed 清理同 diff 去重记录，重建同 id 会话后可再审', async () => {
-  const harness = createHarness({ maxRounds: 2 })
-  harness.state.activation = () => ({
-    result: Promise.resolve({ stopReason: 'completed', structured: { findings: [FINDING] } }),
-  })
-  harness.addSummary({ seq: 7, turn: 1 })
-  await harness.markChanges(7)
-  await harness.emit('agent/turn-stopping', { agent: makeAgent(harness.state), turn: 1, signal: signal() })
-  assert.equal(harness.state.starts.length, 1)
-
-  await harness.emit('session/disposed', { id: 's1' })
-
-  // 同 id、同 turn、同 seq、同内容：去重记录应已随会话清理，必须重新审查。
-  harness.addSummary({ seq: 7, turn: 1 })
-  await harness.markChanges(7)
-  await harness.emit('agent/turn-stopping', { agent: makeAgent(harness.state), turn: 1, signal: signal() })
-  assert.equal(harness.state.starts.length, 2)
-})
-
-test('取材为空不启动子代理、不消耗轮次，之后同 turn 正常 diff 仍能审', async () => {
-  const harness = createHarness({ maxRounds: 2 })
-  harness.state.activation = () => ({
-    result: Promise.resolve({ stopReason: 'completed', structured: { findings: [FINDING] } }),
-  })
-  harness.addSummary({ seq: 7, turn: 1, files: [{ path: 'README.md', display: 'README.md' }] })
-  await harness.markChanges(7)
-  const agent = makeAgent(harness.state)
-
-  await harness.emit('agent/turn-stopping', { agent, turn: 1, signal: signal() })
 
   assert.equal(harness.state.starts.length, 0)
-  assert.equal(harness.state.steers.length, 0)
-  assert.ok(debugHas(harness.state, 'empty-collect'), '应记录 empty-collect')
+  assert.equal(harness.state.follows.length, 0)
+  assert.ok(debugHas(harness.state, 'empty-collect'))
 
-  harness.addSummary({ seq: 8, turn: 1, files: [{ path: 'm.js', display: 'm.js' }] })
-  await harness.markChanges(8)
-  await harness.emit('agent/turn-stopping', { agent, turn: 1, signal: signal() })
-
+  await harness.stop(agent, { seq: 8, turn: 2, diff: '+const a = 2' })
   assert.equal(harness.state.starts.length, 1, '空取材回滚后轮次仍可用')
+
+  harness.resolveNext(completed())
+  await tick()
 })
 
-test('全部 finding 被丢弃不算通过：不注入通过结论', async () => {
+test('全部 finding 被丢弃不算通过，也不注入通过结论', async () => {
   const harness = createHarness({ maxRounds: 3 })
-  harness.state.activation = () => ({
-    result: Promise.resolve({ stopReason: 'completed', structured: { findings: [FINDING] } }),
-  })
-  harness.addSummary({ seq: 7, turn: 1 })
-  await harness.markChanges(7)
-  const agent = makeAgent(harness.state)
+  const agent = makeAgent(harness)
 
-  await harness.emit('agent/turn-stopping', { agent, turn: 1, signal: signal() })
-  assert.equal(harness.state.steers.length, 1)
-  assert.match(harness.state.steers[0], /结论: 需修改/)
+  await harness.stop(agent, { seq: 7, turn: 1 })
+  harness.resolveNext(completed([
+    { ...FINDING, ruleId: 'SEC-999' },
+    { ...FINDING, location: '/etc/passwd:1' },
+  ]))
+  await tick()
 
-  // 第二轮模型输出全部非法（未知规则 + 越界路径），findings 被清空。
-  harness.state.activation = () => ({
-    result: Promise.resolve({
-      stopReason: 'completed',
-      structured: {
-        findings: [
-          { ...FINDING, ruleId: 'SEC-999' },
-          { ...FINDING, location: '/etc/passwd:1' },
-        ],
-      },
-    }),
-  })
-  harness.state.diffLine = '+const a = 2'
-  harness.addSummary({ seq: 8, turn: 1 })
-  await harness.markChanges(8)
-  await harness.emit('agent/turn-stopping', { agent, turn: 1, signal: signal() })
-
-  assert.equal(harness.state.steers.length, 1, '全部丢弃时不应再注入')
-  assert.equal(
-    harness.state.steers.some((text) => text.includes('结论: 通过')),
-    false,
-    '上一轮阻塞后不能因模型输出不可用而注入通过',
-  )
-})
-
-test('steer 抛错不记审查失败，熔断仍关闭', async () => {
-  const harness = createHarness({ maxRounds: 5 })
-  harness.state.activation = () => ({
-    result: Promise.resolve({ stopReason: 'completed', structured: { findings: [FINDING] } }),
-  })
-  const agent = makeAgent(harness.state)
-  agent.steer = () => {
-    throw new Error('steer-boom')
-  }
-
-  for (let index = 0; index < 2; index += 1) {
-    harness.state.diffLine = `+const a = ${index + 1}`
-    harness.addSummary({ seq: 7 + index, turn: 1 })
-    await harness.markChanges(7 + index)
-    await harness.emit('agent/turn-stopping', { agent, turn: 1, signal: signal() })
-  }
-
-  assert.equal(harness.state.starts.length, 2)
-  assert.ok(warnHas(harness.state, 'steer 失败'), '应记录 steer 失败警告')
-  assert.equal(warnHas(harness.state, '连续失败'), false, 'steer 失败不应打开熔断')
-
-  harness.state.activation = () => ({
-    result: Promise.resolve({ stopReason: 'completed', structured: { findings: [] } }),
-  })
-  harness.state.diffLine = '+const a = 9'
-  harness.addSummary({ seq: 9, turn: 1 })
-  await harness.markChanges(9)
-  await harness.emit('agent/turn-stopping', { agent, turn: 1, signal: signal() })
-
-  assert.equal(harness.state.starts.length, 3, '熔断未打开，第三次应正常审查')
-})
-
-test('summary 缺 files 时按 stale 跳过，不抛错也不启动子代理', async () => {
-  const harness = createHarness({ maxRounds: 2 })
-  harness.state.summaries.set('s1:7', { turn: 1 })
-  await harness.markChanges(7)
-  const agent = makeAgent(harness.state)
-
-  await harness.emit('agent/turn-stopping', { agent, turn: 1, signal: signal() })
-
-  assert.equal(harness.state.starts.length, 0)
+  assert.equal(harness.state.follows.length, 0)
   assert.equal(harness.state.steers.length, 0)
-  assert.ok(debugHas(harness.state, 'stale-summary'))
+  assert.ok(debugHas(harness.state, 'review failed: invalid-result'))
+  assert.ok(warnHas(harness.state, '丢弃 2 条非法 finding'))
 })
 
-test('审查失败时 debug 记录原因', async () => {
+// —— followup 与启动失败 ——
+
+test('followup 抛错只告警，不影响审查成功与熔断状态', async () => {
   const harness = createHarness({ maxRounds: 2 })
-  harness.state.activation = () => ({
-    result: Promise.resolve({ stopReason: 'error', structured: undefined }),
-  })
-  harness.addSummary({ seq: 7, turn: 1 })
-  await harness.markChanges(7)
-  const agent = makeAgent(harness.state)
-
-  await harness.emit('agent/turn-stopping', { agent, turn: 1, signal: signal() })
-
-  assert.ok(
-    harness.state.debug.some((args) => String(args[0]).includes('review failed:') && String(args[1]).includes('incomplete')),
-    'debug 应带 review failed: 与失败原因',
-  )
-})
-
-test('复审通过时带未审清单与原因', async () => {
-  const harness = createHarness({ maxRounds: 3 })
-  let calls = 0
-  harness.state.activation = () => {
-    calls += 1
-    return {
-      result: Promise.resolve({
-        stopReason: 'completed',
-        structured: { findings: calls === 1 ? [FINDING] : [] },
-      }),
-    }
-  }
-  const files = [
-    { path: 'm.js', display: 'm.js' },
-    { path: 'notes.md', display: 'notes.md' },
-  ]
-  harness.addSummary({ seq: 7, turn: 1, files })
-  await harness.markChanges(7)
-  const agent = makeAgent(harness.state)
-
-  await harness.emit('agent/turn-stopping', { agent, turn: 1, signal: signal() })
-  harness.state.diffLine = '+const a = 2'
-  harness.addSummary({ seq: 8, turn: 1, files })
-  await harness.markChanges(8)
-  await harness.emit('agent/turn-stopping', { agent, turn: 1, signal: signal() })
-
-  assert.equal(harness.state.steers.length, 2)
-  assert.match(harness.state.steers[1], /结论: 通过/)
-  assert.match(harness.state.steers[1], /未审: notes\.md（not-code）/)
-})
-
-test('maxRounds 封顶：连续三轮只审两轮，第三轮记录 rounds-exhausted', async () => {
-  const harness = createHarness({ maxRounds: 2 })
-  harness.state.activation = () => ({
-    result: Promise.resolve({ stopReason: 'completed', structured: { findings: [FINDING] } }),
-  })
-  const agent = makeAgent(harness.state)
-
-  for (let index = 0; index < 3; index += 1) {
-    harness.state.diffLine = `+const a = ${index + 1}`
-    harness.addSummary({ seq: 7 + index, turn: 1 })
-    await harness.markChanges(7 + index)
-    await harness.emit('agent/turn-stopping', { agent, turn: 1, signal: signal() })
+  const agent = makeAgent(harness)
+  agent.followup = () => {
+    throw new Error('followup-boom')
   }
 
-  assert.equal(harness.state.starts.length, 2)
-  assert.equal(harness.state.steers.length, 2)
-  assert.ok(debugHas(harness.state, 'rounds-exhausted'))
+  await harness.stop(agent, { seq: 7, turn: 1, diff: '+const a = 1' })
+  harness.resolveNext(completed([FINDING]))
+  await tick()
+
+  assert.ok(warnHas(harness.state, 'followup 失败'))
+  assert.ok(metric(harness.state), 'followup 失败不改变成功结算')
+  assert.equal(warnHas(harness.state, '连续失败'), false, 'followup 失败不算审查失败')
+
+  await harness.stop(agent, { seq: 8, turn: 2, diff: '+const a = 2' })
+  assert.equal(harness.state.starts.length, 2, '熔断未打开，下一轮仍可审查')
+
+  harness.resolveNext(completed([]))
+  await tick()
 })
+
+test('startReview 启动失败：记录失败、释放锁，下一次仍可发起', async () => {
+  const harness = createHarness({ maxRounds: 2 })
+  const agent = makeAgent(harness)
+  harness.state.startError = new Error('spawn-boom')
+
+  await harness.stop(agent, { seq: 7, turn: 1 })
+  assert.equal(harness.state.starts.length, 1)
+  assert.equal(harness.state.follows.length, 0)
+  assert.ok(debugHas(harness.state, 'start failed: spawn-boom'))
+  assert.equal(harness.state.pending.length, 0, '启动失败不应产生在途 activation')
+
+  harness.state.startError = undefined
+  await harness.stop(agent, { seq: 8, turn: 2, diff: '+const a = 2' })
+  assert.equal(harness.state.starts.length, 2, '启动失败后必须释放 reviewing 锁')
+
+  harness.resolveNext(completed([]))
+  await tick()
+})
+
+// —— 生命周期、命令与并发门禁 ——
 
 test('命令注册冲突时警告并继续提供自动审查', async () => {
   const harness = createHarness({ maxRounds: 2 }, { registerThrows: true })
-  assert.ok(warnHas(harness.state, '/review 命令注册失败'), '应警告命令注册失败')
+  assert.ok(warnHas(harness.state, '/review 命令注册失败'))
   assert.equal(harness.state.commands.length, 0)
 
-  harness.addSummary({ seq: 7, turn: 1 })
-  await harness.markChanges(7)
-  const agent = makeAgent(harness.state)
-  await harness.emit('agent/turn-stopping', { agent, turn: 1, signal: signal() })
+  const agent = makeAgent(harness)
+  await harness.stop(agent, { seq: 7, turn: 1 })
+  assert.equal(harness.state.starts.length, 1)
 
-  assert.equal(harness.state.starts.length, 1, '命令注册失败不应拖垮自动审查')
+  harness.resolveNext(completed())
+  await tick()
+})
+
+test('session/disposed 清理指纹，同 id 会话同 diff 可再审', async () => {
+  const harness = createHarness({ maxRounds: 2 })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, { seq: 7, turn: 1, diff: '+const a = 1' })
+  harness.resolveNext(completed([FINDING]))
+  await tick()
+  assert.equal(harness.state.starts.length, 1)
+
+  await harness.emit('session/disposed', { id: 's1' })
+  await tick()
+
+  await harness.stop(agent, { seq: 7, turn: 1, diff: '+const a = 1' })
+  assert.equal(harness.state.starts.length, 2, '会话释放后指纹应已清空')
+
+  harness.resolveNext(completed([]))
+  await tick()
+})
+
+test('插件 dispose 取消在途审查，结果被丢弃', async () => {
+  const harness = createHarness({ maxRounds: 2 })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, { seq: 7, turn: 1 })
+  assert.equal(harness.state.pending.length, 1)
+
+  const effect = harness.state.effects.find((item) => String(item.label).includes('code-review'))
+  assert.ok(effect, '应通过 ctx.effect 注册生命周期清理')
+  await harness.dispose()
+
+  assert.equal(harness.state.disposed, 1, '插件卸载应 dispose 在途 activation')
+  assert.equal(harness.state.pending[0].disposed, 1)
+  assert.equal(harness.state.follows.length, 0)
+  assert.equal(debugHas(harness.state, 'review failed'), false, '插件卸载的取消不计失败')
+})
+
+test('reviewing 门禁：在途审查期间新的 stopping 不发起第二个', async () => {
+  const harness = createHarness({ maxRounds: 3 })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, { seq: 7, turn: 1, diff: '+const a = 1' })
+  assert.equal(harness.state.starts.length, 1)
+
+  await harness.stop(agent, { seq: 8, turn: 2, diff: '+const a = 2' })
+  assert.equal(harness.state.starts.length, 1, '在途期间不得并发发起')
+  assert.ok(debugHas(harness.state, 'reviewing'))
+
+  harness.resolveNext(completed([]))
+  await tick()
+  assert.equal(harness.state.follows.length, 0)
+
+  await harness.stop(agent, { seq: 9, turn: 3, diff: '+const a = 3' })
+  assert.equal(harness.state.starts.length, 2, '结算释放锁后应继续')
+
+  harness.resolveNext(completed([]))
+  await tick()
+})
+
+test('turn 信号取消不影响后台审查：结果仍会回灌', async () => {
+  const harness = createHarness({ maxRounds: 2 })
+  const agent = makeAgent(harness)
+  const controller = new AbortController()
+
+  await harness.stop(agent, { seq: 7, turn: 1, signal: controller.signal })
+  controller.abort()
+  harness.resolveNext(completed([FINDING]))
+  await tick()
+
+  assert.equal(harness.state.follows.length, 1, 'turn 取消不应连带取消后台审查')
+  assert.equal(harness.state.disposed, 0)
 })
