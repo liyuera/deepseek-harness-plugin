@@ -1068,3 +1068,76 @@ test('turn 信号取消不影响后台审查：结果仍会回灌', async () => 
   assert.equal(harness.state.follows.length, 1, 'turn 取消不应连带取消后台审查')
   assert.equal(harness.state.disposed, 0)
 })
+
+// —— 非阻塞建议回灌（notifySeverities） ——
+
+const LOW_FINDING = {
+  ruleId: 'MNT-004',
+  dimension: 'maintainability',
+  severity: 'low',
+  location: 'm.js:1',
+  problem: '注释写两次、循环跑三次',
+  suggestion: '把注释改成与实际循环一致',
+}
+
+test('notifySeverities 配置后：只有低严重度建议也回灌，且不要求修复', async () => {
+  const harness = createHarness({ maxRounds: 2, notifySeverities: ['low'] })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, { seq: 7, turn: 1 })
+  harness.resolveNext(completed([LOW_FINDING]))
+  await tick()
+
+  assert.equal(harness.state.follows.length, 1)
+  assert.deepEqual(harness.state.follows[0].source, { kind: 'plugin:code-review' })
+  const text = followText(harness.state, 0)
+  assert.match(text, /结论: 通过（1 处建议）/)
+  assert.match(text, /非阻塞建议:/)
+  assert.match(text, /\[MNT-004\] 可维护性\/low {2}m\.js:1/)
+  assert.match(text, /可选择不改/)
+  assert.doesNotMatch(text, /结论: 需修改/)
+})
+
+test('notifySeverities 默认空：低严重度建议仍静默', async () => {
+  const harness = createHarness({ maxRounds: 2 })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, { seq: 7, turn: 1 })
+  harness.resolveNext(completed([LOW_FINDING]))
+  await tick()
+
+  assert.equal(harness.state.follows.length, 0)
+  assert.equal(harness.state.steers.length, 0)
+  assert.ok(metric(harness.state), '非阻塞不注入仍记 reviewed 指标')
+})
+
+test('notifySeverities 与阻塞项同轮：一条消息同时列出阻塞和建议', async () => {
+  const harness = createHarness({ maxRounds: 2, notifySeverities: ['low'] })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, { seq: 7, turn: 1 })
+  harness.resolveNext(completed([FINDING, LOW_FINDING]))
+  await tick()
+
+  assert.equal(harness.state.follows.length, 1)
+  const text = followText(harness.state, 0)
+  assert.match(text, /结论: 需修改（1 处阻塞，1 处建议）/)
+  assert.match(text, /非阻塞建议:/)
+  assert.match(text, /可选择性处理/)
+  assert.doesNotMatch(text, /可选择不改/)
+})
+
+test('notifySeverities 末轮：非阻塞回灌也声明不再自动复审', async () => {
+  const harness = createHarness({ maxRounds: 1, notifySeverities: ['low'] })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, { seq: 7, turn: 1 })
+  harness.resolveNext(completed([LOW_FINDING]))
+  await tick()
+
+  assert.equal(harness.state.follows.length, 1)
+  const text = followText(harness.state, 0)
+  assert.match(text, /可选择不改/)
+  assert.match(text, /不会再自动复审/)
+  assert.doesNotMatch(text, /修完会再复审一次/)
+})

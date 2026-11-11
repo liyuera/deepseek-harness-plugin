@@ -4,6 +4,7 @@ export const DEFAULTS = Object.freeze({
   auto: true,
   maxRounds: 2,
   blockingSeverities: Object.freeze(['high', 'medium']),
+  notifySeverities: Object.freeze([]),
   codeExtensions: Object.freeze([
     '.js', '.jsx', '.ts', '.tsx', '.vue', '.py', '.go', '.java', '.rs', '.css', '.less', '.scss',
   ]),
@@ -53,6 +54,12 @@ export function resolveConfig(raw = {}) {
   for (const severity of merged.blockingSeverities) {
     if (!SEVERITIES.has(severity)) throw new Error(`code-review: invalid severity "${severity}"`)
   }
+  if (!Array.isArray(merged.notifySeverities)) {
+    throw new Error('code-review: notifySeverities must be an array')
+  }
+  for (const severity of merged.notifySeverities) {
+    if (!SEVERITIES.has(severity)) throw new Error(`code-review: invalid severity "${severity}"`)
+  }
   if (!Array.isArray(merged.codeExtensions)) {
     throw new Error('code-review: codeExtensions must be an array')
   }
@@ -89,6 +96,7 @@ export function resolveConfig(raw = {}) {
     auto: merged.auto,
     maxRounds: merged.maxRounds,
     blockingSeverities: Object.freeze([...merged.blockingSeverities]),
+    notifySeverities: Object.freeze([...merged.notifySeverities]),
     codeExtensions: Object.freeze([...merged.codeExtensions]),
     maxDiffBytes: merged.maxDiffBytes,
     reviewerTimeoutMs: merged.reviewerTimeoutMs,

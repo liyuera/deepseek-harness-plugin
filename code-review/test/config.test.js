@@ -86,3 +86,30 @@ test('覆盖值生效且不污染 DEFAULTS', () => {
   assert.equal(config.maxRounds, 3)
   assert.equal(DEFAULTS.maxRounds, 2)
 })
+
+test('notifySeverities 默认空数组且冻结', () => {
+  assert.deepEqual(DEFAULTS.notifySeverities, [])
+  assert.ok(Object.isFrozen(DEFAULTS.notifySeverities))
+  const config = resolveConfig()
+  assert.deepEqual(config.notifySeverities, [])
+  assert.ok(Object.isFrozen(config.notifySeverities))
+})
+
+test('notifySeverities 覆盖值生效且为冻结副本', () => {
+  const severities = ['low', 'nit']
+  const config = resolveConfig({ notifySeverities: severities })
+  assert.deepEqual(config.notifySeverities, ['low', 'nit'])
+  assert.ok(Object.isFrozen(config.notifySeverities))
+  assert.notEqual(config.notifySeverities, severities, '不得直接复用调用方数组')
+
+  severities.push('high')
+  assert.deepEqual(config.notifySeverities, ['low', 'nit'])
+  assert.deepEqual(DEFAULTS.notifySeverities, [])
+})
+
+test('notifySeverities 校验非数组/非法严重度', () => {
+  for (const value of ['low', null, {}, 7]) {
+    assert.throws(() => resolveConfig({ notifySeverities: value }), /code-review: notifySeverities must be an array/)
+  }
+  assert.throws(() => resolveConfig({ notifySeverities: ['bogus'] }), /code-review: invalid severity "bogus"/)
+})

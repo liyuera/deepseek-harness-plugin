@@ -118,3 +118,55 @@ test('renderPass 带未审清单与原因', () => {
   assert.match(text, /未审: a\.md（not-code）、b\.png（binary）/)
   assert.equal(renderPass({ summary: { files: 1, added: 0, deleted: 0 } }).includes('未审'), false)
 })
+
+test('notify 模式只列非阻塞建议，结论为通过且不要求修复', () => {
+  const text = renderFindings({
+    findings: [finding({ severity: 'low', ruleId: 'MNT-004', dimension: 'maintainability', location: 'src/b.ts:9' })],
+    skipped: [],
+    blockingSeverities: ['high', 'medium'],
+    notifySeverities: ['low', 'nit'],
+    summary: { files: 1, added: 2, deleted: 1 },
+    mode: 'notify',
+  })
+  assert.match(text, /结论: 通过（1 处建议）/)
+  assert.doesNotMatch(text, /需修改/)
+  assert.match(text, /\[MNT-004\] 可维护性\/low {2}src\/b\.ts:9/)
+})
+
+test('notify 模式的空清单/不匹配 severity 返回空串', () => {
+  const low = finding({ severity: 'low', ruleId: 'MNT-004', dimension: 'maintainability' })
+  const base = {
+    skipped: [], blockingSeverities: ['high', 'medium'],
+    summary: { files: 1, added: 1, deleted: 0 }, mode: 'notify',
+  }
+  assert.equal(renderFindings({ ...base, findings: [low], notifySeverities: [] }), '')
+  assert.equal(renderFindings({ ...base, findings: [low], notifySeverities: ['nit'] }), '')
+  assert.equal(renderFindings({ ...base, findings: [finding()], notifySeverities: ['low', 'nit'] }), '')
+})
+
+test('steer 模式在配置 notifySeverities 时附带非阻塞建议段', () => {
+  const text = renderFindings({
+    findings: [finding(), finding({ severity: 'low', ruleId: 'MNT-004', dimension: 'maintainability' })],
+    skipped: [],
+    blockingSeverities: ['high', 'medium'],
+    notifySeverities: ['low'],
+    summary: { files: 1, added: 3, deleted: 0 },
+    mode: 'steer',
+  })
+  assert.match(text, /结论: 需修改（1 处阻塞，1 处建议）/)
+  assert.match(text, /非阻塞建议:/)
+  assert.match(text, /\[MNT-004\]/)
+})
+
+test('steer 模式未配置 notifySeverities 时仍只回注阻塞项', () => {
+  const text = renderFindings({
+    findings: [finding(), finding({ severity: 'low', ruleId: 'MNT-004', dimension: 'maintainability' })],
+    skipped: [],
+    blockingSeverities: ['high', 'medium'],
+    summary: { files: 1, added: 3, deleted: 0 },
+    mode: 'steer',
+  })
+  assert.match(text, /结论: 需修改（1 处阻塞）/)
+  assert.doesNotMatch(text, /非阻塞建议/)
+  assert.doesNotMatch(text, /MNT-004/)
+})

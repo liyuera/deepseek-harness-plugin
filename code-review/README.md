@@ -22,7 +22,7 @@ DSH 会话运行时的「AI 生成代码自动审查」：主代理改完代码�
 2. **门禁**（`src/host/trigger.js`，顺序短路）：`enabled` → `auto` → 来源不是 `subagent` → 当前没有同一会话的审查在跑 → 本链轮数未达 `maxRounds` → 本轮有 workspace 变更 → 熔断未打开。全部通过后再确认摘要属于本 turn 且确实有文件；取材后发现没有可审文件、或内容指纹与链内上一次成功审查相同，直接跳过（**不消耗轮次**）。
 3. **取材与规则过滤**（`src/host/collect.js` + `src/host/scope.js`）：只取后缀在 `codeExtensions` 里的源文件；把 hunk 渲染成 unified diff，按 UTF-8 字节数累计，超过 `maxDiffBytes` 后剩余文件标记 `budget` 跳过。二进制、超大、服务读不到、以及 diff 超时退化成整文件替换（`coarse`）的文件都记入 `skipped`，不会猜内容。取材完成后，按**本次实际变更的文件**过滤规则：带 `scope`（扩展名/路径 glob）的规则只对该类文件生效，没命中的规则不会进 prompt、也不允许被 finding 引用。
 4. **后台审查**（`src/host/reviewer.js`）：`startReview` 经 `ctx.subagents.startActivation`（`delivery:'caller'`）在独立子代理里跑 `reviewerPreset`（默认 `code-review`），带结构化输出 schema；**拿到子代理句柄后立即返回**，不等待审查结果，当前 turn 正常结束。注意启动 `startActivation` 仍在 turn-stopping 的同步段里：启动受同一个 `asyncReviewerTimeoutMs` 总预算约束（超出即有界放弃并记失败，不会无限挂住 turn）；审查跑起来之后的取消信号来自插件生命周期，不随 turn 结束而中断。`asyncReviewerTimeoutMs` 默认 10 分钟。
-5. **结算与回灌**（`index.js` + `src/host/render.js`）：审查结果回来后校验/渲染；只有 `severity` 落在 `blockingSeverities` 的 findings 才生成 `结论: 需修改...`，用 `agent.followup()` 以**插件来源消息**注入，开一个新 turn 让主代理修复。只有 low/nit 或完全干净时**静默**（v2 不再注入「结论: 通过」）。最后一轮（`rounds >= maxRounds`）的文案改为「已达到自动复审上限，修完不会再自动复审，请人工确认」。
+5. **结算与回灌**（`index.js` + `src/host/render.js`）：审查结果回来后校验/渲染；`severity` 落在 `blockingSeverities` 的 findings 生成 `结论: 需修改...`，用 `agent.followup()` 以**插件来源消息**注入，开一个新 turn 让主代理修复。**默认**只有 low/nit 或完全干净时静默（v2 不注入「结论: 通过」）；配置 `notifySeverities` 后，命中的非阻塞建议也会回灌（结论为「通过（N 处建议）」，文案写明「可选择不改」，不要求修复）。最后一轮（`rounds >= maxRounds`）的文案改为「已达到自动复审上限，修完不会再自动复审，请人工确认」。
 6. **轮次与防循环**：一条**人类消息**开启一条「链」，链内最多自动审查 `maxRounds` 次（默认 2：首审 + 修复后复审）。链在以下约束下终止：人类消息重置链；同链内同一份 diff（内容指纹）只审一次且不占轮；单会话同时只有一个在途审查；插件注入的消息是 `plugin` 来源，**不会**重置链。失败路径由熔断兜底。
 7. **失败兜底**：启动失败、超时、子代理失败、输出不合 schema、finding 全部被二次校验丢弃、服务不可用都按 fail-open 处理——只写宿主日志（含失败原因），不注入、不阻塞；会话关闭/插件卸载不计为失败，`timeout` 取消按失败计数（用于熔断）。同一会话连续 2 次失败进入 5 分钟冷却（熔断），冷却后半开放行一次；成功即清零。状态只在内存，会话释放或重启后清空。
 
@@ -73,6 +73,7 @@ dsh plugin --profile desktop remove @liyuera/dsh-code-review
 | `auto` | `true` | `false` 时只保留 `/review` 手动入口，不在 turn-stopping 自动审查。 |
 | `maxRounds` | `2` | **每条链**（一条人类消息开启一条链）最多自动审查几次。默认「首审 + 修复后复审」；调大能多给修复机会，但每条链的 token 与自动 turn 数同步增加。必须为正整数。 |
 | `blockingSeverities` | `["high","medium"]` | 自动回灌的阻塞阈值；不在其中的 findings 只会出现在 `/review` 报告里。可收窄为 `["high"]` 降低打断。 |
+| `notifySeverities` | `[]` | **非阻塞建议也回灌**的严重度。默认空 = 保持静默（只有阻塞级会开新 turn）；例如 `["low","nit"]` 时，命中但不在 `blockingSeverities` 的 findings 会以「结论: 通过（N 处建议）」回灌，文案标注「可选择不改」。与 `blockingSeverities` 重叠时按阻塞处理。 |
 | `codeExtensions` | `[".js",".jsx",".ts",".tsx",".vue",".py",".go",".java",".rs",".css",".less",".scss"]` | 参与审查的源码后缀；其它文件记 `not-code` 跳过。 |
 | `maxDiffBytes` | `200000` | 单次审查可收录 diff 的 UTF-8 字节上限；超出后的剩余文件记 `budget` 跳过。 |
 | `asyncReviewerTimeoutMs` | `600000` | **后台自动审查**的安全上限：超过即取消审查者并记一次失败（触发熔断计数）。异步审查不阻塞对话，所以给得比较宽。 |
@@ -89,7 +90,8 @@ dsh plugin --profile desktop remove @liyuera/dsh-code-review
 - id: code-review
   config:
     maxRounds: 3                 # 每条链最多审 3 次
-    blockingSeverities: [high]   # 只有 high 才自动回灌
+    blockingSeverities: [high]   # 只有 high 才自动回灌（开新 turn 要求修复）
+    notifySeverities: [low, nit] # low/nit 建议也回灌，但文案标「可选择不改」
     asyncReviewerTimeoutMs: 900000
     reviewerTimeoutMs: 180000    # /review 手动等待上限
 ```
@@ -153,7 +155,7 @@ dsh plugin --profile desktop remove @liyuera/dsh-code-review
 ## 已知限制
 
 - **审查是异步的**：当前回复**不会**等审查（v1 会阻塞 turn 结束）。结论在审查跑完后以一条插件消息 `followup` 成新 turn 回灌，主代理会自动继续修复；从「回复结束」到「审查结论到达」通常要 1~2 分钟（取决于审查者速度）。
-- **通过是静默的**：v2 不再注入「结论: 通过」。修完是否干净要看审查子会话/`/review`；只有仍存在阻塞 findings 或达到链上限时才会回灌。
+- **通过默认静默**：v2 不注入「结论: 通过」。修完是否干净要看审查子会话/`/review`；默认只有仍存在阻塞 findings 或达到链上限时才会回灌。配置 `notifySeverities` 后，非阻塞建议也会回灌，但文案明确「可选择不改」。
 - **注入消息是插件来源**：回灌消息的 `source.kind` 是 `plugin:code-review`（不是 `user`），不会被当成人类输入，也不会重置链预算。注意 v4 会话格式已退役旧的 `{kind:'plugin', plugin:…}` wrapper，用它会直接让 turn 变 error。
 - **一条人类消息 = 一条链，最多 `maxRounds` 次自动审查**：链只在人类消息到达时重置；插件自己注入的消息不会重置链，因此不存在自动无限循环。连续发消息会各开一条新链（预期交互）。
 - **fail-open 是静默的**：启动失败、超时、坏输出只写宿主日志（debug/warn 级，含失败原因分类），不会告诉用户，也不阻塞主代理；需要可见结果时用 `/review`。
@@ -163,7 +165,7 @@ dsh plugin --profile desktop remove @liyuera/dsh-code-review
 - **取材有上限**：二进制/超大/服务读不到/比较超时（`coarse`）的文件跳过；超过 `maxDiffBytes` 后的剩余文件不再审。报告（含通过路径）里的 `未审:` 行会列出原因（`budget`/`not-code`/`binary` 等内部标识）。
 - **不碰 GitLab**：不复用 GitLab 审查模板，不建 MR、不 push、不评论；与 bug-workflow 的 MR 审查是两套独立机制。
 - **审查者是独立子代理**：绝不自我审查；`origin: subagent` 的会话不会再触发自动审查，避免递归。
-- **只有阻塞级会自动回灌**：low/nit 不注入，只在 `/review` 报告里可见。
+- **默认只有阻塞级会自动回灌**：low/nit 不注入，只在 `/review` 报告里可见；`notifySeverities` 可以按严重度放开「建议回灌」，但这类消息不要求修复，也不改变阻塞判定。
 - **只读不是 OS 级沙箱**：依赖 preset 工具面 + 按 preset 名的只读白名单；如果宿主子代理的 `agentPreset` 与 `reviewerPreset` 不一致（例如 profile 强行改写子代理预设），guard 不会命中，只剩 preset 自身工具面。这不是 OS 级沙箱。
 - **轮次与熔断是进程内状态**：链轮次、去重指纹、熔断计数都在内存，重启即重置；熔断只影响自动审查，`/review` 仍可手动跑。
 - **成本**：审查者是一次真实模型调用，会消耗 token 与时间；每条链最多 `maxRounds` 次审查者调用 + 对应次数的自动 turn。审查子代理最长占用一个并发槽（`maxActiveSubagents`，默认 8）到 `asyncReviewerTimeoutMs`。
@@ -175,7 +177,8 @@ dsh plugin --profile desktop remove @liyuera/dsh-code-review
 2. 修完后后台会再复审一次：干净时**静默**（不会出现「结论: 通过」）；若仍有阻塞，最多到 `maxRounds` 后停止（末轮文案会写「不会再自动复审」），不会无限自动循环。
 3. 审查前后跑 `git status`：只应有主代理的改动，审查者不应写任何文件。
 4. 在会话里执行 `/review`：报告只出现在 UI，对话不被打断、不产生注入消息（这条仍是同步等待）。
-5. 规则加载自检（在仓库 checkout 里跑；npm 包不含 `test/`）：
+5. 非阻塞回灌自检（可选）：profile 里给 `code-review` 配 `notifySeverities: [low]` 并重启，制造一个只有 low 的改动 → 会话里出现「结论: 通过（N 处建议）」插件消息，文案含「可选择不改」，且不会因此要求主代理必须修改。
+6. 规则加载自检（在仓库 checkout 里跑；npm 包不含 `test/`）：
 
    ```sh
    cd code-review
@@ -183,7 +186,7 @@ dsh plugin --profile desktop remove @liyuera/dsh-code-review
    node --test
    ```
 
-   第一条应打印 `24`；第二条应全绿（当前 208 个用例）。
+   第一条应打印 `24`；第二条应全绿（当前 219 个用例）。
 
 ## 发布
 

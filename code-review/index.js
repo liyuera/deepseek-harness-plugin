@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url'
 import { resolveConfig } from './src/host/config.js'
 import { collect, fingerprint } from './src/host/collect.js'
 import { composeRules, loadRulesResilient } from './src/host/rules.js'
-import { renderFindings } from './src/host/render.js'
+import { partition, renderFindings } from './src/host/render.js'
 import { buildPrompt, startReview } from './src/host/reviewer.js'
 import { shouldReview } from './src/host/trigger.js'
 import { createTracker } from './src/host/loop.js'
@@ -142,15 +142,42 @@ export function apply(ctx, config) {
       }
 
       const scope = { files: totalFiles, added: meta.summary.added, deleted: meta.summary.deleted }
-      const text = renderFindings({
+      const blockingText = renderFindings({
         findings: outcome.findings,
         skipped: meta.collected.skipped,
         blockingSeverities: resolved.blockingSeverities,
+        notifySeverities: resolved.notifySeverities,
         summary: scope,
         mode: 'steer',
       })
-      // v2：通过/只有非阻塞建议时静默，不再注入「结论: 通过」。
-      if (text === '') return
+      // 结算时实时读链轮次：人类重置链后 rounds=0，不能再用旧链的「最后一轮」口径。
+      const lastRound = tracker.roundsOf(sessionId) >= resolved.maxRounds
+      const note = lastRound
+        ? '本轮已达到自动复审上限，修完不会再自动复审，请人工确认。'
+        : '修完会再复审一次。'
+      const notifySet = new Set(resolved.notifySeverities)
+      const notified = partition(outcome.findings, resolved.blockingSeverities).passive
+        .filter((finding) => notifySet.has(finding.severity))
+      let payload = ''
+      if (blockingText !== '') {
+        const suggest = notified.length > 0 ? '；非阻塞建议可选择性处理' : ''
+        payload = `${blockingText}\n\n请按上面每条阻塞 finding 修复${suggest}。${note}如与用户新指令冲突，以用户指令为准。`
+      } else if (resolved.notifySeverities.length > 0) {
+        const notifyText = renderFindings({
+          findings: outcome.findings,
+          skipped: meta.collected.skipped,
+          blockingSeverities: resolved.blockingSeverities,
+          notifySeverities: resolved.notifySeverities,
+          summary: scope,
+          mode: 'notify',
+        })
+        // 没有命中 notifySeverities 的建议（或本轮干净）：仍然静默。
+        if (notifyText === '') return
+        payload = `${notifyText}\n\n以上为非阻塞建议，可选择不改；若认同可顺手修复。${note}如与用户新指令冲突，以用户指令为准。`
+      } else {
+        // v2 默认行为：通过/只有非阻塞建议时静默，不注入「结论: 通过」。
+        return
+      }
 
       // 会话已关闭或同 id 换了一个 agent：丢弃结果，不抛。
       const live = ctx.get?.('agents')?.get(sessionId)
@@ -159,13 +186,8 @@ export function apply(ctx, config) {
         return
       }
 
-      // 结算时实时读链轮次：人类重置链后 rounds=0，不能再用旧链的「最后一轮」口径。
-      const lastRound = tracker.roundsOf(sessionId) >= resolved.maxRounds
-      const repair = lastRound
-        ? '请按上面每条 finding 修复。本轮已达到自动复审上限，修完不会再自动复审，请人工确认。如与用户新指令冲突，以用户指令为准。'
-        : '请按上面每条 finding 修复；修完会再复审一次。如与用户新指令冲突，以用户指令为准。'
       try {
-        live.followup(message(`${text}\n\n${repair}`))
+        live.followup(message(payload))
       } catch (error) {
         ctx.logger.warn(`[code-review] followup 失败：${error.message}`)
       }
