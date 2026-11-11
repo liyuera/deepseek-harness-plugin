@@ -1,0 +1,58 @@
+[
+  {
+    "id": "BEH-001", "dimension": "behavior", "severity": "low",
+    "title": "交互失败必须有用户可见反馈",
+    "check": "用户触发的操作被判定为不可处理（非法输入、状态不匹配、前置条件缺失）时，必须有提示、回落为另一条真实路径，或明确禁用控件；禁止静默 return 让界面毫无反应。",
+    "bad": "if (state.type !== 'keyword') return",
+    "good": "if (state.type === 'incomplete') { message.info('请输入完整坐标'); return }"
+  },
+  {
+    "id": "BEH-002", "dimension": "behavior", "severity": "low",
+    "title": "挂载/解绑副作用必须成对",
+    "check": "attach/mount 里注册的监听、订阅、视图约束、层级限制，detach/unmount 必须逐一撤销；只撤一半会在实例被复用时留下残留副作用。",
+    "bad": "map.on('moveend', handler); return () => { map.un('moveend', handler) }  // applyMaxZoom 写入的 setMaxZoom 未撤销",
+    "good": "const previous = view.getMaxZoom(); view.setMaxZoom(next); return () => { map.un('moveend', handler); view.setMaxZoom(previous) }"
+  },
+  {
+    "id": "BEH-003", "dimension": "behavior", "severity": "low",
+    "title": "写入前保存原值、卸载时还原",
+    "check": "对共享对象（地图 view、全局配置、单例实例）写入前先记录原值，生命周期结束时恢复；否则后续使用方会继承被改过的状态。",
+    "bad": "view.setMaxZoom(16)",
+    "good": "const previous = view.getMaxZoom(); view.setMaxZoom(16); return () => view.setMaxZoom(previous)"
+  },
+  {
+    "id": "BEH-004", "dimension": "behavior", "severity": "low",
+    "title": "卸载/销毁必须清理副作用",
+    "check": "组件或模块卸载时必须清理定时器、事件监听、订阅、在途请求；缺少清理会在切页/热更新后重复触发。",
+    "bad": "useEffect(() => { const timer = setInterval(sync, 1000) })",
+    "good": "useEffect(() => { const timer = setInterval(sync, 1000); return () => clearInterval(timer) })"
+  },
+  {
+    "id": "BEH-005", "dimension": "behavior", "severity": "low",
+    "title": "异步回写必须校验请求代次",
+    "check": "请求返回后写状态前必须校验它仍是当前请求（seq/abort/代次），过期结果不得覆盖新状态；跳过一次校验就会出现旧数据回写到新界面。",
+    "bad": "fetchPoi(keyword).then((list) => setPoiResults(list))",
+    "good": "const seq = ++searchSeq.current; fetchPoi(keyword).then((list) => { if (seq === searchSeq.current) setPoiResults(list) })"
+  },
+  {
+    "id": "BEH-006", "dimension": "behavior", "severity": "low",
+    "title": "禁止空 catch/静默失败",
+    "check": "catch 块不得为空，至少记录或向上抛出；吞掉异常等于把故障藏起来，后续无法定位。",
+    "bad": "try { await save() } catch {}",
+    "good": "try { await save() } catch (error) { logger.warn('save failed', error); throw error }"
+  },
+  {
+    "id": "BEH-007", "dimension": "behavior", "severity": "low",
+    "title": "loading/空结果/错误三态必须收敛",
+    "check": "一次用户操作必须能以成功、无结果、失败三种可见终态之一结束；停在 loading 或什么都不发生都属于交互缺陷。",
+    "bad": "setLoading(true); const data = await load(); if (!data) return",
+    "good": "setLoading(true); try { const data = await load(); setState(data ? 'ok' : 'empty') } catch { setState('error') } finally { setLoading(false) }"
+  },
+  {
+    "id": "BEH-008", "dimension": "behavior", "severity": "low",
+    "title": "生命周期钩子不得留下与主流程矛盾的状态",
+    "check": "挂载/卸载、激活/停用、进入/退出之间对同一状态的口径必须一致；一处注释或代码声明停用、另一处仍在读写同一状态，会导致后续维护者误判。",
+    "bad": "// 已停用：detachZoomLimitRef 没有任何赋值点\nconst detachZoomLimitRef = useRef()\n...\ndetachZoomLimitRef.current = undefined",
+    "good": "把停用说明收敛到一处，并删除或标注所有仍在读写该状态的代码"
+  }
+]

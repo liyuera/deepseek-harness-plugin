@@ -1,7 +1,16 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
-import { validateRules, renderRulesPrompt } from '../src/host/rules.js'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import {
+  validateRules,
+  renderRulesPrompt,
+  loadRulesResilient,
+  composeRules,
+} from '../src/host/rules.js'
+
+const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 
 const pack = JSON.parse(
   await readFile(new URL('../rules/packs/frontend-smartui.json', import.meta.url), 'utf8'),
@@ -123,4 +132,25 @@ test('MNT-007 收紧：>200 行强制、>100 行建议，文件 >500 行交给 M
   assert.match(rule.check, /100/)
   assert.ok(!rule.check.includes('500'), 'MNT-007 不应包含文件行数口径（由 MNT-011 覆盖）')
   assert.match(packById.get('MNT-011').check, /500/)
+})
+
+test('general-issues 包：8 条 behavior 规则全部通过校验且全为 low', async () => {
+  const raw = await readFile(new URL('../rules/packs/general-issues.json', import.meta.url), 'utf8')
+  const rules = JSON.parse(raw)
+  validateRules(rules)
+  assert.equal(rules.length, 8)
+  assert.deepEqual([...new Set(rules.map((rule) => rule.dimension))], ['behavior'])
+  assert.ok(rules.every((rule) => rule.severity === 'low'))
+  assert.equal(new Set(rules.map((rule) => rule.id)).size, 8)
+})
+
+test('general-issues 启用后 prompt 含 BEH 规则', async () => {
+  const loaded = await loadRulesResilient({
+    rulesPath: join(PACKAGE_ROOT, 'rules/rules.json'),
+    principlesPath: join(PACKAGE_ROOT, 'rules/principles.md'),
+    packs: [join(PACKAGE_ROOT, 'rules/packs/general-issues.json')],
+  })
+  const composed = composeRules({ ...loaded, filePaths: ['src/a.ts'] })
+  assert.match(composed.prompt, /### BEH-001/)
+  assert.ok(composed.allowedRuleIds.has('BEH-001'))
 })
