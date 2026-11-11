@@ -604,3 +604,86 @@ v3 引入两层机制解决：**规则作用域（scope）** 按本次变更文�
 - `config`：`notifySeverities` 默认冻结空数组、覆盖值冻结副本、非数组/非法 severity 拒绝启动。
 - `index`：配置后只有 low 也回灌且文案含「可选择不改」；默认空仍静默；阻塞+建议同轮合并一条消息；末轮文案不再承诺复审。
 - 全量回归：208 → 219 个用例全绿。
+
+## 20. v0.3 三项改进（2026-11-11）
+
+### 20.1 动机
+
+真实 MR 对比（会话 `session-98d0a866…`，MR `feat-V1.7.0.20261119-ly`）暴露了插件与团队 GitLab bot 的差距：
+
+- bot 命中两类插件没报的问题：「纯数字输入被判 incomplete 后静默 return，用户无任何反馈」「OpenLayers 缩放上限 detach 只解绑监听、没有还原 `view.setMaxZoom`」——都属于**行为/生命周期语义**，不在插件现有 24+18 条「单文件 diff 可判定」硬规则里。
+- 插件对这两处代码**确实发起过审查**，但：11:18 那次审「五态判定」的审查在 11:20:02 被应用关闭取消（子会话 `turn/end aborted`，父会话直到 14:24 无事件）；14:53 那次只带基础 24 条规则、唯一 low finding 又因 `notifySeverities` 未启用被静默丢弃。用户完全看不到这些中间状态。
+- 插件只审「当轮未提交 diff」，且一旦 agent 提交（turn 3 先 commit），该轮 diff 为空直接跳过——缺少链级/累积视角，而 bot 审的是整个 MR。
+
+本版做三项改进：**通用问题规则包**、**审查留痕**、**链级全量审查**。
+
+### 20.2 通用问题规则包（behavior 维度）
+
+- 规则 schema 新增维度 `behavior`，id 前缀 `BEH`；`PRINCIPLE_IDS` 增加 `PRINCIPLE-behavior`；渲染标签「行为」。
+- 新规则包 `rules/packs/general-issues.json`，8 条，**全部 severity low**（与团队 bot 的 `general_issue` 非阻塞口径一致；需要强制时由用户调 `blockingSeverities`）：
+
+| id | 标题 | 检查要点 |
+| --- | --- | --- |
+| BEH-001 | 交互失败必须有用户可见反馈 | 禁止静默 return/吞掉用户操作；输入被判定不可处理时要有提示或回落路径 |
+| BEH-002 | 挂载/解绑副作用必须成对 | 监听、订阅、视图约束、层级限制：attach 做了什么，detach 必须对应撤销 |
+| BEH-003 | 写入前保存原值、卸载时还原 | set 之前记录原值，detach/卸载时恢复，避免实例复用时状态残留 |
+| BEH-004 | 卸载/销毁必须清理副作用 | 定时器、事件监听、订阅、在途请求 |
+| BEH-005 | 异步回写必须校验请求代次 | 过期结果不得覆盖当前状态（seq/abort/代次校验） |
+| BEH-006 | 禁止空 catch/静默失败 | 至少记录或向上抛出；吞异常等于隐藏故障 |
+| BEH-007 | loading/空结果/错误三态必须收敛 | 用户操作的每种终态都要有出口，不能停在中间态 |
+| BEH-008 | 生命周期钩子不得留下与主流程矛盾的状态 | 挂载/卸载/激活/停用之间状态口径一致 |
+
+- 规则不带 `scope`（行为规则跨语言成立），仅受 `codeExtensions` 过滤。
+- `rules/principles.md` 增加「行为与生命周期」原则段。
+
+### 20.3 审查留痕（journal）
+
+- 依赖：可选 peer `@deepseek-ai/dsh-storage-domain` + `zod`（`dsh-base` 已挂载 storage hub + json backend + domain form）。用**动态 import + `ctx.get('storageDomain')`** 探测，缺失时降级为内存 journal，插件仍可用。
+- Domain：`code_review` / table `reviews`，记录：
+  `{ sessionId, turn, seq, mode: 'turn'|'full', startedAt, finishedAt|null, status: 'running'|'completed'|'cancelled'|'timeout'|'failed', reason|null, files, findingsTotal, findings(≤10: ruleId/dimension/severity/location/problem), injected }`
+- 生命周期：审查开始写 `running`；结算/取消/超时/启动失败更新状态；每 session 保留最近 50 条，写入时裁剪。
+- 展示：`/review` 报告尾部追加「自动审查记录（最近 5 条）」：时间、turn、模式、结果（完成/取消(原因)/失败）、findings 数、是否回灌；24h 内存在 cancelled/running 记录时给出显式提示。**不新增自动注入消息**（不打扰主 agent）。
+- 崩溃/关闭场景：`dispose` 时把在途记录标为 `cancelled(dispose)`；存储写失败只 warn，不影响审查主流程。
+
+### 20.4 链级全量审查（full review）
+
+- 新增链累积器（`src/host/chain.js`）：监听每个 `workspace/changes` 事件，把 summary 里的代码文件按链累积 `{ path, display, lastSeq, turns, added, deleted }`；链边界跟随 tracker（人类消息重置）；上限 `fullReviewMaxFiles`（默认 20，超出保留最近变更）。
+- 触发：
+  1. **自动**：本条链最后一次自动审查（`rounds >= maxRounds` 的那次）且链内文件数 > 本轮 diff 文件数、本链尚未做过 full → 本次改为全量审查；
+  2. **手动**：`/review --full`，同步、不占轮次、`mode: 'report'`。
+- 全量 prompt：本次为链级全量复审；列出链内所有触达文件（路径 + 轮次/增删）；要求用只读工具读取文件当前内容；以整体视角检查跨文件/跨轮次问题（交互反馈、副作用成对、状态还原、契约一致）；附「本链已报告过的问题（勿重复）」清单。全量模式不塞逐轮 diff 文本，由审查者读盘取当前态（含已提交内容）。
+- 校验：`allowedPaths` = 链内文件集合；`allowedRuleIds`/`ruleSeverities` 仍按链内文件过滤；回灌语义（blocking/notify、末轮文案）完全复用现有 settle。
+- 新增配置（严格校验）：`fullReview: true`、`fullReviewMaxFiles: 20`。
+
+### 20.5 配置变化
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `fullReview` | `true` | 是否在链最后一轮自动切链级全量审查 |
+| `fullReviewMaxFiles` | `20` | 链累积器最多跟踪的文件数 |
+
+`rulePacks` 增加内置 `rules/packs/general-issues.json`（默认仍不启用，按 profile 配置）。
+
+### 20.6 不变量与兼容性
+
+- 默认语义不变：`fullReview` 关闭时行为与 0.2.0 一致；journal 不可用时只是少一段报告脚注。
+- 不引入 git 依赖、不重建 MR 级 diff、不新增自动消息类型；仍只审「当前会话可见的改动」。
+- 链累积器与 journal 都是插件本地状态：链状态进程内、journal 持久化；插件卸载/会话释放后 chain 清空。
+- `/review` 依旧是同步报告；手动 `/review --full` 与自动全量共用同一 prompt 构建与校验路径。
+
+### 20.7 测试与验收
+
+- 规则：`behavior` 维度校验/前缀绑定/渲染标签；general-issues 包 8 条全部通过 `validateRules`、id 唯一、severity 全 low；启用后 reviewer prompt 含 `BEH-00x`。
+- journal：内存降级、storageDomain 打开/写入/读取/裁剪、状态流转（running→completed/cancelled/timeout/failed）、报告脚注渲染、写失败只 warn。
+- chain：多轮累积、文件去重与上限、人类消息重置、epoch 隔离。
+- full review：最后一轮触发条件（`rounds >= maxRounds` 且链文件多于本轮）、`allowedPaths` 覆盖链内文件、`/review --full` 输出、已报问题清单去重段。
+- 回归：现有 219 个用例全绿；`npm pack --dry-run` 文件清单含新规则包。
+- E2E：真实仓库多轮改动 → 末轮 full 的 reviewer prompt 含链内文件清单；behavior 规则命中；重启后 `/review` 能读到 journal 记录。
+
+### 20.8 排期
+
+1. **A（通用问题规则包）**：schema + 规则包 + 原则 + profile 启用。独立、直接补类型缺口。
+2. **B（审查留痕）**：journal 模块 + 接线 + `/review` 脚注。独立、让静默与取消可见。
+3. **C（链级全量审查）**：chain 累积器 + full prompt/触发 + `/review --full`。最大改动，复用 A 的规则与 B 的记录。
+
+版本目标 **0.3.0**；npm 首发仍等用户 npm 账号 2FA 恢复后发布。
