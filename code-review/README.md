@@ -99,6 +99,7 @@ dsh plugin --profile desktop remove @liyuera/dsh-code-review
 | `maxFileDiffBytes` | `61440` | 范围/补丁模式单文件 diff 上限；超出记 `budget-file` 跳过，不截断后送审。 |
 | `maxRangeBytes` | `4000000` | 范围/补丁模式总取材上限（字节），超出后剩余文件记 `budget`。 |
 | `rangeTimeoutMs` | `900000` | `/review --range`、`--patch` 的总预算；超时的块按失败计并在报告写覆盖缺口。 |
+| `rangeChunkTimeoutMs` | `240000` | 范围单块 reviewer 超时下限；审查者会用 read/grep 核对上下文，比 turn 模式的 2 分钟基准更长。 |
 | `rangeConcurrency` | `1` | 范围审查块间并发（1 或 2）。默认串行，2 更快但并发占用子代理槽。 |
 | `reviewerTimeoutPerKbMs` | `500` | 单块 reviewer 超时自适应：`base(reviewerTimeoutMs) + ceil(KB)*perKb`。 |
 | `reviewerTimeoutMaxMs` | `900000` | 单块自适应超时上限，避免大块把整场审查拖死。 |
@@ -212,7 +213,7 @@ node evaluation/run.mjs --json
 - **全量复审的边界**：只覆盖「本条链内触达过的文件」的当前内容，不重建 MR 级 diff（提交历史、链开始前的改动看不到）；触发要求本轮仍有可审改动，且每条链只做一次；文件多时更慢、更耗 token。
 - **`/review --full` 是同步的**：最长等 `reviewerTimeoutMs`，人要先等；它不占自动轮次、不触发回灌。
 - **范围模式绕过 workspaceDiff 服务**：`/review --range`、`--patch` 只读 git/补丁文件，需会话有 `cwd` 且在 git 仓库内；非 git 目录或 cwd 缺失直接报错，不降级猜路径。`--patch` 只接受仓库内相对路径。
-- **范围模式受总预算约束**：`rangeTimeoutMs`（默认 15 分钟）用尽后未跑的块记失败，报告写「覆盖缺口，NOT clean」；单块超时按 `reviewerTimeoutPerKbMs` 自适应放大，不会无限等。
+- **范围模式受总预算约束**：`rangeTimeoutMs`（默认 15 分钟）用尽后未跑的块记失败，报告写「覆盖缺口，NOT clean」；单块超时 = `max(rangeChunkTimeoutMs, reviewerTimeoutMs + KB*perKb)`（默认下限 4 分钟），且不超过总预算。单块失败会**先拆半重试一次**（单文件块原样重试一次），provider 输出畸形/超时常见于大 diff，重试仍失败才计入覆盖缺口；失败原因（如 `timeout`、`provider-error`、`invalid-result`）会写进错误文案与覆盖缺口行。
 - **敏感路径强制全量有成本**：命中 `sensitiveGlobs` 时首轮就做链级全量（读文件当前内容而不是只读 diff），token 与时间更高；每条链只做一次，且全量失败不重试。
 - **分块审查可能出现边界遗漏**：块间按文件切分，跨块才成立的因果可能漏报；块合并只按 `(ruleId, path, problem)` 去重，不做跨块二次推断。
 - **证据校验不是语义正确性**：`evidence.snippet` 只保证「片段确实来自本次变更/当前文件」，不证明因果推断成立；真正的因果由复验（`verify: blocking`）兜一层，复验失败/超时仍会降级为仅报告而不是丢弃全部。
@@ -240,11 +241,11 @@ node evaluation/run.mjs --json
    node --test
    ```
 
-   第一条应打印 `24`；第二条应全绿（当前 360 个用例）。再跑 `npm run eval` 应输出 `10/10 cases passed`。
+   第一条应打印 `24`；第二条应全绿（当前 362 个用例）。再跑 `npm run eval` 应输出 `10/10 cases passed`。
 
 ## 发布
 
-- 目标首发版本：**0.6.0**
+- 目标首发版本：**0.6.1**
 - 当前状态：**待发布**（npm 账号 2FA 恢复后首发；包里含 `index.js`、`src/`、`cordis.patch.yml`、`rules/`，不含 `test/`）
 
 首发之后日常发布走 GitHub Actions 的 npm **Trusted Publishing**（OIDC，无 NPM_TOKEN、无浏览器授权）：

@@ -89,15 +89,22 @@ export function createReviewCommand({
           const chunks = chunkFiles(collected.files, config.maxDiffBytes)
           const label = patchFile === undefined ? `范围 ${range}` : `补丁 ${patchFile}`
           const startedAt = Date.now()
-          const outcomes = await mapWithLimit(chunks, config.rangeConcurrency, async (chunk, index) => {
-            if (signal?.aborted) return { ok: false, reason: 'aborted' }
+          const chunkBytesOf = (files) => files.reduce(
+            (total, file) => total + Buffer.byteLength(String(file.text ?? ''), 'utf8'),
+            0,
+          )
+          // 单块审查：范围块超时以 rangeChunkTimeoutMs 为下限（reviewer 会用 read/grep
+          // 核对上下文，turn 模式的 2 分钟基准经常不够）；再受总预算 rangeTimeoutMs 约束。
+          const reviewChunk = (chunk, index, { retry = false } = {}) => {
+            if (signal?.aborted) return Promise.resolve({ ok: false, reason: 'aborted' })
             const remaining = config.rangeTimeoutMs - (Date.now() - startedAt)
-            if (remaining <= 0) return { ok: false, reason: 'timeout' }
-            const chunkBytes = chunk.reduce(
-              (total, file) => total + Buffer.byteLength(String(file.text ?? ''), 'utf8'),
-              0,
-            )
-            return await runReview({
+            if (remaining <= 0) return Promise.resolve({ ok: false, reason: 'timeout' })
+            const base = Math.max(config.rangeChunkTimeoutMs, timeoutFor(chunkBytesOf(chunk), {
+              baseMs: config.reviewerTimeoutMs,
+              perKbMs: config.reviewerTimeoutPerKbMs,
+              maxMs: config.reviewerTimeoutMaxMs,
+            }))
+            return runReview({
               subagents,
               agent,
               preset: config.reviewerPreset,
@@ -106,15 +113,13 @@ export function createReviewCommand({
                 files: chunk,
                 skipped: [],
                 header: [
-                  `${label} 的第 ${index + 1}/${chunks.length} 块（本块 ${chunk.length} 个文件）。`,
+                  `${label} 的第 ${index + 1}/${chunks.length} 块（本块 ${chunk.length} 个文件${retry ? '，重试' : ''}）。`,
                   '只审查本块内出现的 diff；不要推测未提供的文件，也不要跨块重复报告同一问题。',
+                  '本块 diff 已完整提供：不要用 grep/read 探索无关文件；只在必须核对被 diff 引用的定义时读文件。',
+                  'finding 控制在 8 条以内、阻塞项优先；evidence 每个只引一行片段，尽快提交 structured_output。',
                 ],
               }),
-              timeoutMs: Math.min(remaining, timeoutFor(chunkBytes, {
-                baseMs: config.reviewerTimeoutMs,
-                perKbMs: config.reviewerTimeoutPerKbMs,
-                maxMs: config.reviewerTimeoutMaxMs,
-              })),
+              timeoutMs: Math.min(remaining, base),
               modelOverride: config.modelOverride,
               signal,
               allowedRuleIds: composed.allowedRuleIds,
@@ -125,24 +130,51 @@ export function createReviewCommand({
               evidenceMode: config.evidenceMode,
               coverageMode: config.coverageMode,
             })
-          })
+          }
+          // 块失败先拆半重试一次（rebase 后的大 diff 常出现 provider 输出畸形/超时）；
+          // 单文件块原样重试一次。拆分重试仍失败才计入覆盖缺口。
+          const reviewWithRetry = async (chunk, index) => {
+            const first = await reviewChunk(chunk, index)
+            if (first?.ok === true || signal?.aborted) return [first]
+            logger?.warn?.(`[code-review] ${label} 第 ${index + 1}/${chunks.length} 块失败（${first?.reason ?? 'unknown'}），重试`)
+            if (chunk.length > 1) {
+              const half = Math.ceil(chunk.length / 2)
+              const retried = await Promise.all([
+                reviewChunk(chunk.slice(0, half), index, { retry: true }),
+                reviewChunk(chunk.slice(half), index, { retry: true }),
+              ])
+              const ok = retried.filter((outcome) => outcome?.ok === true)
+              if (ok.length > 0) return ok
+              return [{ ok: false, reason: retried.map((outcome) => outcome?.reason ?? 'unknown').join('+') }]
+            }
+            const retried = await reviewChunk(chunk, index, { retry: true })
+            return retried?.ok === true
+              ? [retried]
+              : [{ ok: false, reason: `${first?.reason ?? 'unknown'}+${retried?.reason ?? 'unknown'}` }]
+          }
+          const chunkOutcomes = await mapWithLimit(chunks, config.rangeConcurrency, reviewWithRetry)
           if (signal?.aborted) {
             return { kind: 'error', text: withJournal('范围审查已取消。') }
           }
           const results = []
-          let failedChunks = 0
-          outcomes.forEach((outcome, index) => {
-            if (outcome?.ok === true) {
-              results.push(outcome)
-              return
+          const failedReasons = []
+          chunkOutcomes.forEach((outcomes, index) => {
+            for (const outcome of outcomes) {
+              if (outcome?.ok === true) {
+                results.push(outcome)
+                continue
+              }
+              failedReasons.push(`第 ${index + 1} 块 ${outcome?.reason ?? 'unknown'}`)
+              logger?.warn?.(`[code-review] ${label} 第 ${index + 1}/${chunks.length} 块最终失败：${outcome?.reason ?? 'unknown'}`)
             }
-            failedChunks += 1
-            logger?.warn?.(`[code-review] ${label} 第 ${index + 1}/${chunks.length} 块失败：${outcome?.reason ?? 'unknown'}`)
           })
+          const failedChunks = chunkOutcomes.filter((outcomes) => outcomes.every((outcome) => outcome?.ok !== true)).length
           if (results.length === 0) {
             return {
               kind: 'error',
-              text: withJournal(`${label} 审查未完成（${failedChunks}/${chunks.length} 块失败/超时）。`),
+              text: withJournal(
+                `${label} 审查未完成（${failedChunks}/${chunks.length} 块失败）：${[...new Set(failedReasons)].join('；') || '未知原因'}`,
+              ),
             }
           }
           const merged = mergeReviews(results)
@@ -181,7 +213,7 @@ export function createReviewCommand({
             ? renderPass({ summary: scope, skipped: collected.skipped, coverage: merged.coverage })
             : rendered
           const gap = failedChunks > 0
-            ? `覆盖缺口: ${failedChunks}/${chunks.length} 块审查失败/超时，本报告 NOT clean，请人工确认未覆盖面。`
+            ? `覆盖缺口: ${failedChunks}/${chunks.length} 块审查失败（${[...new Set(failedReasons)].join('；')}），本报告 NOT clean，请人工确认未覆盖面。`
             : ''
           return {
             kind: 'success',

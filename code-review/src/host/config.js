@@ -36,6 +36,7 @@ export const DEFAULTS = Object.freeze({
   maxFileDiffBytes: 61440,
   maxRangeBytes: 4000000,
   rangeTimeoutMs: 900000,
+  rangeChunkTimeoutMs: 240000,
   rangeConcurrency: 1,
   reviewerTimeoutPerKbMs: 500,
   reviewerTimeoutMaxMs: 900000,
@@ -88,7 +89,7 @@ export function resolveConfig(raw = {}) {
   assertPositiveInteger('maxVerifiedFindings', merged.maxVerifiedFindings)
   assertPositiveInteger('verifyTimeoutMs', merged.verifyTimeoutMs)
   for (const field of [
-    'maxFileDiffBytes', 'maxRangeBytes', 'rangeTimeoutMs',
+    'maxFileDiffBytes', 'maxRangeBytes', 'rangeTimeoutMs', 'rangeChunkTimeoutMs',
     'reviewerTimeoutPerKbMs', 'reviewerTimeoutMaxMs',
   ]) {
     assertPositiveInteger(field, merged[field])
@@ -184,6 +185,7 @@ export function resolveConfig(raw = {}) {
     maxFileDiffBytes: merged.maxFileDiffBytes,
     maxRangeBytes: merged.maxRangeBytes,
     rangeTimeoutMs: merged.rangeTimeoutMs,
+    rangeChunkTimeoutMs: merged.rangeChunkTimeoutMs,
     rangeConcurrency: merged.rangeConcurrency,
     reviewerTimeoutPerKbMs: merged.reviewerTimeoutPerKbMs,
     reviewerTimeoutMaxMs: merged.reviewerTimeoutMaxMs,

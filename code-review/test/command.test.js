@@ -636,7 +636,89 @@ test('/review 范围审查的入参错误返回中文文案', async () => {
   }
 })
 
+
+/** 前 N 次 activation 返回不完整结果，之后返回合法 finding（模拟 provider 畸形输出）。 */
+function flakySubagents(state, failures) {
+  return {
+    async startActivation(request) {
+      state.starts += 1
+      const text = request?.request?.prompt?.[0]?.text ?? ''
+      const matches = [...text.matchAll(/^### (\S+)$/gm)]
+      const path = matches.at(-1)?.[1] ?? 'a.js'
+      if (state.starts <= failures) {
+        return { result: Promise.resolve({ stopReason: 'incomplete' }), dispose: async () => {} }
+      }
+      return {
+        result: Promise.resolve({
+          stopReason: 'completed',
+          structured: {
+            findings: [{
+              ruleId: 'COR-001',
+              dimension: 'correctness',
+              severity: 'high',
+              location: `${path}:1`,
+              problem: `重试后的问题 ${path}`,
+              suggestion: '补异常处理',
+            }],
+            coverage: { files: [{ path, status: 'reviewed' }] },
+          },
+        }),
+        dispose: async () => {},
+      }
+    },
+  }
+}
+
+test('/review --range 单块失败时拆半重试，成功则不记覆盖缺口', async () => {
+  const repo = createRangeRepo({ split: true })
+  const state = { starts: 0 }
+  try {
+    const harness = createCommand({
+      // 两个文件装进同一块；首次失败后应拆半重试。
+      config: { ...RANGE_CONFIG, maxDiffBytes: 200000 },
+      subagents: flakySubagents(state, 1),
+    })
+    const result = await harness.command.handler({
+      agent: rangeAgent(repo),
+      rawInput: '--range HEAD~1..HEAD',
+      signal: signal(),
+    })
+    assert.equal(result.kind, 'success', result.text)
+    assert.ok(state.starts === 3, `应为首审 + 拆半两次重试，实际 ${state.starts}`)
+    assert.doesNotMatch(result.text, /覆盖缺口: /)
+    assert.doesNotMatch(result.text, /NOT clean/)
+    // 拆半后每半各报一条，合并后两条都保留。
+    assert.match(result.text, /a\.js:1/)
+    assert.match(result.text, /b\.js:1/)
+  } finally {
+    rmSync(repo, { recursive: true, force: true })
+  }
+})
+
+test('/review --range 重试仍失败时错误文案带原因', async () => {
+  const repo = createRangeRepo()
+  const state = { starts: 0 }
+  try {
+    const harness = createCommand({
+      config: { ...RANGE_CONFIG, maxDiffBytes: 200000 },
+      subagents: flakySubagents(state, 99),
+    })
+    const result = await harness.command.handler({
+      agent: rangeAgent(repo),
+      rawInput: '--range HEAD~1..HEAD',
+      signal: signal(),
+    })
+    assert.equal(result.kind, 'error')
+    assert.match(result.text, /审查未完成（1\/1 块失败）/)
+    assert.match(result.text, /incomplete/, '失败原因必须透出')
+    assert.ok(state.starts === 2, `单文件块应原样重试一次，实际 ${state.starts}`)
+  } finally {
+    rmSync(repo, { recursive: true, force: true })
+  }
+})
+
 // —— 全量审查（--full） ——
+
 
 test('/review --full 用链内文件集合发起全量审查并输出报告', async () => {
   const harness = createCommand()

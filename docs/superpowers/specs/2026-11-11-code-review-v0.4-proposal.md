@@ -390,3 +390,17 @@ R3 已完成并合入 0.6.0；360 个用例 + 10 个离线评测 case 全绿。�
 7. **测试**：新增 `test/git.test.js`（真实临时 git 仓库：范围取材/非法范围/补丁解析/越界拒绝/二进制/超大）、`test/chunk.test.js`（分块/超时公式/去重截断/coverage 合并/并发上限）、命令侧 range/patch/错误文案/分块合并用例、index 侧敏感路径强制全量与不误触发用例；`/review` 既有全量路径回归全绿。
 8. **未做**：`exemptBelowLines`（可选，默认关闭）；范围模式的跨块二次因果推断；`--range` 的后台异步执行（仍同步，受 `rangeTimeoutMs` 约束）。
 
+### 11.7 0.6.1 范围审查稳定性修复（2026-11-12）
+
+wisdom 仓库的 live `/review --range HEAD~3..HEAD` 失败（`1/1 块失败/超时`）。用 reviewer 子会话日志定位到两种失败模式（同一 prompt：19.5KB、2 文件、1 块）：
+
+1. **provider 输出畸形**：子会话 `turn/end` 为 `{"kind":"error","code":"MALFORMED_RESPONSE"}`（`tool input is invalid JSON`）——模型提交 `structured_output` 时 JSON 流畸形；
+2. **超时**：另两次子会话 `turn/end` 为 `aborted/parent`，即 130s 的 range 单块超时；审查者用了 18-20 次 read/grep 核对上下文，turn 模式的超时基准不够。
+
+修复（0.6.1）：
+
+1. **单块超时下限**：新增 `rangeChunkTimeoutMs`（默认 240s）；范围块超时 = `max(rangeChunkTimeoutMs, timeoutFor(bytes))`，仍受总预算 `rangeTimeoutMs` 约束。
+2. **块级重试/拆分**：块失败先拆半重试一次（多文件块各半并发重试；单文件块原样重试一次），仍失败才计入覆盖缺口；错误文案与缺口行写明失败原因（`timeout`/`provider-error`/`invalid-result` 等），不再只写「块失败/超时」。
+3. **收紧探索与输出预算**：范围块 prompt 明确「diff 已完整提供，不要用 grep/read 探索无关文件」「finding ≤8 条、evidence 每行一条、尽快提交 structured_output」，降低慢查询与畸形输出的概率。
+4. **测试**：命令侧新增「单块失败拆半后成功、不记缺口」「重试仍失败时错误文案带原因、且单文件块只重试一次」用例；config 覆盖新键。362 用例 + 10 eval 全绿。
+
