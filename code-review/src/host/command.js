@@ -5,6 +5,7 @@
 import { collect } from './collect.js'
 import { renderFindings, renderPass } from './render.js'
 import { buildPrompt, runReview } from './reviewer.js'
+import { composeRules } from './rules.js'
 
 /**
  * 组装命令定义。
@@ -29,11 +30,14 @@ export function createReviewCommand({ config, workspaceChanges, subagents, getRu
           return { kind: 'error', text: '本轮没有可审查的改动。' }
         }
 
-        const rules = await getRules()
         const collected = await collect({ workspaceChanges, sessionId, seq, config, signal })
         if (collected.files.length === 0) {
           return { kind: 'error', text: '本轮没有可审查的代码文件（可能是二进制或已超预算）。' }
         }
+
+        const loaded = await getRules()
+        // 与自动审查同一口径：规则表、白名单、severity 权威表按本次变更文件过滤。
+        const composed = composeRules({ ...loaded, filePaths: collected.files.map((file) => file.path) })
 
         const scope = {
           files: summary.total ?? summary.files.length,
@@ -44,13 +48,13 @@ export function createReviewCommand({ config, workspaceChanges, subagents, getRu
           subagents,
           agent,
           preset: config.reviewerPreset,
-          prompt: buildPrompt({ rulesPrompt: rules.prompt, files: collected.files, skipped: collected.skipped }),
+          prompt: buildPrompt({ rulesPrompt: composed.prompt, files: collected.files, skipped: collected.skipped }),
           timeoutMs: config.reviewerTimeoutMs,
           modelOverride: config.modelOverride,
           signal,
-          allowedRuleIds: rules.allowedRuleIds,
+          allowedRuleIds: composed.allowedRuleIds,
           allowedPaths: new Set(collected.files.map((file) => file.path)),
-          ruleSeverities: rules.ruleSeverities,
+          ruleSeverities: composed.ruleSeverities,
           logger,
         })
 

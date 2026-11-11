@@ -801,6 +801,125 @@ test('全部 finding 被丢弃不算通过，也不注入通过结论', async ()
   assert.ok(warnHas(harness.state, '丢弃 2 条非法 finding'))
 })
 
+// —— 规则作用域过滤 ——
+
+/** 自动发起时送给 reviewer 的 prompt 文本。 */
+function startedPrompt(harness, index = 0) {
+  return harness.state.starts[index]?.request?.prompt?.[0]?.text
+}
+
+test('按本次变更文件过滤规则：tsx 变更带组件规则、不带样式规则', async () => {
+  const harness = createHarness({
+    maxRounds: 2,
+    rulePacks: ['rules/packs/frontend-smartui.json'],
+  })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, {
+    seq: 7,
+    turn: 1,
+    files: [{ path: 'src/pages/A.tsx', display: 'src/pages/A.tsx' }],
+  })
+
+  assert.equal(harness.state.starts.length, 1)
+  const prompt = startedPrompt(harness)
+  assert.match(prompt, /\[CR-011\.01\]/, 'tsx 变更应带入 Hooks 规则（MNT-008）')
+  assert.doesNotMatch(prompt, /\[CR-008\.0/, 'tsx 变更不应带样式规则（MNT-010）')
+
+  harness.resolveNext(completed())
+  await tick()
+})
+
+test('按本次变更文件过滤规则：less 变更带样式规则、不带组件规则', async () => {
+  const harness = createHarness({
+    maxRounds: 2,
+    rulePacks: ['rules/packs/frontend-smartui.json'],
+  })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, {
+    seq: 7,
+    turn: 1,
+    files: [{ path: 'src/styles/a.less', display: 'src/styles/a.less' }],
+  })
+
+  assert.equal(harness.state.starts.length, 1)
+  const prompt = startedPrompt(harness)
+  assert.match(prompt, /\[CR-008\.0/, 'less 变更应带入样式规则（MNT-010）')
+  assert.doesNotMatch(prompt, /\[CR-011\.01\]/, 'less 变更不应带 Hooks 规则（MNT-008）')
+
+  harness.resolveNext(completed())
+  await tick()
+})
+
+test('无 scope 的基础规则不参与作用域过滤，始终进入 prompt', async () => {
+  const harness = createHarness({
+    maxRounds: 2,
+    rulePacks: ['rules/packs/frontend-smartui.json'],
+  })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, {
+    seq: 7,
+    turn: 1,
+    files: [{ path: 'src/pages/A.tsx', display: 'src/pages/A.tsx' }],
+  })
+
+  assert.match(startedPrompt(harness), /### COR-001/)
+
+  harness.resolveNext(completed())
+  await tick()
+})
+
+test('未启用规则包时前端规则不进入 prompt', async () => {
+  const harness = createHarness({ maxRounds: 2 })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, {
+    seq: 7,
+    turn: 1,
+    files: [{ path: 'src/pages/A.tsx', display: 'src/pages/A.tsx' }],
+  })
+
+  const prompt = startedPrompt(harness)
+  assert.doesNotMatch(prompt, /\[CR-011\.01\]/, '默认 rulePacks=[] 不应加载前端规则包')
+  assert.doesNotMatch(prompt, /\[CR-008\.0/)
+  assert.doesNotMatch(prompt, /MNT-008/)
+  assert.match(prompt, /### COR-001/, '基础规则仍在')
+
+  harness.resolveNext(completed())
+  await tick()
+})
+
+test('白名单按文件过滤：不适用规则的 finding 被丢弃，不算通过', async () => {
+  const harness = createHarness({
+    maxRounds: 2,
+    rulePacks: ['rules/packs/frontend-smartui.json'],
+  })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, {
+    seq: 7,
+    turn: 1,
+    files: [{ path: 'src/pages/A.tsx', display: 'src/pages/A.tsx' }],
+  })
+  // MNT-010（样式规则）不适用于 tsx：prompt 里没有它，白名单也必须拒绝它。
+  harness.resolveNext(completed([{
+    ruleId: 'MNT-010',
+    dimension: 'maintainability',
+    severity: 'medium',
+    location: 'src/pages/A.tsx:1',
+    problem: '顶层 :global 选择器',
+    suggestion: '收进局部容器',
+  }]))
+  await tick()
+
+  assert.equal(harness.state.follows.length, 0, '不适用规则的 finding 不得触发回灌')
+  assert.equal(harness.state.steers.length, 0)
+  assert.ok(warnHas(harness.state, '丢弃 1 条非法 finding'))
+  assert.ok(debugHas(harness.state, 'review failed: invalid-result'))
+})
+
 // —— followup 与启动失败 ——
 
 test('followup 抛错只告警，不影响审查成功与熔断状态', async () => {

@@ -1,6 +1,20 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { createReviewCommand } from '../src/host/command.js'
+import { loadRulesResilient } from '../src/host/rules.js'
+
+const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
+
+/** 从真实规则表 + 前端规则包加载，验证命令侧同样按变更文件过滤。 */
+function loadFrontendRules() {
+  return loadRulesResilient({
+    rulesPath: join(PACKAGE_ROOT, 'rules/rules.json'),
+    principlesPath: join(PACKAGE_ROOT, 'rules/principles.md'),
+    packs: [join(PACKAGE_ROOT, 'rules/packs/frontend-smartui.json')],
+  })
+}
 
 const HUNK = { oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ['+const a = 1'] }
 
@@ -13,7 +27,19 @@ const FINDING = {
   suggestion: '补异常处理',
 }
 
-const RULES = { prompt: 'RULES', allowedRuleIds: new Set(['COR-001']) }
+/** 最小原始规则集：`getRules()` 现在返回 `{ rules, principles }`，由 command 侧 compose。 */
+const LOADED_RULES = {
+  rules: [{
+    id: 'COR-001',
+    dimension: 'correctness',
+    severity: 'high',
+    title: '不得吞掉异常',
+    check: 'catch 块不得为空',
+    bad: 'try { await save() } catch {}',
+    good: 'try { await save() } catch (e) { throw new SaveError(e) }',
+  }],
+  principles: '# 原则\n只按原则审。',
+}
 
 const VALID_RESULT = { stopReason: 'completed', structured: { findings: [FINDING] } }
 
@@ -70,7 +96,7 @@ function createCommand(overrides = {}) {
     subagents,
     getRules: async () => {
       state.rulesCalls += 1
-      return RULES
+      return LOADED_RULES
     },
     logger: {
       warn(...args) {
@@ -201,9 +227,8 @@ test('/review 透传规则表 severity 覆盖模型输出', async () => {
     },
     deps: {
       getRules: async () => ({
-        prompt: 'RULES',
-        allowedRuleIds: new Set(['COR-001']),
-        ruleSeverities: new Map([['COR-001', 'high']]),
+        ...LOADED_RULES,
+        rules: LOADED_RULES.rules.map((rule) => ({ ...rule, severity: 'medium' })),
       }),
     },
   })
@@ -211,5 +236,102 @@ test('/review 透传规则表 severity 覆盖模型输出', async () => {
   const result = await harness.command.handler({ agent, signal: signal() })
 
   assert.equal(result.kind, 'success')
-  assert.match(result.text, /\[COR-001\] 正确性\/high/)
+  assert.match(result.text, /\[COR-001\] 正确性\/medium/)
+})
+
+// —— 规则作用域过滤 ——
+
+test('/review 按本次变更文件过滤规则：tsx 带组件规则、不带样式规则', async () => {
+  const harness = createCommand({
+    config: { codeExtensions: ['.tsx', '.less'] },
+    workspaceChanges: {
+      summary() {
+        return {
+          turn: 1,
+          files: [{ path: 'src/pages/A.tsx', display: 'src/pages/A.tsx' }],
+          total: 1,
+          added: 1,
+          deleted: 0,
+        }
+      },
+    },
+    result: {
+      stopReason: 'completed',
+      structured: { findings: [{ ...FINDING, location: 'src/pages/A.tsx:1' }] },
+    },
+    deps: { getRules: loadFrontendRules },
+  })
+
+  const result = await harness.command.handler({ agent, signal: signal() })
+
+  assert.equal(result.kind, 'success')
+  const prompt = harness.state.requests[0].request.prompt[0].text
+  assert.match(prompt, /\[CR-011\.01\]/, 'tsx 变更应带入 Hooks 规则（MNT-008）')
+  assert.doesNotMatch(prompt, /\[CR-008\.0/, 'tsx 变更不应带样式规则（MNT-010）')
+  assert.match(prompt, /### COR-001/)
+})
+
+test('/review 白名单按文件过滤：不适用规则的 finding 被丢弃', async () => {
+  const harness = createCommand({
+    config: { codeExtensions: ['.tsx', '.less'] },
+    workspaceChanges: {
+      summary() {
+        return {
+          turn: 1,
+          files: [{ path: 'src/pages/A.tsx', display: 'src/pages/A.tsx' }],
+          total: 1,
+          added: 1,
+          deleted: 0,
+        }
+      },
+    },
+    result: {
+      stopReason: 'completed',
+      structured: {
+        findings: [{
+          ...FINDING,
+          ruleId: 'MNT-010',
+          dimension: 'maintainability',
+          location: 'src/pages/A.tsx:1',
+        }],
+      },
+    },
+    deps: { getRules: loadFrontendRules },
+  })
+
+  const result = await harness.command.handler({ agent, signal: signal() })
+
+  assert.equal(result.kind, 'error')
+  assert.match(result.text, /invalid-result/)
+  assert.ok(harness.state.warns.some((args) => String(args[0]).includes('丢弃 1 条非法 finding')))
+})
+
+test('/review 按本次变更文件过滤规则：less 带样式规则、不带组件规则', async () => {
+  const harness = createCommand({
+    config: { codeExtensions: ['.tsx', '.less'] },
+    workspaceChanges: {
+      summary() {
+        return {
+          turn: 1,
+          files: [{ path: 'src/styles/a.less', display: 'src/styles/a.less' }],
+          total: 1,
+          added: 1,
+          deleted: 0,
+        }
+      },
+    },
+    result: {
+      stopReason: 'completed',
+      structured: { findings: [{ ...FINDING, location: 'src/styles/a.less:1' }] },
+    },
+    deps: { getRules: loadFrontendRules },
+  })
+
+  const result = await harness.command.handler({ agent, signal: signal() })
+
+  assert.equal(result.kind, 'success')
+  const prompt = harness.state.requests[0].request.prompt[0].text
+  assert.match(prompt, /\[CR-008\.0/, 'less 变更应带入样式规则（MNT-010）')
+  assert.doesNotMatch(prompt, /\[CR-011\.01\]/, 'less 变更不应带 Hooks 规则（MNT-008）')
+  assert.match(prompt, /### COR-001/)
 })

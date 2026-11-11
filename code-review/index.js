@@ -71,14 +71,13 @@ export function apply(ctx, config) {
   }, 'code-review: dispose in-flight reviews')
 
   const getRules = async () => {
-    const loaded = await loadRulesResilient({
+    // 返回原始规则表（含未过滤的 scope），由调用方按本次变更文件 compose。
+    return loadRulesResilient({
       rulesPath: join(PACKAGE_ROOT, resolved.rulesFile),
       principlesPath: join(PACKAGE_ROOT, resolved.principlesFile),
       packs: resolved.rulePacks.map((pack) => (isAbsolute(pack) ? pack : join(PACKAGE_ROOT, pack))),
       warn: warnOnce,
     })
-    // 兼容 Task 1：尚未接线按变更文件过滤，先只保留无 scope 的通用规则。
-    return composeRules({ ...loaded, filePaths: [] })
   }
 
   try {
@@ -289,7 +288,9 @@ export function apply(ctx, config) {
     let handle
     let startupTimer
     try {
-      const rules = await getRules()
+      const loaded = await getRules()
+      // 规则表、白名单、severity 权威表都按本次实际取材的变更文件过滤。
+      const composed = composeRules({ ...loaded, filePaths: collected.files.map((file) => file.path) })
       // 总预算从 handler 开始计：取材/读规则花掉的时间会挤占启动与审查的时间。
       const budget = Math.max(1, resolved.asyncReviewerTimeoutMs - (Date.now() - startedAt))
       const startupTimedOut = Symbol('startup-timeout')
@@ -300,12 +301,12 @@ export function apply(ctx, config) {
         subagents: ctx.subagents,
         agent,
         preset: resolved.reviewerPreset,
-        prompt: buildPrompt({ rulesPrompt: rules.prompt, files: collected.files, skipped: collected.skipped }),
+        prompt: buildPrompt({ rulesPrompt: composed.prompt, files: collected.files, skipped: collected.skipped }),
         signal: control.signal,
         modelOverride: resolved.modelOverride,
-        allowedRuleIds: rules.allowedRuleIds,
+        allowedRuleIds: composed.allowedRuleIds,
         allowedPaths: new Set(collected.files.map((file) => file.path)),
-        ruleSeverities: rules.ruleSeverities,
+        ruleSeverities: composed.ruleSeverities,
         logger: ctx.logger,
       })
       // 超时返回后 startReview 的迟到 reject 不得变成 unhandled rejection。
