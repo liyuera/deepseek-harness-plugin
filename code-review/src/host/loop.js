@@ -1,6 +1,7 @@
 /**
- * 轮次与熔断状态机。全部在内存，会话释放即清空。
+ * 链式轮次与熔断状态机。全部在内存，会话释放即清空。
  *
+ * 轮次按「会话链」计数：一条人类消息开启一条新链，链内最多自动审查 maxRounds 次。
  * 熔断可恢复：连续失败达到阈值后进入冷却期，冷却期内拒绝新的自动审查；
  * 冷却期结束后进入半开（放行一次），再次失败重新打开，成功则清零。
  * @module @liyuera/dsh-code-review/host/loop
@@ -22,34 +23,26 @@ export function createTracker(options = {}) {
   const rounds = new Map()
   const failures = new Map()
   const reviewing = new Set()
-  const key = (sessionId, turn) => `${sessionId}:${turn}`
 
   return {
-    /** 加锁并记一轮；同一会话已在审查中返回 false。 */
-    begin(sessionId, turn) {
+    /** 加锁并把当前链的轮次 +1；同一会话已在审查中返回 false（且不增轮）。 */
+    begin(sessionId) {
       if (reviewing.has(sessionId)) return false
-      const slot = key(sessionId, turn)
-      rounds.set(slot, (rounds.get(slot) ?? 0) + 1)
+      rounds.set(sessionId, (rounds.get(sessionId) ?? 0) + 1)
       reviewing.add(sessionId)
       return true
     },
-    /** 标记本轮审查结束（无论成败）。 */
+    /** 释放锁（无论审查成败）。 */
     end(sessionId) {
       reviewing.delete(sessionId)
     },
-    /**
-     * 回滚「已 begin 但最终没有真正审查」的一轮计数（最低 0）。
-     *
-     * 用于取材为空、内容指纹与同一 turn 上一轮重复等跳过场景：这些跳过不该消耗轮次，
-     * 也不触碰 `reviewing` 锁与 failures/breaker。调用方仍需在 finally 里 end() 释放锁。
-     */
-    abandonRound(sessionId, turn) {
-      const slot = key(sessionId, turn)
-      const count = rounds.get(slot) ?? 0
-      if (count > 0) rounds.set(slot, count - 1)
+    /** 当前链已自动审查的次数。 */
+    roundsOf(sessionId) {
+      return rounds.get(sessionId) ?? 0
     },
-    roundsOf(sessionId, turn) {
-      return rounds.get(key(sessionId, turn)) ?? 0
+    /** 人类消息开启新链：只清轮次，不动锁与熔断计数。 */
+    resetRounds(sessionId) {
+      rounds.delete(sessionId)
     },
     isReviewing(sessionId) {
       return reviewing.has(sessionId)
@@ -74,10 +67,11 @@ export function createTracker(options = {}) {
       if (state === undefined || state.count < BREAKER_THRESHOLD) return false
       return now() - state.openedAt < cooldownMs
     },
+    /** 会话释放：清空轮次、锁与熔断状态。 */
     forget(sessionId) {
-      failures.delete(sessionId)
+      rounds.delete(sessionId)
       reviewing.delete(sessionId)
-      for (const slot of [...rounds.keys()]) if (slot.startsWith(`${sessionId}:`)) rounds.delete(slot)
+      failures.delete(sessionId)
     },
   }
 }

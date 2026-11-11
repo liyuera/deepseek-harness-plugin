@@ -9,6 +9,22 @@ test('无配置时返回默认值', () => {
   assert.equal(config.maxRounds, 2)
   assert.deepEqual(config.blockingSeverities, ['high', 'medium'])
   assert.equal(config.reviewerPreset, 'code-review')
+  assert.equal(config.asyncReviewerTimeoutMs, 600000)
+  assert.ok(Object.isFrozen(config))
+})
+
+test('asyncReviewerTimeoutMs 必须为正整数', () => {
+  for (const value of [0, -1, 1.5, '600000']) {
+    assert.throws(
+      () => resolveConfig({ asyncReviewerTimeoutMs: value }),
+      /code-review: asyncReviewerTimeoutMs must be a positive integer/,
+    )
+  }
+})
+
+test('asyncReviewerTimeoutMs 覆盖值生效且保持冻结', () => {
+  const config = resolveConfig({ asyncReviewerTimeoutMs: 1200000 })
+  assert.equal(config.asyncReviewerTimeoutMs, 1200000)
   assert.ok(Object.isFrozen(config))
 })
 

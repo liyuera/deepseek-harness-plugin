@@ -13,15 +13,53 @@ function clock(start = 1000) {
   }
 }
 
-test('begin 加锁并计轮，end 解锁后同一 turn 可再计一轮', () => {
+test('begin 加锁并累计链轮次，end 后可继续累加', () => {
   const tracker = createTracker()
-  assert.equal(tracker.begin('s1', 1), true)
-  assert.equal(tracker.begin('s1', 1), false)
+  assert.equal(tracker.begin('s1'), true)
+  assert.equal(tracker.roundsOf('s1'), 1)
   assert.equal(tracker.isReviewing('s1'), true)
   tracker.end('s1')
-  assert.equal(tracker.begin('s1', 1), true)
-  assert.equal(tracker.roundsOf('s1', 1), 2)
-  assert.equal(tracker.roundsOf('s1', 9), 0)
+  assert.equal(tracker.isReviewing('s1'), false)
+  assert.equal(tracker.begin('s1'), true)
+  assert.equal(tracker.roundsOf('s1'), 2)
+  assert.equal(tracker.roundsOf('s2'), 0)
+})
+
+test('重复 begin（已锁）返回 false 且不增加轮次', () => {
+  const tracker = createTracker()
+  assert.equal(tracker.begin('s1'), true)
+  assert.equal(tracker.begin('s1'), false)
+  assert.equal(tracker.roundsOf('s1'), 1)
+  assert.equal(tracker.isReviewing('s1'), true)
+})
+
+test('resetRounds 归零但锁仍在，且不影响熔断计数', () => {
+  const tracker = createTracker()
+  assert.equal(tracker.begin('s1'), true)
+  assert.equal(tracker.roundsOf('s1'), 1)
+  tracker.resetRounds('s1')
+  assert.equal(tracker.roundsOf('s1'), 0)
+  assert.equal(tracker.isReviewing('s1'), true)
+  assert.equal(tracker.begin('s1'), false)
+  tracker.end('s1')
+  assert.equal(tracker.recordFailure('s1'), false)
+  tracker.resetRounds('s1')
+  assert.equal(tracker.recordFailure('s1'), true)
+})
+
+test('forget 清空轮次、锁与熔断状态', () => {
+  const tracker = createTracker()
+  assert.equal(tracker.begin('s1'), true)
+  assert.equal(tracker.roundsOf('s1'), 1)
+  assert.equal(tracker.recordFailure('s1'), false)
+  assert.equal(tracker.recordFailure('s1'), true)
+  assert.equal(tracker.isBreakerOpen('s1'), true)
+  tracker.forget('s1')
+  assert.equal(tracker.roundsOf('s1'), 0)
+  assert.equal(tracker.isReviewing('s1'), false)
+  assert.equal(tracker.isBreakerOpen('s1'), false)
+  assert.equal(tracker.begin('s1'), true)
+  assert.equal(tracker.roundsOf('s1'), 1)
 })
 
 test('连续两次失败打开熔断，成功清零', () => {
@@ -38,15 +76,6 @@ test('不同会话互不影响', () => {
   tracker.recordFailure('s1')
   tracker.recordFailure('s1')
   assert.equal(tracker.isBreakerOpen('s2'), false)
-})
-
-test('会话释放后状态清空', () => {
-  const tracker = createTracker()
-  tracker.begin('s1', 1)
-  tracker.forget('s1')
-  assert.equal(tracker.isReviewing('s1'), false)
-  assert.equal(tracker.roundsOf('s1', 1), 0)
-  assert.equal(tracker.begin('s1', 1), true)
 })
 
 test('两次失败后熔断打开', () => {
@@ -108,40 +137,4 @@ test('forget 同样清除熔断状态', () => {
   assert.equal(tracker.isBreakerOpen('s1'), true)
   tracker.forget('s1')
   assert.equal(tracker.isBreakerOpen('s1'), false)
-})
-
-test('abandonRound 回滚一轮且不出现负数', () => {
-  const tracker = createTracker()
-  assert.equal(tracker.begin('s1', 1), true)
-  assert.equal(tracker.roundsOf('s1', 1), 1)
-  tracker.abandonRound('s1', 1)
-  assert.equal(tracker.roundsOf('s1', 1), 0)
-  tracker.abandonRound('s1', 1)
-  assert.equal(tracker.roundsOf('s1', 1), 0)
-  tracker.end('s1')
-  assert.equal(tracker.begin('s1', 1), true)
-  assert.equal(tracker.roundsOf('s1', 1), 1)
-  tracker.abandonRound('s1', 1)
-  assert.equal(tracker.roundsOf('s1', 1), 0)
-})
-
-test('abandonRound 不释放 reviewing 锁', () => {
-  const tracker = createTracker()
-  tracker.begin('s1', 1)
-  tracker.abandonRound('s1', 1)
-  assert.equal(tracker.isReviewing('s1'), true)
-  assert.equal(tracker.begin('s1', 2), false)
-  tracker.end('s1')
-  assert.equal(tracker.isReviewing('s1'), false)
-})
-
-test('abandonRound 不影响已打开的熔断', () => {
-  const tracker = createTracker()
-  assert.equal(tracker.recordFailure('s1'), false)
-  assert.equal(tracker.recordFailure('s1'), true)
-  assert.equal(tracker.isBreakerOpen('s1'), true)
-  tracker.begin('s1', 1)
-  tracker.abandonRound('s1', 1)
-  assert.equal(tracker.isBreakerOpen('s1'), true)
-  assert.equal(tracker.roundsOf('s1', 1), 0)
 })

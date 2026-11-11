@@ -9,6 +9,7 @@ export const DEFAULTS = Object.freeze({
   ]),
   maxDiffBytes: 200000,
   reviewerTimeoutMs: 120000,
+  asyncReviewerTimeoutMs: 600000,
   reviewerPreset: 'code-review',
   rulesFile: 'rules/rules.json',
   principlesFile: 'rules/principles.md',
@@ -43,6 +44,7 @@ export function resolveConfig(raw = {}) {
   assertPositiveInteger('maxRounds', merged.maxRounds)
   assertPositiveInteger('maxDiffBytes', merged.maxDiffBytes)
   assertPositiveInteger('reviewerTimeoutMs', merged.reviewerTimeoutMs)
+  assertPositiveInteger('asyncReviewerTimeoutMs', merged.asyncReviewerTimeoutMs)
 
   if (!Array.isArray(merged.blockingSeverities) || merged.blockingSeverities.length === 0) {
     throw new Error('code-review: blockingSeverities must be a non-empty array')
@@ -81,6 +83,7 @@ export function resolveConfig(raw = {}) {
     codeExtensions: Object.freeze([...merged.codeExtensions]),
     maxDiffBytes: merged.maxDiffBytes,
     reviewerTimeoutMs: merged.reviewerTimeoutMs,
+    asyncReviewerTimeoutMs: merged.asyncReviewerTimeoutMs,
     reviewerPreset: merged.reviewerPreset,
     rulesFile: merged.rulesFile,
     principlesFile: merged.principlesFile,
