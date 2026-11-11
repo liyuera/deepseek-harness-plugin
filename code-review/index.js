@@ -12,6 +12,7 @@ import { buildFullPrompt, buildPrompt, startReview } from './src/host/reviewer.j
 import { finalizeFindings } from './src/host/finalize.js'
 import { loadSuppressions } from './src/host/suppress.js'
 import { readWorkspaceTexts } from './src/host/readfile.js'
+import { matchGlob } from './src/host/scope.js'
 import { shouldReview } from './src/host/trigger.js'
 import { createTracker } from './src/host/loop.js'
 import { createReviewCommand } from './src/host/command.js'
@@ -480,11 +481,19 @@ export function apply(ctx, config) {
     const epoch = tracker.epochOf(sessionId)
     // 末轮全量：链内触达文件多于本轮取材结果时才值得全量复审；每条链只做一次。
     const chainFiles = chain.filesOf(sessionId, epoch)
-    const fullRound = resolved.fullReview
+    const alreadyFull = chain.isFull(sessionId, epoch)
+    // 敏感路径（auth/迁移/SQL/CI workflow）命中即强制链级全量，不受 fullReview 开关影响；
+    // 与末轮全量共用「每条链只做一次」的约束，避免反复付全量审查成本。
+    const sensitiveHit = !alreadyFull
+      && collected.files.some((file) => (
+        resolved.sensitiveGlobs.some((glob) => matchGlob(glob, file.path))
+      ))
+    const fullRound = (!alreadyFull && resolved.fullReview
       && rounds >= resolved.maxRounds
-      && chainFiles.length > collected.files.length
-      && !chain.isFull(sessionId, epoch)
-    const filesForReview = fullRound ? chainFiles : collected.files
+      && chainFiles.length > collected.files.length) || sensitiveHit
+    const filesForReview = fullRound
+      ? (chainFiles.length >= collected.files.length ? chainFiles : collected.files)
+      : collected.files
     const journalKey = journal.start({
       sessionId,
       turn: summary.turn,

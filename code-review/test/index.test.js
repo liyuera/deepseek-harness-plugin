@@ -401,6 +401,45 @@ test('maxRounds=2：最后一轮自动切链级全量审查，prompt 含链内�
   assert.match(foot.text, /· 全量 ·/)
 })
 
+test('敏感路径命中即强制链级全量，且不受 fullReview:false 降级', async () => {
+  const harness = createHarness({ maxRounds: 3, fullReview: false, sensitiveGlobs: ['**/auth/**'] })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, {
+    seq: 7,
+    turn: 1,
+    diff: '+const token = 1',
+    files: [{ path: 'src/auth/login.js', display: 'src/auth/login.js' }],
+  })
+  const prompt = startedPrompt(harness, 0)
+  try {
+    assert.match(prompt, /链级全量复审/)
+    assert.match(prompt, /src\/auth\/login\.js/)
+  } finally {
+    harness.resolveNext(completed([]))
+    await tick()
+  }
+})
+
+test('非敏感路径首轮仍是单轮审查，不被敏感规则误触发', async () => {
+  const harness = createHarness({ maxRounds: 3, sensitiveGlobs: ['**/auth/**'] })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, {
+    seq: 7,
+    turn: 1,
+    diff: '+const a = 1',
+    files: [{ path: 'src/utils/a.js', display: 'src/utils/a.js' }],
+  })
+  const prompt = startedPrompt(harness, 0)
+  try {
+    assert.doesNotMatch(prompt, /链级全量复审/)
+  } finally {
+    harness.resolveNext(completed([]))
+    await tick()
+  }
+})
+
 test('fullReview=false：末轮不切全量，仍审本轮 diff', async () => {
   const harness = createHarness({ maxRounds: 2, fullReview: false })
   const agent = makeAgent(harness)

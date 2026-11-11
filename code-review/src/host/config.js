@@ -1,5 +1,6 @@
 /** 配置默认值。冻结，避免被调用方改写。 */
 import { DEFAULT_MANUAL_GLOBS } from './fixmode.js'
+import { DEFAULT_SENSITIVE_GLOBS } from './scope.js'
 import { DEFAULT_SUPPRESSIONS_FILE, validateSuppressions } from './suppress.js'
 
 export const DEFAULTS = Object.freeze({
@@ -31,6 +32,14 @@ export const DEFAULTS = Object.freeze({
   forbiddenFixGlobs: Object.freeze([]),
   suppressionsFile: DEFAULT_SUPPRESSIONS_FILE,
   suppressions: Object.freeze([]),
+  // R3：范围审查（/review --range / --patch）、分块与敏感路径。
+  maxFileDiffBytes: 61440,
+  maxRangeBytes: 4000000,
+  rangeTimeoutMs: 900000,
+  rangeConcurrency: 1,
+  reviewerTimeoutPerKbMs: 500,
+  reviewerTimeoutMaxMs: 900000,
+  sensitiveGlobs: Object.freeze([...DEFAULT_SENSITIVE_GLOBS]),
 })
 
 const KEYS = new Set([...Object.keys(DEFAULTS), 'modelOverride'])
@@ -78,6 +87,15 @@ export function resolveConfig(raw = {}) {
   assertPositiveInteger('fullReviewMaxFiles', merged.fullReviewMaxFiles)
   assertPositiveInteger('maxVerifiedFindings', merged.maxVerifiedFindings)
   assertPositiveInteger('verifyTimeoutMs', merged.verifyTimeoutMs)
+  for (const field of [
+    'maxFileDiffBytes', 'maxRangeBytes', 'rangeTimeoutMs',
+    'reviewerTimeoutPerKbMs', 'reviewerTimeoutMaxMs',
+  ]) {
+    assertPositiveInteger(field, merged[field])
+  }
+  if (!Number.isSafeInteger(merged.rangeConcurrency) || merged.rangeConcurrency < 1 || merged.rangeConcurrency > 2) {
+    throw new Error('code-review: rangeConcurrency must be 1 or 2')
+  }
 
   if (!EVIDENCE_MODES.has(merged.evidenceMode)) {
     throw new Error(`code-review: evidenceMode must be one of ${[...EVIDENCE_MODES].join(', ')}`)
@@ -124,6 +142,7 @@ export function resolveConfig(raw = {}) {
   }
   assertStringArray('manualFixGlobs', merged.manualFixGlobs)
   assertStringArray('forbiddenFixGlobs', merged.forbiddenFixGlobs)
+  assertStringArray('sensitiveGlobs', merged.sensitiveGlobs)
 
   let modelOverride
   if (merged.modelOverride !== undefined) {
@@ -162,6 +181,13 @@ export function resolveConfig(raw = {}) {
     forbiddenFixGlobs: Object.freeze([...merged.forbiddenFixGlobs]),
     suppressionsFile: merged.suppressionsFile,
     suppressions,
+    maxFileDiffBytes: merged.maxFileDiffBytes,
+    maxRangeBytes: merged.maxRangeBytes,
+    rangeTimeoutMs: merged.rangeTimeoutMs,
+    rangeConcurrency: merged.rangeConcurrency,
+    reviewerTimeoutPerKbMs: merged.reviewerTimeoutPerKbMs,
+    reviewerTimeoutMaxMs: merged.reviewerTimeoutMaxMs,
+    sensitiveGlobs: Object.freeze([...merged.sensitiveGlobs]),
     ...(modelOverride === undefined ? {} : { modelOverride }),
   })
 }

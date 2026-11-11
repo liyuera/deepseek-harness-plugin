@@ -82,10 +82,10 @@ const REVIEW_GUIDE = Object.freeze([
  * 文件一律渲染 `path`（校验用的持久标识），不用 `display`：后者可能是 `../x.ts`
  * 这类展示用短路径，模型照抄会被 path 白名单拒绝，findings 被静默丢光。
  *
- * @param {{rulesPrompt: string, files: readonly object[], skipped: readonly {path:string,reason:string}[]}} input
+ * @param {{rulesPrompt: string, files: readonly object[], skipped: readonly {path:string,reason:string}[], header?: readonly string[]}} input
  * @returns {string}
  */
-export function buildPrompt({ rulesPrompt, files, skipped }) {
+export function buildPrompt({ rulesPrompt, files, skipped, header = [] }) {
   const listing = files.map((file) => `- ${file.path}（+${file.added} / -${file.deleted}）`).join('\n')
   const diffs = files
     .map((file) => `### ${file.path}\n\`\`\`\`diff\n${file.text}\n\`\`\`\``)
@@ -94,6 +94,7 @@ export function buildPrompt({ rulesPrompt, files, skipped }) {
   const unread = skipped.length > 0 ? `未审文件（不要猜测其内容）：${unreadList}` : undefined
   return [
     rulesPrompt,
+    ...(header.length > 0 ? ['', '## 本轮任务', ...header] : []),
     '',
     '## 评审准则',
     ...REVIEW_GUIDE,

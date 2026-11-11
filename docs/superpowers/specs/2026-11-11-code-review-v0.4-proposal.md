@@ -335,7 +335,7 @@ R1 已完成并合入 0.4.0；全部 319 个用例通过。实施时对方案做
 6. **实现文件**：新增 `evidence.js`、`readfile.js`、`verify.js`、`fixmode.js`、`suppress.js`、`finalize.js`、`structured.js`；修改 `reviewer.js`/`config.js`/`rules.js`/`render.js`/`journal.js`/`command.js`/`index.js`；规则包调整 MNT-011/MNT-016 并新增 BEH-009/BEH-010。
 7. **默认值**：`evidenceMode: warn`、`coverageMode: warn`、`verify: blocking`、`maxVerifiedFindings: 3`、`verifyTimeoutMs: 180000`、`respectFixPolicy: true`；真实使用一段时间、观察「因证据被降级/丢弃」的比例后再把前两项切到 `enforce`。
 
-R2（journal 账本/`/review` 分区/评测语料）已完成并合入 0.5.0，见 11.4；R3（`--range`/`--patch`/分块/超时自适应）尚未开始。
+R2（journal 账本/`/review` 分区/评测语料）已完成并合入 0.5.0（见 11.4）；R3（`--range`/`--patch`/分块/超时自适应/敏感路径）已完成并合入 0.6.0（见 11.6）。
 
 ### 11.1 自审修复（2026-11-11）
 
@@ -376,4 +376,17 @@ R2 已完成并合入 0.5.0；335 个用例 + 10 个离线评测 case 全绿。�
 
 1. **「未再见」无视审查覆盖范围**（阻塞，`ledger.js` + `journal.js` + `command.js`）：turn 轮只审当轮 diff，旧实现只看「本轮 findings 里有没有该指纹」，相邻 turn 改不同文件时会把仍存在的问题判成连续缺席。现在 journal 记录每轮实际送审 `paths`，`notObservedFindings` 要求当前轮与最近各轮都覆盖该 finding 的文件才累计 `missedRuns`；中间任一轮未覆盖、或老记录缺 `paths` 时保守不推断；`/review` 的报告措辞改为「连续 N 轮审过该文件且未再出现」。
 2. **manual 模式外溢报告边界声明**（`render.js`）：`BOUNDARY_LINE` 原先落在 `report || manual` 分支，而 manual 用于自动回灌「不触发修复轮」的通知，会把「覆盖缺口见覆盖行」带进主会话且该行未必存在；现收窄为只加在 `report` 模式，并补 manual 断言。
+
+### 11.6 R3 实施记录（2026-11-11，0.6.0）
+
+R3 已完成并合入 0.6.0；360 个用例 + 10 个离线评测 case 全绿。实施收敛：
+
+1. **范围取证只读 git**（`src/host/git.js`）：`rev-parse --show-toplevel` + `diff --name-only -z --diff-filter=ACMR <range>` + 逐文件 `diff --no-ext-diff --no-color -U3`；`GIT_TERMINAL_PROMPT=0`、`--no-optional-locks`、8MB buffer、10s 单命令超时。范围表达式只接受 `<rev>..<rev>`/`<rev>...<rev>`（拒绝 `-` 开头/空白/参数注入）；非 git 目录或 cwd 缺失直接抛错，不猜路径。二进制/空 diff/超 `maxFileDiffBytes` 的单文件进 `skipped`（`binary`/`empty`/`budget-file`）。
+2. **补丁模式复用同一取材结构**：`--patch <file>` 只允许仓库根目录之下的相对路径（绝对路径/`..` 越界拒绝），大小受 `maxRangeBytes`；解析 `diff --git` 分段与 hunk，二进制段也留记录并披露。
+3. **分块与合并**（`src/host/chunk.js`）：`chunkFiles` 按 `maxDiffBytes` 顺序装块；`timeoutFor(bytes)` = `min(reviewerTimeoutMaxMs, reviewerTimeoutMs + ceil(KB)*reviewerTimeoutPerKbMs)`，每块还受 `rangeTimeoutMs` 剩余预算约束；`mapWithLimit` 实现 `rangeConcurrency`（默认 1，最大 2）；`mergeReviews` 按 `(ruleId, path, 规范化 problem)` 跨块去重、按严重度截断 `MAX_FINDINGS`，`mergeCoverage` 累加计数且任一块未申报即 `missing`。
+4. **`/review` 三个范围入口统一收口**（`command.js`）：`--range`/`--patch` 与 `--full` 共用证据校验/抑制/复验/账本/边界声明；只报告、不回灌、不占自动轮次；有块失败时报告显式写「覆盖缺口，本次 NOT clean」。非法参数/缺 cwd/取材失败都返回中文错误文案。
+5. **敏感路径强制全量**（`index.js` + `config.js`）：`sensitiveGlobs` 默认 `**/auth/**`、`**/migrations/**`、`**/*.sql`、`**/.github/workflows/**`；命中即本次强制链级全量（不受 `fullReview:false` 影响），与末轮全量共用 `chain.isFull` 的「每条链一次」约束，避免反复付费。
+6. **prompt 参数化**（`reviewer.js`）：`buildPrompt` 增加可选 `header`，范围块 prompt 明确「第 i/n 块、只审本块 diff、不要跨块重复报告」。
+7. **测试**：新增 `test/git.test.js`（真实临时 git 仓库：范围取材/非法范围/补丁解析/越界拒绝/二进制/超大）、`test/chunk.test.js`（分块/超时公式/去重截断/coverage 合并/并发上限）、命令侧 range/patch/错误文案/分块合并用例、index 侧敏感路径强制全量与不误触发用例；`/review` 既有全量路径回归全绿。
+8. **未做**：`exemptBelowLines`（可选，默认关闭）；范围模式的跨块二次因果推断；`--range` 的后台异步执行（仍同步，受 `rangeTimeoutMs` 约束）。
 

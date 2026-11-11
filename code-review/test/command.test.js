@@ -2,6 +2,9 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { execFileSync } from 'node:child_process'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { createReviewCommand } from '../src/host/command.js'
 import { LEDGER_WINDOW } from '../src/host/ledger.js'
 import { fingerprintFinding } from '../src/host/suppress.js'
@@ -472,6 +475,165 @@ test('/review 无 journal 或无记录时输出保持不变', async () => {
   const empty = createCommand({ deps: { journal: { recent: () => [] } } })
   const emptyResult = await empty.command.handler({ agent, signal: signal() })
   assert.equal(emptyResult.text, plainResult.text, '无记录时不得追加空脚注')
+})
+
+
+// —— 范围审查（--range / --patch）——
+
+const RANGE_CONFIG = {
+  reviewerPreset: 'code-review',
+  reviewerTimeoutMs: 1000,
+  blockingSeverities: ['high', 'medium'],
+  notifySeverities: [],
+  codeExtensions: ['.js'],
+  maxDiffBytes: 200000,
+  maxFileDiffBytes: 50000,
+  maxRangeBytes: 500000,
+  rangeTimeoutMs: 60000,
+  rangeConcurrency: 1,
+  reviewerTimeoutPerKbMs: 100,
+  reviewerTimeoutMaxMs: 5000,
+  evidenceMode: 'warn',
+  coverageMode: 'warn',
+  respectFixPolicy: true,
+}
+
+const gitIn = (cwd, args) => execFileSync('git', args, { cwd, encoding: 'utf8' })
+
+function createRangeRepo({ split = false } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'cr-cmd-range-'))
+  gitIn(dir, ['init', '-q'])
+  writeFileSync(join(dir, 'a.js'), 'const a = 1\n')
+  if (split) writeFileSync(join(dir, 'b.js'), 'const b = 0\n')
+  gitIn(dir, ['add', '.'])
+  gitIn(dir, ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-m', 'base'])
+  writeFileSync(join(dir, 'a.js'), 'const a = 1\nconst a2 = 2\n')
+  if (split) writeFileSync(join(dir, 'b.js'), 'const b = 0\nconst b2 = 1\n')
+  gitIn(dir, ['add', '.'])
+  gitIn(dir, ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-m', 'head'])
+  return dir
+}
+
+const rangeAgent = (cwd) => ({ session: { id: 's1', header: { origin: 'user', cwd } } })
+
+/** 按 prompt 里的文件路径返回一条合法 finding，支持多块。 */
+function promptAwareSubagents(state) {
+  return {
+    async startActivation(request) {
+      state.starts += 1
+      const text = request?.request?.prompt?.[0]?.text ?? ''
+      // 规则 prompt 里也有 `### <ruleId>` 标题，取最后一个纯净路径标题（Diff 段）。
+      const matches = [...text.matchAll(/^### (\S+)$/gm)]
+      const path = matches.at(-1)?.[1] ?? 'a.js'
+      return {
+        result: Promise.resolve({
+          stopReason: 'completed',
+          structured: {
+            findings: [{
+              ruleId: 'COR-001',
+              dimension: 'correctness',
+              severity: 'high',
+              location: `${path}:1`,
+              problem: `catch 吞掉异常（${path}）`,
+              suggestion: '补异常处理',
+            }],
+            coverage: { files: [{ path, status: 'reviewed' }] },
+          },
+        }),
+        dispose: async () => {},
+      }
+    },
+  }
+}
+
+test('/review --range 审查 git 范围并输出报告（同步、不占轮次）', async () => {
+  const repo = createRangeRepo()
+  try {
+    const harness = createCommand({ config: RANGE_CONFIG })
+    const result = await harness.command.handler({
+      agent: rangeAgent(repo),
+      rawInput: '--range HEAD~1..HEAD',
+      signal: signal(),
+    })
+    assert.equal(result.kind, 'success')
+    assert.match(result.text, /结论: 需修改/)
+    assert.match(result.text, /本次 1 文件/)
+    assert.match(result.text, /边界:/, '范围报告同样带边界声明')
+    assert.equal(harness.state.starts, 1)
+  } finally {
+    rmSync(repo, { recursive: true, force: true })
+  }
+})
+
+test('/review --range 分块送审并合并多块 findings', async () => {
+  const repo = createRangeRepo({ split: true })
+  const state = { starts: 0 }
+  try {
+    const harness = createCommand({
+      // 故意把单块上限设小：两个文件各占一块。
+      config: { ...RANGE_CONFIG, maxDiffBytes: 20 },
+      subagents: promptAwareSubagents(state),
+    })
+    const result = await harness.command.handler({
+      agent: rangeAgent(repo),
+      rawInput: '--range HEAD~1..HEAD',
+      signal: signal(),
+    })
+    assert.equal(result.kind, 'success', result.text)
+    assert.ok(state.starts >= 2, `应分块发起多次审查，实际 ${state.starts}`)
+    assert.match(result.text, /结论: 需修改（2 处阻塞）/)
+    assert.match(result.text, /a\.js:1/)
+    assert.match(result.text, /b\.js:1/)
+  } finally {
+    rmSync(repo, { recursive: true, force: true })
+  }
+})
+
+test('/review --patch 读取仓库内补丁文件并报告', async () => {
+  const repo = createRangeRepo()
+  try {
+    const patch = gitIn(repo, ['diff', 'HEAD~1..HEAD'])
+    writeFileSync(join(repo, 'changes.diff'), patch)
+    const harness = createCommand({ config: RANGE_CONFIG })
+    const result = await harness.command.handler({
+      agent: rangeAgent(repo),
+      rawInput: '--patch changes.diff',
+      signal: signal(),
+    })
+    assert.equal(result.kind, 'success')
+    assert.match(result.text, /结论: 需修改/)
+    assert.match(result.text, /本次 1 文件/)
+  } finally {
+    rmSync(repo, { recursive: true, force: true })
+  }
+})
+
+test('/review 范围审查的入参错误返回中文文案', async () => {
+  const repo = createRangeRepo()
+  try {
+    const harness = createCommand({ config: RANGE_CONFIG })
+    const noCwd = await harness.command.handler({ agent, rawInput: '--range HEAD~1..HEAD', signal: signal() })
+    assert.equal(noCwd.kind, 'error')
+    assert.match(noCwd.text, /没有工作目录/)
+
+    const bare = await harness.command.handler({ agent: rangeAgent(repo), rawInput: '--range', signal: signal() })
+    assert.equal(bare.kind, 'error')
+    assert.match(bare.text, /用法：\/review --range/)
+
+    const bad = await harness.command.handler({
+      agent: rangeAgent(repo),
+      rawInput: '--range nope..HEAD',
+      signal: signal(),
+    })
+    assert.equal(bad.kind, 'error')
+    assert.match(bad.text, /取材失败/)
+
+    const unknown = await harness.command.handler({ agent: rangeAgent(repo), rawInput: '--nope', signal: signal() })
+    assert.equal(unknown.kind, 'error')
+    assert.match(unknown.text, /未知参数/)
+  } finally {
+    rmSync(repo, { recursive: true, force: true })
+  }
 })
 
 // —— 全量审查（--full） ——

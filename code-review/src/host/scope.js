@@ -48,6 +48,14 @@ function globToRegExp(pattern) {
   return new RegExp(`^${source}$`)
 }
 
+/** 默认敏感路径：命中即强制链级全量复审（不可被 fullReview:false 降级）。 */
+export const DEFAULT_SENSITIVE_GLOBS = Object.freeze([
+  '**/auth/**',
+  '**/migrations/**',
+  '**/*.sql',
+  '**/.github/workflows/**',
+])
+
 /**
  * 判断 posix 相对路径是否匹配 glob。
  * @param {string} pattern 不带前导 `./` 的 glob

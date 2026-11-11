@@ -2,8 +2,10 @@
  * `/review` 手动入口：只把报告返回给 UI，不回注、不 steer。
  * @module @liyuera/dsh-code-review/host/command
  */
+import { chunkFiles, mapWithLimit, mergeReviews, timeoutFor } from './chunk.js'
 import { collect } from './collect.js'
 import { finalizeFindings } from './finalize.js'
+import { collectPatch, collectRange } from './git.js'
 import { formatJournal } from './journal.js'
 import { annotateRepeats, LEDGER_WINDOW, notObservedFindings } from './ledger.js'
 import { readWorkspaceTexts } from './readfile.js'
@@ -33,8 +35,8 @@ export function createReviewCommand({
 }) {
   return {
     name: 'review',
-    description: '通用代码审查：审查本轮改动并输出报告',
-    input: { hint: '可留空；输入 --full 复审整条链的改动' },
+    description: '通用代码审查：审查本轮改动、git 范围或补丁文件并输出报告',
+    input: { hint: '可留空；--full 复审整条链，--range <base>..<head> 审 git 范围，--patch <file> 审补丁文件' },
     async handler({ agent, rawInput, signal }) {
       try {
         const sessionId = agent.session.id
@@ -62,8 +64,151 @@ export function createReviewCommand({
         if (isReviewing?.(sessionId)) {
           return { kind: 'error', text: '已有审查在进行中，请稍后再试。' }
         }
+        // 范围审查（--range / --patch）：同步、只报告、不占自动轮次、不回灌。
+        // 取材走只读 git / 宿主补丁文件；分块送审，合并后统一做证据校验/复验/渲染。
+        const runRangeReview = async ({ range, patchFile }) => {
+          const cwd = agent.session?.header?.cwd
+          if (typeof cwd !== 'string' || cwd.length === 0) {
+            return { kind: 'error', text: withJournal('会话没有工作目录，无法执行范围审查。') }
+          }
+          let collected
+          try {
+            collected = patchFile === undefined
+              ? await collectRange({ cwd, range, config })
+              : await collectPatch({ cwd, patchFile, config })
+          } catch (error) {
+            logger?.warn?.(`[code-review] 范围审查取材失败：${error.message}`)
+            return { kind: 'error', text: withJournal(`范围审查取材失败：${error.message}`) }
+          }
+          if (collected.files.length === 0) {
+            return { kind: 'error', text: withJournal('该范围没有可审查的代码文件（可能全是二进制或超出预算）。') }
+          }
+          const loaded = await getRules()
+          const composed = composeRules({ ...loaded, filePaths: collected.files.map((file) => file.path) })
+          const suppressions = await loadSuppressions({ config, cwd, warn: logger?.warn })
+          const chunks = chunkFiles(collected.files, config.maxDiffBytes)
+          const label = patchFile === undefined ? `范围 ${range}` : `补丁 ${patchFile}`
+          const startedAt = Date.now()
+          const outcomes = await mapWithLimit(chunks, config.rangeConcurrency, async (chunk, index) => {
+            if (signal?.aborted) return { ok: false, reason: 'aborted' }
+            const remaining = config.rangeTimeoutMs - (Date.now() - startedAt)
+            if (remaining <= 0) return { ok: false, reason: 'timeout' }
+            const chunkBytes = chunk.reduce(
+              (total, file) => total + Buffer.byteLength(String(file.text ?? ''), 'utf8'),
+              0,
+            )
+            return await runReview({
+              subagents,
+              agent,
+              preset: config.reviewerPreset,
+              prompt: buildPrompt({
+                rulesPrompt: composed.prompt,
+                files: chunk,
+                skipped: [],
+                header: [
+                  `${label} 的第 ${index + 1}/${chunks.length} 块（本块 ${chunk.length} 个文件）。`,
+                  '只审查本块内出现的 diff；不要推测未提供的文件，也不要跨块重复报告同一问题。',
+                ],
+              }),
+              timeoutMs: Math.min(remaining, timeoutFor(chunkBytes, {
+                baseMs: config.reviewerTimeoutMs,
+                perKbMs: config.reviewerTimeoutPerKbMs,
+                maxMs: config.reviewerTimeoutMaxMs,
+              })),
+              modelOverride: config.modelOverride,
+              signal,
+              allowedRuleIds: composed.allowedRuleIds,
+              allowedPaths: new Set(chunk.map((file) => file.path)),
+              ruleSeverities: composed.ruleSeverities,
+              logger,
+              evidenceContext: { mode: 'turn', files: chunk },
+              evidenceMode: config.evidenceMode,
+              coverageMode: config.coverageMode,
+            })
+          })
+          if (signal?.aborted) {
+            return { kind: 'error', text: withJournal('范围审查已取消。') }
+          }
+          const results = []
+          let failedChunks = 0
+          outcomes.forEach((outcome, index) => {
+            if (outcome?.ok === true) {
+              results.push(outcome)
+              return
+            }
+            failedChunks += 1
+            logger?.warn?.(`[code-review] ${label} 第 ${index + 1}/${chunks.length} 块失败：${outcome?.reason ?? 'unknown'}`)
+          })
+          if (results.length === 0) {
+            return {
+              kind: 'error',
+              text: withJournal(`${label} 审查未完成（${failedChunks}/${chunks.length} 块失败/超时）。`),
+            }
+          }
+          const merged = mergeReviews(results)
+          const final = await finalizeFindings({
+            findings: merged.findings,
+            evidence: merged.evidence,
+            ruleFixModes: composed.ruleFixModes,
+            ruleBlocking: composed.ruleBlocking,
+            config,
+            suppressions,
+            files: collected.files,
+            subagents,
+            agent,
+            preset: config.reviewerPreset,
+            signal,
+            logger,
+            modelOverride: config.modelOverride,
+          })
+          const added = collected.files.reduce((total, file) => total + (file.added ?? 0), 0)
+          const deleted = collected.files.reduce((total, file) => total + (file.deleted ?? 0), 0)
+          const scope = { files: collected.files.length + collected.skipped.length, added, deleted }
+          const ledger = withLedger(final.findings, final.suppressed, collected.files.map((file) => file.path))
+          const rendered = renderFindings({
+            findings: ledger.findings,
+            skipped: collected.skipped,
+            blockingSeverities: config.blockingSeverities,
+            notifySeverities: config.notifySeverities ?? [],
+            summary: scope,
+            mode: 'report',
+            coverage: merged.coverage,
+            suppressed: final.suppressed,
+            respectFixPolicy: config.respectFixPolicy,
+          })
+          const verification = verificationLine(final.verification)
+          const body = rendered === ''
+            ? renderPass({ summary: scope, skipped: collected.skipped, coverage: merged.coverage })
+            : rendered
+          const gap = failedChunks > 0
+            ? `覆盖缺口: ${failedChunks}/${chunks.length} 块审查失败/超时，本报告 NOT clean，请人工确认未覆盖面。`
+            : ''
+          return {
+            kind: 'success',
+            text: withJournal([body, verification, ledger.ledger, gap].filter((line) => line !== '').join('\n')),
+          }
+        }
         // 现有调用方可能不传 rawInput：统一转字符串，避免 undefined.trim()。
-        const wantFull = String(rawInput ?? '').trim() === '--full'
+        // 支持的参数：空（最近一轮）、--full、--range <base>..<head>、--patch <file>。
+        const rawInputText = String(rawInput ?? '').trim()
+        const rangeMatch = /^--range\s+(\S.*)$/.exec(rawInputText)
+        const patchMatch = /^--patch\s+(\S.*)$/.exec(rawInputText)
+        const wantFull = rawInputText === '--full'
+        if (rawInputText.startsWith('--range') && rangeMatch === null) {
+          return { kind: 'error', text: '用法：/review --range <base>..<head>' }
+        }
+        if (rawInputText.startsWith('--patch') && patchMatch === null) {
+          return { kind: 'error', text: '用法：/review --patch <补丁文件（相对会话工作目录）>' }
+        }
+        if (rawInputText !== '' && !wantFull && rangeMatch === null && patchMatch === null) {
+          return { kind: 'error', text: '未知参数；可用 --full、--range <base>..<head> 或 --patch <file>。' }
+        }
+        if (rangeMatch !== null || patchMatch !== null) {
+          return await runRangeReview({
+            range: rangeMatch?.[1],
+            patchFile: patchMatch?.[1],
+          })
+        }
         if (wantFull) {
           const epoch = tracker.epochOf(sessionId)
           const chainFiles = chain.filesOf(sessionId, epoch)

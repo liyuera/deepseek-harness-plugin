@@ -1,7 +1,7 @@
 {
   "name": "@liyuera/dsh-code-review",
-  "description": "AI code review for dsh: at turn end a read-only reviewer subagent checks the turn's workspace diff against a pre-made rule layer (correctness / security / performance / maintainability / behavior), verifies blocking findings adversarially, and injects only evidence-checked findings back as a new turn for the agent to fix, at most N rounds per chain.",
-  "version": "0.5.0",
+  "description": "AI code review for dsh: at turn end a read-only reviewer subagent checks the turn's workspace diff against a pre-made rule layer (correctness / security / performance / maintainability / behavior), verifies blocking findings adversarially, injects only evidence-checked findings back as a new turn for the agent to fix (at most N rounds per chain), and supports /review with chain-level, git-range and patch-file modes plus a cross-round ledger and offline pipeline eval.",
+  "version": "0.6.0",
   "type": "module",
   "main": "index.js",
   "exports": {
