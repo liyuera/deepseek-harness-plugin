@@ -1,7 +1,7 @@
 {
   "name": "@liyuera/dsh-code-review",
-  "version": "0.0.1",
-  "private": true,
+  "description": "AI code review for dsh: at turn end a read-only reviewer subagent checks the turn's workspace diff against a pre-made rule layer (correctness / security / performance / maintainability) and injects findings back as a new turn for the agent to fix, at most N rounds per chain.",
+  "version": "0.1.0",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -9,7 +9,39 @@
     "./src/*": "./src/*",
     "./package.json": "./package.json"
   },
-  "files": ["index.js", "cordis.patch.yml", "src", "rules", "test"],
-  "engines": { "dsh": ">=0.2.2-rc.1" },
-  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "src",
+    "rules",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "dsh": ">=0.2.2-rc.1"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "code-review",
+    "ai-code-review",
+    "agent"
+  ],
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/liyuera/deepseek-harness-plugin.git",
+    "directory": "code-review"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  }
 }

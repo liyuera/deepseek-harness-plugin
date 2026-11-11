@@ -2,8 +2,6 @@
 
 DSH 会话运行时的「AI 生成代码自动审查」：主代理改完代码时，插件抓本 turn 的 workspace diff，**在后台**派一个**只读**审查者子代理按预制规范审查；审查不阻塞当前回复，结论以一条插件消息回灌成新 turn，让主代理按带文件/行号/规则 id/严重度的 findings 继续修复，每条链最多 N 轮。
 
-> 当前为 `private` 包，尚未发布 npm；请从本地 checkout 安装。
-
 ## 与 bug-workflow 的 GitLab 审查是什么关系
 
 两者是不同层、不同触发点的两套东西，互不复用输出格式：
@@ -34,26 +32,26 @@ DSH 会话运行时的「AI 生成代码自动审查」：主代理改完代码�
 
 前置：dsh ≥ 0.2.2-rc.1（`package.json` 的 `engines.dsh` 会在安装时校验）。桌面应用用 `desktop` profile；源码启动的 `pnpm dsh web` 用 `web`。
 
-**方式一：命令行（本地 checkout）**
+**方式一：从 npm 装（推荐）**
 
 ```sh
-# 桌面应用
-dsh plugin --profile desktop add link:/绝对路径/deepseek-harness-plugin/code-review
-
-# 源码启动的 web profile
-dsh plugin --profile web add link:/绝对路径/deepseek-harness-plugin/code-review
+dsh plugin --profile desktop add @liyuera/dsh-code-review
 ```
 
-**方式二：应用内插件管理器**
+GUI 等价路径：**设置 → 插件 → 添加插件**，输入包名，按提示安装；若界面提供「立即启用」，选中它。
 
-打开 **设置 → 插件 → 添加插件**，填入同样的本地安装规格（`link:/绝对路径/.../code-review`，或直接填绝对路径），按提示安装；若界面提供「立即启用」，选中它。
+**方式二：从本地 checkout 装（改代码即时生效，适合开发）**
+
+```sh
+dsh plugin --profile desktop add link:/绝对路径/deepseek-harness-plugin/code-review
+```
 
 本包是 **bundle**：`package.json` 声明 `dsh.bundle.patch` → `cordis.patch.yml`，该文件插入两条：
 
 - `preset-code-review`：审查者 preset，只读文件工具 + 审查人格；
 - `code-review`：插件本体。
 
-安装会把它登记进 profile 的 `dsh.profile.bundles`。宿主半边只在应用启动时装配，装完要**重启应用**（源码启动则重启 `dsh web`）；只刷新页面不够。本包未发布 npm，不能按包名从 registry 安装。
+安装会把它登记进 profile 的 `dsh.profile.bundles`。宿主半边只在应用启动时装配，装完要**重启应用**（源码启动则重启 `dsh web`）；只刷新页面不够。
 
 **profile 要求**：本插件依赖宿主提供的 `workspaceChanges` 与 `agentPresets` 服务。桌面/Web profile（`dsh-base` + `dsh-web-app`）默认都有；精简的 `headless` profile 没有这两个服务，插件会停在 `pending (waiting for service: …)` 且不生效——本插件不是为 headless 设计的使用形态。启动日志里看到这两条 pending 就是 profile 选错了。
 
@@ -175,7 +173,7 @@ dsh plugin --profile desktop remove @liyuera/dsh-code-review
 2. 修完后后台会再复审一次：干净时**静默**（不会出现「结论: 通过」）；若仍有阻塞，最多到 `maxRounds` 后停止（末轮文案会写「不会再自动复审」），不会无限自动循环。
 3. 审查前后跑 `git status`：只应有主代理的改动，审查者不应写任何文件。
 4. 在会话里执行 `/review`：报告只出现在 UI，对话不被打断、不产生注入消息（这条仍是同步等待）。
-4. 规则加载自检：
+5. 规则加载自检（在仓库 checkout 里跑；npm 包不含 `test/`）：
 
    ```sh
    cd code-review
@@ -184,3 +182,22 @@ dsh plugin --profile desktop remove @liyuera/dsh-code-review
    ```
 
    第一条应打印 `24`；第二条应全绿（当前 208 个用例）。
+
+## 发布
+
+已发布到 npm：`@liyuera/dsh-code-review`（包里含 `index.js`、`src/`、`cordis.patch.yml`、`rules/`；不含 `test/`）。
+
+日常发布走 GitHub Actions 的 npm **Trusted Publishing**（OIDC，无 NPM_TOKEN、无浏览器授权）：
+
+```sh
+# 1. 改 code-review/package.json 的 version，提交并 push main
+# 2. 打 tag 并 push，触发 .github/workflows/publish-code-review.yml
+git tag code-review-v0.2.0
+git push origin code-review-v0.2.0
+```
+
+workflow 在 `code-review/` 里跑 `npm publish --access public`，tag 与 `package.json` 版本不一致会直接失败；公开仓库 + 公开包会自动生成 provenance 证明。
+
+**首次发布是一次性例外**：npm 不支持为尚不存在的包预配置 Trusted Publisher，所以 `0.1.0` 是在本机手动 `npm publish --access public --registry https://registry.npmjs.org/` 发的（用带 bypass 2FA 的 granular token，发完即删）。之后在 npmjs.com 的包 Settings → Trusted Publisher 配好 `liyuera` / `deepseek-harness-plugin` / `publish-code-review.yml` 并勾上 **Allow npm publish**，创建后 2 天内必须完成一次成功发布来验证配置；再把 Publishing access 设为不允许 token 发布。若 workflow 报 `ENEEDAUTH`，先核对 workflow 文件名、owner/repo 是否与 npm 配置完全一致，以及是否勾了 Allow npm publish。
+
+发布前用 `npm pack --dry-run` 核对文件清单；本包没有构建产物，源码即安装产物。

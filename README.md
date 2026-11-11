@@ -14,6 +14,7 @@ DeepSeek Harness (dsh) 插件集。每个插件一个目录，目录名即插件
 | [`ui-favorite-prompts/`](ui-favorite-prompts/) | `@liyuera/dsh-favorite-prompts` | ✅ 已移植 | 消息下方一键收藏、`@` 拉出收藏并整段插入、设置页增删改 |
 | [`user-ds-balance/`](user-ds-balance/) | `@liyuera/dsh-user-ds-balance` | ✅ 无需改 | DeepSeek 账户余额读数:composer 工具行单元格,每 5 分钟轮询、点击刷新、loading 态(host 半边 `/ds-balance` 路由,API Key 现取现用) |
 | [`wx-mp-tools/`](wx-mp-tools/) | `@liyuera/dsh-wx-mp-tools` | 🆕 | 微信小程序控制(dsh-control-wxMpTools):通过微信开发者工具官方 `wechatide` agent CLI 编译刷新模拟器、截图(模型用 `read_image` 看)、console/network 日志、页面数据与元素读取、点击输入导航、执行 JS、预览上传 |
+| [`code-review/`](code-review/) | `@liyuera/dsh-code-review` | 🆕 | AI 生成代码自动审查:主代理改完代码时在后台派只读审查者子代理,按预制维度/检查项/团队规则审本 turn 的 workspace diff,findings（文件/行号/规则 id/严重度)以插件消息回灌开新 turn 让主代理修复,每条链最多 N 轮;`/review` 手动同步审查 |
 
 ## 安装
 
@@ -33,7 +34,7 @@ dsh plugin --profile desktop add link:/绝对路径/deepseek-harness-plugin/chro
 
 `desktop` 是桌面应用独占的 profile；源码启动的 `pnpm dsh web` 用 `web`。装完**退出重开**——宿主半边只在启动时加载，浏览器硬刷新只换得到 `lib/client.js`。
 
-五个包的 npm 名：`@liyuera/dsh-dev-dock`、`@liyuera/dsh-chrome-browser`、`@liyuera/dsh-favorite-prompts`、`@liyuera/dsh-user-ds-balance`、`@liyuera/dsh-wx-mp-tools`。
+六个包的 npm 名：`@liyuera/dsh-dev-dock`、`@liyuera/dsh-chrome-browser`、`@liyuera/dsh-favorite-prompts`、`@liyuera/dsh-user-ds-balance`、`@liyuera/dsh-wx-mp-tools`、`@liyuera/dsh-code-review`。
 
 `dsh-chrome-browser` 还要在 Chrome 里加载一次配套扩展（扩展随包发布，从 `<dsh 地址>/chrome-browser/extension.zip` 下载解压后「加载已解压的扩展程序」），步骤见[该插件 README](chrome-browser/README.md#2-装配套-chrome-扩展)。
 
@@ -112,4 +113,4 @@ tsc -b && tsdown --config-loader tsx   # 重新构建（bin 解析自 harness �
 
 ## 许可
 
-专有软件，保留所有权利。未经版权持有人书面许可，不得使用、复制、修改、分发或再许可本仓库的任何内容，详见 [LICENSE](LICENSE)。各插件 `package.json` 声明为 `UNLICENSED`；已发布到 npm 的包允许通过 npm 安装并运行，但不授予修改、再分发、再许可或销售的权利（全文见各包 `LICENSE`）。发布流程见 [`chrome-browser/README.md`](chrome-browser/README.md#发布) 与 [`ui-favorite-prompts/README.md`](ui-favorite-prompts/README.md#发布)。
+专有软件，保留所有权利。未经版权持有人书面许可，不得使用、复制、修改、分发或再许可本仓库的任何内容，详见 [LICENSE](LICENSE)。各插件 `package.json` 声明为 `UNLICENSED`；已发布到 npm 的包允许通过 npm 安装并运行，但不授予修改、再分发、再许可或销售的权利（全文见各包 `LICENSE`）。发布流程见 [`chrome-browser/README.md`](chrome-browser/README.md#发布)、[`ui-favorite-prompts/README.md`](ui-favorite-prompts/README.md#发布) 与 [`code-review/README.md`](code-review/README.md#发布)。
