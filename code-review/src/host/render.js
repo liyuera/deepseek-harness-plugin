@@ -13,7 +13,7 @@ const DIMENSION_LABEL = Object.freeze({
 /** 严重度排名：数字越小越严重。渲染与截断共用同一份顺序。 */
 export const SEVERITY_RANK = Object.freeze({ high: 0, medium: 1, low: 2, nit: 3 })
 
-/** `/review` 报告固定边界声明：报告不构成合入批准，未审项以覆盖行为准。 */
+/** `/review` 报告固定边界声明（只用于 `report` 模式，不进入自动回灌）。 */
 export const BOUNDARY_LINE = '边界: 本报告只覆盖本次改动与可读取文件；覆盖缺口见覆盖行，结论不构成合入批准。'
 
 function bySeverity(findings) {
@@ -162,7 +162,9 @@ export function renderFindings({
     if (coverageText !== undefined) sections.push(coverageText)
     const suppressedText = suppressedLine(suppressed)
     if (suppressedText !== undefined) sections.push(suppressedText)
-    sections.push(BOUNDARY_LINE)
+    // manual 模式用于「不触发修复轮」的自动回灌，不能带报告边界声明：
+    // 它的覆盖行只在有 unaccounted 时输出，声明里的「覆盖缺口见覆盖行」会悬空。
+    if (mode === 'report') sections.push(BOUNDARY_LINE)
   } else if (coverage !== undefined && coverage !== null && coverage.unaccounted > 0) {
     sections.push(coverageLine(coverage))
   }
@@ -198,7 +200,7 @@ export function renderLedger(findings) {
   )
   const lines = ordered.map((finding) => (
     `- [${finding.ruleId}] ${finding.location}`
-    + `（连续 ${finding.missedRuns} 轮未再出现，可人工确认后移出跟踪；不自动关闭）`
+    + `（连续 ${finding.missedRuns} 轮审过该文件且未再出现，可人工确认后移出跟踪；不自动关闭）`
   ))
   return ['账本（人工裁决，不自动关闭）:', ...lines].join('\n')
 }

@@ -47,14 +47,17 @@ export function createReviewCommand({
           return footer === '' ? text : `${text}\n\n${footer}`
         }
         // 跨轮账本：本轮 findings 标历史重复次数；历史遗留问题连续缺席 2 轮才提示人工确认。
-        const withLedger = (findings, suppressed) => {
+        const withLedger = (findings, suppressed, currentPaths) => {
           const annotated = annotateRepeats(findings, journalRecords)
           const tracked = new Set(
             [...annotated, ...suppressed.map((entry) => entry.finding ?? entry)]
               .map((finding) => finding?.fingerprint)
               .filter((fingerprint) => typeof fingerprint === 'string'),
           )
-          return { findings: annotated, ledger: renderLedger(notObservedFindings(journalRecords, tracked)) }
+          return {
+            findings: annotated,
+            ledger: renderLedger(notObservedFindings(journalRecords, tracked, currentPaths)),
+          }
         }
         if (isReviewing?.(sessionId)) {
           return { kind: 'error', text: '已有审查在进行中，请稍后再试。' }
@@ -111,7 +114,11 @@ export function createReviewCommand({
             modelOverride: config.modelOverride,
           })
           const scope = { files: chainFiles.length, added: 0, deleted: 0 }
-          const ledger = withLedger(final.findings, final.suppressed)
+          const ledger = withLedger(
+            final.findings,
+            final.suppressed,
+            chainFiles.map((file) => file.path),
+          )
           const rendered = renderFindings({
             findings: ledger.findings,
             skipped: [],
@@ -192,7 +199,11 @@ export function createReviewCommand({
           logger,
           modelOverride: config.modelOverride,
         })
-        const ledger = withLedger(final.findings, final.suppressed)
+        const ledger = withLedger(
+          final.findings,
+          final.suppressed,
+          collected.files.map((file) => file.path),
+        )
         const rendered = renderFindings({
           findings: ledger.findings,
           skipped: collected.skipped,

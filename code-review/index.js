@@ -219,6 +219,8 @@ export function apply(ctx, config) {
           coverage: outcome.coverage,
           verification: final.verification,
           suppressed: final.suppressed.length,
+          // 账本判断「未再见」必须知道本轮实际审过哪些文件：turn 轮只覆盖当轮 diff。
+          paths: (meta.filesForReview ?? []).map((file) => file.path),
         })
       }
 

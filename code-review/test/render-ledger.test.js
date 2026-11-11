@@ -26,11 +26,17 @@ test('steer 模式也标注重复次数（复用同一行渲染）', () => {
   assert.match(text, /（第 3 次报告，尚未修复）/)
 })
 
-test('report 报告末尾带固定边界声明，steer/notify 不带', () => {
+test('report 报告末尾带固定边界声明，steer/notify/manual 不带', () => {
   const report = renderFindings({ ...base, findings: [finding()], mode: 'report' })
   assert.ok(report.includes(BOUNDARY_LINE))
   const steer = renderFindings({ ...base, findings: [finding()], mode: 'steer' })
   assert.equal(steer.includes(BOUNDARY_LINE), false)
+  const manual = renderFindings({
+    ...base,
+    findings: [finding({ fixMode: 'manual' })],
+    mode: 'manual',
+  })
+  assert.equal(manual.includes(BOUNDARY_LINE), false, 'manual 用于自动回灌，不应带报告边界声明')
   const notify = renderFindings({
     ...base,
     findings: [finding({ severity: 'low', dimension: 'maintainability', ruleId: 'MNT-001' })],
@@ -48,7 +54,7 @@ test('renderLedger 空输入返回空串，缺失项按严重度排序并说明�
     finding({ ruleId: 'COR-001', severity: 'high', missedRuns: 3 }),
   ])
   assert.match(text, /账本（人工裁决，不自动关闭）:/)
-  assert.match(text, /\[COR-001\] src\/a\.ts:2（连续 3 轮未再出现/)
+  assert.match(text, /\[COR-001\] src\/a\.ts:2（连续 3 轮审过该文件且未再出现/)
   assert.match(text, /不自动关闭/)
   assert.ok(text.indexOf('[COR-001]') < text.indexOf('[MNT-001]'), '严重度高的排在前面')
 })

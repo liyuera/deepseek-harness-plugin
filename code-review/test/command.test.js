@@ -401,6 +401,7 @@ const journalRecord = (startedAt, findings, over = {}) => ({
   findingsTotal: findings.length,
   findings,
   injected: true,
+  paths: ['a.js'],
   ...over,
 })
 
@@ -426,13 +427,15 @@ test('/review 报告脚注列出连续缺席的历史 finding（不自动关闭�
     ruleId: 'MNT-001',
     dimension: 'maintainability',
     severity: 'medium',
-    location: 'b.js:9',
+    location: 'a.js:9',
     problem: '历史遗留问题',
     suggestion: '待人工确认',
   }
+  // 最近一次出现之后，又有两轮确实审过 a.js（当前轮也算一轮）。
   const prior = [
     journalRecord(300, []),
-    journalRecord(200, [{ ...stale, fingerprint: fingerprintFinding(stale) }]),
+    journalRecord(200, []),
+    journalRecord(100, [{ ...stale, fingerprint: fingerprintFinding(stale) }]),
   ]
   const harness = createCommand({
     config: { respectFixPolicy: true },
@@ -443,7 +446,7 @@ test('/review 报告脚注列出连续缺席的历史 finding（不自动关闭�
 
   assert.equal(result.kind, 'success')
   assert.match(result.text, /账本（人工裁决，不自动关闭）:/)
-  assert.match(result.text, /\[MNT-001\] b\.js:9（连续 2 轮未再出现/)
+  assert.match(result.text, /\[MNT-001\] a\.js:9（连续 3 轮审过该文件且未再出现/)
 })
 
 test('/review 审查未完成时也追加留痕脚注', async () => {

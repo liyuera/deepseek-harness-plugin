@@ -86,11 +86,13 @@ test('settle 记录 coverage/verification/suppressed，formatJournal 展示摘�
     coverage: { valid: true, missing: false, reviewed: 2, skipped: 1, unaccounted: 0 },
     verification: { checked: 2, confirmed: 1, rejected: 0, unverified: 1 },
     suppressed: 1,
+    paths: ['a.ts'],
   })
   const record = journal.recent('s1')[0]
   assert.deepEqual(record.coverage, { valid: true, missing: false, reviewed: 2, skipped: 1, unaccounted: 0 })
   assert.deepEqual(record.verification, { checked: 2, confirmed: 1, rejected: 0, unverified: 1 })
   assert.equal(record.suppressed, 1)
+  assert.deepEqual(record.paths, ['a.ts'], '账本需要本轮实际送审路径')
   assert.equal(record.findings[0].fingerprint, 'abc')
   assert.equal(record.findings[0].verified, 'confirmed')
   const text = formatJournal([record])

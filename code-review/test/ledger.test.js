@@ -62,36 +62,63 @@ test('annotateRepeats 只统计 completed，且无 fingerprint 的记录/条目�
   assert.equal(annotated.firstSeenAt, 100)
 })
 
-test('notObservedFindings 连续缺席达到阈值才列出，本轮仍跟踪的排除', () => {
+test('notObservedFindings 只统计确实审过该文件的轮次，达到阈值才列出', () => {
   const prior = [
-    record(300, [finding({ fingerprint: 'fp-b' })]),
-    record(200, [finding({ fingerprint: 'fp-a' })]),
+    record(300, [], { paths: ['src/a.ts'] }),
+    record(200, [], { paths: ['src/a.ts'] }),
+    record(100, [finding({ fingerprint: 'fp-a' })], { paths: ['src/a.ts'] }),
+  ]
+  const unresolved = notObservedFindings(prior, new Set(), ['src/a.ts'])
+  assert.deepEqual(unresolved.map((item) => item.fingerprint), ['fp-a'])
+  // 本轮 + 300/200 两轮都审过该文件 → 连续 3 轮未见。
+  assert.equal(unresolved[0].missedRuns, 3)
+})
+
+test('notObservedFindings 只缺 1 轮未达阈值不列出', () => {
+  const prior = [
+    record(100, [finding({ fingerprint: 'fp-a' })], { paths: ['src/a.ts'] }),
+  ]
+  // 当前轮审过且未见 = 1 轮，未到 2 轮阈值。
+  assert.deepEqual(notObservedFindings(prior, new Set(), ['src/a.ts']), [])
+})
+
+test('notObservedFindings 本轮没审该文件时不推断已修复', () => {
+  const prior = [
+    record(200, [], { paths: ['src/a.ts'] }),
+    record(100, [finding({ fingerprint: 'fp-a' })], { paths: ['src/a.ts'] }),
+    record(50, [finding({ fingerprint: 'fp-a' })], { paths: ['src/a.ts'] }),
+  ]
+  assert.deepEqual(notObservedFindings(prior, new Set(), ['src/b.ts']), [])
+})
+
+test('notObservedFindings 中间某轮没审该文件时打断连续链', () => {
+  const prior = [
+    record(300, [], { paths: ['src/b.ts'] }),
+    record(200, [], { paths: ['src/a.ts'] }),
+    record(100, [finding({ fingerprint: 'fp-a' })], { paths: ['src/a.ts'] }),
+  ]
+  assert.deepEqual(notObservedFindings(prior, new Set(), ['src/a.ts']), [])
+})
+
+test('notObservedFindings 老记录缺 paths 时保守不累计，且无本轮范围直接返回空', () => {
+  const legacy = [
+    record(200, []),
     record(100, [finding({ fingerprint: 'fp-a' })]),
   ]
-  // fp-a 最近一次在 200（新一轮 300 与当前轮都缺席）→ missedRuns=2，列出；
-  // fp-b 最近一次在 300（当前轮缺席）→ missedRuns=1，不列出。
-  const unresolved = notObservedFindings(prior, new Set())
-  assert.deepEqual(unresolved.map((item) => item.fingerprint), ['fp-a'])
-  assert.equal(unresolved[0].missedRuns, RESOLVE_AFTER_MISSES)
+  assert.deepEqual(notObservedFindings(legacy, new Set(), ['src/a.ts']), [])
+  const prior = [
+    record(200, [], { paths: ['src/a.ts'] }),
+    record(100, [finding({ fingerprint: 'fp-a' })], { paths: ['src/a.ts'] }),
+  ]
+  assert.deepEqual(notObservedFindings(prior, new Set(), undefined), [])
 })
 
 test('notObservedFindings 本轮仍跟踪或已抑制的指纹不算未再见', () => {
   const prior = [
-    record(200, [finding({ fingerprint: 'fp-a' })]),
-    record(100, [finding({ fingerprint: 'fp-a' })]),
+    record(200, [], { paths: ['src/a.ts'] }),
+    record(100, [finding({ fingerprint: 'fp-a' })], { paths: ['src/a.ts'] }),
   ]
-  assert.deepEqual(notObservedFindings(prior, new Set(['fp-a'])), [])
-})
-
-test('notObservedFindings 只看最近一次出现，不重复计数', () => {
-  const prior = [
-    record(300, []),
-    record(200, [finding({ fingerprint: 'fp-a' })]),
-    record(100, [finding({ fingerprint: 'fp-a' })]),
-  ]
-  const unresolved = notObservedFindings(prior, new Set())
-  assert.equal(unresolved.length, 1)
-  assert.equal(unresolved[0].missedRuns, 2)
+  assert.deepEqual(notObservedFindings(prior, new Set(['fp-a']), ['src/a.ts']), [])
 })
 
 test('summarizeRecords 汇总完成/未结论、findings、覆盖、复验与抑制', () => {

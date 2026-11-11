@@ -108,6 +108,7 @@ export function createJournalCore({ logger, now = Date.now } = {}) {
         ...(patch.coverage === undefined ? {} : { coverage: patch.coverage }),
         ...(patch.verification === undefined ? {} : { verification: patch.verification }),
         ...(patch.suppressed === undefined ? {} : { suppressed: patch.suppressed }),
+        ...(patch.paths === undefined ? {} : { paths: patch.paths }),
       })
     },
     cancel(key, reason) {
@@ -181,6 +182,7 @@ const RECORD_SCHEMA = (z) => z.object({
     firstSeenAt: z.number().optional(),
   })).max(MAX_FINDINGS),
   injected: z.boolean(),
+  paths: z.array(z.string()).max(2000).optional(),
   coverage: z.object({
     reviewed: z.number(), skipped: z.number(), unaccounted: z.number(),
     valid: z.boolean(), missing: z.boolean().optional(),

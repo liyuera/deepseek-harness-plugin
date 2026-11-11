@@ -3,9 +3,12 @@
  *
  * 账本只做展示与人工裁决辅助，不写回「已修复」，也不自动关闭问题：
  * - repeats ≥ 2 表示同一指纹在历史轮次已经报过，报告里标「第 N 次报告（尚未修复）」；
- * - 连续 {@link RESOLVE_AFTER_MISSES} 轮未再出现才提示人工确认，避免把「模型漏报」当成修复。
+ * - 「未再见」只统计**确实审过该 finding 所在文件**的轮次：turn 轮只覆盖当轮 diff，
+ *   相邻 turn 改不同文件时缺省不算缺席；连续 {@link RESOLVE_AFTER_MISSES} 轮审过该文件
+ *   却未再出现，才提示人工确认，避免把「没审」和「模型漏报」当成修复。
  * @module @liyuera/dsh-code-review/host/ledger
  */
+import { locationPath } from './evidence.js'
 
 /** 连续多少轮未再出现才提示「可人工确认已修复」。 */
 export const RESOLVE_AFTER_MISSES = 2
@@ -20,6 +23,17 @@ const fingerprintOf = (finding) => (
     ? finding.fingerprint
     : undefined
 )
+
+/**
+ * 一轮审查实际覆盖的路径集合。老记录没有 `paths` 时返回 undefined：
+ * 无法证明它审过某个文件，账本按「未覆盖」保守处理，不累计缺席。
+ * @param {readonly string[] | undefined} paths
+ * @returns {Set<string> | undefined}
+ */
+function coverageOf(paths) {
+  if (!Array.isArray(paths)) return undefined
+  return new Set(paths.filter((path) => typeof path === 'string' && path.length > 0))
+}
 
 /**
  * 给本轮 findings 标注历史重复次数，不修改入参。
@@ -53,14 +67,21 @@ export function annotateRepeats(findings, priorRecords) {
 }
 
 /**
- * 历史 finding 中「本轮未再出现」且连续缺失达阈值的条目。
+ * 历史 finding 中「本轮及最近若干轮都审过其文件、却未再出现」且连续缺席达阈值的条目。
  *
  * 本轮被抑制的问题要计入 `currentFingerprints`（人工裁决不等于已修复）。
+ * 本轮或中间任一轮没有覆盖该 finding 的文件时，不推断「已修复」——turn 轮只审当轮改动，
+ * 没送审不能算缺席；没有 `paths` 的老记录同样不参与累计。
+ *
  * @param {readonly object[]} priorRecords journal 记录（只有 completed 参与统计）
  * @param {ReadonlySet<string>} currentFingerprints 本轮仍在跟踪的指纹（含被抑制项）
- * @returns {object[]} finding 副本，额外带 `missedRuns`（缺失的连续轮次，含本轮）
+ * @param {readonly string[]} currentPaths 本轮实际送审的文件路径
+ * @returns {object[]} finding 副本，额外带 `missedRuns`（连续审过该文件且未出现的轮次，含本轮）
  */
-export function notObservedFindings(priorRecords, currentFingerprints) {
+export function notObservedFindings(priorRecords, currentFingerprints, currentPaths) {
+  const currentCoverage = coverageOf(currentPaths)
+  // 没有本轮审查范围（或老调用方不传）就无法证明「未见」，不产生任何推断。
+  if (currentCoverage === undefined) return []
   const ordered = [...(priorRecords ?? [])]
     .filter((record) => record?.status === 'completed')
     .sort((left, right) => (right?.startedAt ?? 0) - (left?.startedAt ?? 0))
@@ -69,15 +90,28 @@ export function notObservedFindings(priorRecords, currentFingerprints) {
     for (const finding of findingsOf(record)) {
       const fingerprint = fingerprintOf(finding)
       if (fingerprint === undefined || latest.has(fingerprint)) continue
-      // 只记最近一次出现；它之后的轮次（含本轮）都算「未再见」。
-      latest.set(fingerprint, { finding, missedRuns: index + 1 })
+      // 只记最近一次出现；它之后的轮次按「该文件是否送审」逐轮核对。
+      latest.set(fingerprint, { finding, index })
     }
   })
   const result = []
   for (const [fingerprint, entry] of latest) {
     if (currentFingerprints.has(fingerprint)) continue
-    if (entry.missedRuns < RESOLVE_AFTER_MISSES) continue
-    result.push({ ...entry.finding, missedRuns: entry.missedRuns })
+    const path = locationPath(entry.finding.location)
+    if (!currentCoverage.has(path)) continue
+    let missedRuns = 1 // 本轮审过该文件且未出现
+    let coveredEveryRound = true
+    for (let index = 0; index < entry.index; index += 1) {
+      const coverage = coverageOf(ordered[index].paths)
+      if (coverage === undefined || !coverage.has(path)) {
+        // 有一轮没审这个文件：不能把这段空白算成「连续未见」。
+        coveredEveryRound = false
+        break
+      }
+      missedRuns += 1
+    }
+    if (!coveredEveryRound || missedRuns < RESOLVE_AFTER_MISSES) continue
+    result.push({ ...entry.finding, missedRuns })
   }
   return result
 }

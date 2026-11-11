@@ -370,3 +370,10 @@ R2 已完成并合入 0.5.0；335 个用例 + 10 个离线评测 case 全绿。�
 6. **离线评测语料**（`evaluation/`）：10 个 case 覆盖行为维度不被漏、证据伪造 warn/enforce、旧行号丢弃、复验反驳/超时、wontfix 抑制、非法 coverage、full 模式证据、超量截断；`evaluation/run.mjs` 不调模型、可 `npm run eval`，并被 `test/eval-corpus.test.js` 纳入 `npm test`。模型质量评测按 `evaluation/README.md` 的预注册分母、null≠0 口径单独文档化，不混入管道 eval。
 7. **未做**：`/review-status`（可选，暂无消费者）；storageDomain 三表；把 `evidenceMode/coverageMode` 切到 enforce（等 live 统计，见 11 的默认值说明）。
 
+### 11.5 0.5.0 自审修复（2026-11-11）
+
+0.5.0 提交后插件对 R2 diff 的自动审查报出 1 条阻塞、1 条建议，均已修复：
+
+1. **「未再见」无视审查覆盖范围**（阻塞，`ledger.js` + `journal.js` + `command.js`）：turn 轮只审当轮 diff，旧实现只看「本轮 findings 里有没有该指纹」，相邻 turn 改不同文件时会把仍存在的问题判成连续缺席。现在 journal 记录每轮实际送审 `paths`，`notObservedFindings` 要求当前轮与最近各轮都覆盖该 finding 的文件才累计 `missedRuns`；中间任一轮未覆盖、或老记录缺 `paths` 时保守不推断；`/review` 的报告措辞改为「连续 N 轮审过该文件且未再出现」。
+2. **manual 模式外溢报告边界声明**（`render.js`）：`BOUNDARY_LINE` 原先落在 `report || manual` 分支，而 manual 用于自动回灌「不触发修复轮」的通知，会把「覆盖缺口见覆盖行」带进主会话且该行未必存在；现收窄为只加在 `report` 模式，并补 manual 断言。
+
