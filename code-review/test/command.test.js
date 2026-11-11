@@ -3,6 +3,8 @@ import assert from 'node:assert/strict'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createReviewCommand } from '../src/host/command.js'
+import { LEDGER_WINDOW } from '../src/host/ledger.js'
+import { fingerprintFinding } from '../src/host/suppress.js'
 import { loadRulesResilient } from '../src/host/rules.js'
 
 const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
@@ -384,7 +386,64 @@ test('/review 成功时追加自动审查留痕脚注', async () => {
   assert.match(result.text, /自动审查记录（最近 5 条）:/)
   assert.match(result.text, /完成 · 1 条建议（已回灌）/)
   assert.ok(result.text.indexOf('结论') < result.text.indexOf('自动审查记录'), '脚注必须在报告之后')
-  assert.deepEqual(recentCalls, [['s1', 5]])
+  // 命令只读一次账本窗口，脚注再截取最近 5 条。
+  assert.deepEqual(recentCalls, [['s1', LEDGER_WINDOW]])
+})
+
+const journalRecord = (startedAt, findings, over = {}) => ({
+  sessionId: 's1',
+  turn: startedAt,
+  mode: 'turn',
+  startedAt,
+  finishedAt: startedAt + 1,
+  status: 'completed',
+  reason: null,
+  findingsTotal: findings.length,
+  findings,
+  injected: true,
+  ...over,
+})
+
+test('/review 对历史已报过的 finding 标注「第 N 次报告」', async () => {
+  const fingerprint = fingerprintFinding(FINDING)
+  const prior = [
+    journalRecord(100, [{ ...FINDING, fingerprint }]),
+    journalRecord(200, [{ ...FINDING, fingerprint }]),
+  ]
+  const harness = createCommand({
+    config: { respectFixPolicy: true },
+    deps: { journal: { recent: () => prior } },
+  })
+
+  const result = await harness.command.handler({ agent, signal: signal() })
+
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /（第 3 次报告，尚未修复）/)
+})
+
+test('/review 报告脚注列出连续缺席的历史 finding（不自动关闭）', async () => {
+  const stale = {
+    ruleId: 'MNT-001',
+    dimension: 'maintainability',
+    severity: 'medium',
+    location: 'b.js:9',
+    problem: '历史遗留问题',
+    suggestion: '待人工确认',
+  }
+  const prior = [
+    journalRecord(300, []),
+    journalRecord(200, [{ ...stale, fingerprint: fingerprintFinding(stale) }]),
+  ]
+  const harness = createCommand({
+    config: { respectFixPolicy: true },
+    deps: { journal: { recent: () => prior } },
+  })
+
+  const result = await harness.command.handler({ agent, signal: signal() })
+
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /账本（人工裁决，不自动关闭）:/)
+  assert.match(result.text, /\[MNT-001\] b\.js:9（连续 2 轮未再出现/)
 })
 
 test('/review 审查未完成时也追加留痕脚注', async () => {

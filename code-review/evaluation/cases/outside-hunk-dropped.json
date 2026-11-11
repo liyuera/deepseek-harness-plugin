@@ -1,0 +1,84 @@
+{
+  "description": "location 落在本轮 hunk 之外（旧代码冒充新问题）总是丢弃，即使片段真实存在。",
+  "mode": "turn",
+  "files": [
+    {
+      "path": "src/sum.js",
+      "hunks": [
+        {
+          "oldStart": 1,
+          "oldLines": 0,
+          "newStart": 1,
+          "newLines": 5,
+          "lines": [
+            "+export function sum(items) {",
+            "+  return items.reduce((acc, item) => acc + item, 0)",
+            "+}",
+            "+",
+            "+export const MAX = 10"
+          ]
+        }
+      ],
+      "text": "export function sum(items) {\n  return items.reduce((acc, item) => acc + item, 0)\n}\n\nexport const MAX = 10"
+    }
+  ],
+  "reviewer": {
+    "findings": [
+      {
+        "ruleId": "COR-001",
+        "dimension": "correctness",
+        "severity": "high",
+        "location": "src/sum.js:2",
+        "problem": "reduce 初值为 0 之外会得到意外结果。",
+        "suggestion": "显式给出初值并处理空数组。",
+        "evidence": {
+          "snippet": "return items.reduce((acc, item) => acc + item, 0)"
+        }
+      },
+      {
+        "ruleId": "COR-002",
+        "dimension": "correctness",
+        "severity": "medium",
+        "location": "src/sum.js:99",
+        "problem": "历史行号定位的问题不应混入本轮报告。",
+        "suggestion": "无。",
+        "evidence": {
+          "snippet": "export const MAX = 10"
+        }
+      }
+    ],
+    "coverage": {
+      "files": [
+        {
+          "path": "src/sum.js",
+          "status": "reviewed"
+        }
+      ]
+    }
+  },
+  "config": {
+    "verify": "blocking"
+  },
+  "verifier": [
+    "confirmed"
+  ],
+  "expected": {
+    "ok": true,
+    "kept": [
+      {
+        "ruleId": "COR-001",
+        "verified": "confirmed"
+      }
+    ],
+    "dropped": [
+      "COR-002"
+    ],
+    "verification": {
+      "checked": 1,
+      "confirmed": 1,
+      "rejected": 0,
+      "unverified": 0
+    }
+  },
+  "name": "outside-hunk-dropped"
+}

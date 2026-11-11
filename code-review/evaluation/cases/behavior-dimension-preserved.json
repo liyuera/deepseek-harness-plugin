@@ -1,0 +1,91 @@
+{
+  "description": "行为维度 finding 经过 schema 校验、证据校验与证伪复验后仍应保留（0.4.0 行为维度白名单缺失回归）。",
+  "mode": "turn",
+  "files": [
+    {
+      "path": "src/merge-settings.js",
+      "hunks": [
+        {
+          "oldStart": 1,
+          "oldLines": 0,
+          "newStart": 1,
+          "newLines": 13,
+          "lines": [
+            "+import fs from 'node:fs'",
+            "+",
+            "+export function mergeSettings(settings, patch) {",
+            "+  const merged = { ...settings }",
+            "+  let extra = []",
+            "+  try {",
+            "+    extra = JSON.parse(patch.extraText)",
+            "+  } catch (err) {",
+            "+    // 解析失败时按空数组处理",
+            "+  }",
+            "+  merged.extra = extra",
+            "+  return merged",
+            "+}"
+          ]
+        }
+      ],
+      "text": "import fs from 'node:fs'\n\nexport function mergeSettings(settings, patch) {\n  const merged = { ...settings }\n  let extra = []\n  try {\n    extra = JSON.parse(patch.extraText)\n  } catch (err) {\n    // 解析失败时按空数组处理\n  }\n  merged.extra = extra\n  return merged\n}"
+    }
+  ],
+  "reviewer": {
+    "findings": [
+      {
+        "ruleId": "BEH-009",
+        "dimension": "behavior",
+        "severity": "medium",
+        "location": "src/merge-settings.js:11",
+        "problem": "解析失败时 catch 块只留注释，随后仍执行 merged.extra = extra，把调用方原有 extra 覆盖成空数组，属于替换语义下的静默丢数据。",
+        "suggestion": "把赋值移进 try，或在 catch 中保留原值并向上抛出解析错误。",
+        "evidence": {
+          "snippet": "merged.extra = extra"
+        }
+      }
+    ],
+    "coverage": {
+      "files": [
+        {
+          "path": "src/merge-settings.js",
+          "status": "reviewed"
+        }
+      ]
+    }
+  },
+  "config": {
+    "verify": "blocking",
+    "evidenceMode": "warn"
+  },
+  "verifier": [
+    "confirmed"
+  ],
+  "expected": {
+    "ok": true,
+    "kept": [
+      {
+        "ruleId": "BEH-009",
+        "severity": "medium",
+        "verified": "confirmed",
+        "evidenceStatus": "ok",
+        "fixMode": "auto"
+      }
+    ],
+    "verification": {
+      "checked": 1,
+      "confirmed": 1,
+      "rejected": 0,
+      "unverified": 0
+    },
+    "renderContains": [
+      "结论: 需修改（1 处阻塞）",
+      "行为/medium",
+      "边界:"
+    ],
+    "promptContains": [
+      "BEH-009",
+      "src/merge-settings.js"
+    ]
+  },
+  "name": "behavior-dimension-preserved"
+}

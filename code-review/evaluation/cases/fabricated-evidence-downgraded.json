@@ -1,0 +1,86 @@
+{
+  "description": "证据片段对不上时 warn 模式保留但降级为仅报告，且不发起复验。",
+  "mode": "turn",
+  "files": [
+    {
+      "path": "src/merge-settings.js",
+      "hunks": [
+        {
+          "oldStart": 1,
+          "oldLines": 0,
+          "newStart": 1,
+          "newLines": 13,
+          "lines": [
+            "+import fs from 'node:fs'",
+            "+",
+            "+export function mergeSettings(settings, patch) {",
+            "+  const merged = { ...settings }",
+            "+  let extra = []",
+            "+  try {",
+            "+    extra = JSON.parse(patch.extraText)",
+            "+  } catch (err) {",
+            "+    // 解析失败时按空数组处理",
+            "+  }",
+            "+  merged.extra = extra",
+            "+  return merged",
+            "+}"
+          ]
+        }
+      ],
+      "text": "import fs from 'node:fs'\n\nexport function mergeSettings(settings, patch) {\n  const merged = { ...settings }\n  let extra = []\n  try {\n    extra = JSON.parse(patch.extraText)\n  } catch (err) {\n    // 解析失败时按空数组处理\n  }\n  merged.extra = extra\n  return merged\n}"
+    }
+  ],
+  "reviewer": {
+    "findings": [
+      {
+        "ruleId": "COR-001",
+        "dimension": "correctness",
+        "severity": "high",
+        "location": "src/merge-settings.js:8",
+        "problem": "catch 吞掉了 JSON 解析异常，调用方无法区分空配置与解析失败。",
+        "suggestion": "让异常向上抛出，或在结果中显式返回失败状态。",
+        "evidence": {
+          "snippet": "throw new Error('parse failed')"
+        }
+      }
+    ],
+    "coverage": {
+      "files": [
+        {
+          "path": "src/merge-settings.js",
+          "status": "reviewed"
+        }
+      ]
+    }
+  },
+  "config": {
+    "verify": "blocking",
+    "evidenceMode": "warn"
+  },
+  "verifier": [],
+  "expected": {
+    "ok": true,
+    "kept": [
+      {
+        "ruleId": "COR-001",
+        "severity": "high",
+        "evidenceStatus": "mismatch",
+        "fixMode": "auto"
+      }
+    ],
+    "verification": {
+      "checked": 0,
+      "confirmed": 0,
+      "rejected": 0,
+      "unverified": 0
+    },
+    "renderContains": [
+      "结论: 仅报告（1 处未复验/证据不足，需人工确认）",
+      "[未复验] [COR-001]"
+    ],
+    "renderExcludes": [
+      "请按上面每条阻塞 finding 修复"
+    ]
+  },
+  "name": "fabricated-evidence-downgraded"
+}

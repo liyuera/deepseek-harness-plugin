@@ -14,7 +14,7 @@ DeepSeek Harness (dsh) 插件集。每个插件一个目录，目录名即插件
 | [`ui-favorite-prompts/`](ui-favorite-prompts/) | `@liyuera/dsh-favorite-prompts` | ✅ 已移植 | 消息下方一键收藏、`@` 拉出收藏并整段插入、设置页增删改 |
 | [`user-ds-balance/`](user-ds-balance/) | `@liyuera/dsh-user-ds-balance` | ✅ 无需改 | DeepSeek 账户余额读数:composer 工具行单元格,每 5 分钟轮询、点击刷新、loading 态(host 半边 `/ds-balance` 路由,API Key 现取现用) |
 | [`wx-mp-tools/`](wx-mp-tools/) | `@liyuera/dsh-wx-mp-tools` | 🆕 | 微信小程序控制(dsh-control-wxMpTools):通过微信开发者工具官方 `wechatide` agent CLI 编译刷新模拟器、截图(模型用 `read_image` 看)、console/network 日志、页面数据与元素读取、点击输入导航、执行 JS、预览上传 |
-| [`code-review/`](code-review/) | `@liyuera/dsh-code-review` | 🆕 | AI 生成代码自动审查:主代理改完代码时在后台派只读审查者子代理,按预制维度/检查项/团队规则审本 turn 的 workspace diff,findings（文件/行号/规则 id/严重度)以插件消息回灌开新 turn 让主代理修复,每条链最多 N 轮;`/review` 手动同步审查 |
+| [`code-review/`](code-review/) | `@liyuera/dsh-code-review` | 🆕 | AI 生成代码自动审查:主代理改完代码时在后台派只读审查者子代理,按预制维度/检查项/团队规则审本 turn 的 workspace diff,findings（文件/行号/规则 id/严重度)以插件消息回灌开新 turn 让主代理修复,每条链最多 N 轮;`/review` 手动同步审查;v0.4 证据校验/证伪复验/修复策略/抑制,v0.5 跨轮账本(重复报告/未再见观察)与离线评测语料 |
 
 ## 安装
 

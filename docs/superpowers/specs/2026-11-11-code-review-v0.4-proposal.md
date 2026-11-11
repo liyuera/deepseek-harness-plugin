@@ -335,7 +335,7 @@ R1 已完成并合入 0.4.0；全部 319 个用例通过。实施时对方案做
 6. **实现文件**：新增 `evidence.js`、`readfile.js`、`verify.js`、`fixmode.js`、`suppress.js`、`finalize.js`、`structured.js`；修改 `reviewer.js`/`config.js`/`rules.js`/`render.js`/`journal.js`/`command.js`/`index.js`；规则包调整 MNT-011/MNT-016 并新增 BEH-009/BEH-010。
 7. **默认值**：`evidenceMode: warn`、`coverageMode: warn`、`verify: blocking`、`maxVerifiedFindings: 3`、`verifyTimeoutMs: 180000`、`respectFixPolicy: true`；真实使用一段时间、观察「因证据被降级/丢弃」的比例后再把前两项切到 `enforce`。
 
-R2（journal 账本/`/review` 分区/评测语料）与 R3（`--range`/`--patch`/分块/超时自适应）尚未开始。
+R2（journal 账本/`/review` 分区/评测语料）已完成并合入 0.5.0，见 11.4；R3（`--range`/`--patch`/分块/超时自适应）尚未开始。
 
 ### 11.1 自审修复（2026-11-11）
 
@@ -357,3 +357,16 @@ R2（journal 账本/`/review` 分区/评测语料）与 R3（`--range`/`--patch`
 1. **behavior 维度被校验层漏掉**（阻塞）：`structured.js` 的维度白名单与 `REVIEW_SCHEMA.dimension` enum 都只有四维，BEH-* 与 PRINCIPLE-behavior 会被当非法 finding 丢弃；现在维度单一来源为 `rules.js` 的 `RULE_DIMENSIONS`，schema/校验共用，并补 behavior 维度回归用例。
 2. **MAX_FINDINGS 第二份真相**：`index.js` 去掉 `slice(0, 20)`，`reviewer.js` 的 knownFindings 截断改用 `MAX_FINDINGS` 常量。
 3. **location 语法第二份实现**：`structured.js` 改用 `evidence.js` 的 `locationLine`/`locationPath`，删除重复的 `LOCATION_SUFFIX`。
+
+### 11.4 R2 实施记录（2026-11-11，0.5.0）
+
+R2 已完成并合入 0.5.0；335 个用例 + 10 个离线评测 case 全绿。实施时对方案做了以下收敛（以代码为准）：
+
+1. **账本只读 journal，不新增存储表**（`src/host/ledger.js`）：`annotateRepeats` 按同 session 最近 20 条 completed 记录统计 fingerprint 次数（repeats=1 首次、≥2 标「第 N 次报告，尚未修复」）；`notObservedFindings` 只记每个 fingerprint 最近一次出现，其后连续缺席 ≥2 轮才进「未再见」观察列表；`summarizeRecords` 供 journal 脚注显示近期合计。跨重启的 `chains/findings/runs` 三表与逐条 verifier witnesses 仍留给 R2.5（避免 storageDomain schema 迁移）。
+2. **「已修复」不写回**：账本不产生 `resolved` 状态，只在 `/review` 报告列出「连续 2 轮未再出现，可人工确认后移出跟踪；不自动关闭」；本轮被抑制的问题计入「仍跟踪」，不会误入未再见。
+3. **重复标注同时覆盖自动回灌与 `/review`**：自动审查在 `finalize` 后用 journal 历史标注 repeats（在途 running 记录不计入），回灌 finding 行尾直接可见；`/review` 从同一窗口标注并额外输出未再见账本。`/review` 自身不写 journal，历史只来自自动审查——这是保留的既有口径（命令是留痕唯一观察点，不新增记录类型）。
+4. **journal v2 增量兼容**：`reviews` 表仅新增可选字段 `findings[].repeats/firstSeenAt` 与脚注「近期合计」行，老记录读取时按缺省处理，无 schema 版本迁移。
+5. **`/review` 结论边界**：报告末尾固定输出 `BOUNDARY_LINE`（只覆盖本次改动与可读取文件、覆盖缺口见覆盖行、不构成合入批准）；自动回灌文案仍不使用 passed/failed 字样。
+6. **离线评测语料**（`evaluation/`）：10 个 case 覆盖行为维度不被漏、证据伪造 warn/enforce、旧行号丢弃、复验反驳/超时、wontfix 抑制、非法 coverage、full 模式证据、超量截断；`evaluation/run.mjs` 不调模型、可 `npm run eval`，并被 `test/eval-corpus.test.js` 纳入 `npm test`。模型质量评测按 `evaluation/README.md` 的预注册分母、null≠0 口径单独文档化，不混入管道 eval。
+7. **未做**：`/review-status`（可选，暂无消费者）；storageDomain 三表；把 `evidenceMode/coverageMode` 切到 enforce（等 live 统计，见 11 的默认值说明）。
+

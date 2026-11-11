@@ -1239,6 +1239,24 @@ test('审查完成写留痕；/review 脚注显示自动审查记录', async () 
   assert.match(result.text, /已回灌/)
 })
 
+test('同一链两轮报同一问题：第二轮回灌标注「第 2 次报告」', async () => {
+  const harness = createHarness({ maxRounds: 2 })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, { seq: 7, turn: 1 })
+  harness.resolveNext(completed([FINDING]))
+  await tick()
+  assert.equal(harness.state.follows.length, 1, '前置：第一轮已回灌')
+
+  // 换一行 diff，避免 duplicate-diff 跳过；同一 finding 命中历史指纹 → repeats=2。
+  await harness.stop(agent, { seq: 8, turn: 2, diff: '+const b = 2' })
+  harness.resolveNext(completed([FINDING]))
+  await tick()
+
+  assert.equal(harness.state.follows.length, 2)
+  assert.match(followText(harness.state, 1), /（第 2 次报告，尚未修复）/)
+})
+
 test('审查通过（未回灌）也写留痕：completed + injected=false', async () => {
   const harness = createHarness({ maxRounds: 2 })
   const agent = makeAgent(harness)

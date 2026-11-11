@@ -1,0 +1,64 @@
+{
+  "description": "证伪复验明确反驳的阻塞 finding 被丢弃；复验统计仍应记录 rejected（journal 可审计）。",
+  "mode": "turn",
+  "files": [
+    {
+      "path": "src/parse.js",
+      "hunks": [
+        {
+          "oldStart": 1,
+          "oldLines": 0,
+          "newStart": 1,
+          "newLines": 3,
+          "lines": [
+            "+export function parse(text) {",
+            "+  return JSON.parse(text)",
+            "+}"
+          ]
+        }
+      ],
+      "text": "export function parse(text) {\n  return JSON.parse(text)\n}"
+    }
+  ],
+  "reviewer": {
+    "findings": [
+      {
+        "ruleId": "COR-001",
+        "dimension": "correctness",
+        "severity": "high",
+        "location": "src/parse.js:2",
+        "problem": "JSON.parse 的异常会向上传播，但没有类型保护。",
+        "suggestion": "增加输入校验。",
+        "evidence": {
+          "snippet": "return JSON.parse(text)"
+        }
+      }
+    ],
+    "coverage": {
+      "files": [
+        {
+          "path": "src/parse.js",
+          "status": "reviewed"
+        }
+      ]
+    }
+  },
+  "config": {
+    "verify": "blocking"
+  },
+  "verifier": [
+    "rejected"
+  ],
+  "expected": {
+    "ok": true,
+    "kept": [],
+    "verification": {
+      "checked": 1,
+      "confirmed": 0,
+      "rejected": 1,
+      "unverified": 0
+    },
+    "renderEmpty": true
+  },
+  "name": "verifier-refuted-dropped"
+}

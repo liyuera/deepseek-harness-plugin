@@ -1,0 +1,315 @@
+{
+  "description": "findings 超过 MAX_FINDINGS 时按严重度截断，不静默全吞。",
+  "mode": "turn",
+  "files": [
+    {
+      "path": "src/bulk.js",
+      "hunks": [
+        {
+          "oldStart": 1,
+          "oldLines": 0,
+          "newStart": 1,
+          "newLines": 30,
+          "lines": [
+            "+const value1 = 1",
+            "+const value2 = 2",
+            "+const value3 = 3",
+            "+const value4 = 4",
+            "+const value5 = 5",
+            "+const value6 = 6",
+            "+const value7 = 7",
+            "+const value8 = 8",
+            "+const value9 = 9",
+            "+const value10 = 10",
+            "+const value11 = 11",
+            "+const value12 = 12",
+            "+const value13 = 13",
+            "+const value14 = 14",
+            "+const value15 = 15",
+            "+const value16 = 16",
+            "+const value17 = 17",
+            "+const value18 = 18",
+            "+const value19 = 19",
+            "+const value20 = 20",
+            "+const value21 = 21",
+            "+const value22 = 22",
+            "+const value23 = 23",
+            "+const value24 = 24",
+            "+const value25 = 25",
+            "+const value26 = 26",
+            "+const value27 = 27",
+            "+const value28 = 28",
+            "+const value29 = 29",
+            "+const value30 = 30"
+          ]
+        }
+      ],
+      "text": "const value1 = 1\nconst value2 = 2\nconst value3 = 3\nconst value4 = 4\nconst value5 = 5\nconst value6 = 6\nconst value7 = 7\nconst value8 = 8\nconst value9 = 9\nconst value10 = 10\nconst value11 = 11\nconst value12 = 12\nconst value13 = 13\nconst value14 = 14\nconst value15 = 15\nconst value16 = 16\nconst value17 = 17\nconst value18 = 18\nconst value19 = 19\nconst value20 = 20\nconst value21 = 21\nconst value22 = 22\nconst value23 = 23\nconst value24 = 24\nconst value25 = 25\nconst value26 = 26\nconst value27 = 27\nconst value28 = 28\nconst value29 = 29\nconst value30 = 30"
+    }
+  ],
+  "reviewer": {
+    "findings": [
+      {
+        "ruleId": "PRINCIPLE-maintainability",
+        "dimension": "maintainability",
+        "severity": "low",
+        "location": "src/bulk.js:1",
+        "problem": "重复代码块 1。",
+        "suggestion": "提取公共函数。",
+        "evidence": {
+          "snippet": "const value1 = 1"
+        }
+      },
+      {
+        "ruleId": "PRINCIPLE-maintainability",
+        "dimension": "maintainability",
+        "severity": "low",
+        "location": "src/bulk.js:2",
+        "problem": "重复代码块 2。",
+        "suggestion": "提取公共函数。",
+        "evidence": {
+          "snippet": "const value2 = 2"
+        }
+      },
+      {
+        "ruleId": "PRINCIPLE-maintainability",
+        "dimension": "maintainability",
+        "severity": "low",
+        "location": "src/bulk.js:3",
+        "problem": "重复代码块 3。",
+        "suggestion": "提取公共函数。",
+        "evidence": {
+          "snippet": "const value3 = 3"
+        }
+      },
+      {
+        "ruleId": "PRINCIPLE-maintainability",
+        "dimension": "maintainability",
+        "severity": "low",
+        "location": "src/bulk.js:4",
+        "problem": "重复代码块 4。",
+        "suggestion": "提取公共函数。",
+        "evidence": {
+          "snippet": "const value4 = 4"
+        }
+      },
+      {
+        "ruleId": "PRINCIPLE-maintainability",
+        "dimension": "maintainability",
+        "severity": "low",
+        "location": "src/bulk.js:5",
+        "problem": "重复代码块 5。",
+        "suggestion": "提取公共函数。",
+        "evidence": {
+          "snippet": "const value5 = 5"
+        }
+      },
+      {
+        "ruleId": "PRINCIPLE-maintainability",
+        "dimension": "maintainability",
+        "severity": "low",
+        "location": "src/bulk.js:6",
+        "problem": "重复代码块 6。",
+        "suggestion": "提取公共函数。",
+        "evidence": {
+          "snippet": "const value6 = 6"
+        }
+      },
+      {
+        "ruleId": "PRINCIPLE-maintainability",
+        "dimension": "maintainability",
+        "severity": "low",
+        "location": "src/bulk.js:7",
+        "problem": "重复代码块 7。",
+        "suggestion": "提取公共函数。",
+        "evidence": {
+          "snippet": "const value7 = 7"
+        }
+      },
+      {
+        "ruleId": "PRINCIPLE-maintainability",
+        "dimension": "maintainability",
+        "severity": "low",
+        "location": "src/bulk.js:8",
+        "problem": "重复代码块 8。",
+        "suggestion": "提取公共函数。",
+        "evidence": {
+          "snippet": "const value8 = 8"
+        }
+      },
+      {
+        "ruleId": "PRINCIPLE-maintainability",
+        "dimension": "maintainability",
+        "severity": "low",
+        "location": "src/bulk.js:9",
+        "problem": "重复代码块 9。",
+        "suggestion": "提取公共函数。",
+        "evidence": {
+          "snippet": "const value9 = 9"
+        }
+      },
+      {
+        "ruleId": "PRINCIPLE-maintainability",
+        "dimension": "maintainability",
+        "severity": "low",
+        "location": "src/bulk.js:10",
+        "problem": "重复代码块 10。",
+        "suggestion": "提取公共函数。",
+        "evidence": {
+          "snippet": "const value10 = 10"
+        }
+      },
+      {
+        "ruleId": "PRINCIPLE-maintainability",
+        "dimension": "maintainability",
+        "severity": "low",
+        "location": "src/bulk.js:11",
+        "problem": "重复代码块 11。",
+        "suggestion": "提取公共函数。",
+        "evidence": {
+          "snippet": "const value11 = 11"
+        }
+      },
+      {
+        "ruleId": "PRINCIPLE-maintainability",
+        "dimension": "maintainability",
+        "severity": "low",
+        "location": "src/bulk.js:12",
+        "problem": "重复代码块 12。",
+        "suggestion": "提取公共函数。",
+        "evidence": {
+          "snippet": "const value12 = 12"
+        }
+      },
+      {
+        "ruleId": "PRINCIPLE-maintainability",
+        "dimension": "maintainability",
+        "severity": "low",
+        "location": "src/bulk.js:13",
+        "problem": "重复代码块 13。",
+        "suggestion": "提取公共函数。",
+        "evidence": {
+          "snippet": "const value13 = 13"
+        }
+      },
+      {
+        "ruleId": "PRINCIPLE-maintainability",
+        "dimension": "maintainability",
+        "severity": "low",
+        "location": "src/bulk.js:14",
+        "problem": "重复代码块 14。",
+        "suggestion": "提取公共函数。",
+        "evidence": {
+          "snippet": "const value14 = 14"
+        }
+      },
+      {
+        "ruleId": "PRINCIPLE-maintainability",
+        "dimension": "maintainability",
+        "severity": "low",
+        "location": "src/bulk.js:15",
+        "problem": "重复代码块 15。",
+        "suggestion": "提取公共函数。",
+        "evidence": {
+          "snippet": "const value15 = 15"
+        }
+      },
+      {
+        "ruleId": "PRINCIPLE-maintainability",
+        "dimension": "maintainability",
+        "severity": "low",
+        "location": "src/bulk.js:16",
+        "problem": "重复代码块 16。",
+        "suggestion": "提取公共函数。",
+        "evidence": {
+          "snippet": "const value16 = 16"
+        }
+      },
+      {
+        "ruleId": "PRINCIPLE-maintainability",
+        "dimension": "maintainability",
+        "severity": "low",
+        "location": "src/bulk.js:17",
+        "problem": "重复代码块 17。",
+        "suggestion": "提取公共函数。",
+        "evidence": {
+          "snippet": "const value17 = 17"
+        }
+      },
+      {
+        "ruleId": "PRINCIPLE-maintainability",
+        "dimension": "maintainability",
+        "severity": "low",
+        "location": "src/bulk.js:18",
+        "problem": "重复代码块 18。",
+        "suggestion": "提取公共函数。",
+        "evidence": {
+          "snippet": "const value18 = 18"
+        }
+      },
+      {
+        "ruleId": "PRINCIPLE-maintainability",
+        "dimension": "maintainability",
+        "severity": "low",
+        "location": "src/bulk.js:19",
+        "problem": "重复代码块 19。",
+        "suggestion": "提取公共函数。",
+        "evidence": {
+          "snippet": "const value19 = 19"
+        }
+      },
+      {
+        "ruleId": "PRINCIPLE-maintainability",
+        "dimension": "maintainability",
+        "severity": "low",
+        "location": "src/bulk.js:20",
+        "problem": "重复代码块 20。",
+        "suggestion": "提取公共函数。",
+        "evidence": {
+          "snippet": "const value20 = 20"
+        }
+      },
+      {
+        "ruleId": "PRINCIPLE-maintainability",
+        "dimension": "maintainability",
+        "severity": "low",
+        "location": "src/bulk.js:21",
+        "problem": "重复代码块 21。",
+        "suggestion": "提取公共函数。",
+        "evidence": {
+          "snippet": "const value21 = 21"
+        }
+      },
+      {
+        "ruleId": "PRINCIPLE-maintainability",
+        "dimension": "maintainability",
+        "severity": "low",
+        "location": "src/bulk.js:22",
+        "problem": "重复代码块 22。",
+        "suggestion": "提取公共函数。",
+        "evidence": {
+          "snippet": "const value22 = 22"
+        }
+      }
+    ],
+    "coverage": {
+      "files": [
+        {
+          "path": "src/bulk.js",
+          "status": "reviewed"
+        }
+      ]
+    }
+  },
+  "config": {
+    "verify": "off"
+  },
+  "expected": {
+    "ok": true,
+    "keptLength": 20,
+    "renderContains": [
+      "结论: 通过（20 处建议）"
+    ]
+  },
+  "name": "max-findings-truncated"
+}

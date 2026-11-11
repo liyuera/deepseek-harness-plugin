@@ -1,0 +1,73 @@
+{
+  "description": "复验超时/失败时 finding 标未复验，保留为仅报告，不得静默丢弃。",
+  "mode": "turn",
+  "files": [
+    {
+      "path": "src/parse.js",
+      "hunks": [
+        {
+          "oldStart": 1,
+          "oldLines": 0,
+          "newStart": 1,
+          "newLines": 3,
+          "lines": [
+            "+export function parse(text) {",
+            "+  return JSON.parse(text)",
+            "+}"
+          ]
+        }
+      ],
+      "text": "export function parse(text) {\n  return JSON.parse(text)\n}"
+    }
+  ],
+  "reviewer": {
+    "findings": [
+      {
+        "ruleId": "COR-001",
+        "dimension": "correctness",
+        "severity": "high",
+        "location": "src/parse.js:2",
+        "problem": "JSON.parse 的异常会向上传播，但没有类型保护。",
+        "suggestion": "增加输入校验。",
+        "evidence": {
+          "snippet": "return JSON.parse(text)"
+        }
+      }
+    ],
+    "coverage": {
+      "files": [
+        {
+          "path": "src/parse.js",
+          "status": "reviewed"
+        }
+      ]
+    }
+  },
+  "config": {
+    "verify": "blocking"
+  },
+  "verifier": [
+    "timeout"
+  ],
+  "expected": {
+    "ok": true,
+    "kept": [
+      {
+        "ruleId": "COR-001",
+        "verified": "unverified",
+        "evidenceStatus": "ok"
+      }
+    ],
+    "verification": {
+      "checked": 1,
+      "confirmed": 0,
+      "rejected": 0,
+      "unverified": 1
+    },
+    "renderContains": [
+      "结论: 仅报告（1 处未复验/证据不足，需人工确认）",
+      "[未复验] [COR-001]"
+    ]
+  },
+  "name": "verifier-timeout-unverified"
+}

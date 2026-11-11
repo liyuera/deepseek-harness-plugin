@@ -3,6 +3,8 @@
  * `/review` 用 formatJournal 把最近记录渲染成脚注。
  * @module @liyuera/dsh-code-review/host/journal
  */
+import { summarizeRecords } from './ledger.js'
+
 const DOMAIN_NAME = 'code_review'
 const TABLE_NAME = 'reviews'
 const MAX_PER_SESSION = 50
@@ -18,6 +20,8 @@ const pickFinding = (finding) => ({
   ...(finding.fixMode === undefined ? {} : { fixMode: String(finding.fixMode) }),
   ...(finding.verified === undefined ? {} : { verified: String(finding.verified) }),
   ...(finding.evidenceStatus === undefined ? {} : { evidenceStatus: String(finding.evidenceStatus) }),
+  ...(finding.repeats === undefined ? {} : { repeats: Number(finding.repeats) }),
+  ...(finding.firstSeenAt === undefined ? {} : { firstSeenAt: Number(finding.firstSeenAt) }),
 })
 
 const keyOf = (record) => `${record.sessionId}:${record.seq}:${record.startedAt}`
@@ -173,6 +177,8 @@ const RECORD_SCHEMA = (z) => z.object({
     fixMode: z.string().optional(),
     verified: z.string().optional(),
     evidenceStatus: z.string().optional(),
+    repeats: z.number().optional(),
+    firstSeenAt: z.number().optional(),
   })).max(MAX_FINDINGS),
   injected: z.boolean(),
   coverage: z.object({
@@ -218,6 +224,18 @@ export function formatJournal(records, { now = Date.now } = {}) {
   if (!Array.isArray(records) || records.length === 0) return ''
   const timeOf = (value) => new Date(value).toTimeString().slice(0, 5)
   const lines = ['自动审查记录（最近 5 条）:']
+  const summary = summarizeRecords(records)
+  if (summary.completed > 0) {
+    const parts = [`近期: 完成 ${summary.completed}/${summary.total}`]
+    if (summary.findings > 0) parts.push(`findings ${summary.findings}`)
+    const coverageTotal = summary.coverageReviewed + summary.coverageSkipped
+    if (coverageTotal > 0) parts.push(`覆盖 ${summary.coverageReviewed}/${coverageTotal}`)
+    if (summary.verificationChecked > 0) {
+      parts.push(`复验确认 ${summary.verificationConfirmed}/${summary.verificationChecked}`)
+    }
+    if (summary.suppressed > 0) parts.push(`抑制 ${summary.suppressed}`)
+    lines.push(`- ${parts.join(' · ')}`)
+  }
   for (const record of records) {
     const mode = record.mode === 'full' ? '全量' : '单轮'
     let result

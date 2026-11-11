@@ -1,0 +1,84 @@
+{
+  "description": "wontfix 抑制命中后不阻塞、不触发修复，但报告仍可见原因。",
+  "mode": "turn",
+  "files": [
+    {
+      "path": "src/sum.js",
+      "hunks": [
+        {
+          "oldStart": 1,
+          "oldLines": 0,
+          "newStart": 1,
+          "newLines": 5,
+          "lines": [
+            "+export function sum(items) {",
+            "+  return items.reduce((acc, item) => acc + item, 0)",
+            "+}",
+            "+",
+            "+export const MAX = 10"
+          ]
+        }
+      ],
+      "text": "export function sum(items) {\n  return items.reduce((acc, item) => acc + item, 0)\n}\n\nexport const MAX = 10"
+    }
+  ],
+  "reviewer": {
+    "findings": [
+      {
+        "ruleId": "MNT-001",
+        "dimension": "maintainability",
+        "severity": "medium",
+        "location": "src/sum.js:2",
+        "problem": "reduce 参数命名过于抽象。",
+        "suggestion": "改用具名参数。",
+        "evidence": {
+          "snippet": "return items.reduce((acc, item) => acc + item, 0)"
+        }
+      }
+    ],
+    "coverage": {
+      "files": [
+        {
+          "path": "src/sum.js",
+          "status": "reviewed"
+        }
+      ]
+    }
+  },
+  "config": {
+    "verify": "off"
+  },
+  "suppressions": [
+    {
+      "ruleId": "MNT-001",
+      "pathGlob": "src/sum.js",
+      "reason": "wontfix: 该实现来自历史模块，保留现状",
+      "disposition": "wontfix"
+    }
+  ],
+  "expected": {
+    "ok": true,
+    "kept": [],
+    "suppressed": [
+      {
+        "ruleId": "MNT-001",
+        "severity": "medium"
+      }
+    ],
+    "suppressedReasons": [
+      "wontfix: 该实现来自历史模块，保留现状"
+    ],
+    "verification": {
+      "checked": 0,
+      "confirmed": 0,
+      "rejected": 0,
+      "unverified": 0
+    },
+    "renderContains": [
+      "结论: 通过（0 处建议）",
+      "已抑制（人工裁决，不再报告）",
+      "边界:"
+    ]
+  },
+  "name": "suppression-wontfix"
+}

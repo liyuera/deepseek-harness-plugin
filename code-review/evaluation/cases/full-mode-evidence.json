@@ -1,0 +1,46 @@
+{
+  "description": "全量模式用当前文件内容做证据校验（无 hunk），片段命中文件即 ok。",
+  "mode": "full",
+  "files": [
+    {
+      "path": "src/legacy.js",
+      "text": "export function legacy() {\n  const value = 1\n  return value\n}\n"
+    }
+  ],
+  "reviewer": {
+    "findings": [
+      {
+        "ruleId": "MNT-005",
+        "dimension": "maintainability",
+        "severity": "low",
+        "location": "src/legacy.js:2",
+        "problem": "value 仅做透传，属于死代码。",
+        "suggestion": "删除中间变量，直接返回常量。",
+        "evidence": {
+          "snippet": "const value = 1"
+        }
+      }
+    ]
+  },
+  "config": {
+    "verify": "off"
+  },
+  "expected": {
+    "ok": true,
+    "kept": [
+      {
+        "ruleId": "MNT-005",
+        "severity": "low",
+        "evidenceStatus": "ok"
+      }
+    ],
+    "coverage": {
+      "valid": false,
+      "missing": true
+    },
+    "renderContains": [
+      "可维护性/low"
+    ]
+  },
+  "name": "full-mode-evidence"
+}

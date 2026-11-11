@@ -1,0 +1,56 @@
+{
+  "description": "enforce 模式下证据对不上直接丢弃；全部被丢弃视为 invalid-result，不得当成通过。",
+  "mode": "turn",
+  "files": [
+    {
+      "path": "src/merge-settings.js",
+      "hunks": [
+        {
+          "oldStart": 1,
+          "oldLines": 0,
+          "newStart": 1,
+          "newLines": 13,
+          "lines": [
+            "+import fs from 'node:fs'",
+            "+",
+            "+export function mergeSettings(settings, patch) {",
+            "+  const merged = { ...settings }",
+            "+  let extra = []",
+            "+  try {",
+            "+    extra = JSON.parse(patch.extraText)",
+            "+  } catch (err) {",
+            "+    // 解析失败时按空数组处理",
+            "+  }",
+            "+  merged.extra = extra",
+            "+  return merged",
+            "+}"
+          ]
+        }
+      ],
+      "text": "import fs from 'node:fs'\n\nexport function mergeSettings(settings, patch) {\n  const merged = { ...settings }\n  let extra = []\n  try {\n    extra = JSON.parse(patch.extraText)\n  } catch (err) {\n    // 解析失败时按空数组处理\n  }\n  merged.extra = extra\n  return merged\n}"
+    }
+  ],
+  "reviewer": {
+    "findings": [
+      {
+        "ruleId": "COR-001",
+        "dimension": "correctness",
+        "severity": "high",
+        "location": "src/merge-settings.js:8",
+        "problem": "catch 吞掉了 JSON 解析异常。",
+        "suggestion": "让异常向上抛出。",
+        "evidence": {
+          "snippet": "throw new Error('parse failed')"
+        }
+      }
+    ]
+  },
+  "config": {
+    "evidenceMode": "enforce"
+  },
+  "expected": {
+    "ok": false,
+    "reason": "invalid-result"
+  },
+  "name": "fabricated-evidence-enforce-dropped"
+}

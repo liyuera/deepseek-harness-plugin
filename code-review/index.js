@@ -18,6 +18,7 @@ import { createReviewCommand } from './src/host/command.js'
 import { createReviewerGuard } from './src/host/guard.js'
 import { createJournal } from './src/host/journal.js'
 import { createChainStore } from './src/host/chain.js'
+import { annotateRepeats, LEDGER_WINDOW } from './src/host/ledger.js'
 
 export const name = 'code-review'
 export const inject = ['commands', 'subagents', 'workspaceChanges', 'tools', 'agentPresets', 'agents']
@@ -199,7 +200,9 @@ export function apply(ctx, config) {
           verification: { checked: 0, confirmed: 0, rejected: 0, unverified: 0 },
         }
       }
-      const findings = final.findings
+      // 跨轮账本：同一指纹历史已报过就标 repeats，渲染时提示「第 N 次报告」。
+      // journal 在途记录状态为 running，不会被计入历史。
+      const findings = annotateRepeats(final.findings, journal.recent(sessionId, LEDGER_WINDOW))
       // 复验可能耗时较长：期间会话关闭/插件卸载时 journal 已被 cancel，
       // 这里不再把记录回写成 completed，也不回灌。
       if (lifetime.signal.aborted || (generations.get(sessionId) ?? 0) !== meta.generation) {

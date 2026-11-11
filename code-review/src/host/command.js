@@ -5,8 +5,9 @@
 import { collect } from './collect.js'
 import { finalizeFindings } from './finalize.js'
 import { formatJournal } from './journal.js'
+import { annotateRepeats, LEDGER_WINDOW, notObservedFindings } from './ledger.js'
 import { readWorkspaceTexts } from './readfile.js'
-import { renderFindings, renderPass } from './render.js'
+import { renderFindings, renderLedger, renderPass } from './render.js'
 import { buildFullPrompt, buildPrompt, runReview } from './reviewer.js'
 import { composeRules } from './rules.js'
 import { loadSuppressions } from './suppress.js'
@@ -39,9 +40,21 @@ export function createReviewCommand({
         const sessionId = agent.session.id
         const cwd = agent.session?.header?.cwd
         // 自动审查的留痕通过命令输出回看；没有记录时不改变原有输出。
+        // 一次读取账本窗口：脚注固定展示最近 5 条，重复/未再见统计用完整窗口。
+        const journalRecords = journal?.recent?.(sessionId, LEDGER_WINDOW) ?? []
         const withJournal = (text) => {
-          const footer = journal === undefined ? '' : formatJournal(journal.recent(sessionId, 5))
+          const footer = formatJournal(journalRecords.slice(0, 5))
           return footer === '' ? text : `${text}\n\n${footer}`
+        }
+        // 跨轮账本：本轮 findings 标历史重复次数；历史遗留问题连续缺席 2 轮才提示人工确认。
+        const withLedger = (findings, suppressed) => {
+          const annotated = annotateRepeats(findings, journalRecords)
+          const tracked = new Set(
+            [...annotated, ...suppressed.map((entry) => entry.finding ?? entry)]
+              .map((finding) => finding?.fingerprint)
+              .filter((fingerprint) => typeof fingerprint === 'string'),
+          )
+          return { findings: annotated, ledger: renderLedger(notObservedFindings(journalRecords, tracked)) }
         }
         if (isReviewing?.(sessionId)) {
           return { kind: 'error', text: '已有审查在进行中，请稍后再试。' }
@@ -98,8 +111,9 @@ export function createReviewCommand({
             modelOverride: config.modelOverride,
           })
           const scope = { files: chainFiles.length, added: 0, deleted: 0 }
+          const ledger = withLedger(final.findings, final.suppressed)
           const rendered = renderFindings({
-            findings: final.findings,
+            findings: ledger.findings,
             skipped: [],
             blockingSeverities: config.blockingSeverities,
             notifySeverities: config.notifySeverities ?? [],
@@ -115,7 +129,7 @@ export function createReviewCommand({
             : rendered
           return {
             kind: 'success',
-            text: withJournal(verification === '' ? body : `${body}\n${verification}`),
+            text: withJournal([body, verification, ledger.ledger].filter((line) => line !== '').join('\n')),
           }
         }
         const seq = latestSeq(sessionId)
@@ -178,8 +192,9 @@ export function createReviewCommand({
           logger,
           modelOverride: config.modelOverride,
         })
+        const ledger = withLedger(final.findings, final.suppressed)
         const rendered = renderFindings({
-          findings: final.findings,
+          findings: ledger.findings,
           skipped: collected.skipped,
           blockingSeverities: config.blockingSeverities,
           notifySeverities: config.notifySeverities ?? [],
@@ -195,7 +210,7 @@ export function createReviewCommand({
           : rendered
         return {
           kind: 'success',
-          text: withJournal(verification === '' ? body : `${body}\n${verification}`),
+          text: withJournal([body, verification, ledger.ledger].filter((line) => line !== '').join('\n')),
         }
       } catch (error) {
         logger?.warn?.(`[code-review] /review 失败：${error.message}`)

@@ -13,6 +13,9 @@ const DIMENSION_LABEL = Object.freeze({
 /** 严重度排名：数字越小越严重。渲染与截断共用同一份顺序。 */
 export const SEVERITY_RANK = Object.freeze({ high: 0, medium: 1, low: 2, nit: 3 })
 
+/** `/review` 报告固定边界声明：报告不构成合入批准，未审项以覆盖行为准。 */
+export const BOUNDARY_LINE = '边界: 本报告只覆盖本次改动与可读取文件；覆盖缺口见覆盖行，结论不构成合入批准。'
+
 function bySeverity(findings) {
   return [...findings].sort(
     (left, right) => (SEVERITY_RANK[left.severity] ?? Number.MAX_SAFE_INTEGER)
@@ -67,8 +70,12 @@ export function classifyFindings(findings, blockingSeverities, respectFixPolicy 
 function findingLines(finding, label = '') {
   const dimension = DIMENSION_LABEL[finding.dimension] ?? finding.dimension
   const badge = label === '' ? '' : `[${label}] `
+  // 跨轮重复：repeats=1 是首次报告，不打扰；≥2 才标注，提醒「报过但尚未确认修复」。
+  const repeat = Number(finding.repeats) >= 2
+    ? `（第 ${finding.repeats} 次报告，尚未修复）`
+    : ''
   return [
-    `${badge}[${finding.ruleId}] ${dimension}/${finding.severity}  ${finding.location}`,
+    `${badge}[${finding.ruleId}] ${dimension}/${finding.severity}  ${finding.location}${repeat}`,
     `  问题: ${finding.problem}`,
     `  建议: ${finding.suggestion}`,
   ].join('\n')
@@ -155,6 +162,7 @@ export function renderFindings({
     if (coverageText !== undefined) sections.push(coverageText)
     const suppressedText = suppressedLine(suppressed)
     if (suppressedText !== undefined) sections.push(suppressedText)
+    sections.push(BOUNDARY_LINE)
   } else if (coverage !== undefined && coverage !== null && coverage.unaccounted > 0) {
     sections.push(coverageLine(coverage))
   }
@@ -172,5 +180,25 @@ export function renderPass({ summary, skipped = [], coverage }) {
   if (skipped.length > 0) lines.push(`未审: ${skipped.map((item) => `${item.path}（${item.reason}）`).join('、')}`)
   const coverageText = coverageLine(coverage)
   if (coverageText !== undefined) lines.push(coverageText)
+  lines.push(BOUNDARY_LINE)
   return lines.join('\n')
+}
+
+/**
+ * 账本脚注：只列「连续 N 轮未再出现」的历史 finding，供人工确认后移出跟踪。
+ * 不自动关闭、不写回修复状态。
+ * @param {readonly object[]} findings notObservedFindings 的返回值
+ * @returns {string} 无内容时返回空串
+ */
+export function renderLedger(findings) {
+  if (!Array.isArray(findings) || findings.length === 0) return ''
+  const ordered = [...findings].sort(
+    (left, right) => (SEVERITY_RANK[left.severity] ?? Number.MAX_SAFE_INTEGER)
+      - (SEVERITY_RANK[right.severity] ?? Number.MAX_SAFE_INTEGER),
+  )
+  const lines = ordered.map((finding) => (
+    `- [${finding.ruleId}] ${finding.location}`
+    + `（连续 ${finding.missedRuns} 轮未再出现，可人工确认后移出跟踪；不自动关闭）`
+  ))
+  return ['账本（人工裁决，不自动关闭）:', ...lines].join('\n')
 }

@@ -1,0 +1,82 @@
+{
+  "description": "coverage 申报了白名单外路径时整体无效，warn 模式不丢 findings，报告显式说无效。",
+  "mode": "turn",
+  "files": [
+    {
+      "path": "src/sum.js",
+      "hunks": [
+        {
+          "oldStart": 1,
+          "oldLines": 0,
+          "newStart": 1,
+          "newLines": 5,
+          "lines": [
+            "+export function sum(items) {",
+            "+  return items.reduce((acc, item) => acc + item, 0)",
+            "+}",
+            "+",
+            "+export const MAX = 10"
+          ]
+        }
+      ],
+      "text": "export function sum(items) {\n  return items.reduce((acc, item) => acc + item, 0)\n}\n\nexport const MAX = 10"
+    }
+  ],
+  "reviewer": {
+    "findings": [
+      {
+        "ruleId": "COR-001",
+        "dimension": "correctness",
+        "severity": "high",
+        "location": "src/sum.js:2",
+        "problem": "reduce 初值为 0 之外会得到意外结果。",
+        "suggestion": "显式给出初值并处理空数组。",
+        "evidence": {
+          "snippet": "return items.reduce((acc, item) => acc + item, 0)"
+        }
+      }
+    ],
+    "coverage": {
+      "files": [
+        {
+          "path": "src/unknown.js",
+          "status": "reviewed"
+        }
+      ]
+    }
+  },
+  "config": {
+    "verify": "blocking",
+    "coverageMode": "warn"
+  },
+  "verifier": [
+    "confirmed"
+  ],
+  "expected": {
+    "ok": true,
+    "kept": [
+      {
+        "ruleId": "COR-001",
+        "verified": "confirmed"
+      }
+    ],
+    "coverage": {
+      "valid": false,
+      "missing": false,
+      "reviewed": 0,
+      "skipped": 0,
+      "unaccounted": 1
+    },
+    "verification": {
+      "checked": 1,
+      "confirmed": 1,
+      "rejected": 0,
+      "unverified": 0
+    },
+    "renderContains": [
+      "覆盖: 申报无效（按未申报处理）",
+      "边界:"
+    ]
+  },
+  "name": "coverage-invalid-warn"
+}
