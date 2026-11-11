@@ -11,6 +11,8 @@ export const DEFAULTS = Object.freeze({
   maxDiffBytes: 200000,
   reviewerTimeoutMs: 120000,
   asyncReviewerTimeoutMs: 600000,
+  fullReview: true,
+  fullReviewMaxFiles: 20,
   reviewerPreset: 'code-review',
   rulesFile: 'rules/rules.json',
   principlesFile: 'rules/principles.md',
@@ -40,13 +42,14 @@ export function resolveConfig(raw = {}) {
   }
   const merged = { ...DEFAULTS, ...raw }
 
-  for (const field of ['enabled', 'auto']) {
+  for (const field of ['enabled', 'auto', 'fullReview']) {
     if (typeof merged[field] !== 'boolean') throw new Error(`code-review: ${field} must be a boolean`)
   }
   assertPositiveInteger('maxRounds', merged.maxRounds)
   assertPositiveInteger('maxDiffBytes', merged.maxDiffBytes)
   assertPositiveInteger('reviewerTimeoutMs', merged.reviewerTimeoutMs)
   assertPositiveInteger('asyncReviewerTimeoutMs', merged.asyncReviewerTimeoutMs)
+  assertPositiveInteger('fullReviewMaxFiles', merged.fullReviewMaxFiles)
 
   if (!Array.isArray(merged.blockingSeverities) || merged.blockingSeverities.length === 0) {
     throw new Error('code-review: blockingSeverities must be a non-empty array')
@@ -101,6 +104,8 @@ export function resolveConfig(raw = {}) {
     maxDiffBytes: merged.maxDiffBytes,
     reviewerTimeoutMs: merged.reviewerTimeoutMs,
     asyncReviewerTimeoutMs: merged.asyncReviewerTimeoutMs,
+    fullReview: merged.fullReview,
+    fullReviewMaxFiles: merged.fullReviewMaxFiles,
     reviewerPreset: merged.reviewerPreset,
     rulesFile: merged.rulesFile,
     principlesFile: merged.principlesFile,

@@ -67,6 +67,42 @@ export function buildPrompt({ rulesPrompt, files, skipped }) {
   ].join('\n')
 }
 
+/**
+ * 链级全量审查 prompt：不塞逐轮 diff，要求审查者读文件当前内容。
+ * 文件同样一律渲染 `path`，保证 findings 的 location 能通过 path 白名单。
+ *
+ * @param {{rulesPrompt: string, files: readonly {path:string, turns:number[], added:number, deleted:number}[], knownFindings?: readonly object[]}} input
+ * @returns {string}
+ */
+export function buildFullPrompt({ rulesPrompt, files, knownFindings = [] }) {
+  const lines = [
+    '## 本轮任务：链级全量复审',
+    `本条链共改动 ${files.length} 个文件。请用只读工具（read / glob / grep）读取这些文件的**当前内容**，以整体视角审查跨文件、跨轮次的问题：交互失败是否有反馈、挂载/解绑副作用是否成对、写入的状态是否还原、跨文件契约是否一致。不要只看局部 diff。`,
+    '',
+    '## 审查规则',
+    rulesPrompt,
+    '',
+    '## 链内触达文件',
+    ...files.map((file) => `- ${file.path}（第 ${file.turns.join('、')} 轮，+${file.added} / -${file.deleted}）`),
+  ]
+  if (knownFindings.length > 0) {
+    lines.push('', '## 本链已报告过的问题（不要重复报告）')
+    lines.push(
+      ...knownFindings
+        .slice(0, 20)
+        .map((finding) => `- [${finding.ruleId}] ${finding.location} ${finding.problem}`),
+    )
+  }
+  lines.push(
+    '',
+    '## 输出要求',
+    '只返回 JSON：必须调用 `structured_output` 工具提交结果，参数形状为 {"findings":[{"ruleId","dimension","severity","location","problem","suggestion"}]}；不要在最终文本里输出 JSON。',
+    'ruleId 必须是上文硬规则里的 id，长尾问题用 PRINCIPLE-<dimension>；location 必须是 `路径:行号`（或 `路径:起-止`），路径取上文文件清单里的路径。',
+    '只报确有把握的问题，证据不足不报；没有问题时返回 {"findings":[]}。不要修改任何文件。',
+  )
+  return lines.join('\n')
+}
+
 function normalizeFinding(finding, allowedRuleIds, allowedPaths, ruleSeverities) {
   if (typeof finding !== 'object' || finding === null) return undefined
   const { ruleId, dimension, severity, location, problem, suggestion } = finding

@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { buildPrompt, runReview, startReview, REVIEW_SCHEMA } from '../src/host/reviewer.js'
+import { buildFullPrompt, buildPrompt, runReview, startReview, REVIEW_SCHEMA } from '../src/host/reviewer.js'
 
 const files = [{ path: 'src/a.ts', display: 'src/a.ts', text: '@@ -1,1 +1,1 @@\n-a\n+b', added: 1, deleted: 1 }]
 
@@ -11,6 +11,22 @@ test('buildPrompt 带变更清单与 diff', () => {
   assert.match(prompt, /@@ -1,1 \+1,1 @@/)
   assert.match(prompt, /x\.png（binary）/)
   assert.match(prompt, /只返回 JSON/)
+  assert.match(prompt, /structured_output/)
+})
+
+test('buildFullPrompt 列出链内文件与已报问题，并要求读当前内容', () => {
+  const prompt = buildFullPrompt({
+    rulesPrompt: '### MNT-004 · maintainability · low · 注释一致',
+    files: [
+      { path: 'src/a.ts', display: 'src/a.ts', turns: [1, 2], added: 3, deleted: 1 },
+      { path: 'src/b.ts', display: 'src/b.ts', turns: [3], added: 1, deleted: 0 },
+    ],
+    knownFindings: [{ ruleId: 'MNT-004', location: 'src/a.ts:3', problem: '注释与代码不一致' }],
+  })
+  assert.match(prompt, /链级全量复审/)
+  assert.match(prompt, /src\/a\.ts（第 1、2 轮，\+3 \/ -1）/)
+  assert.match(prompt, /已报告过的问题/)
+  assert.match(prompt, /MNT-004/)
   assert.match(prompt, /structured_output/)
 })
 

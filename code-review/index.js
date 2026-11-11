@@ -5,15 +5,16 @@
 import { dirname, isAbsolute, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { resolveConfig } from './src/host/config.js'
-import { collect, fingerprint } from './src/host/collect.js'
+import { collect, fingerprint, isCodeFile } from './src/host/collect.js'
 import { composeRules, loadRulesResilient } from './src/host/rules.js'
 import { partition, renderFindings } from './src/host/render.js'
-import { buildPrompt, startReview } from './src/host/reviewer.js'
+import { buildFullPrompt, buildPrompt, startReview } from './src/host/reviewer.js'
 import { shouldReview } from './src/host/trigger.js'
 import { createTracker } from './src/host/loop.js'
 import { createReviewCommand } from './src/host/command.js'
 import { createReviewerGuard } from './src/host/guard.js'
 import { createJournal } from './src/host/journal.js'
+import { createChainStore } from './src/host/chain.js'
 
 export const name = 'code-review'
 export const inject = ['commands', 'subagents', 'workspaceChanges', 'tools', 'agentPresets', 'agents']
@@ -43,6 +44,11 @@ export function apply(ctx, config) {
   ctx.tools.guard(createReviewerGuard(resolved.reviewerPreset))
   const tracker = createTracker()
   const journal = createJournal({ ctx, logger: ctx.logger })
+  const chain = createChainStore({ maxFiles: resolved.fullReviewMaxFiles })
+  /** 已宣告但尚未并入链的 workspace/changes：`sessionId` → [{seq, epoch, turn}]。 */
+  const pendingChanges = new Map()
+  /** 本链最近一次成功审查的 findings（全量复审去重用）：`sessionId` → findings。 */
+  const lastFindings = new Map()
   /** 在途审查的 journal key：sessionId → key，结算/取消后删除。 */
   const journalKeys = new Map()
   const latestSeq = new Map()
@@ -98,6 +104,8 @@ export function apply(ctx, config) {
       logger: ctx.logger,
       latestSeq: (sessionId) => latestSeq.get(sessionId),
       isReviewing: (sessionId) => tracker.isReviewing(sessionId),
+      chain,
+      tracker,
       journal,
     }))
   } catch (error) {
@@ -152,9 +160,13 @@ export function apply(ctx, config) {
 
       tracker.recordSuccess(sessionId)
       // 只有成功审查才写指纹（失败/取消允许同一份 diff 重试）；人类消息可能在
-      // 审查在途时重置了链，旧链结果不得污染新链的去重指纹。
+      // 审查在途时重置了链，旧链结果不得污染新链的去重指纹/全量状态/已报问题。
       const sameChain = meta.epoch === tracker.epochOf(sessionId)
-      if (sameChain) lastFingerprint.set(sessionId, meta.hash)
+      if (sameChain) {
+        lastFingerprint.set(sessionId, meta.hash)
+        if (meta.fullRound) chain.markFull(sessionId, meta.epoch)
+        lastFindings.set(sessionId, outcome.findings.slice(0, 20))
+      }
       const elapsed = Date.now() - meta.startedAt
       const totalFiles = meta.summary.total ?? meta.summary.files.length
       ctx.logger.debug?.(
@@ -235,12 +247,18 @@ export function apply(ctx, config) {
   ctx.on('session/event', (session, event) => {
     if (event?.type === 'workspace/changes') {
       latestSeq.set(session.id, event.seq)
+      // 先排队，等 turn-stopping 时再统一读 summary 观察：事件可能早于摘要落库，
+      // 且同一条链里多轮变更要按各自 seq 逐条并入。
+      const queue = pendingChanges.get(session.id) ?? []
+      queue.push({ seq: event.seq, epoch: tracker.epochOf(session.id), turn: event.data?.turn })
+      pendingChanges.set(session.id, queue)
       return
     }
     // 只有人类消息开启新链；插件注入的 followup 是 plugin 来源，不得重置。
     if (event?.type === 'user/message' && event.data?.source?.kind === 'user') {
       tracker.resetRounds(session.id)
       lastFingerprint.delete(session.id)
+      lastFindings.delete(session.id)
     }
   })
 
@@ -261,11 +279,41 @@ export function apply(ctx, config) {
     starting.delete(session.id)
     latestSeq.delete(session.id)
     lastFingerprint.delete(session.id)
+    pendingChanges.delete(session.id)
+    lastFindings.delete(session.id)
+    chain.forget(session.id)
     tracker.forget(session.id)
   })
 
   ctx.on('agent/turn-stopping', async ({ agent, turn, signal }) => {
     const sessionId = agent.session.id
+    // 先把此前宣告的 workspace/changes 并入链。摘要可能尚未落库或形状不对：
+    // 一律跳过，不把 turn 变成错误。人类消息已换链的旧 epoch 队列直接丢弃，
+    // 否则 chain.observe 会用旧 epoch 覆盖新链状态。
+    const flushChain = () => {
+      const queue = pendingChanges.get(sessionId) ?? []
+      pendingChanges.delete(sessionId)
+      const epoch = tracker.epochOf(sessionId)
+      for (const item of queue) {
+        if (item.epoch !== epoch) continue
+        let queued
+        try {
+          queued = ctx.workspaceChanges.summary(sessionId, item.seq)
+        } catch {
+          continue
+        }
+        if (queued === undefined || !Array.isArray(queued.files)) continue
+        chain.observe(
+          sessionId,
+          item.epoch,
+          item.seq,
+          queued.turn,
+          queued.files,
+          (path) => isCodeFile(path, resolved.codeExtensions),
+        )
+      }
+    }
+    flushChain()
     const generation = generations.get(sessionId) ?? 0
     const seq = latestSeq.get(sessionId)
     const decision = shouldReview({
@@ -343,13 +391,19 @@ export function apply(ctx, config) {
     const rounds = tracker.roundsOf(sessionId)
     // 链身份在 begin 后固化：人类消息可能在本审查在途时重置链。
     const epoch = tracker.epochOf(sessionId)
-    // Task 6 改为 fullRound ? 'full' : 'turn'；本任务先固定为单轮。
+    // 末轮全量：链内触达文件多于本轮取材结果时才值得全量复审；每条链只做一次。
+    const chainFiles = chain.filesOf(sessionId, epoch)
+    const fullRound = resolved.fullReview
+      && rounds >= resolved.maxRounds
+      && chainFiles.length > collected.files.length
+      && !chain.isFull(sessionId, epoch)
+    const filesForReview = fullRound ? chainFiles : collected.files
     const journalKey = journal.start({
       sessionId,
       turn: summary.turn,
       seq,
-      mode: 'turn',
-      files: collected.files.length,
+      mode: fullRound ? 'full' : 'turn',
+      files: filesForReview.length,
     })
     journalKeys.set(sessionId, journalKey)
 
@@ -361,23 +415,30 @@ export function apply(ctx, config) {
     let startupTimer
     try {
       const loaded = await getRules()
-      // 规则表、白名单、severity 权威表都按本次实际取材的变更文件过滤。
-      const composed = composeRules({ ...loaded, filePaths: collected.files.map((file) => file.path) })
+      // 规则表、白名单、severity 权威表都按本次实际送审的文件过滤。
+      const composed = composeRules({ ...loaded, filePaths: filesForReview.map((file) => file.path) })
       // 总预算从 handler 开始计：取材/读规则花掉的时间会挤占启动与审查的时间。
       const budget = Math.max(1, resolved.asyncReviewerTimeoutMs - (Date.now() - startedAt))
       const startupTimedOut = Symbol('startup-timeout')
       const deadline = new Promise((resolve) => {
         startupTimer = setTimeout(() => resolve(startupTimedOut), budget)
       })
+      const prompt = fullRound
+        ? buildFullPrompt({
+            rulesPrompt: composed.prompt,
+            files: filesForReview,
+            knownFindings: lastFindings.get(sessionId) ?? [],
+          })
+        : buildPrompt({ rulesPrompt: composed.prompt, files: collected.files, skipped: collected.skipped })
       const startup = startReview({
         subagents: ctx.subagents,
         agent,
         preset: resolved.reviewerPreset,
-        prompt: buildPrompt({ rulesPrompt: composed.prompt, files: collected.files, skipped: collected.skipped }),
+        prompt,
         signal: control.signal,
         modelOverride: resolved.modelOverride,
         allowedRuleIds: composed.allowedRuleIds,
-        allowedPaths: new Set(collected.files.map((file) => file.path)),
+        allowedPaths: new Set(filesForReview.map((file) => file.path)),
         ruleSeverities: composed.ruleSeverities,
         logger: ctx.logger,
       })
@@ -433,7 +494,7 @@ export function apply(ctx, config) {
     // 启动花掉的时间从总预算里扣，保证「启动 + 审查」不超过 asyncReviewerTimeoutMs。
     const reviewBudget = Math.max(1, resolved.asyncReviewerTimeoutMs - (Date.now() - startedAt))
     const timer = setTimeout(() => handle.cancel('timeout'), reviewBudget)
-    const meta = { agent, summary, collected, hash, rounds, epoch, journalKey, startedAt, timer }
+    const meta = { agent, summary, collected, hash, rounds, epoch, fullRound, journalKey, startedAt, timer }
 
     // 后台结算：handler 到这里就返回，不等待审查结果。
     void handle.result

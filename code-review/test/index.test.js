@@ -150,7 +150,13 @@ function createHarness(config = {}, options = {}) {
     added = 1,
     deleted = 0,
   }) => {
-    state.summaries.set(`${sessionId}:${seq}`, { turn, files, total, added, deleted })
+    // 真实服务在 summary.files[] 上带每文件行数；补齐默认值，链级累积才有 +N/-N。
+    const normalized = files.map((file) => ({
+      ...file,
+      ...(file.added === undefined ? { added } : {}),
+      ...(file.deleted === undefined ? { deleted } : {}),
+    }))
+    state.summaries.set(`${sessionId}:${seq}`, { turn, files: normalized, total, added, deleted })
   }
 
   const markChanges = (seq, sessionId = 's1') =>
@@ -362,6 +368,57 @@ test('链预算：maxRounds=2 只发起两次，第二次注入末轮文案，�
   assert.equal(harness.state.starts.length, 2, '链预算用尽后不应再发起')
   assert.equal(harness.state.follows.length, 2)
   assert.ok(debugHas(harness.state, 'rounds-exhausted'))
+})
+
+test('maxRounds=2：最后一轮自动切链级全量审查，prompt 含链内文件', async () => {
+  const harness = createHarness({ maxRounds: 2 })
+  const agent = makeAgent(harness)
+
+  // 第 1 轮：改 a.js（finding 必须落在 a.js，才会被记入已报问题）
+  await harness.stop(agent, { seq: 7, turn: 1, diff: '+const a = 1', files: [{ path: 'a.js', display: 'a.js' }] })
+  harness.resolveNext(completed([{ ...FINDING, location: 'a.js:1' }]))
+  await tick()
+
+  // 第 2 轮：只改 b.js；链内已有 a.js（2 个文件 > 本轮 1 个），rounds=2 为最后一轮 → full
+  await harness.stop(agent, { seq: 8, turn: 2, diff: '+const b = 2', files: [{ path: 'b.js', display: 'b.js' }] })
+
+  const prompt = startedPrompt(harness, 1)
+  try {
+    assert.match(prompt, /链级全量复审/)
+    assert.match(prompt, /a\.js（第 1 轮，\+1 \/ -0）/)
+    assert.match(prompt, /b\.js（第 2 轮，\+1 \/ -0）/)
+    // 第 1 轮的 finding 应作为「已报告过的问题」带入全量 prompt，避免重复报告。
+    assert.match(prompt, /已报告过的问题/)
+    assert.match(prompt, /- \[COR-001\] a\.js:1 /)
+  } finally {
+    harness.resolveNext(completed([]))
+    await tick()
+  }
+
+  // 留痕 mode 也应按全量记录，供 /review 脚注回看。
+  const foot = await reviewFoot(harness, agent, [])
+  assert.equal(foot.kind, 'success')
+  assert.match(foot.text, /· 全量 ·/)
+})
+
+test('fullReview=false：末轮不切全量，仍审本轮 diff', async () => {
+  const harness = createHarness({ maxRounds: 2, fullReview: false })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, { seq: 7, turn: 1, diff: '+const a = 1', files: [{ path: 'a.js', display: 'a.js' }] })
+  harness.resolveNext(completed([]))
+  await tick()
+
+  await harness.stop(agent, { seq: 8, turn: 2, diff: '+const b = 2', files: [{ path: 'b.js', display: 'b.js' }] })
+
+  const prompt = startedPrompt(harness, 1)
+  try {
+    assert.doesNotMatch(prompt, /链级全量复审/)
+    assert.match(prompt, /@@ -1,1 \+1,1 @@/, '关闭全量后仍应带本轮 diff')
+  } finally {
+    harness.resolveNext(completed([]))
+    await tick()
+  }
 })
 
 test('人类消息重置链：轮次与指纹一起清空，同 diff 可再发起', async () => {

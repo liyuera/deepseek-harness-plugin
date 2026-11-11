@@ -58,6 +58,17 @@ test('asyncReviewerTimeoutMs 覆盖值生效且保持冻结', () => {
   assert.ok(Object.isFrozen(config))
 })
 
+test('fullReview 配置默认与校验', () => {
+  const config = resolveConfig()
+  assert.equal(config.fullReview, true)
+  assert.equal(config.fullReviewMaxFiles, 20)
+  assert.throws(() => resolveConfig({ fullReview: 'yes' }), /fullReview must be a boolean/)
+  assert.throws(() => resolveConfig({ fullReviewMaxFiles: 0 }), /fullReviewMaxFiles must be a positive integer/)
+  assert.throws(() => resolveConfig({ fullReviewMaxFiles: 1.5 }), /fullReviewMaxFiles must be a positive integer/)
+  assert.equal(resolveConfig({ fullReview: false, fullReviewMaxFiles: 5 }).fullReview, false)
+  assert.equal(resolveConfig({ fullReviewMaxFiles: 5 }).fullReviewMaxFiles, 5)
+})
+
 test('未知键拒绝启动', () => {
   assert.throws(() => resolveConfig({ nope: 1 }), /unknown config key "nope"/)
 })

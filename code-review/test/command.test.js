@@ -105,6 +105,9 @@ function createCommand(overrides = {}) {
     },
     latestSeq: () => 7,
     isReviewing: () => false,
+    tracker: { epochOf: () => 1 },
+    chain: { filesOf: () => [{ path: 'a.js', turns: [1], added: 1, deleted: 0 }] },
+    journal: undefined,
     ...overrides.deps,
   })
 
@@ -407,4 +410,24 @@ test('/review 无 journal 或无记录时输出保持不变', async () => {
   const empty = createCommand({ deps: { journal: { recent: () => [] } } })
   const emptyResult = await empty.command.handler({ agent, signal: signal() })
   assert.equal(emptyResult.text, plainResult.text, '无记录时不得追加空脚注')
+})
+
+// —— 全量审查（--full） ——
+
+test('/review --full 用链内文件集合发起全量审查并输出报告', async () => {
+  const harness = createCommand()
+  const result = await harness.command.handler({ agent, rawInput: '--full', signal: signal() })
+
+  assert.equal(result.kind, 'success')
+  assert.equal(harness.state.starts, 1)
+  assert.match(harness.state.requests[0].request.prompt[0].text, /链级全量复审/)
+  assert.match(result.text, /结论/)
+})
+
+test('/review --full 在链内无文件时直接返回错误，不启动 reviewer', async () => {
+  const harness = createCommand({ deps: { chain: { filesOf: () => [] } } })
+  const result = await harness.command.handler({ agent, rawInput: '--full', signal: signal() })
+
+  assert.deepEqual(result, { kind: 'error', text: '本条链没有可审查的改动。' })
+  assert.equal(harness.state.starts, 0)
 })
