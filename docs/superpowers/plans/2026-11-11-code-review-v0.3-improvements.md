@@ -1233,3 +1233,14 @@ git commit -m "chore(code-review): 0.3.0 版本与文档（留痕/全量审查/b
 - [ ] 类型/命名一致：`filesOf(sessionId, epoch)`、`markFull/isFull(sessionId, epoch)`、`createJournalCore/createJournal/formatJournal`、`buildFullPrompt({rulesPrompt, files, knownFindings})`、journal 记录字段在全计划中一致。
 - [ ] 默认值一致：`fullReview: true`、`fullReviewMaxFiles: 20`、`notifySeverities` 不变、`blockingSeverities` 不变。
 - [ ] 每个任务以「全量测试 + commit」收尾；回归任务记录最终测试数。
+
+---
+
+## 执行偏差记录（施工时回填）
+
+- **Task 2（general-issues）**：计划测试片段省略了 `dirname/join`、`fileURLToPath`、`loadRulesResilient`、`composeRules` 的 import 与 `PACKAGE_ROOT` 常量，按 `command.test.js` 约定补齐；规则 JSON 与原则文案与计划逐字一致。提交 `81fad5e`。
+- **Task 3（journal）**：计划代码与计划测试有 3 处矛盾，按测试语义修正实现——`start()` 透传显式 `startedAt`；`recent()` 改为「最近活动时间」倒序（已结算按 `finishedAt`、在途按 `startedAt`），并合并内存与存储记录、按 key 去重（内存覆盖存储），保证写失败/半降级时不丢历史。提交 `6aa781f`。
+- **Task 3 补丁**：本会话的 code-review 插件自身审查到 journal.js 两处单行 `if/for` 缺大括号（MNT-016/CR-006.05 低严重度建议），已采纳并复测（5/5）。
+- **Task 5（chain）**：`maxFiles` 裁剪在 `lastSeq` 并列时，计划实现会保留旧文件而测试要求保留最近观察的文件；实现增加内部 `touch/order` 计数做 tie-break，`filesOf` 输出仍不含 `order`。提交 `1f6241b`。
+
+执行方式：Subagent-Driven（每个任务一个独立执行者，只改各自文件范围、不提交；Lead 验收后统一 commit）。
