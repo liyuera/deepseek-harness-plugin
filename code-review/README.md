@@ -22,7 +22,7 @@ DSH 会话运行时的「AI 生成代码自动审查」：主代理改完代码�
 
 1. **触发**：宿主在 `agent/turn-stopping` 事件上调用门禁。
 2. **门禁**（`src/host/trigger.js`，顺序短路）：`enabled` → `auto` → 来源不是 `subagent` → 当前没有同一会话的审查在跑 → 本链轮数未达 `maxRounds` → 本轮有 workspace 变更 → 熔断未打开。全部通过后再确认摘要属于本 turn 且确实有文件；取材后发现没有可审文件、或内容指纹与链内上一次成功审查相同，直接跳过（**不消耗轮次**）。
-3. **取材**（`src/host/collect.js`）：只取后缀在 `codeExtensions` 里的源文件；把 hunk 渲染成 unified diff，按 UTF-8 字节数累计，超过 `maxDiffBytes` 后剩余文件标记 `budget` 跳过。二进制、超大、服务读不到、以及 diff 超时退化成整文件替换（`coarse`）的文件都记入 `skipped`，不会猜内容。
+3. **取材与规则过滤**（`src/host/collect.js` + `src/host/scope.js`）：只取后缀在 `codeExtensions` 里的源文件；把 hunk 渲染成 unified diff，按 UTF-8 字节数累计，超过 `maxDiffBytes` 后剩余文件标记 `budget` 跳过。二进制、超大、服务读不到、以及 diff 超时退化成整文件替换（`coarse`）的文件都记入 `skipped`，不会猜内容。取材完成后，按**本次实际变更的文件**过滤规则：带 `scope`（扩展名/路径 glob）的规则只对该类文件生效，没命中的规则不会进 prompt、也不允许被 finding 引用。
 4. **后台审查**（`src/host/reviewer.js`）：`startReview` 经 `ctx.subagents.startActivation`（`delivery:'caller'`）在独立子代理里跑 `reviewerPreset`（默认 `code-review`），带结构化输出 schema；**拿到子代理句柄后立即返回**，不等待审查结果，当前 turn 正常结束。注意启动 `startActivation` 仍在 turn-stopping 的同步段里：启动受同一个 `asyncReviewerTimeoutMs` 总预算约束（超出即有界放弃并记失败，不会无限挂住 turn）；审查跑起来之后的取消信号来自插件生命周期，不随 turn 结束而中断。`asyncReviewerTimeoutMs` 默认 10 分钟。
 5. **结算与回灌**（`index.js` + `src/host/render.js`）：审查结果回来后校验/渲染；只有 `severity` 落在 `blockingSeverities` 的 findings 才生成 `结论: 需修改...`，用 `agent.followup()` 以**插件来源消息**注入，开一个新 turn 让主代理修复。只有 low/nit 或完全干净时**静默**（v2 不再注入「结论: 通过」）。最后一轮（`rounds >= maxRounds`）的文案改为「已达到自动复审上限，修完不会再自动复审，请人工确认」。
 6. **轮次与防循环**：一条**人类消息**开启一条「链」，链内最多自动审查 `maxRounds` 次（默认 2：首审 + 修复后复审）。链在以下约束下终止：人类消息重置链；同链内同一份 diff（内容指纹）只审一次且不占轮；单会话同时只有一个在途审查；插件注入的消息是 `plugin` 来源，**不会**重置链。失败路径由熔断兜底。
@@ -78,6 +78,7 @@ dsh plugin --profile desktop remove @liyuera/dsh-code-review
 | `asyncReviewerTimeoutMs` | `600000` | **后台自动审查**的安全上限：超过即取消审查者并记一次失败（触发熔断计数）。异步审查不阻塞对话，所以给得比较宽。 |
 | `reviewerTimeoutMs` | `120000` | **`/review` 手动审查**的等待上限（人坐在那里等，不能无限等）。超时按失败处理。 |
 | `reviewerPreset` | `"code-review"` | 审查者使用的 preset id。见下节「preset 冲突与降级」。 |
+| `rulePacks` | `[]` | 额外规则包（JSON 路径数组，相对包根或绝对路径）。团队/语言/框架规范放这里，默认不启用；某个包加载失败只警告并跳过，不影响基础规则。见下节「规则作用域与规则包」。 |
 | `rulesFile` | `"rules/rules.json"` | 硬规则文件，相对包根目录。 |
 | `principlesFile` | `"rules/principles.md"` | 原则文件，相对包根目录。 |
 | `modelOverride` | 无默认 | 形如 `{ provider, model }`，覆盖审查者模型；省略则沿用主会话。只给其一视为配置非法。 |
@@ -134,6 +135,21 @@ dsh plugin --profile desktop remove @liyuera/dsh-code-review
 
 规则文件在**每轮审查前**从包目录读盘，不缓存：改完下一轮审查即生效，不用重建、重启或重载插件。规则文件加载失败时，插件降级为只用原则层并记一条警告（每进程只记一次），不阻塞会话；原则文件本身读不到则本次审查失败（仍按 fail-open 处理）。
 
+### 规则作用域与规则包
+
+规则分三层：**维度**（正确性/安全/性能/可维护性，跨语言通用）、**检查项**（分语言/框架/领域）、**团队约定**（命名/风格/工程规范）。后两层通过两种机制挂进来：
+
+- **`scope`（作用域）**：规则条目可选 `scope: { extensions?: [".tsx"], globs?: ["**/services/**"] }`；命中本次变更的任一文件才生效（extensions 与 globs 之间是 OR）。无 `scope` 的规则对所有代码文件生效。这样同一个 monorepo 里 `.tsx` 走 React 规则、`.less` 走 CSS 规则、`services/**` 走接口契约规则，互不误报。
+- **`rulePacks`（规则包）**：团队/项目规范放独立 JSON 文件，例如内置的 `rules/packs/frontend-smartui.json`（18 条，源自 SmartUI 前端团队规范，带 `sourceId: "CR-xxx"` 便于对账）。默认不启用，按需在 profile 配置：
+
+  ```yaml
+  - id: code-review
+    config:
+      rulePacks: ["rules/packs/frontend-smartui.json"]
+  ```
+
+  包加载失败（缺失/坏 JSON/校验失败/规则 id 冲突）只警告并跳过该包，基础 24 条不受影响。规则包里可以用 `sourceId` 保留团队编号，审查 prompt 和 `/review` 报告会渲染成 `[CR-011.01]` 这样的标签。
+
 ## 已知限制
 
 - **审查是异步的**：当前回复**不会**等审查（v1 会阻塞 turn 结束）。结论在审查跑完后以一条插件消息 `followup` 成新 turn 回灌，主代理会自动继续修复；从「回复结束」到「审查结论到达」通常要 1~2 分钟（取决于审查者速度）。
@@ -143,7 +159,7 @@ dsh plugin --profile desktop remove @liyuera/dsh-code-review
 - **fail-open 是静默的**：启动失败、超时、坏输出只写宿主日志（debug/warn 级，含失败原因分类），不会告诉用户，也不阻塞主代理；需要可见结果时用 `/review`。
 - **同一链的同一份 diff 只审一次**：`workspace-changes` 每个 turn-stopping 都会用新 seq 重新宣告同一份未变 diff，插件按 `path + 渲染文本` 的内容指纹去重——重复的 stopping 跳过且不消耗轮次；只有 diff 真的变了才会复审。
 - **最后一轮不再承诺复审**：达到 `maxRounds` 的那次注入文案是「本轮已达到自动复审上限，修完不会再自动复审，请人工确认」。
-- **只审本 turn 的 workspace 变更**：不含历史提交、未变更文件或其它分支；`workspaceChanges` 缺失时插件根本不加载，没有 `git diff` 回退。
+- **只审本 turn 的 workspace 变更**：不含历史提交、未变更文件或其它分支；`workspaceChanges` 缺失时插件根本不加载，没有 `git diff` 回退。作用域规则也只看**本次变更文件**，未改动的目录/文件名看不到。
 - **取材有上限**：二进制/超大/服务读不到/比较超时（`coarse`）的文件跳过；超过 `maxDiffBytes` 后的剩余文件不再审。报告（含通过路径）里的 `未审:` 行会列出原因（`budget`/`not-code`/`binary` 等内部标识）。
 - **不碰 GitLab**：不复用 GitLab 审查模板，不建 MR、不 push、不评论；与 bug-workflow 的 MR 审查是两套独立机制。
 - **审查者是独立子代理**：绝不自我审查；`origin: subagent` 的会话不会再触发自动审查，避免递归。
