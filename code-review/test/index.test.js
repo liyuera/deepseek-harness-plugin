@@ -240,7 +240,7 @@ test('inject 声明 agents 与 agentPresets', () => {
   assert.ok(inject.includes('agentPresets'), `inject=${inject.join(',')}`)
 })
 
-test('turn-stopping 立即返回：不等待审查结果、不注入', async () => {
+test('turn-stopping 未等 activation.result 就返回：pending 仍在等待、不注入', async () => {
   const harness = createHarness({ maxRounds: 2 })
   const agent = makeAgent(harness)
   const turnSignal = signal()
@@ -248,15 +248,40 @@ test('turn-stopping 立即返回：不等待审查结果、不注入', async () 
   await harness.stop(agent, { seq: 7, turn: 1, signal: turnSignal })
 
   assert.equal(harness.state.starts.length, 1)
+  // activation.result 仍未结算，handler 却已返回：这就是异步发起。
   assert.equal(harness.state.pending.length, 1, '结果应仍在等待，证明没有阻塞')
   assert.equal(harness.state.follows.length, 0)
   assert.equal(harness.state.steers.length, 0)
   assert.equal(harness.state.starts[0].delivery, 'caller')
-  // 后台审查必须挂在插件生命周期信号上，而不是 turn 信号。
+  // 后台审查必须独立于 turn 信号（挂在 startReview 自己的控制信号上）。
   assert.notEqual(harness.state.starts[0].signal, turnSignal)
   assert.equal(harness.state.starts[0].signal.aborted, false)
 
   harness.resolveNext(completed())
+  await tick()
+})
+
+test('启动 deadline：startActivation 永不返回时 handler 在总预算内返回并记失败', async () => {
+  const harness = createHarness({ maxRounds: 2, asyncReviewerTimeoutMs: 20 })
+  const agent = makeAgent(harness)
+  harness.state.startGate = new Promise(() => {})
+
+  const startedAt = Date.now()
+  await harness.stop(agent, { seq: 7, turn: 1 })
+  const elapsed = Date.now() - startedAt
+
+  assert.ok(elapsed < 100, `handler 应在启动预算内返回，实际 ${elapsed}ms`)
+  assert.equal(harness.state.pending.length, 0, '未拿到 activation，不应有在途句柄')
+  assert.equal(harness.state.follows.length, 0)
+  assert.ok(debugHas(harness.state, 'start timeout'), '应记录启动超时')
+  assert.ok(debugHas(harness.state, 'review failed'), '启动超时应计一次失败')
+
+  // 超时释放了锁与轮次：下一次仍能发起（maxRounds=2，若未释放轮次也还有一次）。
+  harness.state.startGate = undefined
+  await harness.stop(agent, { seq: 8, turn: 2, diff: '+const a = 2' })
+  assert.equal(harness.state.starts.length, 2, '启动超时后不得留下 reviewing 锁')
+
+  harness.resolveNext(completed([]))
   await tick()
 })
 
@@ -343,6 +368,38 @@ test('人类消息重置链：轮次与指纹一起清空，同 diff 可再发�
   await tick()
 })
 
+test('在途审查跨人类重置：结算按当前链口径，旧链结果不写新链指纹', async () => {
+  const harness = createHarness({ maxRounds: 2 })
+  const agent = makeAgent(harness)
+
+  // 先把链推进到第二次审查（rounds=2，即旧口径下的末轮）。
+  await harness.stop(agent, { seq: 7, turn: 1, diff: '+const a = 1' })
+  harness.resolveNext(completed([FINDING]))
+  await tick()
+
+  await harness.stop(agent, { seq: 8, turn: 2, diff: '+const a = 2' })
+  assert.equal(harness.state.starts.length, 2)
+  assert.equal(harness.state.pending.length, 2)
+
+  // 审查在途时人类发消息：轮次归零、epoch +1、指纹清空。
+  await harness.userMessage({ source: { kind: 'user' } })
+
+  // 旧链的结果照常回灌，但文案必须按新链（rounds=0）判断，不能再说不会再复审。
+  harness.resolveNext(completed([FINDING]))
+  await tick()
+  assert.equal(harness.state.follows.length, 2, '两次审查各回灌一次')
+  assert.match(followText(harness.state, 1), /修完会再复审一次/)
+  assert.doesNotMatch(followText(harness.state, 1), /不会再自动复审/)
+
+  // 旧链结果不得写指纹：同一份 diff 再 stopping 应能重新发起。
+  await harness.stop(agent, { seq: 9, turn: 3, diff: '+const a = 2' })
+  assert.equal(harness.state.starts.length, 3, '旧链结果不得污染新链去重')
+  assert.equal(debugHas(harness.state, 'duplicate-diff'), false)
+
+  harness.resolveNext(completed([]))
+  await tick()
+})
+
 test('非人类来源消息不重置链，杜绝自激循环', async () => {
   const harness = createHarness({ maxRounds: 1 })
   const agent = makeAgent(harness)
@@ -416,6 +473,29 @@ test('agent 已关闭：成功结果被丢弃，不 followup、不抛错', async
   assert.equal(warnHas(harness.state, '连续失败'), false)
 })
 
+test('agent 被替换：成功结果被丢弃，不 followup、不抛错', async () => {
+  const harness = createHarness({ maxRounds: 2 })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, { seq: 7, turn: 1 })
+
+  // 同 id 换了另一个 agent 对象：结果不得注入旧 agent，也不得抛错。
+  const replacementFollows = []
+  harness.state.agents.set('s1', {
+    session: { id: 's1', header: { origin: undefined } },
+    followup(message) {
+      replacementFollows.push(message)
+    },
+  })
+  harness.resolveNext(completed([FINDING]))
+  await tick()
+
+  assert.equal(harness.state.follows.length, 0, '不得 followup 旧 agent')
+  assert.equal(replacementFollows.length, 0, '也不得 followup 新 agent')
+  assert.ok(debugHas(harness.state, 'agent 已关闭或更换'))
+  assert.equal(warnHas(harness.state, '连续失败'), false)
+})
+
 test('session/disposed 取消在途审查并释放锁与轮次', async () => {
   const harness = createHarness({ maxRounds: 2 })
   const agent = makeAgent(harness)
@@ -439,7 +519,88 @@ test('session/disposed 取消在途审查并释放锁与轮次', async () => {
   await tick()
 })
 
-test('session/disposed 撞上 startActivation 等待：返回后立刻取消，不留下定时器', async () => {
+test('启动中被 disposed：abort startReview、不记失败，handler 由 startup deadline 有界返回', async () => {
+  const harness = createHarness({ maxRounds: 2, asyncReviewerTimeoutMs: 20 })
+  const agent = makeAgent(harness)
+  let release
+  harness.state.startGate = new Promise((resolve) => {
+    release = resolve
+  })
+  let markStarted
+  const startCalled = new Promise((resolve) => {
+    markStarted = resolve
+  })
+  harness.state.onStart = markStarted
+
+  harness.addSummary({ seq: 7, turn: 1 })
+  await harness.markChanges(7)
+  const startedAt = Date.now()
+  const stopping = harness.emit('agent/turn-stopping', { agent, turn: 1, signal: signal() })
+  await startCalled
+  assert.equal(harness.state.starts.length, 1, 'startActivation 应已进入但未返回')
+  assert.equal(harness.state.pending.length, 0)
+
+  await harness.emit('session/disposed', { id: 's1' })
+  assert.equal(
+    harness.state.starts[0].signal.aborted,
+    true,
+    'disposed 必须 abort 启动中的 startReview（透传到 startActivation 的 signal）',
+  )
+
+  // startActivation 仍挂起；handler 只能靠 startup deadline 收尾，不允许无限等待。
+  const bounded = await Promise.race([
+    stopping.then(() => 'returned'),
+    delay(100).then(() => 'timeout'),
+  ])
+  assert.equal(bounded, 'returned', '启动中被 disposed 后 handler 仍须有界返回')
+  assert.ok(Date.now() - startedAt < 100, `handler 应有界返回，实际 ${Date.now() - startedAt}ms`)
+  assert.equal(debugHas(harness.state, 'review failed'), false, '会话关闭的取消不计失败')
+  assert.equal(warnHas(harness.state, '连续失败'), false, '会话关闭不得累计熔断')
+  assert.equal(harness.state.follows.length, 0)
+
+  // 放行启动：startReview 拿到 activation 后应立即 dispose，不留活句柄。
+  release()
+  await tick()
+  assert.equal(harness.state.disposed, 1, '取消后拿到的 activation 必须 dispose')
+})
+
+test('插件 dispose 叫停启动中的 startReview，结果丢弃且不计失败', async () => {
+  const harness = createHarness({ maxRounds: 2, asyncReviewerTimeoutMs: 20 })
+  const agent = makeAgent(harness)
+  let release
+  harness.state.startGate = new Promise((resolve) => {
+    release = resolve
+  })
+  let markStarted
+  const startCalled = new Promise((resolve) => {
+    markStarted = resolve
+  })
+  harness.state.onStart = markStarted
+
+  harness.addSummary({ seq: 7, turn: 1 })
+  await harness.markChanges(7)
+  const stopping = harness.emit('agent/turn-stopping', { agent, turn: 1, signal: signal() })
+  await startCalled
+  assert.equal(harness.state.starts.length, 1)
+
+  await harness.dispose()
+  assert.equal(
+    harness.state.starts[0].signal.aborted,
+    true,
+    '插件卸载必须 abort starting 里的控制信号',
+  )
+
+  release()
+  await stopping
+  await tick()
+
+  assert.equal(harness.state.disposed, 1, '取消后拿到的 activation 必须 dispose')
+  assert.equal(harness.state.follows.length, 0)
+  assert.equal(debugHas(harness.state, 'review failed'), false, '插件卸载的取消不计失败')
+  assert.equal(warnHas(harness.state, '连续失败'), false)
+})
+
+test('session/disposed 撞上 startActivation 等待：启动中被 disposed 会取消 startReview', async () => {
   const harness = createHarness({ maxRounds: 2 })
   const agent = makeAgent(harness)
   let release
@@ -460,10 +621,13 @@ test('session/disposed 撞上 startActivation 等待：返回后立刻取消，�
   assert.equal(harness.state.pending.length, 0)
 
   await harness.emit('session/disposed', { id: 's1' })
+  assert.equal(harness.state.starts[0].signal.aborted, true, 'disposed 应取消启动中的 startReview')
   release()
   await stopping
   await tick()
 
+  // 启动阶段本身由 startup deadline 兜底（见上一条用例）；这里验证的是
+  // disposed 会立刻取消 startReview，并让返回后的 activation 被 dispose。
   assert.equal(harness.state.pending.length, 1)
   assert.equal(harness.state.disposed, 1, 'startActivation 返回后必须立刻 dispose')
   assert.equal(harness.state.follows.length, 0)
@@ -675,6 +839,25 @@ test('startReview 启动失败：记录失败、释放锁，下一次仍可发�
   harness.state.startError = undefined
   await harness.stop(agent, { seq: 8, turn: 2, diff: '+const a = 2' })
   assert.equal(harness.state.starts.length, 2, '启动失败后必须释放 reviewing 锁')
+
+  harness.resolveNext(completed([]))
+  await tick()
+})
+
+test('启动失败不消耗链轮次：maxRounds=1 时下一次仍能发起', async () => {
+  const harness = createHarness({ maxRounds: 1 })
+  const agent = makeAgent(harness)
+  harness.state.startError = new Error('spawn-boom')
+
+  await harness.stop(agent, { seq: 7, turn: 1, diff: '+const a = 1' })
+  assert.equal(harness.state.starts.length, 1)
+  assert.ok(debugHas(harness.state, 'start failed: spawn-boom'))
+
+  harness.state.startError = undefined
+  await harness.stop(agent, { seq: 8, turn: 2, diff: '+const a = 2' })
+
+  assert.equal(harness.state.starts.length, 2, '启动失败不得消耗链轮次')
+  assert.equal(debugHas(harness.state, 'rounds-exhausted'), false)
 
   harness.resolveNext(completed([]))
   await tick()

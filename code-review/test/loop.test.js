@@ -47,6 +47,46 @@ test('resetRounds 归零但锁仍在，且不影响熔断计数', () => {
   assert.equal(tracker.recordFailure('s1'), true)
 })
 
+test('releaseRound 递减链轮次到 0 即止，不动锁与熔断计数', () => {
+  const tracker = createTracker()
+  assert.equal(tracker.begin('s1'), true)
+  assert.equal(tracker.roundsOf('s1'), 1)
+
+  tracker.releaseRound('s1')
+  assert.equal(tracker.roundsOf('s1'), 0)
+  tracker.releaseRound('s1')
+  assert.equal(tracker.roundsOf('s1'), 0, '轮次不得为负')
+  assert.equal(tracker.isReviewing('s1'), true, 'releaseRound 不得释放锁')
+
+  // 未知会话同样安全。
+  tracker.releaseRound('s2')
+  assert.equal(tracker.roundsOf('s2'), 0)
+
+  tracker.end('s1')
+  assert.equal(tracker.recordFailure('s1'), false)
+  tracker.releaseRound('s1')
+  assert.equal(tracker.isBreakerOpen('s1'), false, 'releaseRound 不得清熔断计数')
+  assert.equal(tracker.recordFailure('s1'), true, '失败计数应保持连续')
+})
+
+test('链 epoch：初始 0，resetRounds 递增，begin/releaseRound 不变，forget 清零', () => {
+  const tracker = createTracker()
+  assert.equal(tracker.epochOf('s1'), 0)
+
+  assert.equal(tracker.begin('s1'), true)
+  assert.equal(tracker.epochOf('s1'), 0, 'begin 不开启新链')
+  tracker.releaseRound('s1')
+  assert.equal(tracker.epochOf('s1'), 0, 'releaseRound 不开启新链')
+
+  tracker.resetRounds('s1')
+  assert.equal(tracker.epochOf('s1'), 1)
+  tracker.resetRounds('s1')
+  assert.equal(tracker.epochOf('s1'), 2)
+
+  tracker.forget('s1')
+  assert.equal(tracker.epochOf('s1'), 0, 'forget 后回到初始 epoch')
+})
+
 test('forget 清空轮次、锁与熔断状态', () => {
   const tracker = createTracker()
   assert.equal(tracker.begin('s1'), true)

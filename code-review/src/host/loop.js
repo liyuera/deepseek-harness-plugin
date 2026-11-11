@@ -23,6 +23,8 @@ export function createTracker(options = {}) {
   const rounds = new Map()
   const failures = new Map()
   const reviewing = new Set()
+  // 链 epoch：每次人类消息重置链时 +1，供在途审查结算时判断是否跨链。
+  const epochs = new Map()
 
   return {
     /** 加锁并把当前链的轮次 +1；同一会话已在审查中返回 false（且不增轮）。 */
@@ -40,9 +42,20 @@ export function createTracker(options = {}) {
     roundsOf(sessionId) {
       return rounds.get(sessionId) ?? 0
     },
-    /** 人类消息开启新链：只清轮次，不动锁与熔断计数。 */
+    /** 启动失败/超时：退回本次占用的轮次（最低 0），不动锁与熔断。 */
+    releaseRound(sessionId) {
+      const current = rounds.get(sessionId) ?? 0
+      if (current <= 1) rounds.delete(sessionId)
+      else rounds.set(sessionId, current - 1)
+    },
+    /** 当前链的 epoch；每次人类消息重置链时递增。 */
+    epochOf(sessionId) {
+      return epochs.get(sessionId) ?? 0
+    },
+    /** 人类消息开启新链：清轮次并递增 epoch，不动锁与熔断计数。 */
     resetRounds(sessionId) {
       rounds.delete(sessionId)
+      epochs.set(sessionId, (epochs.get(sessionId) ?? 0) + 1)
     },
     isReviewing(sessionId) {
       return reviewing.has(sessionId)
@@ -67,11 +80,12 @@ export function createTracker(options = {}) {
       if (state === undefined || state.count < BREAKER_THRESHOLD) return false
       return now() - state.openedAt < cooldownMs
     },
-    /** 会话释放：清空轮次、锁与熔断状态。 */
+    /** 会话释放：清空轮次、锁、熔断状态与链 epoch。 */
     forget(sessionId) {
       rounds.delete(sessionId)
       reviewing.delete(sessionId)
       failures.delete(sessionId)
+      epochs.delete(sessionId)
     },
   }
 }

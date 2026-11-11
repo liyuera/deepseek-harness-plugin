@@ -20,7 +20,7 @@ export const inject = ['commands', 'subagents', 'workspaceChanges', 'tools', 'ag
 const PACKAGE_ROOT = dirname(fileURLToPath(import.meta.url))
 
 /**
- * 构造一条插件来源的消息。`plugin` 来源不会重置链预算，也不会被当成人类输入。
+ * 构造一条插件来源的消息。`plugin:code-review` 来源不会重置链预算，也不会被当成人类输入。
  * source 必填，漏了渲染时会崩。
  */
 function message(text) {
@@ -46,6 +46,8 @@ export function apply(ctx, config) {
   const lastFingerprint = new Map()
   // 在途审查：`sessionId` → { result, cancel }。一个会话同时只允许一个。
   const inflight = new Map()
+  // 启动中的审查：`sessionId` → AbortController，用于 disposed/插件卸载时叫停 startReview。
+  const starting = new Map()
   // 会话代次：disposed 时 +1，用于识别启动过程中被关闭的会话。
   const generations = new Map()
   // 后台审查的生命周期信号：不随 turn 结束/取消而中断。
@@ -63,6 +65,9 @@ export function apply(ctx, config) {
     lifetime.abort()
     for (const handle of inflight.values()) handle.cancel('plugin-disposed')
     inflight.clear()
+    for (const control of starting.values()) control.abort()
+    starting.clear()
+    generations.clear()
   }, 'code-review: dispose in-flight reviews')
 
   const getRules = () => loadRulesResilient({
@@ -114,8 +119,10 @@ export function apply(ctx, config) {
       }
 
       tracker.recordSuccess(sessionId)
-      // 只有成功审查才写指纹；失败/取消允许同一份 diff 重试。
-      lastFingerprint.set(sessionId, meta.hash)
+      // 只有成功审查才写指纹（失败/取消允许同一份 diff 重试）；人类消息可能在
+      // 审查在途时重置了链，旧链结果不得污染新链的去重指纹。
+      const sameChain = meta.epoch === tracker.epochOf(sessionId)
+      if (sameChain) lastFingerprint.set(sessionId, meta.hash)
       const elapsed = Date.now() - meta.startedAt
       const totalFiles = meta.summary.total ?? meta.summary.files.length
       ctx.logger.debug?.(
@@ -148,7 +155,9 @@ export function apply(ctx, config) {
         return
       }
 
-      const repair = meta.lastRound
+      // 结算时实时读链轮次：人类重置链后 rounds=0，不能再用旧链的「最后一轮」口径。
+      const lastRound = tracker.roundsOf(sessionId) >= resolved.maxRounds
+      const repair = lastRound
         ? '请按上面每条 finding 修复。本轮已达到自动复审上限，修完不会再自动复审，请人工确认。如与用户新指令冲突，以用户指令为准。'
         : '请按上面每条 finding 修复；修完会再复审一次。如与用户新指令冲突，以用户指令为准。'
       try {
@@ -180,6 +189,9 @@ export function apply(ctx, config) {
       handle.cancel('session-disposed')
       inflight.delete(session.id)
     }
+    // 启动尚未返回：叫停 startReview，拿到 activation 后它会自行 dispose。
+    starting.get(session.id)?.abort()
+    starting.delete(session.id)
     latestSeq.delete(session.id)
     lastFingerprint.delete(session.id)
     tracker.forget(session.id)
@@ -262,43 +274,84 @@ export function apply(ctx, config) {
       return
     }
     const rounds = tracker.roundsOf(sessionId)
-    const lastRound = rounds >= resolved.maxRounds
+    // 链身份在 begin 后固化：人类消息可能在本审查在途时重置链。
+    const epoch = tracker.epochOf(sessionId)
+
+    // 启动阶段也要有界、可取消：独立控制信号，disposed/插件卸载会 abort 它。
+    const control = new AbortController()
+    starting.set(sessionId, control)
 
     let handle
+    let startupTimer
     try {
       const rules = await getRules()
-      handle = await startReview({
+      // 总预算从 handler 开始计：取材/读规则花掉的时间会挤占启动与审查的时间。
+      const budget = Math.max(1, resolved.asyncReviewerTimeoutMs - (Date.now() - startedAt))
+      const startupTimedOut = Symbol('startup-timeout')
+      const deadline = new Promise((resolve) => {
+        startupTimer = setTimeout(() => resolve(startupTimedOut), budget)
+      })
+      const startup = startReview({
         subagents: ctx.subagents,
         agent,
         preset: resolved.reviewerPreset,
         prompt: buildPrompt({ rulesPrompt: rules.prompt, files: collected.files, skipped: collected.skipped }),
-        signal: lifetime.signal,
+        signal: control.signal,
         modelOverride: resolved.modelOverride,
         allowedRuleIds: rules.allowedRuleIds,
         allowedPaths: new Set(collected.files.map((file) => file.path)),
         ruleSeverities: rules.ruleSeverities,
         logger: ctx.logger,
       })
+      // 超时返回后 startReview 的迟到 reject 不得变成 unhandled rejection。
+      startup.catch(() => {})
+      const started = await Promise.race([startup, deadline])
+      if (started === startupTimedOut) {
+        control.abort()
+        // 启动期间会话被释放/插件卸载：静默丢弃，不记失败。
+        if (lifetime.signal.aborted || (generations.get(sessionId) ?? 0) !== generation) {
+          ctx.logger.debug?.(`[code-review] drop: session ${sessionId} 的启动已失效`)
+          return
+        }
+        ctx.logger.debug?.('[code-review] start timeout')
+        ctx.logger.debug?.('[code-review] review failed: timeout')
+        if (tracker.recordFailure(sessionId)) {
+          ctx.logger.warn('[code-review] 连续失败，已暂停本会话的自动审查')
+        }
+        // 启动失败不消耗链预算。
+        tracker.releaseRound(sessionId)
+        tracker.end(sessionId)
+        return
+      }
+      handle = started
     } catch (error) {
+      // 启动期间会话被释放/插件卸载：不算失败，也不碰可能已重建的新链状态。
+      if (lifetime.signal.aborted || (generations.get(sessionId) ?? 0) !== generation) return
       // 启动失败由这里记一次失败并释放锁；不占用 inflight 表。
       ctx.logger.debug?.(`[code-review] start failed: ${error.message}`)
       if (tracker.recordFailure(sessionId)) {
         ctx.logger.warn('[code-review] 连续失败，已暂停本会话的自动审查')
       }
+      tracker.releaseRound(sessionId)
       tracker.end(sessionId)
       return
+    } finally {
+      clearTimeout(startupTimer)
+      // disposed/新一代可能已覆盖这条记录，只删自己。
+      if (starting.get(sessionId) === control) starting.delete(sessionId)
     }
 
-    // 启动期间会话被释放：拿到 activation 后立刻取消，不留下 10 分钟定时器。
-    if ((generations.get(sessionId) ?? 0) !== generation) {
-      handle.cancel('session-disposed')
-      tracker.end(sessionId)
+    // 启动期间会话被释放/插件卸载：拿到 activation 后立刻取消，不留下后台定时器。
+    if ((generations.get(sessionId) ?? 0) !== generation || lifetime.signal.aborted) {
+      handle.cancel(lifetime.signal.aborted ? 'plugin-disposed' : 'session-disposed')
       return
     }
 
     inflight.set(sessionId, handle)
-    const timer = setTimeout(() => handle.cancel('timeout'), resolved.asyncReviewerTimeoutMs)
-    const meta = { agent, summary, collected, hash, rounds, lastRound, startedAt, timer }
+    // 启动花掉的时间从总预算里扣，保证「启动 + 审查」不超过 asyncReviewerTimeoutMs。
+    const reviewBudget = Math.max(1, resolved.asyncReviewerTimeoutMs - (Date.now() - startedAt))
+    const timer = setTimeout(() => handle.cancel('timeout'), reviewBudget)
+    const meta = { agent, summary, collected, hash, rounds, epoch, startedAt, timer }
 
     // 后台结算：handler 到这里就返回，不等待审查结果。
     void handle.result
