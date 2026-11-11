@@ -30,6 +30,27 @@ test('buildFullPrompt 列出链内文件与已报问题，并要求读当前内�
   assert.match(prompt, /structured_output/)
 })
 
+test('两种 prompt 都内置评审准则：团队规范优先/证据边界/不重复治理/最小修复/数量上限', () => {
+  const turn = buildPrompt({
+    rulesPrompt: 'RULES',
+    files: [{ path: 'src/a.ts', added: 1, deleted: 0, text: '@@ -1,1 +1,1 @@\n+const a = 1' }],
+    skipped: [],
+  })
+  const full = buildFullPrompt({
+    rulesPrompt: 'RULES',
+    files: [{ path: 'src/a.ts', turns: [1], added: 1, deleted: 0 }],
+  })
+  for (const prompt of [turn, full]) {
+    assert.match(prompt, /团队规范优先/)
+    assert.match(prompt, /证据边界/)
+    assert.match(prompt, /禁止跨上下文推断/)
+    assert.match(prompt, /不重复治理/)
+    assert.match(prompt, /最小修复/)
+    assert.match(prompt, /最多报告 20 条/)
+    assert.match(prompt, /反引号包裹/)
+  }
+})
+
 test('schema 要求 findings 数组', () => {
   assert.equal(REVIEW_SCHEMA.type, 'object')
   assert.deepEqual(REVIEW_SCHEMA.required, ['findings'])
@@ -89,6 +110,24 @@ test('超出规则或路径范围的 finding 被丢弃', async () => {
   })
   assert.equal(result.ok, true)
   assert.equal(result.findings.length, 1)
+})
+
+test('findings 超过 20 条时按严重度截断', async () => {
+  const findings = []
+  for (let index = 0; index < 10; index += 1) {
+    findings.push({ ...validFinding, severity: 'high', problem: `h${index}` })
+  }
+  for (let index = 0; index < 15; index += 1) {
+    findings.push({ ...validFinding, severity: 'low', problem: `l${index}` })
+  }
+  const result = await reviewFindings(findings, { allowedRuleIds: new Set(['SEC-001']) })
+  assert.equal(result.ok, true)
+  assert.equal(result.findings.length, 20)
+  assert.deepEqual(
+    result.findings.slice(0, 10).map((finding) => finding.severity),
+    Array(10).fill('high'),
+    'high 必须全部排在前 10 位并保留',
+  )
 })
 
 test('structured 形状不对视为失败', async () => {
@@ -265,7 +304,9 @@ test('超时返回不等待永不 settle 的 dispose', async () => {
 
 test('buildPrompt 保留分节空行，仅去掉未审文件的空行', () => {
   const prompt = buildPrompt({ rulesPrompt: 'RULES', files, skipped: [] })
-  assert.match(prompt, /^RULES\n\n## 待审变更\n/m)
+  // 规则层之后新增「评审准则」段，再进入待审变更；空行分隔保持。
+  assert.match(prompt, /^RULES\n\n## 评审准则\n/m)
+  assert.match(prompt, /\n\n## 待审变更\n/)
   assert.match(prompt, /- src\/a\.ts（\+1 \/ -1）\n\n## Diff\n/)
   assert.equal(prompt.includes('未审文件'), false)
 

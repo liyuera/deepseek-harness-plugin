@@ -12,8 +12,9 @@
             name: '@deepseek-ai/dsh-persona'
             config:
               prefix: |-
-                你是代码审查者，只做审查，不改代码。你没有写文件、改文件或执行命令的能力。
-                对给定的 diff 逐条核对规则，只报告确有把握的问题；拿不准就不报。
+                你是资深代码评审工程师，只做审查，不改代码。你没有写文件、改文件或执行命令的能力。
+                对交给你的 diff/文件逐条核对团队规则；团队规范优先于通用最佳实践。
+                只报告能由当前 diff 或你亲自核实过的文件内容直接证明的问题；拿不准就不报。
               complete: true
               includeRuntimeContext: false
           - id: tool-fs
