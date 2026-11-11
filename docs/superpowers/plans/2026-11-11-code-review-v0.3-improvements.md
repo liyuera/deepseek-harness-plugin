@@ -1244,3 +1244,5 @@ git commit -m "chore(code-review): 0.3.0 版本与文档（留痕/全量审查/b
 - **Task 5（chain）**：`maxFiles` 裁剪在 `lastSeq` 并列时，计划实现会保留旧文件而测试要求保留最近观察的文件；实现增加内部 `touch/order` 计数做 tie-break，`filesOf` 输出仍不含 `order`。提交 `1f6241b`。
 
 执行方式：Subagent-Driven（每个任务一个独立执行者，只改各自文件范围、不提交；Lead 验收后统一 commit）。
+- **Task 6（全量审查）**：`buildFullPrompt` 输出段沿用 `buildPrompt` 的 structured_output 句式并补 ruleId/location 约束；`flushChain` 按当前 epoch 过滤旧队列；`markFull/lastFindings` 移进 `sameChain` 分支（避免旧链结果污染新链）；测试适配 harness 的 `startedPrompt`/`addSummary` 形状；额外覆盖 `fullReview=false` 回归与 `/review --full` 空链错误。提交 `733d68d`。
+- **Task 7（收尾）**：版本 0.3.0；`peerDependencies` 增加可选 `@deepseek-ai/dsh-storage-domain`/`zod`；README 补链级全量、journal、behavior 规则包、新配置与已知限制；desktop profile 的 `rulePacks` 追加 `general-issues`。全量测试 246/246，`npm pack --dry-run` 19 文件。
