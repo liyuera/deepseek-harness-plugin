@@ -1,7 +1,7 @@
 {
   "name": "@liyuera/dsh-code-review",
   "description": "AI code review for dsh: at turn end a read-only reviewer subagent checks the turn's workspace diff against a pre-made rule layer (correctness / security / performance / maintainability) and injects findings back as a new turn for the agent to fix, at most N rounds per chain.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "main": "index.js",
   "exports": {

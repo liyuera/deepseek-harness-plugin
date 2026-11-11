@@ -32,13 +32,15 @@ DSH 会话运行时的「AI 生成代码自动审查」：主代理改完代码�
 
 前置：dsh ≥ 0.2.2-rc.1（`package.json` 的 `engines.dsh` 会在安装时校验）。桌面应用用 `desktop` profile；源码启动的 `pnpm dsh web` 用 `web`。
 
-**方式一：从 npm 装（推荐）**
+**方式一：从 npm 装（0.2.0 发布后可用）**
 
 ```sh
 dsh plugin --profile desktop add @liyuera/dsh-code-review
 ```
 
 GUI 等价路径：**设置 → 插件 → 添加插件**，输入包名，按提示安装；若界面提供「立即启用」，选中它。
+
+> npm 首发待账号 2FA 恢复后进行（见文末「发布」）；在那之前请用方式二或本地 tarball（`npm pack` 后用 `dsh plugin --profile desktop add /绝对路径/liyuera-dsh-code-review-0.2.0.tgz`）。
 
 **方式二：从本地 checkout 装（改代码即时生效，适合开发）**
 
@@ -185,19 +187,20 @@ dsh plugin --profile desktop remove @liyuera/dsh-code-review
 
 ## 发布
 
-已发布到 npm：`@liyuera/dsh-code-review`（包里含 `index.js`、`src/`、`cordis.patch.yml`、`rules/`；不含 `test/`）。
+- 目标首发版本：**0.2.0**
+- 当前状态：**待发布**（npm 账号 2FA 恢复后首发；包里含 `index.js`、`src/`、`cordis.patch.yml`、`rules/`，不含 `test/`）
 
-日常发布走 GitHub Actions 的 npm **Trusted Publishing**（OIDC，无 NPM_TOKEN、无浏览器授权）：
+首发之后日常发布走 GitHub Actions 的 npm **Trusted Publishing**（OIDC，无 NPM_TOKEN、无浏览器授权）：
 
 ```sh
 # 1. 改 code-review/package.json 的 version，提交并 push main
 # 2. 打 tag 并 push，触发 .github/workflows/publish-code-review.yml
-git tag code-review-v0.2.0
-git push origin code-review-v0.2.0
+git tag code-review-v0.2.1
+git push origin code-review-v0.2.1
 ```
 
 workflow 在 `code-review/` 里跑 `npm publish --access public`，tag 与 `package.json` 版本不一致会直接失败；公开仓库 + 公开包会自动生成 provenance 证明。
 
-**首次发布是一次性例外**：npm 不支持为尚不存在的包预配置 Trusted Publisher，所以 `0.1.0` 是在本机手动 `npm publish --access public --registry https://registry.npmjs.org/` 发的（用带 bypass 2FA 的 granular token，发完即删）。之后在 npmjs.com 的包 Settings → Trusted Publisher 配好 `liyuera` / `deepseek-harness-plugin` / `publish-code-review.yml` 并勾上 **Allow npm publish**，创建后 2 天内必须完成一次成功发布来验证配置；再把 Publishing access 设为不允许 token 发布。若 workflow 报 `ENEEDAUTH`，先核对 workflow 文件名、owner/repo 是否与 npm 配置完全一致，以及是否勾了 Allow npm publish。
+**首发必须在本机手动发一次**：npm 不支持为尚不存在的包预配置 Trusted Publisher，所以 `0.2.0` 要用 `npm publish --access public --registry https://registry.npmjs.org/` 在本机发布（用带 bypass 2FA 的 granular token，发完即删；`npm config` 默认 registry 是 npmmirror，必须显式 `--registry`）。首发成功后在 npmjs.com 的包 Settings → Trusted Publisher 配好 `liyuera` / `deepseek-harness-plugin` / `publish-code-review.yml` 并勾上 **Allow npm publish**，创建后 2 天内必须完成一次成功发布来验证配置；再把 Publishing access 设为不允许 token 发布。若 workflow 报 `ENEEDAUTH`，先核对 workflow 文件名、owner/repo 是否与 npm 配置完全一致，以及是否勾了 Allow npm publish。
 
 发布前用 `npm pack --dry-run` 核对文件清单；本包没有构建产物，源码即安装产物。

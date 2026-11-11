@@ -1,9 +1,10 @@
 # Publish code-review to npm with Trusted Publishing (OIDC).
 #
 # Bootstrap note: npm does not allow a Trusted Publisher to be configured for a
-# package that does not exist yet, so the *first* release (0.1.0) was published
-# manually with a granular token. Once 0.1.0 exists, add the trusted publisher
-# on npmjs.com: package Settings -> Trusted Publisher -> GitHub Actions, with:
+# package that does not exist yet, so the *first* release (0.2.0) must be
+# published manually with a granular token. Once 0.2.0 exists, add the trusted
+# publisher on npmjs.com: package Settings -> Trusted Publisher -> GitHub
+# Actions, with:
 #   Organization/user:  liyuera
 #   Repository:         deepseek-harness-plugin
 #   Workflow filename:  publish-code-review.yml
