@@ -7,6 +7,7 @@ const DIMENSION_LABEL = Object.freeze({
   security: '安全',
   performance: '性能',
   maintainability: '可维护性',
+  behavior: '行为',
 })
 
 /** 严重度排名：数字越小越严重。用于渲染前的稳定排序。 */

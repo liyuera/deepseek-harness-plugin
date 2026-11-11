@@ -425,6 +425,20 @@ test('loadRulesResilient 包内重复 id 时整包跳过', async () => {
   assert.match(warnings[0], /duplicate rule id "SEC-003"/)
 })
 
+test('behavior 维度使用 BEH 前缀，PRINCIPLE_IDS 含 behavior', () => {
+  const rule = {
+    id: 'BEH-001', dimension: 'behavior', severity: 'low',
+    title: '交互失败必须有反馈', check: '禁止静默 return',
+    bad: 'if (!ok) return', good: 'if (!ok) message.info(...)',
+  }
+  assert.doesNotThrow(() => validateRules([rule]))
+  assert.throws(
+    () => validateRules([{ ...rule, id: 'MNT-999' }]),
+    /prefix does not match dimension "behavior"/,
+  )
+  assert.ok(PRINCIPLE_IDS.includes('PRINCIPLE-behavior'))
+})
+
 test('loadRulesResilient 基础规则失败时不加载规则包（只用原则层）', async () => {
   const warnings = []
   const files = baseFiles()

@@ -13,6 +13,7 @@ const PREFIX_BY_DIMENSION = Object.freeze({
   security: 'SEC',
   performance: 'PRF',
   maintainability: 'MNT',
+  behavior: 'BEH',
 })
 const SEVERITIES = new Set(['high', 'medium', 'low', 'nit'])
 const FIELDS = ['id', 'dimension', 'severity', 'title', 'check', 'bad', 'good']
@@ -24,6 +25,7 @@ export const PRINCIPLE_IDS = Object.freeze([
   'PRINCIPLE-security',
   'PRINCIPLE-performance',
   'PRINCIPLE-maintainability',
+  'PRINCIPLE-behavior',
 ])
 
 /**

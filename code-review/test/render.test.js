@@ -158,6 +158,18 @@ test('steer 模式在配置 notifySeverities 时附带非阻塞建议段', () =>
   assert.match(text, /\[MNT-004\]/)
 })
 
+test('behavior 维度渲染为「行为」', () => {
+  const text = renderFindings({
+    findings: [finding({ ruleId: 'BEH-001', dimension: 'behavior', severity: 'low', location: 'a.ts:1' })],
+    skipped: [],
+    blockingSeverities: ['high', 'medium'],
+    notifySeverities: ['low'],
+    summary: { files: 1, added: 1, deleted: 0 },
+    mode: 'notify',
+  })
+  assert.match(text, /\[BEH-001\] 行为\/low {2}a\.ts:1/)
+})
+
 test('steer 模式未配置 notifySeverities 时仍只回注阻塞项', () => {
   const text = renderFindings({
     findings: [finding(), finding({ severity: 'low', ruleId: 'MNT-004', dimension: 'maintainability' })],
