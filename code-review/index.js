@@ -2,11 +2,11 @@
  * Host half of `@liyuera/dsh-code-review`.
  * @module @liyuera/dsh-code-review
  */
-import { dirname, join } from 'node:path'
+import { dirname, isAbsolute, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { resolveConfig } from './src/host/config.js'
 import { collect, fingerprint } from './src/host/collect.js'
-import { loadRulesResilient } from './src/host/rules.js'
+import { composeRules, loadRulesResilient } from './src/host/rules.js'
 import { renderFindings } from './src/host/render.js'
 import { buildPrompt, startReview } from './src/host/reviewer.js'
 import { shouldReview } from './src/host/trigger.js'
@@ -70,11 +70,16 @@ export function apply(ctx, config) {
     generations.clear()
   }, 'code-review: dispose in-flight reviews')
 
-  const getRules = () => loadRulesResilient({
-    rulesPath: join(PACKAGE_ROOT, resolved.rulesFile),
-    principlesPath: join(PACKAGE_ROOT, resolved.principlesFile),
-    warn: warnOnce,
-  })
+  const getRules = async () => {
+    const loaded = await loadRulesResilient({
+      rulesPath: join(PACKAGE_ROOT, resolved.rulesFile),
+      principlesPath: join(PACKAGE_ROOT, resolved.principlesFile),
+      packs: resolved.rulePacks.map((pack) => (isAbsolute(pack) ? pack : join(PACKAGE_ROOT, pack))),
+      warn: warnOnce,
+    })
+    // 兼容 Task 1：尚未接线按变更文件过滤，先只保留无 scope 的通用规则。
+    return composeRules({ ...loaded, filePaths: [] })
+  }
 
   try {
     ctx.commands.register(createReviewCommand({

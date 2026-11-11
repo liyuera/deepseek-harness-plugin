@@ -13,6 +13,7 @@ export const DEFAULTS = Object.freeze({
   reviewerPreset: 'code-review',
   rulesFile: 'rules/rules.json',
   principlesFile: 'rules/principles.md',
+  rulePacks: Object.freeze([]),
 })
 
 const KEYS = new Set([...Object.keys(DEFAULTS), 'modelOverride'])
@@ -65,6 +66,14 @@ export function resolveConfig(raw = {}) {
       throw new Error(`code-review: ${field} must be a non-empty string`)
     }
   }
+  if (!Array.isArray(merged.rulePacks)) {
+    throw new Error('code-review: rulePacks must be an array')
+  }
+  for (const pack of merged.rulePacks) {
+    if (typeof pack !== 'string' || pack.length === 0) {
+      throw new Error('code-review: rulePacks entries must be non-empty strings')
+    }
+  }
 
   let modelOverride
   if (merged.modelOverride !== undefined) {
@@ -87,6 +96,7 @@ export function resolveConfig(raw = {}) {
     reviewerPreset: merged.reviewerPreset,
     rulesFile: merged.rulesFile,
     principlesFile: merged.principlesFile,
+    rulePacks: Object.freeze([...merged.rulePacks]),
     ...(modelOverride === undefined ? {} : { modelOverride }),
   })
 }

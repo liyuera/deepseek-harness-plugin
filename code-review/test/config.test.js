@@ -10,7 +10,37 @@ test('无配置时返回默认值', () => {
   assert.deepEqual(config.blockingSeverities, ['high', 'medium'])
   assert.equal(config.reviewerPreset, 'code-review')
   assert.equal(config.asyncReviewerTimeoutMs, 600000)
+  assert.deepEqual(config.rulePacks, [])
   assert.ok(Object.isFrozen(config))
+})
+
+test('rulePacks 默认空数组且冻结', () => {
+  assert.deepEqual(DEFAULTS.rulePacks, [])
+  assert.ok(Object.isFrozen(DEFAULTS.rulePacks))
+})
+
+test('rulePacks 必须是非空字符串数组', () => {
+  for (const value of ['rules/packs/a.json', null, {}, 7]) {
+    assert.throws(() => resolveConfig({ rulePacks: value }), /code-review: rulePacks must be an array/)
+  }
+  for (const value of [[1], [''], ['rules/packs/a.json', null], ['ok.json', '']]) {
+    assert.throws(
+      () => resolveConfig({ rulePacks: value }),
+      /code-review: rulePacks entries must be non-empty strings/,
+    )
+  }
+})
+
+test('rulePacks 覆盖值生效且为冻结副本', () => {
+  const packs = ['rules/packs/frontend-smartui.json']
+  const config = resolveConfig({ rulePacks: packs })
+  assert.deepEqual(config.rulePacks, ['rules/packs/frontend-smartui.json'])
+  assert.ok(Object.isFrozen(config.rulePacks))
+  assert.notEqual(config.rulePacks, packs, '不得直接复用调用方数组')
+
+  packs.push('rules/packs/other.json')
+  assert.deepEqual(config.rulePacks, ['rules/packs/frontend-smartui.json'])
+  assert.deepEqual(DEFAULTS.rulePacks, [])
 })
 
 test('asyncReviewerTimeoutMs 必须为正整数', () => {
