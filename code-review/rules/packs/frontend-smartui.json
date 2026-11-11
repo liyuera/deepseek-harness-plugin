@@ -1,0 +1,200 @@
+[
+  {
+    "id": "MNT-008",
+    "dimension": "maintainability",
+    "severity": "medium",
+    "title": "Hooks 依赖数组不得包含 setState/dispatch",
+    "check": "useEffect/useCallback/useMemo 等 Hooks 的依赖数组不得包含 setState 函数或 useReducer 的 dispatch；它们引用稳定，加入只会让依赖表失真、掩盖真正会变化的依赖",
+    "bad": "const [open, setOpen] = useState(false)\nuseEffect(() => {\n  setOpen(defaultOpen)\n}, [defaultOpen, setOpen])",
+    "good": "const [open, setOpen] = useState(false)\nuseEffect(() => {\n  setOpen(defaultOpen)\n}, [defaultOpen])",
+    "sourceId": "CR-011.01",
+    "scope": { "extensions": [".tsx", ".jsx"] }
+  },
+  {
+    "id": "MNT-009",
+    "dimension": "maintainability",
+    "severity": "medium",
+    "title": "services 请求与响应类型禁用 any",
+    "check": "**/services/** 下的接口方法，其请求参数类型与响应返回类型不得使用 any；确需兜底时必须收敛为 unknown，并在使用前用类型守卫判型",
+    "bad": "// src/services/user.ts\nexport function getUser(params: any): Promise<any> {\n  return request('/api/users', { data: params })\n}",
+    "good": "// src/services/user.ts\nexport interface User {\n  id: string\n  name: string\n}\n\nfunction isUser(value: unknown): value is User {\n  return typeof value === 'object' && value !== null && 'id' in value\n}\n\nexport async function getUser(id: string): Promise<User> {\n  const data: unknown = await request(`/api/users/${id}`)\n  if (!isUser(data)) {\n    throw new Error('invalid user payload')\n  }\n  return data\n}",
+    "sourceId": "CR-012.01/.02",
+    "scope": { "globs": ["**/services/**"] }
+  },
+  {
+    "id": "MNT-010",
+    "dimension": "maintainability",
+    "severity": "medium",
+    "title": "组件样式禁全局选择器且嵌套不超过 4 层",
+    "check": "组件样式不得在顶层使用 :global(...)（仅允许 .wrapper :global(...) 这类局部容器作用域），且选择器嵌套层级不得超过 4 层",
+    "bad": "// src/components/UserPanel/index.less\n:global(.ant-btn) {\n  color: #1677ff;\n}",
+    "good": "// src/components/UserPanel/index.less\n.user-panel {\n  :global(.ant-btn) {\n    color: #1677ff;\n  }\n}",
+    "sourceId": "CR-008.01/.02",
+    "scope": { "extensions": [".css", ".less", ".scss"] }
+  },
+  {
+    "id": "MNT-011",
+    "dimension": "maintainability",
+    "severity": "medium",
+    "title": "单文件不得超过 500 行",
+    "check": "新增或实质修改的文件不得超过 500 行；超过时必须拆分为组件、Hooks、工具函数或独立样式文件",
+    "bad": "// src/pages/OrderList.tsx（860 行）\nexport default function OrderList() {\n  // 表格列、筛选表单、导出逻辑、详情弹窗、权限判断全部内联\n}",
+    "good": "// src/pages/OrderList/index.tsx（180 行）\nexport default function OrderList() {\n  return (\n    <Page>\n      <OrderFilters />\n      <OrderTable />\n      <OrderDetailModal />\n    </Page>\n  )\n}",
+    "sourceId": "CR-010.03",
+    "scope": { "extensions": [".js", ".jsx", ".ts", ".tsx", ".vue"] }
+  },
+  {
+    "id": "MNT-012",
+    "dimension": "maintainability",
+    "severity": "medium",
+    "title": "列表接口空结果必须返回空数组",
+    "check": "列表接口在无数据时不得返回 {}、null 或 undefined，必须返回空数组 []（或契约约定的 { list: [], total: 0 }），避免调用方逐个判空",
+    "bad": "// src/services/order.ts\nexport async function queryOrders(): Promise<Order[] | null> {\n  const data = await request('/api/orders')\n  return data.rows.length > 0 ? data.rows : null\n}",
+    "good": "// src/services/order.ts\nexport async function queryOrders(): Promise<Order[]> {\n  const data = await request('/api/orders')\n  return data.rows ?? []\n}",
+    "sourceId": "CR-104.14/108.04",
+    "scope": { "globs": ["**/services/**"] }
+  },
+  {
+    "id": "MNT-013",
+    "dimension": "maintainability",
+    "severity": "low",
+    "title": "default export 禁止匿名函数",
+    "check": "export default 不得直接导出匿名函数、匿名箭头函数或匿名类；必须先命名再导出",
+    "bad": "export default () => <div className=\"panel\" />",
+    "good": "function Panel() {\n  return <div className=\"panel\" />\n}\n\nexport default Panel",
+    "sourceId": "CR-009.01",
+    "scope": { "extensions": [".js", ".jsx", ".ts", ".tsx", ".vue"] }
+  },
+  {
+    "id": "MNT-014",
+    "dimension": "maintainability",
+    "severity": "low",
+    "title": "禁止使用 var",
+    "check": "新增代码不得使用 var 声明变量；一律使用 const，确需重新赋值时使用 let",
+    "bad": "var timeout = 3000",
+    "good": "const timeout = 3000",
+    "sourceId": "CR-006.02",
+    "scope": { "extensions": [".js", ".jsx", ".ts", ".tsx", ".vue"] }
+  },
+  {
+    "id": "MNT-015",
+    "dimension": "maintainability",
+    "severity": "low",
+    "title": "判空统一使用 void 0",
+    "check": "判断变量是否未定义时不得直接使用 undefined，统一写成 void 0（如 value === void 0）",
+    "bad": "function getName(user) {\n  if (user.name === undefined) {\n    return ''\n  }\n  return user.name\n}",
+    "good": "function getName(user) {\n  if (user.name === void 0) {\n    return ''\n  }\n  return user.name\n}",
+    "sourceId": "CR-006.04",
+    "scope": { "extensions": [".js", ".jsx", ".ts", ".tsx", ".vue"] }
+  },
+  {
+    "id": "MNT-016",
+    "dimension": "maintainability",
+    "severity": "low",
+    "title": "控制流必须使用大括号",
+    "check": "if/else/for/while/switch/try/catch/finally 的代码块必须使用大括号；switch 的每个 case/default 分支代码块也必须用大括号包裹",
+    "bad": "if (loading) return\nswitch (status) {\n  case 'ok':\n    render()\n    break\n}",
+    "good": "if (loading) {\n  return\n}\nswitch (status) {\n  case 'ok': {\n    render()\n    break\n  }\n}",
+    "sourceId": "CR-006.05/.06",
+    "scope": { "extensions": [".js", ".jsx", ".ts", ".tsx", ".vue"] }
+  },
+  {
+    "id": "MNT-017",
+    "dimension": "maintainability",
+    "severity": "low",
+    "title": "字符串引号风格统一",
+    "check": "JS/TS 字符串使用单引号，HTML/JSX 属性使用双引号；同一文件不得混用两种引号",
+    "bad": "const label = \"提交\"\nreturn <div className='card' title={label} />",
+    "good": "const label = '提交'\nreturn <div className=\"card\" title={label} />",
+    "sourceId": "CR-006.01",
+    "scope": { "extensions": [".js", ".jsx", ".ts", ".tsx", ".vue"] }
+  },
+  {
+    "id": "MNT-018",
+    "dimension": "maintainability",
+    "severity": "low",
+    "title": "禁止逗号一行声明多个变量",
+    "check": "不得用逗号在一条 const/let/var 语句里声明多个变量；每个变量单独一行声明",
+    "bad": "const width = 100, height = 200",
+    "good": "const width = 100\nconst height = 200",
+    "sourceId": "CR-006.03",
+    "scope": { "extensions": [".js", ".jsx", ".ts", ".tsx", ".vue"] }
+  },
+  {
+    "id": "MNT-019",
+    "dimension": "maintainability",
+    "severity": "low",
+    "title": "禁止中文与单字母命名",
+    "check": "标识符不得包含中文或中文拼音混拼（ht 等公司约定缩写除外），也不得使用无业务语义的单字母命名（循环下标 i/j/k 除外）",
+    "bad": "const yonghuList = []\nconst d = userMap[id]",
+    "good": "const userList = []\nconst userDetail = userMap[id]",
+    "sourceId": "CR-001.01/.02",
+    "scope": { "extensions": [".js", ".jsx", ".ts", ".tsx", ".vue"] }
+  },
+  {
+    "id": "MNT-020",
+    "dimension": "maintainability",
+    "severity": "low",
+    "title": "命名大小写风格必须统一",
+    "check": "变量、参数与函数使用 camelCase，类型/interface/class/枚举使用 PascalCase，系统常量使用 UPPER_SNAKE_CASE",
+    "bad": "const MaxRetry = 3\nfunction GetUser(id: string) {\n  return request(`/api/users/${id}`, { retry: MaxRetry })\n}",
+    "good": "const MAX_RETRY = 3\nfunction getUser(id: string) {\n  return request(`/api/users/${id}`, { retry: MAX_RETRY })\n}",
+    "sourceId": "CR-004.01/.02/.03",
+    "scope": { "extensions": [".js", ".jsx", ".ts", ".tsx", ".vue"] }
+  },
+  {
+    "id": "MNT-021",
+    "dimension": "maintainability",
+    "severity": "low",
+    "title": "目录与组件命名必须符合规范",
+    "check": "目录（组件目录除外）使用 kebab-case；组件文件与 components 下的组件目录使用 PascalCase",
+    "bad": "import OrderList from './components/order-list/OrderList'\nimport { formatDate } from './Utils/dateFormat'",
+    "good": "import OrderList from './components/OrderList/OrderList'\nimport { formatDate } from './utils/dateFormat'",
+    "sourceId": "CR-002.01/.03.03/.03.04",
+    "scope": { "extensions": [".js", ".jsx", ".ts", ".tsx", ".vue"] }
+  },
+  {
+    "id": "MNT-022",
+    "dimension": "maintainability",
+    "severity": "low",
+    "title": "事件处理函数必须以 on/handle 开头",
+    "check": "React/Vue 的事件处理函数（含传给 onClick 等事件的回调与模板事件绑定）命名必须以 on 或 handle 开头",
+    "bad": "function submit() {\n  form.submit()\n}\nreturn <Button onClick={submit}>提交</Button>",
+    "good": "function handleSubmit() {\n  form.submit()\n}\nreturn <Button onClick={handleSubmit}>提交</Button>",
+    "sourceId": "CR-005.01",
+    "scope": { "extensions": [".js", ".jsx", ".ts", ".tsx", ".vue"] }
+  },
+  {
+    "id": "MNT-023",
+    "dimension": "maintainability",
+    "severity": "low",
+    "title": "TS 无默认值变量必须显式声明类型",
+    "check": "TypeScript 中声明变量但未给默认值时，必须显式标注类型，不得依赖隐式推断或留成 any",
+    "bad": "let cache\nfunction initCache() {\n  cache = new Map()\n}",
+    "good": "let cache: Map<string, User>\nfunction initCache() {\n  cache = new Map()\n}",
+    "sourceId": "CR-004.04",
+    "scope": { "extensions": [".ts", ".tsx"] }
+  },
+  {
+    "id": "MNT-024",
+    "dimension": "maintainability",
+    "severity": "low",
+    "title": "单行不得超过 120 字符",
+    "check": "单行代码（含类型标注与行尾注释）不得超过 120 个字符；超长表达式必须换行或提取中间变量",
+    "bad": "const result = await request(`/api/orders/${orderId}/approval?status=${status}&operator=${operatorId}&page=${page}&size=${size}`, { method: 'POST', headers })",
+    "good": "const url = `/api/orders/${orderId}/approval`\nconst result = await request(url, { method: 'POST', headers })",
+    "sourceId": "CR-104.03",
+    "scope": { "extensions": [".js", ".jsx", ".ts", ".tsx", ".vue"] }
+  },
+  {
+    "id": "MNT-025",
+    "dimension": "maintainability",
+    "severity": "low",
+    "title": "CSS 缩写、顺序与选择器规范",
+    "check": "CSS 属性优先使用缩写，按「布局定位 → 盒模型 → 文本 → 其他」顺序书写，少用 ID 选择器，慎用 !important，0 后不带单位",
+    "bad": "#user-card {\n  padding-top: 0px;\n  padding-right: 0px;\n  padding-bottom: 0px;\n  padding-left: 0px;\n  color: red !important;\n}",
+    "good": ".user-card {\n  position: relative;\n  margin: 0 auto;\n  padding: 0 16px;\n  font-size: 14px;\n  color: #d4380d;\n}",
+    "sourceId": "CR-103.01~.05",
+    "scope": { "extensions": [".css", ".less", ".scss"] }
+  }
+]

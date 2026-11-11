@@ -166,18 +166,18 @@
     "dimension": "maintainability",
     "severity": "low",
     "title": "不得留下调试残留",
-    "check": "不得提交 console.log、debugger、TODO 占位实现",
-    "bad": "console.log('here')",
-    "good": "（删除）"
+    "check": "不得提交 debugger、console.log/console.debug/console.info 调试日志或 TODO 占位实现；错误处理路径允许 console.error（必要时 console.warn）",
+    "bad": "debugger\nconsole.log('user', user)",
+    "good": "try {\n  await save(user)\n} catch (error) {\n  console.error('save user failed', error)\n}"
   },
   {
     "id": "MNT-003",
     "dimension": "maintainability",
     "severity": "low",
     "title": "不得复制粘贴近似代码块",
-    "check": "同一变更里不得新增两段只差少量字面量的近似逻辑；必须抽成一个函数或参数化，避免改一处漏一处",
-    "bad": "async function saveUser(u) { await validate(u); return db.save('user', u) }\nasync function saveTeam(t) { await validate(t); return db.save('team', t) }",
-    "good": "async function save(kind, value) { await validate(value); return db.save(kind, value) }"
+    "check": "同一变更里复制的逻辑满足任一条件才算问题：出现 ≥3 处且每处有效逻辑 ≥5 行，或重复的是核心业务分支、异常处理、权限判断；日志文案、简单赋值、测试夹具重复默认不算",
+    "bad": "async function approveOrder(id) {\n  const order = await getOrder(id)\n  if (order.status !== 'pending') throw new Error('invalid status')\n  order.status = 'approved'\n  await saveOrder(order)\n  await sendNotice(order.owner, 'approved')\n}\nasync function rejectOrder(id) {\n  const order = await getOrder(id)\n  if (order.status !== 'pending') throw new Error('invalid status')\n  order.status = 'rejected'\n  await saveOrder(order)\n  await sendNotice(order.owner, 'rejected')\n}\nasync function cancelOrder(id) {\n  const order = await getOrder(id)\n  if (order.status !== 'pending') throw new Error('invalid status')\n  order.status = 'canceled'\n  await saveOrder(order)\n  await sendNotice(order.owner, 'canceled')\n}",
+    "good": "async function transitionOrder(id, next) {\n  const order = await getOrder(id)\n  if (order.status !== 'pending') throw new Error('invalid status')\n  order.status = next\n  await saveOrder(order)\n  await sendNotice(order.owner, next)\n}\n// approveOrder / rejectOrder / cancelOrder 都改为调用 transitionOrder"
   },
   {
     "id": "MNT-004",
@@ -211,7 +211,7 @@
     "dimension": "maintainability",
     "severity": "low",
     "title": "巨型函数必须拆分",
-    "check": "新增或实质修改的函数不得同时承担参数校验、业务计算与 I/O 三类职责；超过 80 行必须拆分",
+    "check": "新增或实质修改的函数超过 200 行必须强制拆分；超过 100 行建议拆分；且不得同时承担参数校验、业务计算与 I/O 三类职责",
     "bad": "async function handle(req) {\n  const data = validate(req)\n  const total = calculate(data)\n  await db.save(total)\n  await mail.send(total)\n}",
     "good": "async function handle(req) {\n  const order = parseOrder(req)\n  await saveOrder(order)\n}"
   }
