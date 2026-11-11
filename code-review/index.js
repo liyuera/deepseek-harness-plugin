@@ -27,7 +27,7 @@ function message(text) {
   return {
     id: crypto.randomUUID(),
     role: 'user',
-    source: { kind: 'plugin', plugin: 'code-review' },
+    source: { kind: 'plugin:code-review' },
     content: [{ type: 'text', text }],
   }
 }

@@ -270,7 +270,7 @@ test('结果回灌：followup 带 plugin 来源、结论与修复要求', async 
 
   assert.equal(harness.state.follows.length, 1)
   const message = harness.state.follows[0]
-  assert.deepEqual(message.source, { kind: 'plugin', plugin: 'code-review' })
+  assert.deepEqual(message.source, { kind: 'plugin:code-review' })
   assert.equal(message.role, 'user')
   assert.equal(typeof message.id, 'string')
   assert.match(followText(harness.state, 0), /结论: 需修改/)
@@ -351,7 +351,7 @@ test('非人类来源消息不重置链，杜绝自激循环', async () => {
   harness.resolveNext(completed([FINDING]))
   await tick()
 
-  await harness.userMessage({ source: { kind: 'plugin', plugin: 'code-review' } })
+  await harness.userMessage({ source: { kind: 'plugin:code-review' } })
   await harness.stop(agent, { seq: 8, turn: 2, diff: '+const a = 2' })
 
   assert.equal(harness.state.starts.length, 1, '插件消息不得重置链预算')

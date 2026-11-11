@@ -412,7 +412,7 @@ v1 在 `agent/turn-stopping` 里**同步等待**审查者，审查耗时直接�
 - `turn-stopping` 只做「门禁 → 摘要预检 → 取材 → 去重 → `startActivation`」，然后**立即返回**；不再 `await activation.result`。
 - 仍用 `delivery: 'caller'`：只有 caller 投递能拿到 `result.structured` 走 schema 校验、severity 权威、路径白名单。`delivery: 'parent'` 的运行时 settlement 消息不可控（会把 `Structured result: {json}` 原样塞进父会话），弃用。
 - 结算在后台完成：`.then(result)` → 校验/渲染。**有 blocking findings 时**用 `agent.followup(message)` 注入；`followup = send(message, 'next-turn', true)`，空闲 agent 会被唤醒并开新 turn。**无 blocking 时静默**（v2 不注入「结论: 通过」，避免每次通过都多一个 turn）。
-- 注入消息的 source 是 `{kind: 'plugin', plugin: 'code-review'}`（会话格式 v3 允许，`messageSourceValue` 校验 `kind + plugin`）。这样它不会被当成人类输入（不误触权限/目标轮次判定），也不会重置链预算。
+- 注入消息的 source 是 `{kind: 'plugin:code-review'}`。**不能用 `{kind:'plugin', plugin:…}`**：v4 会话格式已退役 plugin wrapper，落盘时抛 `format v4 message requires a producer-owned source kind`（实测触发过一轮 turn error）；v3→v4 迁移对第三方生产者正是用 `plugin:<name>` 这种 kind。该 kind 不是 `'user'`，因此不会被当成人类输入（不误触权限/目标轮次判定），也不会重置链预算。
 - 审查者的取消信号来自**插件生命周期 `AbortController`**，不是 turn-stopping 的 `signal`（后者会随 turn 结束/取消连带杀掉后台审查）。`session/disposed`、插件 dispose 时 dispose 在途 activation。
 - 注入前校验 `ctx.agents.get(sessionId)` 仍命中原 agent；会话已关闭则丢弃结果（debug 日志，不抛）。
 
