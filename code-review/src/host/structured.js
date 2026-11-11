@@ -3,15 +3,15 @@
  * 从 reviewer.js 拆出，保持 activation 生命周期与 prompt 组装的文件体积可控。
  * @module @liyuera/dsh-code-review/host/structured
  */
-import { locationPath, validateFindingEvidence } from './evidence.js'
+import { locationLine, locationPath, validateFindingEvidence } from './evidence.js'
+import { RULE_DIMENSIONS } from './rules.js'
 import { SEVERITY_RANK } from './render.js'
 
 /** 单次审查最多保留的 findings：超出按严重度截断，避免回灌消息与修复成本失控。 */
 export const MAX_FINDINGS = 20
 
-const DIMENSIONS = new Set(['correctness', 'security', 'performance', 'maintainability'])
+const DIMENSIONS = new Set(RULE_DIMENSIONS)
 const SEVERITIES = new Set(['high', 'medium', 'low', 'nit'])
-const LOCATION_SUFFIX = /^\d+(?:-\d+)?$/
 const COVERAGE_STATUSES = new Set(['reviewed', 'sampled', 'skipped'])
 
 export function normalizeFinding(finding, allowedRuleIds, allowedPaths, ruleSeverities) {
@@ -23,10 +23,8 @@ export function normalizeFinding(finding, allowedRuleIds, allowedPaths, ruleSeve
   const knownRule = allowedRuleIds.has(ruleId)
   const principled = knownRule && ruleId === `PRINCIPLE-${dimension}`
   if (!knownRule || (ruleId.startsWith('PRINCIPLE-') && !principled)) return undefined
-  const separator = location.lastIndexOf(':')
-  if (separator <= 0) return undefined
-  const path = location.slice(0, separator)
-  if (!LOCATION_SUFFIX.test(location.slice(separator + 1))) return undefined
+  if (locationLine(location) === undefined) return undefined
+  const path = locationPath(location)
   if (!allowedPaths.has(path)) return undefined
   // 硬规则的 severity 以规则表为权威；PRINCIPLE-* 不在表里，保留模型判断。
   const authoritative = ruleSeverities?.has(ruleId) ? ruleSeverities.get(ruleId) : severity

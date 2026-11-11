@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { REVIEW_SCHEMA, runReview } from '../src/host/reviewer.js'
+import { RULE_DIMENSIONS } from '../src/host/rules.js'
 import { fakeSubagents } from './helpers.js'
 
 const FILE = {
@@ -129,4 +130,34 @@ test('文本模式（full）按当前文件内容校验证据', async () => {
   )
   assert.equal(result.ok, true)
   assert.deepEqual(result.evidence, ['ok', 'mismatch'])
+})
+
+test('behavior 维度 finding 能通过校验（BEH 规则与 PRINCIPLE-behavior）', async () => {
+  const beh = finding({
+    ruleId: 'BEH-001',
+    dimension: 'behavior',
+    severity: 'low',
+  })
+  const behResult = await review({ findings: [beh] }, {
+    allowedRuleIds: new Set(['BEH-001', 'PRINCIPLE-behavior']),
+  })
+  assert.equal(behResult.ok, true)
+  assert.equal(behResult.findings[0].dimension, 'behavior')
+
+  const principle = finding({
+    ruleId: 'PRINCIPLE-behavior',
+    dimension: 'behavior',
+    severity: 'medium',
+  })
+  const principleResult = await review({ findings: [principle] }, {
+    allowedRuleIds: new Set(['BEH-001', 'PRINCIPLE-behavior']),
+  })
+  assert.equal(principleResult.ok, true)
+  assert.equal(principleResult.findings[0].ruleId, 'PRINCIPLE-behavior')
+})
+
+test('REVIEW_SCHEMA 的 dimension enum 与规则维度单一来源一致', () => {
+  const dimensions = REVIEW_SCHEMA.properties.findings.items.properties.dimension.enum
+  assert.deepEqual(dimensions, [...RULE_DIMENSIONS])
+  assert.ok(dimensions.includes('behavior'))
 })

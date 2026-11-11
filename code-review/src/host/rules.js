@@ -15,6 +15,9 @@ const PREFIX_BY_DIMENSION = Object.freeze({
   maintainability: 'MNT',
   behavior: 'BEH',
 })
+
+/** 规则维度单一来源：schema/校验/渲染都从这里取，避免各自维护白名单。 */
+export const RULE_DIMENSIONS = Object.freeze(Object.keys(PREFIX_BY_DIMENSION))
 const SEVERITIES = new Set(['high', 'medium', 'low', 'nit'])
 const FIX_MODES = new Set(['auto', 'manual', 'forbidden'])
 const FIELDS = ['id', 'dimension', 'severity', 'title', 'check', 'bad', 'good']

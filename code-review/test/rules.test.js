@@ -483,3 +483,8 @@ test('composeRules 返回 fixMode/blocking 映射（只含有显式值的规则�
   assert.deepEqual([...composed.ruleFixModes], [['SEC-002', 'manual']])
   assert.deepEqual([...composed.ruleBlocking], [['SEC-002', false]])
 })
+
+test('RULE_DIMENSIONS 暴露五个维度（behavior 与 BEH 前缀同源）', async () => {
+  const { RULE_DIMENSIONS } = await import('../src/host/rules.js')
+  assert.deepEqual([...RULE_DIMENSIONS], ['correctness', 'security', 'performance', 'maintainability', 'behavior'])
+})

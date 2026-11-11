@@ -231,7 +231,7 @@ export function apply(ctx, config) {
       }
       lastFingerprint.set(sessionId, meta.hash)
       if (meta.fullRound) chain.markFull(sessionId, meta.epoch)
-      lastFindings.set(sessionId, findings.slice(0, 20))
+      lastFindings.set(sessionId, findings)
       const elapsed = Date.now() - meta.startedAt
       const totalFiles = meta.summary.total ?? meta.summary.files.length
       ctx.logger.debug?.(

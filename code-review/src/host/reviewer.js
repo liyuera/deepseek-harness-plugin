@@ -2,6 +2,7 @@
  * 审查者：把一个只读子代理跑成一次「diff 进、findings 出」的调用。
  * @module @liyuera/dsh-code-review/host/reviewer
  */
+import { RULE_DIMENSIONS } from './rules.js'
 import { MAX_FINDINGS, validateResult } from './structured.js'
 
 /** 审查者必须返回的结构。verdict 由插件推导，不由模型给。 */
@@ -14,7 +15,7 @@ export const REVIEW_SCHEMA = Object.freeze({
         type: 'object',
         properties: {
           ruleId: { type: 'string' },
-          dimension: { type: 'string', enum: ['correctness', 'security', 'performance', 'maintainability'] },
+          dimension: { type: 'string', enum: [...RULE_DIMENSIONS] },
           severity: { type: 'string', enum: ['high', 'medium', 'low', 'nit'] },
           location: { type: 'string' },
           problem: { type: 'string' },
@@ -149,7 +150,7 @@ export function buildFullPrompt({ rulesPrompt, files, knownFindings = [] }) {
     lines.push('', '## 本链已报告过的问题（不要重复报告）')
     lines.push(
       ...knownFindings
-        .slice(0, 20)
+        .slice(0, MAX_FINDINGS)
         .map((finding) => `- [${finding.ruleId}] ${finding.location} ${finding.problem}`),
     )
   }

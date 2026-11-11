@@ -320,7 +320,7 @@ R3：
 
 ## 11. R1 实施记录（2026-11-11，0.4.0）
 
-R1 已完成并合入 0.4.0；全部 316 个用例通过。实施时对方案做了以下收敛（以代码为准）：
+R1 已完成并合入 0.4.0；全部 319 个用例通过。实施时对方案做了以下收敛（以代码为准）：
 
 1. **证据语义分三档**（`src/host/evidence.js` + `reviewer.js`）：
    - `location` 不在本轮 hunk 新侧范围 → **总是丢弃**（旧代码冒充新问题）；
@@ -351,3 +351,9 @@ R2（journal 账本/`/review` 分区/评测语料）与 R3（`--range`/`--patch`
 
 1. **abort 在 startActivation 返回前胜出时 activation 泄漏**（`verify.js`）：保存 `starting` 引用，abort/deadline 迟到返回时补 dispose，并观察 `result` 防未处理拒绝；补回归用例。
 2. **旧链成功结果不再清零熔断计数**（`index.js`）：`tracker.recordSuccess` 移回跨链判断之前，只有指纹/全量状态/已报问题留在 sameChain 分支；补回归用例（旧链成功后一次失败不会提前打开熔断）。
+
+### 11.3 第三轮自审修复（2026-11-11）
+
+1. **behavior 维度被校验层漏掉**（阻塞）：`structured.js` 的维度白名单与 `REVIEW_SCHEMA.dimension` enum 都只有四维，BEH-* 与 PRINCIPLE-behavior 会被当非法 finding 丢弃；现在维度单一来源为 `rules.js` 的 `RULE_DIMENSIONS`，schema/校验共用，并补 behavior 维度回归用例。
+2. **MAX_FINDINGS 第二份真相**：`index.js` 去掉 `slice(0, 20)`，`reviewer.js` 的 knownFindings 截断改用 `MAX_FINDINGS` 常量。
+3. **location 语法第二份实现**：`structured.js` 改用 `evidence.js` 的 `locationLine`/`locationPath`，删除重复的 `LOCATION_SUFFIX`。

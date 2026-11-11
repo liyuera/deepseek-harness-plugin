@@ -211,7 +211,7 @@ dsh plugin --profile desktop remove @liyuera/dsh-code-review
    node --test
    ```
 
-   第一条应打印 `24`；第二条应全绿（当前 316 个用例）。
+   第一条应打印 `24`；第二条应全绿（当前 319 个用例）。
 
 ## 发布
 
