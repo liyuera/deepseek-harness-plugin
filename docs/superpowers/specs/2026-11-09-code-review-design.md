@@ -459,3 +459,111 @@ v1 在 `agent/turn-stopping` 里**同步等待**审查者，审查耗时直接�
 - 注入消息以 plugin 来源出现在会话里；若宿主/客户端对 plugin 来源用户消息渲染异常，退回 `{kind: 'user'}`（会失去"非人类输入"的语义，仅作降级）。
 - 通过不注入 → 用户不会在对话里看到"审查通过"，需要看审查子会话/日志或手动 `/review`。
 - 长跑审查子代理会占用并发槽（`maxActiveSubagents`，默认 8）；`asyncReviewerTimeoutMs` 是**启动 + 审查**的总预算，超时即取消。
+
+## 18. 规则作用域与规则包（2026-11-11）
+
+### 18.1 动机
+
+团队规范（如 SmartUI 前端 `CR-xxx` 系列）有大量**语言/框架/项目特有**的检查项：React Hooks 依赖只对 `.tsx` 有意义，CSS 全局污染只对样式文件有意义，命名/目录规范只对特定团队成立。把它们直接塞进通用 24 条会导致：后端仓库被前端风格规则误报、单仓库前端文件被无关规则审查、通用规则集被单一团队口味污染。
+
+v3 引入两层机制解决：**规则作用域（scope）** 按本次变更文件过滤，**规则包（pack）** 让团队规范可插拔。
+
+### 18.2 规则 schema 扩展
+
+`rules/rules.json` 的条目在原有 7 个必填字符串字段（`id`/`dimension`/`severity`/`title`/`check`/`bad`/`good`）之上，新增两个**可选**字段：
+
+```json
+{
+  "id": "MNT-008",
+  "dimension": "maintainability",
+  "severity": "medium",
+  "title": "React Hooks 依赖数组不得包含 setState/dispatch",
+  "check": "...",
+  "bad": "...",
+  "good": "...",
+  "sourceId": "CR-011.01",
+  "scope": { "extensions": [".tsx", ".jsx"] }
+}
+```
+
+- `sourceId`（string）：外部规范编号（团队 `CR-xxx.yy`），渲染进 prompt 与 `/review` 报告，方便和团队规范对账。
+- `scope`（object，可选）：`{ extensions?: string[], globs?: string[] }`；两者都可省略。`extensions` 条目必须以 `.` 开头；`globs` 为 posix 相对路径 glob（见 §18.5）。**scope 内 extensions 与 globs 之间是 OR**；命中任一即视为适用。
+- 无 `scope` = 对所有代码文件适用（现有 24 条保持不写 scope）。
+- `validateRules` 对可选字段做校验：`sourceId` 非空字符串；`scope` 是对象且只含 `extensions`/`globs`，数组元素为非空字符串，extensions 以 `.` 开头；`scope` 出现时必须至少有一个非空数组。不合法 → 加载失败（与既有「不静默」口径一致）。
+
+### 18.3 规则包
+
+- 配置新增 `rulePacks: string[]`（默认 `[]`），元素是规则包 JSON 路径，相对包根目录或绝对路径。
+- 加载顺序：`rulesFile`（基础规则）→ 按 `rulePacks` 顺序逐个加载并校验；每个包是「规则条目数组」，字段要求与 §18.2 相同。
+- **失败隔离（fail-open）**：某个包读不到/JSON 非法/校验失败/与已加载规则 id 重复 → 记一次警告并**跳过该包**，基础规则不受影响。基础规则自身失败仍按 §8.3 降级为只用原则层。
+- 包内 id 必须全局唯一（跨基础规则与其它包），重复视为该包非法。
+- 规则包默认不启用；需要时在 profile 的 `cordis.patch.yml` 里配置，例如前端仓库：`rulePacks: ["rules/packs/frontend-smartui.json"]`。
+
+### 18.4 按文件过滤
+
+`collect()` 之后、构建 prompt 之前，按本次变更文件过滤规则：
+
+- 无 `scope` → 保留。
+- 有 `scope` → 任一变更文件的 `path` 满足 scope（扩展名命中或 glob 命中）才保留。
+- 同一个规则集用于三处，必须一致：渲染进 prompt 的规则表、`allowedRuleIds`（finding 二次校验白名单）、`ruleSeverities`（severity 权威表）。不适用规则的 id 不得被接受。
+- 没有任何规则适用时，prompt 退化为「本轮没有适用的硬规则，只按原则审」，findings 仍可用 `PRINCIPLE-<dimension>`。
+- 过滤逻辑不改变 `/review` 手动路径（同样按最近一次变更文件过滤）。
+
+### 18.5 glob 语义
+
+自带小实现，不引依赖：`*` 匹配段内任意字符（不跨 `/`），`**` 匹配任意层目录，`?` 匹配单个非 `/` 字符；匹配目标是用 `/` 规范化后的相对路径（如 `src/pages/a/services/b.ts`），模式不带前导 `./`。大小写按文件系统原样比较（扩展名过滤单独做小写处理）。
+
+### 18.6 前端规则包 `rules/packs/frontend-smartui.json`
+
+来源：SmartUI 前端团队 `frontend-code-review-guidelines.md`。按「能从当前 diff 直接判断」精选 **18 条新增** + **3 条收紧**，不导入 commit message/编辑器/工程配置/目录结构/bot 策略类（详见 18.9）。
+
+新增 18 条（`MNT-008` ~ `MNT-025`，均 `dimension: maintainability`；行为类 `medium`、风格类 `low`）：
+
+| id | 来源 | severity | scope | 检查 |
+|---|---|---|---|---|
+| MNT-008 | CR-011.01 | medium | `.tsx`, `.jsx` | Hooks 依赖数组不得包含 `setState`/`dispatch` |
+| MNT-009 | CR-012.01/.02 | medium | `**/services/**` | services 层请求参数/响应类型禁 `any`，兜底用 `unknown`+类型守卫 |
+| MNT-010 | CR-008.01/.02 | medium | `.css`, `.less`, `.scss` | 禁顶层 `:global(...)`；嵌套层级 ≤4 |
+| MNT-011 | CR-010.03 | medium | code extensions | 单文件不得超过 500 行 |
+| MNT-012 | CR-104.14/108.04 | medium | `**/services/**` | 列表接口空结果返回 `[]`，不得返回 `{}`/`null` |
+| MNT-013 | CR-009.01 | low | code extensions | `default export` 禁止匿名函数 |
+| MNT-014 | CR-006.02 | low | code extensions | 禁止 `var` |
+| MNT-015 | CR-006.04 | low | code extensions | 判空统一用 `void 0`，不直接用 `undefined` |
+| MNT-016 | CR-006.05/.06 | low | code extensions | 控制流必须大括号；`case/default` 代码块用大括号 |
+| MNT-017 | CR-006.01 | low | code extensions | JS/TS 单引号，HTML 属性双引号 |
+| MNT-018 | CR-006.03 | low | code extensions | 禁止逗号一行声明多个变量 |
+| MNT-019 | CR-001.01/.02 | low | code extensions | 禁中文/拼音混合命名；禁单字母无语义命名（循环下标除外） |
+| MNT-020 | CR-004.01/.02/.03 | low | code extensions | 变量/函数 camelCase；类型/class PascalCase；常量 UPPER_SNAKE |
+| MNT-021 | CR-002.01/.03.03/.03.04 | low | code extensions | 目录 kebab-case；组件文件/组件目录 PascalCase |
+| MNT-022 | CR-005.01 | low | code extensions | 事件处理函数以 `on`/`handle` 开头 |
+| MNT-023 | CR-004.04 | low | `.ts`, `.tsx` | TS 无默认值变量必须显式声明类型 |
+| MNT-024 | CR-104.03 | low | code extensions | 单行不超过 120 字符 |
+| MNT-025 | CR-103.01~.05 | low | `.css`, `.less`, `.scss` | CSS 缩写优先、书写顺序、少用 ID、慎用 `!important`、`0` 不带单位 |
+
+收紧 3 条基础规则（补团队口径，severity 不变）：
+
+- `MNT-002` 调试残留：明确禁 `debugger`、`console.log/debug/info`；**允许**错误路径的 `console.error`（必要时 `warn`）。
+- `MNT-003` 复制粘贴：补口径「≥3 处且每处有效逻辑 ≥5 行，或涉及核心业务/异常/权限分支」才算阻塞；日志文案、简单赋值、测试夹具重复默认不算。
+- `MNT-007` 巨型函数：函数 >200 行强制修改；另由新规则 MNT-011 覆盖文件 >500 行。
+
+### 18.7 prompt 渲染
+
+规则表每行追加来源标签：`### MNT-008 · maintainability · medium · [CR-011.01] 标题`；无 `sourceId` 的规则不渲染该标签。`/review` 报告里的 finding 行同样带 `[sourceId]`（如有），便于和团队规范对照。
+
+### 18.8 测试与验收
+
+- `validateRules`：可选字段合法/非法各分支（sourceId 空串、scope 非对象、scope 空、extensions 不以 `.` 开头、未知 scope 键）。
+- glob 匹配：`*` 不跨目录、`**` 跨目录、`?`、多段路径、无匹配。
+- 过滤：无 scope 恒保留；extensions 命中/未命中；globs 命中/未命中；空文件列表时只剩无 scope 规则；prompt/allowedRuleIds/ruleSeverities 三者一致。
+- 规则包：正常加载合并；包缺失/坏 JSON/校验失败/id 重复 → 跳过并警告、基础规则仍在；`rulePacks: []` 默认不变。
+- 前端包内容：`validateRules` 通过、18 条 id 唯一、severity 与 scope 符合 §18.6；pack 加载后 prompt 含 `[CR-011.01]` 类标签。
+- 集成：index 与 `/review` 传入文件列表后，不适用规则不出现；E2E 用 `.tsx` 仓库验证 prompt 只含前端相关规则、CSS 规则不出现。
+- 全量回归：现有 148 个用例不退化。
+
+### 18.9 不导入的规则与理由
+
+- **commit message 格式（CR-007.04~.06）**：本插件只审本 turn 的 diff，不读取提交信息；这类规则留给 CI/提交钩子。
+- **编辑器与工程配置（CR-101、CR-107）**：不是代码内容，diff 里也判断不了（VS Code、kubb、eslint 插件安装）。
+- **目录结构类（CR-002 部分）**：只能看被修改文件路径，看不到未改动目录，容易误判；保留可从 diff 路径判断的命名部分（MNT-021）。
+- **bot 策略（fix_mode / decision policy）**：那是 SmartUI GitLab bot 的自动修复策略；本插件的「修复者」是主代理，语义不同。
+- **纯偏好类（CR-104 大量建议）**：如「函数名优先动词」「请求方法与接口行为不强绑定」等，无法从 diff 证伪或已由通用规则覆盖。
