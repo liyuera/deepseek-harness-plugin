@@ -320,7 +320,7 @@ R3：
 
 ## 11. R1 实施记录（2026-11-11，0.4.0）
 
-R1 已完成并合入 0.4.0；全部 314 个用例通过。实施时对方案做了以下收敛（以代码为准）：
+R1 已完成并合入 0.4.0；全部 316 个用例通过。实施时对方案做了以下收敛（以代码为准）：
 
 1. **证据语义分三档**（`src/host/evidence.js` + `reviewer.js`）：
    - `location` 不在本轮 hunk 新侧范围 → **总是丢弃**（旧代码冒充新问题）；
@@ -346,3 +346,8 @@ R2（journal 账本/`/review` 分区/评测语料）与 R3（`--range`/`--patch`
 3. **diff 前缀导致证据误判**：模型照抄 `+const x = 1` 时片段对不上；`evidence.js` 现在同时接受带/不带 `+`/`-` 前缀的写法。
 
 同时按自审建议：拆出 `structured.js` 让 `reviewer.js` 回到 500 行内；补齐 verifier 的 abortPromise（取消立即返回并 dispose）；拆分若干超长行。
+
+### 11.2 第二轮自审修复（2026-11-11）
+
+1. **abort 在 startActivation 返回前胜出时 activation 泄漏**（`verify.js`）：保存 `starting` 引用，abort/deadline 迟到返回时补 dispose，并观察 `result` 防未处理拒绝；补回归用例。
+2. **旧链成功结果不再清零熔断计数**（`index.js`）：`tracker.recordSuccess` 移回跨链判断之前，只有指纹/全量状态/已报问题留在 sameChain 分支；补回归用例（旧链成功后一次失败不会提前打开熔断）。

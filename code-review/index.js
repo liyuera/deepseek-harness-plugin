@@ -219,6 +219,8 @@ export function apply(ctx, config) {
         })
       }
 
+      // 审查本身已成功跑完：无论按不按当前链口径回灌，都要清零熔断失败计数。
+      tracker.recordSuccess(sessionId)
       // 复验把收口窗口拉长到分钟级：期间人类消息可能已开启新链，
       // 旧链结果不得回灌，也不得污染新链的去重指纹/全量状态/已报问题。
       const sameChain = meta.epoch === tracker.epochOf(sessionId)
@@ -227,7 +229,6 @@ export function apply(ctx, config) {
         recordCompleted(false)
         return
       }
-      tracker.recordSuccess(sessionId)
       lastFingerprint.set(sessionId, meta.hash)
       if (meta.fullRound) chain.markFull(sessionId, meta.epoch)
       lastFindings.set(sessionId, findings.slice(0, 20))

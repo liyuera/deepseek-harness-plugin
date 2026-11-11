@@ -181,3 +181,36 @@ test('父 signal 取消时立即返回未证实并 dispose，不等 verifier 结
   assert.equal(result.unverified, 1)
   assert.equal(disposed, 1)
 })
+
+test('abort 在 startActivation 返回前胜出：迟到 activation 仍被 dispose 且 result 被观察', async () => {
+  let release
+  const gate = new Promise((resolve) => { release = resolve })
+  let disposed = 0
+  const subagents = {
+    async startActivation() {
+      await gate
+      const result = new Promise((resolve, reject) => {
+        setTimeout(() => reject(new Error('late-boom')), 0)
+      })
+      return { childId: 'v', result, dispose: async () => { disposed += 1 } }
+    },
+  }
+  const controller = new AbortController()
+  const pending = verifyFindings({
+    subagents,
+    agent: {},
+    preset: 'code-review',
+    findings: [finding()],
+    files: [],
+    blockingSeverities: ['high'],
+    timeoutMs: 120000,
+    signal: controller.signal,
+  })
+  await new Promise((resolve) => setImmediate(resolve))
+  controller.abort()
+  const result = await pending
+  assert.equal(result.unverified, 1)
+  release()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(disposed, 1, '迟到的 activation 必须被 dispose')
+})

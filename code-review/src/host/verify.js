@@ -95,23 +95,34 @@ async function runVerdict({
     timer = setTimeout(() => resolve(deadlineSymbol), timeoutMs)
   })
   try {
-    const started = await Promise.race([
-      Promise.resolve(subagents.startActivation({
-        provider: 'spawn',
-        label: 'code-review-verify',
-        delivery: 'caller',
-        signal: controller.signal,
-        request: {
-          parent: agent,
-          agentPreset: preset,
-          outputSchema: VERDICT_SCHEMA,
-          ...(modelOverride === undefined ? {} : { agentOptions: modelOverride }),
-          prompt: [{ type: 'text', text: prompt }],
-        },
-      })),
-      deadline,
-      abortPromise,
-    ])
+    const starting = Promise.resolve(subagents.startActivation({
+      provider: 'spawn',
+      label: 'code-review-verify',
+      delivery: 'caller',
+      signal: controller.signal,
+      request: {
+        parent: agent,
+        agentPreset: preset,
+        outputSchema: VERDICT_SCHEMA,
+        ...(modelOverride === undefined ? {} : { agentOptions: modelOverride }),
+        prompt: [{ type: 'text', text: prompt }],
+      },
+    }))
+    // abort/deadline 可能在 startActivation 仍未返回时先赢得 race；迟到的 activation
+    // 也必须 dispose，并观察 result 避免未处理拒绝。
+    starting.then(
+      (value) => {
+        if (!timedOut && !aborted) return
+        try {
+          void Promise.resolve(value?.dispose?.()).catch(() => {})
+        } catch {}
+        try {
+          void Promise.resolve(value?.result).catch(() => {})
+        } catch {}
+      },
+      () => {},
+    )
+    const started = await Promise.race([starting, deadline, abortPromise])
     if (started === deadlineSymbol) {
       timedOut = true
       return undefined

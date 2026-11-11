@@ -1443,3 +1443,31 @@ test('coverage 申报有效时写入留痕，/review 脚注展示覆盖', async 
   assert.equal(result.kind, 'success')
   assert.match(result.text, /覆盖 1\/1/)
 })
+
+test('旧链成功结算仍清零熔断计数，不因跨链丢弃而提前熔断', async () => {
+  const harness = createHarness({ maxRounds: 5, verify: 'off' })
+  const agent = makeAgent(harness)
+
+  // 1) 先制造一次失败（计数 1）。
+  await harness.stop(agent, { seq: 7, turn: 1, diff: '+const a = 1' })
+  harness.resolveNext({ stopReason: 'error' })
+  await tick()
+
+  // 2) 第二次审查在途时人类重置链，旧链随后成功结算（结果不回灌）。
+  await harness.stop(agent, { seq: 8, turn: 2, diff: '+const a = 2' })
+  await harness.userMessage({ source: { kind: 'user' } })
+  harness.resolveNext(completed([]))
+  await tick()
+
+  // 3) 再失败一次：若旧链成功没清零，计数会到 2 并打开熔断。
+  await harness.stop(agent, { seq: 9, turn: 3, diff: '+const a = 3' })
+  harness.resolveNext({ stopReason: 'error' })
+  await tick()
+  assert.equal(warnHas(harness.state, '连续失败'), false, '旧链成功应清零失败计数')
+
+  // 4) 熔断未打开，仍能发起下一次审查。
+  await harness.stop(agent, { seq: 10, turn: 4, diff: '+const a = 4' })
+  assert.equal(harness.state.starts.length, 4)
+  harness.resolveNext(completed([]))
+  await tick()
+})
