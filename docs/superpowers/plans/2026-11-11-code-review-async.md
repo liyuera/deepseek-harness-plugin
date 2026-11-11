@@ -108,7 +108,7 @@ const lastFingerprint = new Map() // sessionId -> hash（同链去重）
 ```
 
 - `apply` 里 `ctx.effect(() => () => { lifetime.abort(); for (const h of inflight.values()) h.cancel('plugin-disposed'); inflight.clear() })`。
-- 注入消息 source：`{ kind: 'plugin', plugin: 'code-review' }`。
+- 注入消息 source：`{ kind: 'plugin:code-review' }`（v4 会话格式拒绝 `kind:'plugin'` wrapper，实测会 turn error）。
 - `session/event`：
   - `workspace/changes` → `latestSeq`（不变）；
   - `user/message` 且 `event.data?.source?.kind === 'user'` → `tracker.resetRounds(sessionId)` + `lastFingerprint.delete(sessionId)`（人类消息开新链）。
@@ -138,7 +138,7 @@ const lastFingerprint = new Map() // sessionId -> hash（同链去重）
 
 必须覆盖：
 1. **不阻塞**：turn-stopping 的 promise 在审查结果 resolve **之前**就已返回（用未 resolve 的 activation.result，await handler 后断言行已结束且 `state.follows` 为空）。
-2. **回灌**：result 为 1 条 `COR-001/high` → `followup` 收到 1 条，文本含 `结论: 需修改`、含 `修完会再复审一次`；`message.source.kind === 'plugin'`。
+2. **回灌**：result 为 1 条 `COR-001/high` → `followup` 收到 1 条，文本含 `结论: 需修改`、含 `修完会再复审一次`；`message.source.kind === 'plugin:code-review'`。
 3. **通过静默**：findings 为空 → 无 followup、无 steer。
 4. **链预算**：maxRounds=2，连续三轮 stopping（每轮 diff 文本不同）：第 1、2 轮各发起 1 次；第 3 轮不发起；第 2 次注入含 `不会再自动复审`。
 5. **人类消息重置**：第 4 轮前灌入 `user/message`（source.kind='user'）→ 再 stopping 能重新发起。

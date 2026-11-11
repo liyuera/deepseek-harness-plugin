@@ -87,6 +87,8 @@ AI 在主会话里写完代码，人往往要到提 MR 之后才第一次被审�
 
 ## 6. 运行时契约
 
+> **版本说明**：§6–§13 记录的是 **v1 同步审查**口径（turn-stopping 内同步等待、`steer` 回注、每 turn 计数、`reviewerTimeoutMs` 120s）。v2（2026-11-11）已改为后台审查 + `followup` 回灌 + 按链计数，冲突时**以 §17 为准**，下列 v1 段落仅作历史与契约来源保留。
+
 ### 6.1 触发
 
 监听 `agent/turn-stopping`，按顺序短路求值：
@@ -409,7 +411,7 @@ v1 在 `agent/turn-stopping` 里**同步等待**审查者，审查耗时直接�
 
 ### 17.2 机制
 
-- `turn-stopping` 只做「门禁 → 摘要预检 → 取材 → 去重 → `startActivation`」，然后**立即返回**；不再 `await activation.result`。
+- `turn-stopping` 只做「门禁 → 摘要预检 → 取材 → 去重 → `startActivation`」，拿到句柄后**立即返回**；不再 `await activation.result`。注意 `startActivation` 本身仍在同步段里：它受同一个 `asyncReviewerTimeoutMs` 总预算赛跑（启动超时即有界放弃并记失败），`session/disposed` 也能通过 startup AbortController 取消启动，因此 turn 结束不会被启动卡死。
 - 仍用 `delivery: 'caller'`：只有 caller 投递能拿到 `result.structured` 走 schema 校验、severity 权威、路径白名单。`delivery: 'parent'` 的运行时 settlement 消息不可控（会把 `Structured result: {json}` 原样塞进父会话），弃用。
 - 结算在后台完成：`.then(result)` → 校验/渲染。**有 blocking findings 时**用 `agent.followup(message)` 注入；`followup = send(message, 'next-turn', true)`，空闲 agent 会被唤醒并开新 turn。**无 blocking 时静默**（v2 不注入「结论: 通过」，避免每次通过都多一个 turn）。
 - 注入消息的 source 是 `{kind: 'plugin:code-review'}`。**不能用 `{kind:'plugin', plugin:…}`**：v4 会话格式已退役 plugin wrapper，落盘时抛 `format v4 message requires a producer-owned source kind`（实测触发过一轮 turn error）；v3→v4 迁移对第三方生产者正是用 `plugin:<name>` 这种 kind。该 kind 不是 `'user'`，因此不会被当成人类输入（不误触权限/目标轮次判定），也不会重置链预算。
@@ -421,7 +423,7 @@ v1 在 `agent/turn-stopping` 里**同步等待**审查者，审查耗时直接�
 链状态全部在内存、按 session：`rounds`（本轮链已自动审几次）、`lastFingerprint`（链内上一次成功审查的 diff 指纹）、`reviewing` 锁（在途审查）。
 
 1. **链预算**：`maxRounds`（默认 2）是**每条链**的上限，不是每个 turn。`rounds >= maxRounds` 时门禁跳过（`rounds-exhausted`）。
-2. **只有人类消息重置链**：订阅 `session/event` 的 `user/message`，`source.kind === 'user'` 才重置 `rounds`/指纹。插件注入的消息是 `plugin` 来源，**不会**重置链，杜绝自激循环。
+2. **只有人类消息重置链**：订阅 `session/event` 的 `user/message`，`source.kind === 'user'` 才重置 `rounds`/指纹，并让链 epoch +1。插件注入的消息 source 是 `plugin:code-review`（不是 `user`），**不会**重置链，杜绝自激循环。
 3. **内容指纹去重**：链内已成功审过的同一份 diff（`path + 渲染文本` 的 SHA-256）直接跳过，且**不消耗轮次**。
 4. **单实例锁**：一个 session 同时只有一个在途审查；在途期间新的 turn-stopping 被 `reviewing` 门禁拒绝。
 
@@ -445,9 +447,10 @@ v1 在 `agent/turn-stopping` 里**同步等待**审查者，审查耗时直接�
 ### 17.6 测试与验收
 
 - `loop`：链轮次按 session 计数、人类重置、锁、熔断。
-- `reviewer`：`activateReview` / `settleReview` 拆分后，覆盖超时 dispose、取消、schema 校验不变。
+- `reviewer`：新增 `startReview`（异步发起/幂等 cancel），校验抽成 `validateResult` / `validateStructured`；`runReview` 保留给 `/review`。覆盖取消 dispose、schema 校验不变。
 - `index`：异步发起不阻塞、结算后 followup、链预算封顶（第 3 次不再审）、人类消息重置、指纹去重不占轮、失败熔断、agent 已关闭丢弃、session disposed 取消、末轮文案。
 - `/review`：保持同步，测试不变。
+- index：启动 deadline/会话关闭取消启动、在途时人类消息重置链后不再串写指纹或误用末轮文案（epoch）。
 - E2E：真实会话改一个文件 → turn 结束不再等审查；审查结论在**新 turn**回灌；修复后复审静默；无第三次自动审查。
 
 ### 17.7 取舍与已知限制
@@ -455,4 +458,4 @@ v1 在 `agent/turn-stopping` 里**同步等待**审查者，审查耗时直接�
 - turn 结束变快；代价是审查结论晚一个 turn 到达，主代理会在无用户输入的情况下自动继续修复（最多 `maxRounds` 轮，见 §17.3）。
 - 注入消息以 plugin 来源出现在会话里；若宿主/客户端对 plugin 来源用户消息渲染异常，退回 `{kind: 'user'}`（会失去"非人类输入"的语义，仅作降级）。
 - 通过不注入 → 用户不会在对话里看到"审查通过"，需要看审查子会话/日志或手动 `/review`。
-- 长跑审查子代理会占用并发槽（`maxActiveSubagents`，默认 8）最长 `asyncReviewerTimeoutMs`。
+- 长跑审查子代理会占用并发槽（`maxActiveSubagents`，默认 8）；`asyncReviewerTimeoutMs` 是**启动 + 审查**的总预算，超时即取消。
