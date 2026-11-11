@@ -3,6 +3,7 @@
  * @module @liyuera/dsh-code-review/host/command
  */
 import { collect } from './collect.js'
+import { formatJournal } from './journal.js'
 import { renderFindings, renderPass } from './render.js'
 import { buildPrompt, runReview } from './reviewer.js'
 import { composeRules } from './rules.js'
@@ -12,13 +13,20 @@ import { composeRules } from './rules.js'
  * @param {object} deps
  * @returns {object} CommandDefinition
  */
-export function createReviewCommand({ config, workspaceChanges, subagents, getRules, logger, latestSeq, isReviewing }) {
+export function createReviewCommand({
+  config, workspaceChanges, subagents, getRules, logger, latestSeq, isReviewing, journal,
+}) {
   return {
     name: 'review',
     description: '通用代码审查：审查本轮改动并输出报告',
     async handler({ agent, signal }) {
       try {
         const sessionId = agent.session.id
+        // 自动审查的留痕通过命令输出回看；没有记录时不改变原有输出。
+        const withJournal = (text) => {
+          const footer = journal === undefined ? '' : formatJournal(journal.recent(sessionId, 5))
+          return footer === '' ? text : `${text}\n\n${footer}`
+        }
         if (isReviewing?.(sessionId)) {
           return { kind: 'error', text: '已有审查在进行中，请稍后再试。' }
         }
@@ -60,7 +68,7 @@ export function createReviewCommand({ config, workspaceChanges, subagents, getRu
 
         if (!reviewed.ok) {
           logger.warn(`[code-review] /review failed: ${reviewed.reason}`)
-          return { kind: 'error', text: `审查未完成（${reviewed.reason}）。` }
+          return { kind: 'error', text: withJournal(`审查未完成（${reviewed.reason}）。`) }
         }
 
         const text = renderFindings({
@@ -69,7 +77,10 @@ export function createReviewCommand({ config, workspaceChanges, subagents, getRu
           blockingSeverities: config.blockingSeverities,
           summary: scope,
         })
-        return { kind: 'success', text: text === '' ? renderPass({ summary: scope, skipped: collected.skipped }) : text }
+        return {
+          kind: 'success',
+          text: withJournal(text === '' ? renderPass({ summary: scope, skipped: collected.skipped }) : text),
+        }
       } catch (error) {
         logger?.warn?.(`[code-review] /review 失败：${error.message}`)
         return { kind: 'error', text: `审查失败：${error.message}` }

@@ -13,6 +13,7 @@ import { shouldReview } from './src/host/trigger.js'
 import { createTracker } from './src/host/loop.js'
 import { createReviewCommand } from './src/host/command.js'
 import { createReviewerGuard } from './src/host/guard.js'
+import { createJournal } from './src/host/journal.js'
 
 export const name = 'code-review'
 export const inject = ['commands', 'subagents', 'workspaceChanges', 'tools', 'agentPresets', 'agents']
@@ -41,6 +42,9 @@ export function apply(ctx, config) {
   const resolved = resolveConfig(config)
   ctx.tools.guard(createReviewerGuard(resolved.reviewerPreset))
   const tracker = createTracker()
+  const journal = createJournal({ ctx, logger: ctx.logger })
+  /** 在途审查的 journal key：sessionId → key，结算/取消后删除。 */
+  const journalKeys = new Map()
   const latestSeq = new Map()
   // 同一条链内上一次成功审查的 diff 指纹：`sessionId` → fingerprint。
   const lastFingerprint = new Map()
@@ -62,6 +66,11 @@ export function apply(ctx, config) {
   }
 
   ctx.effect(() => () => {
+    // 新增：在途留痕标为 cancelled，并关闭存储 domain
+    for (const key of journalKeys.values()) journal.cancel(key, 'plugin-disposed')
+    journalKeys.clear()
+    void journal.dispose()
+    // 以下为现有清理逻辑，保持不动
     lifetime.abort()
     for (const handle of inflight.values()) handle.cancel('plugin-disposed')
     inflight.clear()
@@ -89,6 +98,7 @@ export function apply(ctx, config) {
       logger: ctx.logger,
       latestSeq: (sessionId) => latestSeq.get(sessionId),
       isReviewing: (sessionId) => tracker.isReviewing(sessionId),
+      journal,
     }))
   } catch (error) {
     // 命令重名只影响手动入口，自动审查仍应可用。
@@ -109,17 +119,35 @@ export function apply(ctx, config) {
 
     // 会话关闭/插件卸载时句柄已被摘除：结果一律丢弃，也不计失败。
     if (!active || lifetime.signal.aborted) {
+      // 正常情况下卸载钩子已经取消并摘掉了 key；这里只兜底尚未收口的记录，
+      // 避免用 'dispose' 覆盖掉 'session-disposed' / 'plugin-disposed' 原因。
+      const pendingKey = journalKeys.get(sessionId)
+      if (pendingKey !== undefined) {
+        journalKeys.delete(sessionId)
+        journal.cancel(pendingKey, lifetime.signal.aborted ? 'plugin-disposed' : 'dispose')
+      }
       ctx.logger.debug?.(`[code-review] drop: session ${sessionId} 的审查结果已失效`)
       return
     }
 
     try {
       if (outcome.ok !== true) {
+        journalKeys.delete(sessionId)
+        journal.settle(meta.journalKey, {
+          // 审查阶段超时（timer 调 handle.cancel('timeout')）单列 timeout 状态。
+          status: outcome.reason === 'timeout' ? 'timeout' : 'failed',
+          reason: outcome.reason,
+        })
         ctx.logger.debug?.(`[code-review] review failed: ${outcome.reason}`)
         if (tracker.recordFailure(sessionId)) {
           ctx.logger.warn('[code-review] 连续失败，已暂停本会话的自动审查')
         }
         return
+      }
+
+      const recordCompleted = (injected) => {
+        journalKeys.delete(sessionId)
+        journal.settle(meta.journalKey, { status: 'completed', findings: outcome.findings, injected })
       }
 
       tracker.recordSuccess(sessionId)
@@ -172,23 +200,31 @@ export function apply(ctx, config) {
           mode: 'notify',
         })
         // 没有命中 notifySeverities 的建议（或本轮干净）：仍然静默。
-        if (notifyText === '') return
+        if (notifyText === '') {
+          recordCompleted(false)
+          return
+        }
         payload = `${notifyText}\n\n以上为非阻塞建议，可选择不改；若认同可顺手修复。${note}如与用户新指令冲突，以用户指令为准。`
       } else {
         // v2 默认行为：通过/只有非阻塞建议时静默，不注入「结论: 通过」。
+        recordCompleted(false)
         return
       }
 
       // 会话已关闭或同 id 换了一个 agent：丢弃结果，不抛。
       const live = ctx.get?.('agents')?.get(sessionId)
       if (live !== meta.agent) {
+        recordCompleted(false)
         ctx.logger.debug?.(`[code-review] drop: session ${sessionId} 的 agent 已关闭或更换`)
         return
       }
 
       try {
         live.followup(message(payload))
+        recordCompleted(true)
       } catch (error) {
+        // followup 失败时审查本身仍算完成，但结果没有回灌。
+        recordCompleted(false)
         ctx.logger.warn(`[code-review] followup 失败：${error.message}`)
       }
     } catch (error) {
@@ -210,6 +246,11 @@ export function apply(ctx, config) {
 
   ctx.on('session/disposed', (session) => {
     generations.set(session.id, (generations.get(session.id) ?? 0) + 1)
+    const journalKey = journalKeys.get(session.id)
+    if (journalKey !== undefined) {
+      journalKeys.delete(session.id)
+      journal.cancel(journalKey, 'session-disposed')
+    }
     const handle = inflight.get(session.id)
     if (handle !== undefined) {
       handle.cancel('session-disposed')
@@ -302,6 +343,15 @@ export function apply(ctx, config) {
     const rounds = tracker.roundsOf(sessionId)
     // 链身份在 begin 后固化：人类消息可能在本审查在途时重置链。
     const epoch = tracker.epochOf(sessionId)
+    // Task 6 改为 fullRound ? 'full' : 'turn'；本任务先固定为单轮。
+    const journalKey = journal.start({
+      sessionId,
+      turn: summary.turn,
+      seq,
+      mode: 'turn',
+      files: collected.files.length,
+    })
+    journalKeys.set(sessionId, journalKey)
 
     // 启动阶段也要有界、可取消：独立控制信号，disposed/插件卸载会 abort 它。
     const control = new AbortController()
@@ -342,6 +392,8 @@ export function apply(ctx, config) {
           return
         }
         ctx.logger.debug?.('[code-review] start timeout')
+        journalKeys.delete(sessionId)
+        journal.settle(journalKey, { status: 'timeout', reason: 'timeout' })
         ctx.logger.debug?.('[code-review] review failed: timeout')
         if (tracker.recordFailure(sessionId)) {
           ctx.logger.warn('[code-review] 连续失败，已暂停本会话的自动审查')
@@ -356,6 +408,8 @@ export function apply(ctx, config) {
       // 启动期间会话被释放/插件卸载：不算失败，也不碰可能已重建的新链状态。
       if (lifetime.signal.aborted || (generations.get(sessionId) ?? 0) !== generation) return
       // 启动失败由这里记一次失败并释放锁；不占用 inflight 表。
+      journalKeys.delete(sessionId)
+      journal.settle(journalKey, { status: 'failed', reason: 'start-failed' })
       ctx.logger.debug?.(`[code-review] start failed: ${error.message}`)
       if (tracker.recordFailure(sessionId)) {
         ctx.logger.warn('[code-review] 连续失败，已暂停本会话的自动审查')
@@ -379,7 +433,7 @@ export function apply(ctx, config) {
     // 启动花掉的时间从总预算里扣，保证「启动 + 审查」不超过 asyncReviewerTimeoutMs。
     const reviewBudget = Math.max(1, resolved.asyncReviewerTimeoutMs - (Date.now() - startedAt))
     const timer = setTimeout(() => handle.cancel('timeout'), reviewBudget)
-    const meta = { agent, summary, collected, hash, rounds, epoch, startedAt, timer }
+    const meta = { agent, summary, collected, hash, rounds, epoch, journalKey, startedAt, timer }
 
     // 后台结算：handler 到这里就返回，不等待审查结果。
     void handle.result

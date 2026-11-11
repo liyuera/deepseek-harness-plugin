@@ -52,6 +52,7 @@ function createHarness(config = {}, options = {}) {
     guard: undefined,
     summaries: new Map(),
     agents: new Map(),
+    storageDomain: undefined,
     diffLine: '+const a = 1',
     startError: undefined,
     startGate: undefined,
@@ -90,8 +91,9 @@ function createHarness(config = {}, options = {}) {
       return disposer
     },
     get(service) {
-      if (service !== 'agents') return undefined
-      return { get: (sessionId) => state.agents.get(sessionId) }
+      if (service === 'agents') return { get: (sessionId) => state.agents.get(sessionId) }
+      if (service === 'storageDomain') return state.storageDomain
+      return undefined
     },
     workspaceChanges: {
       summary(sessionId, seq) {
@@ -217,6 +219,25 @@ function makeAgent(harness, sessionId = 's1') {
   }
   harness.state.agents.set(sessionId, agent)
   return agent
+}
+
+/**
+ * 让 `/review` 内部的 activation 立即完成，再执行命令读取输出里的 journal 脚注。
+ * 命令是自动审查留痕唯一的对外观察点（journal 只接给命令）。
+ */
+async function reviewFoot(harness, agent, findings = [FINDING]) {
+  harness.state.onStart = () => {
+    // startActivation 先调 onStart、后把 entry 放进 pending，所以查找要延后到微任务。
+    queueMicrotask(() => {
+      const entry = harness.state.pending.find((item) => item.settled !== true)
+      if (entry === undefined) return
+      entry.settled = true
+      entry.resolve(completed(findings))
+    })
+  }
+  const command = harness.state.commands[0]
+  assert.ok(command, '命令应已注册')
+  return command.handler({ agent, rawInput: '', signal: signal() })
 }
 
 const followText = (state, index) => state.follows[index]?.content[0]?.text
@@ -1140,4 +1161,106 @@ test('notifySeverities 末轮：非阻塞回灌也声明不再自动复审', asy
   assert.match(text, /可选择不改/)
   assert.match(text, /不会再自动复审/)
   assert.doesNotMatch(text, /修完会再复审一次/)
+})
+
+// —— journal 留痕 ——
+
+test('审查完成写留痕；/review 脚注显示自动审查记录', async () => {
+  const harness = createHarness({ maxRounds: 2 })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, { seq: 7, turn: 1 })
+  harness.resolveNext(completed([FINDING]))
+  await tick()
+  assert.equal(harness.state.follows.length, 1, '前置：自动审查已回灌')
+
+  // 触发一次 /review：命令会跑一次同步审查并追加 journal 脚注
+  const result = await reviewFoot(harness, agent)
+
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /自动审查记录/)
+  assert.match(result.text, /完成 · 1 条建议/)
+  assert.match(result.text, /已回灌/)
+})
+
+test('审查通过（未回灌）也写留痕：completed + injected=false', async () => {
+  const harness = createHarness({ maxRounds: 2 })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, { seq: 7, turn: 1 })
+  harness.resolveNext(completed([]))
+  await tick()
+  assert.equal(harness.state.follows.length, 0, '前置：无阻塞项时静默')
+
+  const result = await reviewFoot(harness, agent, [])
+
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /完成 · 0 条建议（未回灌）/)
+})
+
+test('审查失败写留痕：failed + 原因', async () => {
+  const harness = createHarness({ maxRounds: 2 })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, { seq: 7, turn: 1 })
+  harness.resolveNext({ stopReason: 'incomplete' })
+  await tick()
+  assert.equal(harness.state.follows.length, 0)
+
+  const result = await reviewFoot(harness, agent)
+
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /失败（incomplete）/)
+})
+
+test('审查超时写留痕：timeout', async () => {
+  const harness = createHarness({ maxRounds: 2, asyncReviewerTimeoutMs: 20 })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, { seq: 7, turn: 1 })
+  await waitFor(() => harness.state.disposed === 1)
+  await tick()
+
+  const result = await reviewFoot(harness, agent)
+
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /超时 · 未出结论/)
+})
+
+test('session/disposed 取消在途审查写留痕：cancelled + session-disposed', async () => {
+  const harness = createHarness({ maxRounds: 2 })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, { seq: 7, turn: 1 })
+  assert.equal(harness.state.pending.length, 1, '前置：已有在途审查')
+
+  await harness.emit('session/disposed', { id: 's1' })
+  await tick()
+
+  // 会话释放清空了 latestSeq：重新宣告一次变更后 /review 才能读到留痕。
+  harness.addSummary({ seq: 8, turn: 1 })
+  await harness.markChanges(8)
+
+  const result = await reviewFoot(harness, agent)
+
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /已取消（session-disposed）/)
+})
+
+test('插件卸载取消在途审查写留痕：cancelled + plugin-disposed', async () => {
+  const harness = createHarness({ maxRounds: 2 })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, { seq: 7, turn: 1 })
+  await harness.dispose()
+
+  // 插件卸载后 tracker 仍持有旧锁（实例已随插件丢弃）；先释放会话再读留痕。
+  await harness.emit('session/disposed', { id: 's1' })
+  harness.addSummary({ seq: 7, turn: 1 })
+  await harness.markChanges(7)
+
+  const result = await reviewFoot(harness, agent)
+
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /已取消（plugin-disposed）/)
 })

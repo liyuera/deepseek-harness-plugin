@@ -335,3 +335,76 @@ test('/review 按本次变更文件过滤规则：less 带样式规则、不带�
   assert.doesNotMatch(prompt, /\[CR-011\.01\]/, 'less 变更不应带 Hooks 规则（MNT-008）')
   assert.match(prompt, /### COR-001/)
 })
+
+// —— journal 脚注 ——
+
+const COMPLETED_RECORD = {
+  sessionId: 's1',
+  turn: 1,
+  seq: 7,
+  mode: 'turn',
+  startedAt: Date.now() - 60_000,
+  finishedAt: Date.now(),
+  status: 'completed',
+  reason: null,
+  files: 1,
+  findingsTotal: 1,
+  findings: [],
+  injected: true,
+}
+
+const TIMEOUT_RECORD = {
+  ...COMPLETED_RECORD,
+  status: 'timeout',
+  reason: 'timeout',
+  findingsTotal: 0,
+  injected: false,
+}
+
+test('/review 成功时追加自动审查留痕脚注', async () => {
+  const recentCalls = []
+  const harness = createCommand({
+    deps: {
+      journal: {
+        recent(sessionId, limit) {
+          recentCalls.push([sessionId, limit])
+          return [COMPLETED_RECORD]
+        },
+      },
+    },
+  })
+
+  const result = await harness.command.handler({ agent, signal: signal() })
+
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /结论: 需修改/)
+  assert.match(result.text, /自动审查记录（最近 5 条）:/)
+  assert.match(result.text, /完成 · 1 条建议（已回灌）/)
+  assert.ok(result.text.indexOf('结论') < result.text.indexOf('自动审查记录'), '脚注必须在报告之后')
+  assert.deepEqual(recentCalls, [['s1', 5]])
+})
+
+test('/review 审查未完成时也追加留痕脚注', async () => {
+  const harness = createCommand({
+    result: { stopReason: 'incomplete' },
+    deps: { journal: { recent: () => [TIMEOUT_RECORD] } },
+  })
+
+  const result = await harness.command.handler({ agent, signal: signal() })
+
+  assert.equal(result.kind, 'error')
+  assert.match(result.text, /^审查未完成（incomplete）。/)
+  assert.match(result.text, /自动审查记录/)
+  assert.match(result.text, /超时 · 未出结论/)
+})
+
+test('/review 无 journal 或无记录时输出保持不变', async () => {
+  const plain = createCommand()
+  const plainResult = await plain.command.handler({ agent, signal: signal() })
+  assert.equal(plainResult.kind, 'success')
+  assert.doesNotMatch(plainResult.text, /自动审查记录/)
+
+  const empty = createCommand({ deps: { journal: { recent: () => [] } } })
+  const emptyResult = await empty.command.handler({ agent, signal: signal() })
+  assert.equal(emptyResult.text, plainResult.text, '无记录时不得追加空脚注')
+})
