@@ -87,6 +87,42 @@ function normalizeFinding(finding, allowedRuleIds, allowedPaths, ruleSeverities)
 }
 
 /**
+ * 校验结构化输出并落成 findings。
+ *
+ * @param {unknown} structured
+ * @param {{allowedRuleIds: Set<string>, allowedPaths: Set<string>, ruleSeverities?: Map<string, string>, logger?: object}} input
+ * @returns {{ok:true, findings: object[]} | {ok:false, reason:string}}
+ */
+function validateStructured(structured, { allowedRuleIds, allowedPaths, ruleSeverities, logger }) {
+  if (typeof structured !== 'object' || structured === null || !Array.isArray(structured.findings)) {
+    return { ok: false, reason: 'invalid-result' }
+  }
+  const rawFindings = structured.findings
+  const findings = rawFindings
+    .map((finding) => normalizeFinding(finding, allowedRuleIds, allowedPaths, ruleSeverities))
+    .filter((finding) => finding !== undefined)
+  const dropped = rawFindings.length - findings.length
+  if (dropped > 0) logger?.warn?.(`[code-review] 丢弃 ${dropped} 条非法 finding`)
+  // 全被丢弃说明模型输出不可用（规则/路径/格式全不合规），不能当成「没有问题」。
+  if (rawFindings.length > 0 && findings.length === 0) return { ok: false, reason: 'invalid-result' }
+  return { ok: true, findings }
+}
+
+/**
+ * 校验一次 activation 的结算结果：先要求正常跑完，再校验 structured。
+ *
+ * @param {unknown} result
+ * @param {{allowedRuleIds: Set<string>, allowedPaths: Set<string>, ruleSeverities?: Map<string, string>, logger?: object}} options
+ * @returns {{ok:true, findings: object[]} | {ok:false, reason:string}}
+ */
+function validateResult(result, options) {
+  if (result?.stopReason !== 'completed' || result.structured === undefined) {
+    return { ok: false, reason: 'incomplete' }
+  }
+  return validateStructured(result.structured, options)
+}
+
+/**
  * 跑一次审查。
  *
  * 整体 deadline：计时器在 `startActivation` 之前创建，启动与结果两段都跟同一个
@@ -168,23 +204,7 @@ export async function runReview({
       return { ok: false, reason: 'aborted' }
     }
 
-    const result = settled.value
-    if (result?.stopReason !== 'completed' || result.structured === undefined) {
-      return { ok: false, reason: 'incomplete' }
-    }
-    const raw = result.structured
-    if (typeof raw !== 'object' || raw === null || !Array.isArray(raw.findings)) {
-      return { ok: false, reason: 'invalid-result' }
-    }
-    const rawFindings = raw.findings
-    const findings = rawFindings
-      .map((finding) => normalizeFinding(finding, allowedRuleIds, allowedPaths, ruleSeverities))
-      .filter((finding) => finding !== undefined)
-    const dropped = rawFindings.length - findings.length
-    if (dropped > 0) logger?.warn?.(`[code-review] 丢弃 ${dropped} 条非法 finding`)
-    // 全被丢弃说明模型输出不可用（规则/路径/格式全不合规），不能当成「没有问题」。
-    if (rawFindings.length > 0 && findings.length === 0) return { ok: false, reason: 'invalid-result' }
-    return { ok: true, findings }
+    return validateResult(settled.value, { allowedRuleIds, allowedPaths, ruleSeverities, logger })
   } catch {
     if (aborted || signal?.aborted) return { ok: false, reason: 'aborted' }
     return { ok: false, reason: 'provider-error' }
@@ -198,4 +218,108 @@ export async function runReview({
       } catch {}
     }
   }
+}
+
+/**
+ * 异步发起一次审查，不等待结果。返回的 `result` 永不 reject，取消/失败都落成
+ * `{ok:false, reason}`；只有 `startActivation` 本身抛错时 `startReview` reject。
+ *
+ * @param {object} input
+ * @returns {Promise<{childId: string, result: Promise<{ok:true, findings: object[]} | {ok:false, reason:string}>, cancel(reason?: string): void}>}
+ */
+export async function startReview({
+  subagents, agent, preset, prompt, signal, modelOverride,
+  allowedRuleIds, allowedPaths, ruleSeverities, logger,
+}) {
+  // 已取消的父级信号不启动子代理；返回一个已结算的句柄，调用方无需再区分。
+  if (signal?.aborted) {
+    return {
+      childId: '',
+      result: Promise.resolve({ ok: false, reason: 'aborted' }),
+      cancel() {},
+    }
+  }
+
+  const controller = new AbortController()
+  const validation = { allowedRuleIds, allowedPaths, ruleSeverities, logger }
+  let activation
+  let settled = false
+  let disposed = false
+  let cancelReason
+  let resolveResult
+  const result = new Promise((resolve) => {
+    resolveResult = resolve
+  })
+
+  const finish = (outcome) => {
+    if (settled) return
+    settled = true
+    signal?.removeEventListener('abort', onAbort)
+    resolveResult(outcome)
+  }
+
+  const disposeActivation = () => {
+    if (disposed || activation === undefined) return
+    disposed = true
+    try {
+      void Promise.resolve(activation.dispose?.()).catch(() => {})
+    } catch {}
+  }
+
+  const cancel = (reason = 'cancelled') => {
+    if (settled) return
+    if (cancelReason === undefined) cancelReason = reason
+    controller.abort()
+    disposeActivation()
+    finish({ ok: false, reason: cancelReason })
+  }
+
+  const onAbort = () => {
+    cancel('aborted')
+  }
+  signal?.addEventListener('abort', onAbort, { once: true })
+
+  try {
+    activation = await subagents.startActivation({
+      provider: 'spawn',
+      label: 'code-review',
+      delivery: 'caller',
+      signal: controller.signal,
+      request: {
+        parent: agent,
+        agentPreset: preset,
+        outputSchema: REVIEW_SCHEMA,
+        ...(modelOverride === undefined ? {} : { agentOptions: modelOverride }),
+        prompt: [{ type: 'text', text: prompt }],
+      },
+    })
+  } catch (error) {
+    // 启动失败由调用方记失败，不能伪装成一次审查结果。
+    finish({ ok: false, reason: cancelReason ?? 'provider-error' })
+    throw error
+  }
+
+  // cancel 发生在 startActivation 返回之前：现在才拿到可 dispose 的 activation。
+  if (cancelReason !== undefined) disposeActivation()
+
+  // 始终挂上拒绝处理，避免已取消时 activation.result 的拒绝变成 unhandled。
+  try {
+    Promise.resolve(activation.result).then(
+      (value) => {
+        if (settled) return
+        try {
+          finish(validateResult(value, validation))
+        } catch {
+          finish({ ok: false, reason: 'provider-error' })
+        }
+      },
+      () => {
+        finish({ ok: false, reason: 'provider-error' })
+      },
+    )
+  } catch {
+    finish({ ok: false, reason: 'provider-error' })
+  }
+
+  return { childId: activation.childId, result, cancel }
 }
