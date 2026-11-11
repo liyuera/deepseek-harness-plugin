@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { buildFullPrompt, buildPrompt, runReview, startReview, REVIEW_SCHEMA } from '../src/host/reviewer.js'
+import { buildFullPrompt, buildPrompt, runReview, REVIEW_SCHEMA } from '../src/host/reviewer.js'
+import { fakeSubagents, validFinding } from './helpers.js'
 
 const files = [{ path: 'src/a.ts', display: 'src/a.ts', text: '@@ -1,1 +1,1 @@\n-a\n+b', added: 1, deleted: 1 }]
 
@@ -56,20 +57,6 @@ test('schema 要求 findings 数组', () => {
   assert.deepEqual(REVIEW_SCHEMA.required, ['findings'])
 })
 
-function fakeSubagents(result) {
-  return {
-    calls: [],
-    async startActivation(spec) {
-      this.calls.push(spec)
-      return { childId: 'child-1', result: Promise.resolve(result), dispose: async () => {} }
-    },
-  }
-}
-
-const validFinding = {
-  ruleId: 'SEC-001', dimension: 'security', severity: 'high',
-  location: 'src/a.ts:42', problem: 'p', suggestion: 's',
-}
 
 test('成功路径返回校验后的 findings', async () => {
   const subagents = fakeSubagents({ stopReason: 'completed', structured: { findings: [validFinding] } })
@@ -397,149 +384,4 @@ test('丢弃非法 finding 时记录 warn 日志，不记录正文', async () =>
   assert.equal(warned.length, 1)
   assert.match(warned[0], /丢弃 1 条非法 finding/)
   assert.equal(warned[0].includes('SEC-999'), false, '日志不应带 finding 正文')
-})
-
-function startInput(overrides = {}) {
-  const corFinding = {
-    ruleId: 'COR-001', dimension: 'correctness', severity: 'high',
-    location: 'src/a.ts:7', problem: 'p', suggestion: 's',
-  }
-  return {
-    subagents: fakeSubagents({ stopReason: 'completed', structured: { findings: [corFinding] } }),
-    agent: { id: 'agent-1' }, preset: 'code-review', prompt: 'P',
-    allowedRuleIds: new Set(['COR-001']), allowedPaths: new Set(['src/a.ts']),
-    ...overrides,
-  }
-}
-
-test('startReview 正常路径返回 childId 与校验后的 findings，启动参数与 runReview 一致', async () => {
-  const agent = { id: 'agent-1' }
-  const subagents = fakeSubagents({
-    stopReason: 'completed',
-    structured: {
-      findings: [{
-        ruleId: 'COR-001', dimension: 'correctness', severity: 'high',
-        location: 'src/a.ts:7', problem: 'p', suggestion: 's',
-      }],
-    },
-  })
-  const handle = await startReview({
-    subagents, agent, preset: 'code-review', prompt: 'P',
-    allowedRuleIds: new Set(['COR-001']), allowedPaths: new Set(['src/a.ts']),
-  })
-  assert.equal(typeof handle.childId, 'string')
-  assert.ok(handle.childId.length > 0)
-  const outcome = await handle.result
-  assert.equal(outcome.ok, true)
-  assert.equal(outcome.findings.length, 1)
-  assert.equal(outcome.findings[0].ruleId, 'COR-001')
-
-  const spec = subagents.calls[0]
-  assert.equal(spec.provider, 'spawn')
-  assert.equal(spec.label, 'code-review')
-  assert.equal(spec.delivery, 'caller')
-  assert.equal(spec.request.parent, agent)
-  assert.equal(spec.request.agentPreset, 'code-review')
-  assert.equal(spec.request.outputSchema, REVIEW_SCHEMA)
-  assert.deepEqual(spec.request.prompt, [{ type: 'text', text: 'P' }])
-})
-
-test('startReview cancel 以 cancelled 结算、dispose 一次且幂等', async () => {
-  let disposed = 0
-  const subagents = {
-    async startActivation() {
-      return {
-        childId: 'child-1',
-        result: new Promise(() => {}),
-        dispose: async () => { disposed += 1 },
-      }
-    },
-  }
-  const handle = await startReview(startInput({ subagents }))
-  handle.cancel()
-  assert.deepEqual(await handle.result, { ok: false, reason: 'cancelled' })
-  assert.equal(disposed, 1)
-  handle.cancel('again')
-  await new Promise((resolve) => setImmediate(resolve))
-  assert.equal(disposed, 1, '重复 cancel 不应重复 dispose')
-  assert.deepEqual(await handle.result, { ok: false, reason: 'cancelled' })
-})
-
-test('startReview 父 signal abort 时以 aborted 结算并 dispose', async () => {
-  let disposed = 0
-  const subagents = {
-    async startActivation() {
-      return {
-        childId: 'child-1',
-        result: new Promise(() => {}),
-        dispose: async () => { disposed += 1 },
-      }
-    },
-  }
-  const controller = new AbortController()
-  const handle = await startReview(startInput({ subagents, signal: controller.signal }))
-  controller.abort()
-  assert.deepEqual(await handle.result, { ok: false, reason: 'aborted' })
-  assert.equal(disposed, 1)
-})
-
-test('startReview 的 activation.result 拒绝时为 provider-error，不 reject', async () => {
-  const subagents = {
-    async startActivation() {
-      return { childId: 'child-1', result: Promise.reject(new Error('boom')), dispose: async () => {} }
-    },
-  }
-  const handle = await startReview(startInput({ subagents }))
-  assert.deepEqual(await handle.result, { ok: false, reason: 'provider-error' })
-})
-
-test('startReview 的 startActivation 抛错时整体 reject，不吞成 result', async () => {
-  const subagents = { async startActivation() { throw new Error('start-boom') } }
-  await assert.rejects(startReview(startInput({ subagents })), /start-boom/)
-})
-
-test('startReview 同样以规则表 severity 为权威', async () => {
-  const subagents = fakeSubagents({
-    stopReason: 'completed',
-    structured: {
-      findings: [{
-        ruleId: 'COR-001', dimension: 'correctness', severity: 'low',
-        location: 'src/a.ts:7', problem: 'p', suggestion: 's',
-      }],
-    },
-  })
-  const handle = await startReview(startInput({
-    subagents,
-    ruleSeverities: new Map([['COR-001', 'high']]),
-  }))
-  const outcome = await handle.result
-  assert.equal(outcome.ok, true)
-  assert.equal(outcome.findings[0].severity, 'high')
-})
-
-test('startActivation 返回前父 signal abort：拿到 activation 后立即 dispose 并以 aborted 结算', async () => {
-  let release
-  const gate = new Promise((resolve) => { release = resolve })
-  let disposed = 0
-  let spec
-  const subagents = {
-    async startActivation(request) {
-      spec = request
-      await gate
-      return {
-        childId: 'child-1',
-        result: new Promise(() => {}),
-        dispose: async () => { disposed += 1 },
-      }
-    },
-  }
-  const controller = new AbortController()
-  const pending = startReview(startInput({ subagents, signal: controller.signal }))
-  await new Promise((resolve) => setImmediate(resolve))
-  controller.abort()
-  release()
-  const handle = await pending
-  assert.deepEqual(await handle.result, { ok: false, reason: 'aborted' })
-  assert.equal(disposed, 1)
-  assert.equal(spec.signal.aborted, true)
 })

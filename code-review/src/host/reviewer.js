@@ -2,6 +2,7 @@
  * 审查者：把一个只读子代理跑成一次「diff 进、findings 出」的调用。
  * @module @liyuera/dsh-code-review/host/reviewer
  */
+import { SEVERITY_RANK } from './render.js'
 
 /** 审查者必须返回的结构。verdict 由插件推导，不由模型给。 */
 export const REVIEW_SCHEMA = Object.freeze({
@@ -33,7 +34,6 @@ const SEVERITIES = new Set(['high', 'medium', 'low', 'nit'])
 const LOCATION_SUFFIX = /^\d+(?:-\d+)?$/
 /** 单次审查最多保留的 findings：超出按严重度截断，避免回灌消息与修复成本失控。 */
 const MAX_FINDINGS = 20
-const SEVERITY_ORDER = Object.freeze({ high: 0, medium: 1, low: 2, nit: 3 })
 
 /**
  * 两种审查模式共用的评审准则：团队规范优先、证据边界、不重复治理、最小修复、数量上限。
@@ -46,7 +46,7 @@ const REVIEW_GUIDE = Object.freeze([
   '- 禁止跨上下文推断：不要仅凭 diff 缺失就断言变量未定义、导入缺失、环境变量未声明或某个逻辑不存在；怀疑时先用 read/grep 核实，核实不了就不报。',
   '- 不重复治理：项目基础层已统一封装的职责（请求、错误提示、权限、日志等）不得要求在调用点重复实现；本 diff 未改动封装层时，不因调用点没有单独 try/catch 或弹框而报问题。',
   '- 最小修复：suggestion 指出改哪行、怎么改的最小可执行方向，不提大规模重构、重命名或架构调整。',
-  '- 数量与排序：最多报告 20 条，按严重度降序；没有真实问题就返回空数组，不要为了凑数把风格偏好写成 finding。',
+  `- 数量与排序：最多报告 ${MAX_FINDINGS} 条，按严重度降序；没有真实问题就返回空数组，不要为了凑数把风格偏好写成 finding。`,
   '- severity 口径（PRINCIPLE 类问题按此定级）：high=线上故障/安全风险/数据错误；medium=可复现的功能边界缺陷或明显维护风险；low=非阻塞优化建议。',
 ])
 
@@ -169,8 +169,8 @@ function validateStructured(structured, { allowedRuleIds, allowedPaths, ruleSeve
   if (rawFindings.length > 0 && findings.length === 0) return { ok: false, reason: 'invalid-result' }
   // 超出上限：按严重度取前 MAX_FINDINGS 条，避免回灌消息与修复成本失控。
   const ranked = [...findings].sort(
-    (left, right) => (SEVERITY_ORDER[left.severity] ?? Number.MAX_SAFE_INTEGER)
-      - (SEVERITY_ORDER[right.severity] ?? Number.MAX_SAFE_INTEGER),
+    (left, right) => (SEVERITY_RANK[left.severity] ?? Number.MAX_SAFE_INTEGER)
+      - (SEVERITY_RANK[right.severity] ?? Number.MAX_SAFE_INTEGER),
   )
   if (ranked.length > MAX_FINDINGS) {
     logger?.warn?.(`[code-review] findings 超过 ${MAX_FINDINGS} 条，按严重度截断`)

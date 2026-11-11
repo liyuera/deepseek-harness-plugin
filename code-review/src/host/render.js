@@ -10,8 +10,8 @@ const DIMENSION_LABEL = Object.freeze({
   behavior: '行为',
 })
 
-/** 严重度排名：数字越小越严重。用于渲染前的稳定排序。 */
-const SEVERITY_RANK = Object.freeze({ high: 0, medium: 1, low: 2, nit: 3 })
+/** 严重度排名：数字越小越严重。渲染与截断共用同一份顺序。 */
+export const SEVERITY_RANK = Object.freeze({ high: 0, medium: 1, low: 2, nit: 3 })
 
 function bySeverity(findings) {
   return [...findings].sort(
