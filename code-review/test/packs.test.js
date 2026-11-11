@@ -27,11 +27,11 @@ test('前端规则包通过 validateRules，18 条且 id 唯一', () => {
   assert.equal(new Set(pack.map((rule) => rule.id)).size, 18)
 })
 
-test('严重度为 5 条 medium（MNT-008~012）+ 13 条 low', () => {
+test('严重度为 4 条 medium（MNT-008~010、MNT-012）+ 14 条 low（MNT-011 已按团队口径降为非阻塞）', () => {
   const medium = pack.filter((rule) => rule.severity === 'medium').map((rule) => rule.id)
   const low = pack.filter((rule) => rule.severity === 'low').map((rule) => rule.id)
-  assert.deepEqual(medium, ['MNT-008', 'MNT-009', 'MNT-010', 'MNT-011', 'MNT-012'])
-  assert.equal(low.length, 13)
+  assert.deepEqual(medium, ['MNT-008', 'MNT-009', 'MNT-010', 'MNT-012'])
+  assert.equal(low.length, 14)
   assert.equal(pack.length, medium.length + low.length)
 })
 
@@ -134,14 +134,16 @@ test('MNT-007 收紧：>200 行强制、>100 行建议，文件 >500 行交给 M
   assert.match(packById.get('MNT-011').check, /500/)
 })
 
-test('general-issues 包：8 条 behavior 规则全部通过校验且全为 low', async () => {
+test('general-issues 包：10 条 behavior 规则通过校验，9 low + 1 medium', async () => {
   const raw = await readFile(new URL('../rules/packs/general-issues.json', import.meta.url), 'utf8')
   const rules = JSON.parse(raw)
   validateRules(rules)
-  assert.equal(rules.length, 8)
+  assert.equal(rules.length, 10)
   assert.deepEqual([...new Set(rules.map((rule) => rule.dimension))], ['behavior'])
-  assert.ok(rules.every((rule) => rule.severity === 'low'))
-  assert.equal(new Set(rules.map((rule) => rule.id)).size, 8)
+  const medium = rules.filter((rule) => rule.severity === 'medium').map((rule) => rule.id)
+  assert.deepEqual(medium, ['BEH-009'])
+  assert.equal(rules.filter((rule) => rule.severity === 'low').length, 9)
+  assert.equal(new Set(rules.map((rule) => rule.id)).size, 10)
 })
 
 test('general-issues 启用后 prompt 含 BEH 规则', async () => {
@@ -153,4 +155,16 @@ test('general-issues 启用后 prompt 含 BEH 规则', async () => {
   const composed = composeRules({ ...loaded, filePaths: ['src/a.ts'] })
   assert.match(composed.prompt, /### BEH-001/)
   assert.ok(composed.allowedRuleIds.has('BEH-001'))
+})
+
+test('MNT-011 按团队口径（CR-010.03 非阻塞）降为 low，不再阻塞自动修复', () => {
+  assert.equal(packById.get('MNT-011').severity, 'low')
+  assert.match(packById.get('MNT-011').check, /500/)
+})
+
+test('MNT-016 允许单行语句例外（团队 CR-006.05）', () => {
+  const rule = packById.get('MNT-016')
+  assert.equal(rule.severity, 'low')
+  assert.match(rule.check, /单行/)
+  assert.match(rule.check, /可例外/)
 })

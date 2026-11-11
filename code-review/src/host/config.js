@@ -1,4 +1,7 @@
 /** 配置默认值。冻结，避免被调用方改写。 */
+import { DEFAULT_MANUAL_GLOBS } from './fixmode.js'
+import { DEFAULT_SUPPRESSIONS_FILE, validateSuppressions } from './suppress.js'
+
 export const DEFAULTS = Object.freeze({
   enabled: true,
   auto: true,
@@ -17,14 +20,37 @@ export const DEFAULTS = Object.freeze({
   rulesFile: 'rules/rules.json',
   principlesFile: 'rules/principles.md',
   rulePacks: Object.freeze([]),
+  // v0.4：证据、复验、覆盖、修复策略、抑制记忆。
+  evidenceMode: 'warn',
+  coverageMode: 'warn',
+  verify: 'blocking',
+  maxVerifiedFindings: 3,
+  verifyTimeoutMs: 180000,
+  respectFixPolicy: true,
+  manualFixGlobs: Object.freeze([...DEFAULT_MANUAL_GLOBS]),
+  forbiddenFixGlobs: Object.freeze([]),
+  suppressionsFile: DEFAULT_SUPPRESSIONS_FILE,
+  suppressions: Object.freeze([]),
 })
 
 const KEYS = new Set([...Object.keys(DEFAULTS), 'modelOverride'])
 const SEVERITIES = new Set(['high', 'medium', 'low', 'nit'])
+const EVIDENCE_MODES = new Set(['warn', 'enforce'])
+const COVERAGE_MODES = new Set(['warn', 'enforce'])
+const VERIFY_MODES = new Set(['off', 'blocking'])
 
 function assertPositiveInteger(name, value) {
   if (!Number.isSafeInteger(value) || value < 1) {
     throw new Error(`code-review: ${name} must be a positive integer`)
+  }
+}
+
+function assertStringArray(name, value) {
+  if (!Array.isArray(value)) throw new Error(`code-review: ${name} must be an array`)
+  for (const entry of value) {
+    if (typeof entry !== 'string' || entry.length === 0) {
+      throw new Error(`code-review: ${name} entries must be non-empty strings`)
+    }
   }
 }
 
@@ -42,7 +68,7 @@ export function resolveConfig(raw = {}) {
   }
   const merged = { ...DEFAULTS, ...raw }
 
-  for (const field of ['enabled', 'auto', 'fullReview']) {
+  for (const field of ['enabled', 'auto', 'fullReview', 'respectFixPolicy']) {
     if (typeof merged[field] !== 'boolean') throw new Error(`code-review: ${field} must be a boolean`)
   }
   assertPositiveInteger('maxRounds', merged.maxRounds)
@@ -50,6 +76,18 @@ export function resolveConfig(raw = {}) {
   assertPositiveInteger('reviewerTimeoutMs', merged.reviewerTimeoutMs)
   assertPositiveInteger('asyncReviewerTimeoutMs', merged.asyncReviewerTimeoutMs)
   assertPositiveInteger('fullReviewMaxFiles', merged.fullReviewMaxFiles)
+  assertPositiveInteger('maxVerifiedFindings', merged.maxVerifiedFindings)
+  assertPositiveInteger('verifyTimeoutMs', merged.verifyTimeoutMs)
+
+  if (!EVIDENCE_MODES.has(merged.evidenceMode)) {
+    throw new Error(`code-review: evidenceMode must be one of ${[...EVIDENCE_MODES].join(', ')}`)
+  }
+  if (!COVERAGE_MODES.has(merged.coverageMode)) {
+    throw new Error(`code-review: coverageMode must be one of ${[...COVERAGE_MODES].join(', ')}`)
+  }
+  if (!VERIFY_MODES.has(merged.verify)) {
+    throw new Error(`code-review: verify must be one of ${[...VERIFY_MODES].join(', ')}`)
+  }
 
   if (!Array.isArray(merged.blockingSeverities) || merged.blockingSeverities.length === 0) {
     throw new Error('code-review: blockingSeverities must be a non-empty array')
@@ -71,7 +109,7 @@ export function resolveConfig(raw = {}) {
       throw new Error('code-review: codeExtensions entries must start with "."')
     }
   }
-  for (const field of ['reviewerPreset', 'rulesFile', 'principlesFile']) {
+  for (const field of ['reviewerPreset', 'rulesFile', 'principlesFile', 'suppressionsFile']) {
     if (typeof merged[field] !== 'string' || merged[field].length === 0) {
       throw new Error(`code-review: ${field} must be a non-empty string`)
     }
@@ -84,6 +122,8 @@ export function resolveConfig(raw = {}) {
       throw new Error('code-review: rulePacks entries must be non-empty strings')
     }
   }
+  assertStringArray('manualFixGlobs', merged.manualFixGlobs)
+  assertStringArray('forbiddenFixGlobs', merged.forbiddenFixGlobs)
 
   let modelOverride
   if (merged.modelOverride !== undefined) {
@@ -93,6 +133,8 @@ export function resolveConfig(raw = {}) {
     }
     modelOverride = Object.freeze({ provider, model })
   }
+
+  const suppressions = validateSuppressions(merged.suppressions)
 
   return Object.freeze({
     enabled: merged.enabled,
@@ -110,6 +152,16 @@ export function resolveConfig(raw = {}) {
     rulesFile: merged.rulesFile,
     principlesFile: merged.principlesFile,
     rulePacks: Object.freeze([...merged.rulePacks]),
+    evidenceMode: merged.evidenceMode,
+    coverageMode: merged.coverageMode,
+    verify: merged.verify,
+    maxVerifiedFindings: merged.maxVerifiedFindings,
+    verifyTimeoutMs: merged.verifyTimeoutMs,
+    respectFixPolicy: merged.respectFixPolicy,
+    manualFixGlobs: Object.freeze([...merged.manualFixGlobs]),
+    forbiddenFixGlobs: Object.freeze([...merged.forbiddenFixGlobs]),
+    suppressionsFile: merged.suppressionsFile,
+    suppressions,
     ...(modelOverride === undefined ? {} : { modelOverride }),
   })
 }

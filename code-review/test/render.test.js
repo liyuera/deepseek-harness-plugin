@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { partition, renderFindings, renderPass } from '../src/host/render.js'
+import { classifyFindings, partition, renderFindings, renderPass } from '../src/host/render.js'
 
 const finding = (over) => ({
   ruleId: 'SEC-001', dimension: 'security', severity: 'high',
@@ -181,4 +181,53 @@ test('steer 模式未配置 notifySeverities 时仍只回注阻塞项', () => {
   assert.match(text, /结论: 需修改（1 处阻塞）/)
   assert.doesNotMatch(text, /非阻塞建议/)
   assert.doesNotMatch(text, /MNT-004/)
+})
+
+test('classifyFindings 按 blocking/fixMode/复验状态分桶', () => {
+  const buckets = classifyFindings([
+    finding({ fixMode: 'auto' }),
+    finding({ severity: 'medium', fixMode: 'manual' }),
+    finding({ severity: 'medium', verified: 'unverified' }),
+    finding({ severity: 'medium', evidenceStatus: 'mismatch' }),
+    finding({ severity: 'low' }),
+    finding({ severity: 'high', blocking: false }),
+  ], ['high', 'medium'])
+  assert.equal(buckets.auto.length, 1)
+  assert.equal(buckets.manual.length, 1)
+  assert.equal(buckets.unverified.length, 2)
+  assert.equal(buckets.passive.length, 2)
+})
+
+test('report 渲染人工确认/未复验/抑制/覆盖分区与结论', () => {
+  const text = renderFindings({
+    findings: [
+      finding({ fixMode: 'manual', location: 'src/generated/api.ts:1' }),
+      finding({ severity: 'medium', verified: 'unverified', location: 'src/a.ts:3' }),
+    ],
+    skipped: [],
+    blockingSeverities: ['high', 'medium'],
+    summary: { files: 1, added: 2, deleted: 0 },
+    coverage: { valid: true, missing: false, reviewed: 1, skipped: 0, unaccounted: 0 },
+    suppressed: [{ finding: finding({ severity: 'low', ruleId: 'BEH-001', location: 'src/a.ts:9' }), reason: '产品决策' }],
+  })
+  assert.match(text, /结论: 需人工确认（1 处人工确认，1 处未复验）/)
+  assert.match(text, /需人工确认（不要自动修改）:/)
+  assert.match(text, /\[人工\] \[SEC-001\]/)
+  assert.match(text, /仅报告（未复验\/证据不足，不要据此修复）:/)
+  assert.match(text, /\[未复验\] \[SEC-001\]/)
+  assert.match(text, /覆盖: 已审 1\/1/)
+  assert.match(text, /已抑制（人工裁决，不再报告）: \[BEH-001\] src\/a\.ts:9（产品决策）/)
+  assert.doesNotMatch(text, /请按上面/)
+})
+
+test('respectFixPolicy=false 时 manual 项回到自动修复桶', () => {
+  const text = renderFindings({
+    findings: [finding({ fixMode: 'manual' })],
+    skipped: [],
+    blockingSeverities: ['high', 'medium'],
+    summary: { files: 1, added: 1, deleted: 0 },
+    respectFixPolicy: false,
+  })
+  assert.match(text, /结论: 需修改（1 处阻塞）/)
+  assert.doesNotMatch(text, /人工确认/)
 })

@@ -317,3 +317,22 @@ R3：
 - **range 模式绕过宿主 diff 服务**：只读 git 命令 + 路径白名单 + 超时；失败即报错，不降级猜测。
 - 回滚：每个配置项可关（`verify:'off'`、`evidenceMode:'warn'`、`respectFixPolicy:false`、`fullReview:false`）；
   规则调整可在 profile 覆盖 pack；不引入数据迁移破坏 journal（v2 读时兼容）。
+
+## 11. R1 实施记录（2026-11-11，0.4.0）
+
+R1 已完成并合入 0.4.0；全部 311 个用例通过。实施时对方案做了以下收敛（以代码为准）：
+
+1. **证据语义分三档**（`src/host/evidence.js` + `reviewer.js`）：
+   - `location` 不在本轮 hunk 新侧范围 → **总是丢弃**（旧代码冒充新问题）；
+   - `evidence.snippet` 对不上 → `warn` 下保留但降级为「仅报告」（`evidenceStatus: mismatch`），`enforce` 下丢弃；
+   - 缺少证据 → `warn` 保留（schema 在真实宿主会先要求 evidence），`enforce` 丢弃；
+   - 宿主读不到文件内容 → `unreadable`，保留 finding。
+   这样默认不会因为模型偶发不带 evidence 而误吞真问题，但伪造/引用旧代码的片段不会阻塞、不会触发修复。
+2. **复验只对「阻塞 + 证据 ok」的 finding 发起**（`src/host/verify.js` + `finalize.js`），避免为未证实证据付 verifier 费用；确认才保留、明确反驳丢弃、超时/失败标 `unverified`（仅报告）。
+3. **manual-only 不再承诺「修完会再复审」**：不触发修复轮，文案只要求人工确认/勿自动修改。
+4. **full 模式的证据校验需要宿主持有文件内容**：新增 `src/host/readfile.js`，从 `agent.session.header.cwd` 读取链内文件（每文件 256KB 上限、realpath 越界拒绝）；读不到按不可读处理。
+5. **journal 只记复验统计**（checked/confirmed/rejected/unverified + coverage + suppressed 数）；逐条 verifier 的 witnesses 与 finding 级跨重启账本留给 R2。
+6. **实现文件**：新增 `evidence.js`、`readfile.js`、`verify.js`、`fixmode.js`、`suppress.js`、`finalize.js`；修改 `reviewer.js`/`config.js`/`rules.js`/`render.js`/`journal.js`/`command.js`/`index.js`；规则包调整 MNT-011/MNT-016 并新增 BEH-009/BEH-010。
+7. **默认值**：`evidenceMode: warn`、`coverageMode: warn`、`verify: blocking`、`maxVerifiedFindings: 3`、`verifyTimeoutMs: 180000`、`respectFixPolicy: true`；真实使用一段时间、观察「因证据被降级/丢弃」的比例后再把前两项切到 `enforce`。
+
+R2（journal 账本/`/review` 分区/评测语料）与 R3（`--range`/`--patch`/分块/超时自适应）尚未开始。

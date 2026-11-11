@@ -14,6 +14,10 @@ const pickFinding = (finding) => ({
   severity: String(finding.severity ?? ''),
   location: String(finding.location ?? ''),
   problem: String(finding.problem ?? ''),
+  ...(finding.fingerprint === undefined ? {} : { fingerprint: String(finding.fingerprint) }),
+  ...(finding.fixMode === undefined ? {} : { fixMode: String(finding.fixMode) }),
+  ...(finding.verified === undefined ? {} : { verified: String(finding.verified) }),
+  ...(finding.evidenceStatus === undefined ? {} : { evidenceStatus: String(finding.evidenceStatus) }),
 })
 
 const keyOf = (record) => `${record.sessionId}:${record.seq}:${record.startedAt}`
@@ -97,6 +101,9 @@ export function createJournalCore({ logger, now = Date.now } = {}) {
         findingsTotal: Array.isArray(patch.findings) ? patch.findings.length : current.findingsTotal,
         findings: Array.isArray(patch.findings) ? patch.findings.slice(0, MAX_FINDINGS).map(pickFinding) : current.findings,
         injected: patch.injected === true,
+        ...(patch.coverage === undefined ? {} : { coverage: patch.coverage }),
+        ...(patch.verification === undefined ? {} : { verification: patch.verification }),
+        ...(patch.suppressed === undefined ? {} : { suppressed: patch.suppressed }),
       })
     },
     cancel(key, reason) {
@@ -162,8 +169,20 @@ const RECORD_SCHEMA = (z) => z.object({
   findings: z.array(z.object({
     ruleId: z.string(), dimension: z.string(), severity: z.string(),
     location: z.string(), problem: z.string(),
+    fingerprint: z.string().optional(),
+    fixMode: z.string().optional(),
+    verified: z.string().optional(),
+    evidenceStatus: z.string().optional(),
   })).max(MAX_FINDINGS),
   injected: z.boolean(),
+  coverage: z.object({
+    reviewed: z.number(), skipped: z.number(), unaccounted: z.number(),
+    valid: z.boolean(), missing: z.boolean().optional(),
+  }).optional(),
+  verification: z.object({
+    checked: z.number(), confirmed: z.number(), rejected: z.number(), unverified: z.number(),
+  }).optional(),
+  suppressed: z.number().optional(),
 })
 
 async function attachStorage(journal, storageDomain, logger) {
@@ -203,8 +222,17 @@ export function formatJournal(records, { now = Date.now } = {}) {
     const mode = record.mode === 'full' ? '全量' : '单轮'
     let result
     if (record.status === 'running') result = '进行中'
-    else if (record.status === 'completed') result = `完成 · ${record.findingsTotal} 条建议（${record.injected ? '已回灌' : '未回灌'}）`
-    else if (record.status === 'cancelled') result = `已取消（${record.reason ?? '未知原因'}）· 未出结论`
+    else if (record.status === 'completed') {
+      const extra = []
+      if (record.coverage !== undefined && record.coverage.valid === true) {
+        extra.push(`覆盖 ${record.coverage.reviewed}/${record.coverage.reviewed + record.coverage.skipped}`)
+      }
+      if (record.verification !== undefined && record.verification.checked > 0) {
+        extra.push(`复验 ${record.verification.confirmed}/${record.verification.checked}`)
+      }
+      if (record.suppressed !== undefined && record.suppressed > 0) extra.push(`抑制 ${record.suppressed}`)
+      result = `完成 · ${record.findingsTotal} 条建议（${record.injected ? '已回灌' : '未回灌'}）${extra.length > 0 ? ` · ${extra.join(' · ')}` : ''}`
+    } else if (record.status === 'cancelled') result = `已取消（${record.reason ?? '未知原因'}）· 未出结论`
     else if (record.status === 'timeout') result = '超时 · 未出结论'
     else result = `失败（${record.reason ?? '未知原因'}）· 未出结论`
     lines.push(`- ${timeOf(record.startedAt)} turn ${record.turn} · ${mode} · ${result}`)

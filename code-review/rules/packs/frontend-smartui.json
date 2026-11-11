@@ -8,7 +8,12 @@
     "bad": "const [open, setOpen] = useState(false)\nuseEffect(() => {\n  setOpen(defaultOpen)\n}, [defaultOpen, setOpen])",
     "good": "const [open, setOpen] = useState(false)\nuseEffect(() => {\n  setOpen(defaultOpen)\n}, [defaultOpen])",
     "sourceId": "CR-011.01",
-    "scope": { "extensions": [".tsx", ".jsx"] }
+    "scope": {
+      "extensions": [
+        ".tsx",
+        ".jsx"
+      ]
+    }
   },
   {
     "id": "MNT-009",
@@ -19,7 +24,11 @@
     "bad": "// src/services/user.ts\nexport function getUser(params: any): Promise<any> {\n  return request('/api/users', { data: params })\n}",
     "good": "// src/services/user.ts\nexport interface User {\n  id: string\n  name: string\n}\n\nfunction isUser(value: unknown): value is User {\n  return typeof value === 'object' && value !== null && 'id' in value\n}\n\nexport async function getUser(id: string): Promise<User> {\n  const data: unknown = await request(`/api/users/${id}`)\n  if (!isUser(data)) {\n    throw new Error('invalid user payload')\n  }\n  return data\n}",
     "sourceId": "CR-012.01/.02",
-    "scope": { "globs": ["**/services/**"] }
+    "scope": {
+      "globs": [
+        "**/services/**"
+      ]
+    }
   },
   {
     "id": "MNT-010",
@@ -30,18 +39,32 @@
     "bad": "// src/components/UserPanel/index.less\n:global(.ant-btn) {\n  color: #1677ff;\n}",
     "good": "// src/components/UserPanel/index.less\n.user-panel {\n  :global(.ant-btn) {\n    color: #1677ff;\n  }\n}",
     "sourceId": "CR-008.01/.02",
-    "scope": { "extensions": [".css", ".less", ".scss"] }
+    "scope": {
+      "extensions": [
+        ".css",
+        ".less",
+        ".scss"
+      ]
+    }
   },
   {
     "id": "MNT-011",
     "dimension": "maintainability",
-    "severity": "medium",
+    "severity": "low",
     "title": "单文件不得超过 500 行",
     "check": "新增或实质修改的文件不得超过 500 行；超过时必须拆分为组件、Hooks、工具函数或独立样式文件",
     "bad": "// src/pages/OrderList.tsx（860 行）\nexport default function OrderList() {\n  // 表格列、筛选表单、导出逻辑、详情弹窗、权限判断全部内联\n}",
     "good": "// src/pages/OrderList/index.tsx（180 行）\nexport default function OrderList() {\n  return (\n    <Page>\n      <OrderFilters />\n      <OrderTable />\n      <OrderDetailModal />\n    </Page>\n  )\n}",
     "sourceId": "CR-010.03",
-    "scope": { "extensions": [".js", ".jsx", ".ts", ".tsx", ".vue"] }
+    "scope": {
+      "extensions": [
+        ".js",
+        ".jsx",
+        ".ts",
+        ".tsx",
+        ".vue"
+      ]
+    }
   },
   {
     "id": "MNT-012",
@@ -52,7 +75,11 @@
     "bad": "// src/services/order.ts\nexport async function queryOrders(): Promise<Order[] | null> {\n  const data = await request('/api/orders')\n  return data.rows.length > 0 ? data.rows : null\n}",
     "good": "// src/services/order.ts\nexport async function queryOrders(): Promise<Order[]> {\n  const data = await request('/api/orders')\n  return data.rows ?? []\n}",
     "sourceId": "CR-104.14/108.04",
-    "scope": { "globs": ["**/services/**"] }
+    "scope": {
+      "globs": [
+        "**/services/**"
+      ]
+    }
   },
   {
     "id": "MNT-013",
@@ -63,7 +90,15 @@
     "bad": "export default () => <div className=\"panel\" />",
     "good": "function Panel() {\n  return <div className=\"panel\" />\n}\n\nexport default Panel",
     "sourceId": "CR-009.01",
-    "scope": { "extensions": [".js", ".jsx", ".ts", ".tsx", ".vue"] }
+    "scope": {
+      "extensions": [
+        ".js",
+        ".jsx",
+        ".ts",
+        ".tsx",
+        ".vue"
+      ]
+    }
   },
   {
     "id": "MNT-014",
@@ -74,7 +109,15 @@
     "bad": "var timeout = 3000",
     "good": "const timeout = 3000",
     "sourceId": "CR-006.02",
-    "scope": { "extensions": [".js", ".jsx", ".ts", ".tsx", ".vue"] }
+    "scope": {
+      "extensions": [
+        ".js",
+        ".jsx",
+        ".ts",
+        ".tsx",
+        ".vue"
+      ]
+    }
   },
   {
     "id": "MNT-015",
@@ -85,18 +128,34 @@
     "bad": "function getName(user) {\n  if (user.name === undefined) {\n    return ''\n  }\n  return user.name\n}",
     "good": "function getName(user) {\n  if (user.name === void 0) {\n    return ''\n  }\n  return user.name\n}",
     "sourceId": "CR-006.04",
-    "scope": { "extensions": [".js", ".jsx", ".ts", ".tsx", ".vue"] }
+    "scope": {
+      "extensions": [
+        ".js",
+        ".jsx",
+        ".ts",
+        ".tsx",
+        ".vue"
+      ]
+    }
   },
   {
     "id": "MNT-016",
     "dimension": "maintainability",
     "severity": "low",
     "title": "控制流必须使用大括号",
-    "check": "if/else/for/while/switch/try/catch/finally 的代码块必须使用大括号；switch 的每个 case/default 分支代码块也必须用大括号包裹",
-    "bad": "if (loading) return\nswitch (status) {\n  case 'ok':\n    render()\n    break\n}",
-    "good": "if (loading) {\n  return\n}\nswitch (status) {\n  case 'ok': {\n    render()\n    break\n  }\n}",
+    "check": "if/else/for/while/switch/try/catch/finally 的多行代码块必须使用大括号；单行语句（含单行 return/break/continue 与单行 case 语句）可例外",
+    "bad": "if (loading) {\n  return\n} else\n  render()",
+    "good": "if (loading) {\n  return\n} else {\n  render()\n}\n\nswitch (status) {\n  case 'ok': {\n    render()\n    break\n  }\n}",
     "sourceId": "CR-006.05/.06",
-    "scope": { "extensions": [".js", ".jsx", ".ts", ".tsx", ".vue"] }
+    "scope": {
+      "extensions": [
+        ".js",
+        ".jsx",
+        ".ts",
+        ".tsx",
+        ".vue"
+      ]
+    }
   },
   {
     "id": "MNT-017",
@@ -107,7 +166,15 @@
     "bad": "const label = \"提交\"\nreturn <div className='card' title={label} />",
     "good": "const label = '提交'\nreturn <div className=\"card\" title={label} />",
     "sourceId": "CR-006.01",
-    "scope": { "extensions": [".js", ".jsx", ".ts", ".tsx", ".vue"] }
+    "scope": {
+      "extensions": [
+        ".js",
+        ".jsx",
+        ".ts",
+        ".tsx",
+        ".vue"
+      ]
+    }
   },
   {
     "id": "MNT-018",
@@ -118,7 +185,15 @@
     "bad": "const width = 100, height = 200",
     "good": "const width = 100\nconst height = 200",
     "sourceId": "CR-006.03",
-    "scope": { "extensions": [".js", ".jsx", ".ts", ".tsx", ".vue"] }
+    "scope": {
+      "extensions": [
+        ".js",
+        ".jsx",
+        ".ts",
+        ".tsx",
+        ".vue"
+      ]
+    }
   },
   {
     "id": "MNT-019",
@@ -129,7 +204,15 @@
     "bad": "const yonghuList = []\nconst d = userMap[id]",
     "good": "const userList = []\nconst userDetail = userMap[id]",
     "sourceId": "CR-001.01/.02",
-    "scope": { "extensions": [".js", ".jsx", ".ts", ".tsx", ".vue"] }
+    "scope": {
+      "extensions": [
+        ".js",
+        ".jsx",
+        ".ts",
+        ".tsx",
+        ".vue"
+      ]
+    }
   },
   {
     "id": "MNT-020",
@@ -140,7 +223,15 @@
     "bad": "const MaxRetry = 3\nfunction GetUser(id: string) {\n  return request(`/api/users/${id}`, { retry: MaxRetry })\n}",
     "good": "const MAX_RETRY = 3\nfunction getUser(id: string) {\n  return request(`/api/users/${id}`, { retry: MAX_RETRY })\n}",
     "sourceId": "CR-004.01/.02/.03",
-    "scope": { "extensions": [".js", ".jsx", ".ts", ".tsx", ".vue"] }
+    "scope": {
+      "extensions": [
+        ".js",
+        ".jsx",
+        ".ts",
+        ".tsx",
+        ".vue"
+      ]
+    }
   },
   {
     "id": "MNT-021",
@@ -151,7 +242,15 @@
     "bad": "import OrderList from './components/order-list/OrderList'\nimport { formatDate } from './Utils/dateFormat'",
     "good": "import OrderList from './components/OrderList/OrderList'\nimport { formatDate } from './utils/dateFormat'",
     "sourceId": "CR-002.01/.03.03/.03.04",
-    "scope": { "extensions": [".js", ".jsx", ".ts", ".tsx", ".vue"] }
+    "scope": {
+      "extensions": [
+        ".js",
+        ".jsx",
+        ".ts",
+        ".tsx",
+        ".vue"
+      ]
+    }
   },
   {
     "id": "MNT-022",
@@ -162,7 +261,15 @@
     "bad": "function submit() {\n  form.submit()\n}\nreturn <Button onClick={submit}>提交</Button>",
     "good": "function handleSubmit() {\n  form.submit()\n}\nreturn <Button onClick={handleSubmit}>提交</Button>",
     "sourceId": "CR-005.01",
-    "scope": { "extensions": [".js", ".jsx", ".ts", ".tsx", ".vue"] }
+    "scope": {
+      "extensions": [
+        ".js",
+        ".jsx",
+        ".ts",
+        ".tsx",
+        ".vue"
+      ]
+    }
   },
   {
     "id": "MNT-023",
@@ -173,7 +280,12 @@
     "bad": "let cache\nfunction initCache() {\n  cache = new Map()\n}",
     "good": "let cache: Map<string, User>\nfunction initCache() {\n  cache = new Map()\n}",
     "sourceId": "CR-004.04",
-    "scope": { "extensions": [".ts", ".tsx"] }
+    "scope": {
+      "extensions": [
+        ".ts",
+        ".tsx"
+      ]
+    }
   },
   {
     "id": "MNT-024",
@@ -184,7 +296,15 @@
     "bad": "const result = await request(`/api/orders/${orderId}/approval?status=${status}&operator=${operatorId}&page=${page}&size=${size}`, { method: 'POST', headers })",
     "good": "const url = `/api/orders/${orderId}/approval`\nconst result = await request(url, { method: 'POST', headers })",
     "sourceId": "CR-104.03",
-    "scope": { "extensions": [".js", ".jsx", ".ts", ".tsx", ".vue"] }
+    "scope": {
+      "extensions": [
+        ".js",
+        ".jsx",
+        ".ts",
+        ".tsx",
+        ".vue"
+      ]
+    }
   },
   {
     "id": "MNT-025",
@@ -195,6 +315,12 @@
     "bad": "#user-card {\n  padding-top: 0px;\n  padding-right: 0px;\n  padding-bottom: 0px;\n  padding-left: 0px;\n  color: red !important;\n}",
     "good": ".user-card {\n  position: relative;\n  margin: 0 auto;\n  padding: 0 16px;\n  font-size: 14px;\n  color: #d4380d;\n}",
     "sourceId": "CR-103.01~.05",
-    "scope": { "extensions": [".css", ".less", ".scss"] }
+    "scope": {
+      "extensions": [
+        ".css",
+        ".less",
+        ".scss"
+      ]
+    }
   }
 ]

@@ -431,3 +431,43 @@ test('/review --full 在链内无文件时直接返回错误，不启动 reviewe
   assert.deepEqual(result, { kind: 'error', text: '本条链没有可审查的改动。' })
   assert.equal(harness.state.starts, 0)
 })
+
+// —— v0.4：证据、复验、覆盖报告 ——
+
+const EVIDENCE_FINDING = { ...FINDING, evidence: { snippet: 'const a = 1' } }
+
+test('/review 报告带 coverage 覆盖行与复验统计', async () => {
+  const harness = createCommand({
+    result: {
+      stopReason: 'completed',
+      structured: {
+        findings: [EVIDENCE_FINDING],
+        coverage: { files: [{ path: 'a.js', status: 'reviewed' }] },
+      },
+    },
+    config: { verify: 'blocking' },
+  })
+
+  const result = await harness.command.handler({ agent, signal: signal() })
+
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /覆盖: 已审 1\/1/)
+  // 复验只对证据 ok 的阻塞项发起；假 subagents 对复验返回的是 review 结果，按未证实降级。
+  assert.match(result.text, /复验 1 条，未证实 1/)
+  assert.equal(harness.state.starts, 2)
+})
+
+test('/review 证据片段伪造（warn）：finding 仅报告，不阻塞', async () => {
+  const harness = createCommand({
+    result: {
+      stopReason: 'completed',
+      structured: { findings: [{ ...EVIDENCE_FINDING, evidence: { snippet: 'const fake = 1' } }] },
+    },
+  })
+
+  const result = await harness.command.handler({ agent, signal: signal() })
+
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /结论: 需人工确认/)
+  assert.match(result.text, /未复验\/证据不足/)
+})

@@ -16,6 +16,7 @@ const PREFIX_BY_DIMENSION = Object.freeze({
   behavior: 'BEH',
 })
 const SEVERITIES = new Set(['high', 'medium', 'low', 'nit'])
+const FIX_MODES = new Set(['auto', 'manual', 'forbidden'])
 const FIELDS = ['id', 'dimension', 'severity', 'title', 'check', 'bad', 'good']
 const SCOPE_KEYS = ['extensions', 'globs']
 
@@ -95,6 +96,12 @@ export function validateRules(rules) {
     }
     if (rule.sourceId !== undefined && (typeof rule.sourceId !== 'string' || rule.sourceId.length === 0)) {
       throw new Error(`code-review: rule "${rule.id}" sourceId must be a non-empty string`)
+    }
+    if (rule.blocking !== undefined && typeof rule.blocking !== 'boolean') {
+      throw new Error(`code-review: rule "${rule.id}" blocking must be a boolean`)
+    }
+    if (rule.fixMode !== undefined && !FIX_MODES.has(rule.fixMode)) {
+      throw new Error(`code-review: rule "${rule.id}" fixMode must be one of ${[...FIX_MODES].join(', ')}`)
     }
     validateScope(rule)
   }
@@ -192,6 +199,12 @@ export function composeRules({ rules, principles, filePaths = [] }) {
     prompt: renderRulesPrompt({ rules: applicable, principles }),
     allowedRuleIds: new Set([...applicable.map((rule) => rule.id), ...PRINCIPLE_IDS]),
     ruleSeverities: new Map(applicable.map((rule) => [rule.id, rule.severity])),
+    ruleFixModes: new Map(
+      applicable.filter((rule) => rule.fixMode !== undefined).map((rule) => [rule.id, rule.fixMode]),
+    ),
+    ruleBlocking: new Map(
+      applicable.filter((rule) => rule.blocking !== undefined).map((rule) => [rule.id, rule.blocking]),
+    ),
   }
 }
 

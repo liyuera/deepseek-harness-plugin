@@ -76,3 +76,25 @@ test('formatJournal 渲染完成/取消/超时与未结论提示', () => {
   assert.match(text, /⚠/)
   assert.equal(formatJournal([]), '')
 })
+
+test('settle 记录 coverage/verification/suppressed，formatJournal 展示摘要', () => {
+  const journal = createJournalCore({ now: () => 1000 })
+  const key = journal.start({ ...META, mode: 'full' })
+  journal.settle(key, {
+    findings: [{ ruleId: 'COR-001', dimension: 'correctness', severity: 'high', location: 'a.ts:1', problem: 'x', suggestion: 'y', fingerprint: 'abc', fixMode: 'auto', verified: 'confirmed' }],
+    injected: true,
+    coverage: { valid: true, missing: false, reviewed: 2, skipped: 1, unaccounted: 0 },
+    verification: { checked: 2, confirmed: 1, rejected: 0, unverified: 1 },
+    suppressed: 1,
+  })
+  const record = journal.recent('s1')[0]
+  assert.deepEqual(record.coverage, { valid: true, missing: false, reviewed: 2, skipped: 1, unaccounted: 0 })
+  assert.deepEqual(record.verification, { checked: 2, confirmed: 1, rejected: 0, unverified: 1 })
+  assert.equal(record.suppressed, 1)
+  assert.equal(record.findings[0].fingerprint, 'abc')
+  assert.equal(record.findings[0].verified, 'confirmed')
+  const text = formatJournal([record])
+  assert.match(text, /覆盖 2\/3/)
+  assert.match(text, /复验 1\/2/)
+  assert.match(text, /抑制 1/)
+})

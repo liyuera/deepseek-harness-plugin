@@ -1321,3 +1321,123 @@ test('插件卸载取消在途审查写留痕：cancelled + plugin-disposed', as
   assert.equal(result.kind, 'success')
   assert.match(result.text, /已取消（plugin-disposed）/)
 })
+
+// —— v0.4：证据、复验、修复策略、抑制、覆盖 ——
+
+const FINDING_EVIDENCE = {
+  ...FINDING,
+  evidence: { snippet: 'const a = 1' },
+}
+
+test('证据命中变更行 → 触发复验；确认后正常回灌', async () => {
+  const harness = createHarness({ maxRounds: 2 })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, { seq: 7, turn: 1, diff: '+const a = 1' })
+  harness.resolveNext(completed([FINDING_EVIDENCE]))
+
+  await waitFor(() => harness.state.starts.length === 2, { timeout: 1000 })
+  assert.equal(harness.state.starts[1].request.agentPreset, 'code-review')
+  assert.equal(harness.state.starts[1].label, 'code-review-verify')
+  harness.resolveNext({ stopReason: 'completed', structured: { confirmed: true, reason: '确实会吞掉异常且路径可达' } })
+  await waitFor(() => harness.state.follows.length === 1, { timeout: 1000 })
+
+  assert.match(followText(harness.state, 0), /结论: 需修改/)
+  assert.match(followText(harness.state, 0), /\[COR-001\]/)
+})
+
+test('复验驳回的 finding 被丢弃，不触发修复轮', async () => {
+  const harness = createHarness({ maxRounds: 2 })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, { seq: 7, turn: 1, diff: '+const a = 1' })
+  harness.resolveNext(completed([FINDING_EVIDENCE]))
+  await waitFor(() => harness.state.starts.length === 2, { timeout: 1000 })
+  harness.resolveNext({ stopReason: 'completed', structured: { confirmed: false, reason: '外层已有 try/catch 保护不会触发' } })
+  await tick()
+
+  assert.equal(harness.state.follows.length, 0)
+  assert.equal(harness.state.steers.length, 0)
+})
+
+test('生成代码命中 manual 策略：只要求人工确认，不写“请修复”', async () => {
+  const harness = createHarness({ maxRounds: 2, verify: 'off' })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, {
+    seq: 7,
+    turn: 1,
+    diff: '+const a = 1',
+    files: [{ path: 'src/generated/x.ts', display: 'src/generated/x.ts' }],
+  })
+  harness.resolveNext(completed([{ ...FINDING_EVIDENCE, location: 'src/generated/x.ts:1' }]))
+  await waitFor(() => harness.state.follows.length === 1, { timeout: 1000 })
+
+  const text = followText(harness.state, 0)
+  assert.match(text, /结论: 需人工确认/)
+  assert.match(text, /需人工确认（不要自动修改）:/)
+  assert.match(text, /\[人工\] \[COR-001\]/)
+  assert.doesNotMatch(text, /请按上面每条阻塞 finding 修复/)
+  assert.doesNotMatch(text, /修完会再复审一次/)
+})
+
+test('配置抑制命中：finding 不回灌；/review 脚注显示抑制数', async () => {
+  const harness = createHarness({
+    maxRounds: 2,
+    verify: 'off',
+    suppressions: [{ ruleId: 'COR-001', reason: '产品决策' }],
+  })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, { seq: 7, turn: 1, diff: '+const a = 1' })
+  harness.resolveNext(completed([FINDING_EVIDENCE]))
+  await tick()
+  assert.equal(harness.state.follows.length, 0)
+
+  const result = await reviewFoot(harness, agent, [])
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /抑制 1/)
+})
+
+test('证据片段不符（warn）：finding 降级为仅报告，不触发修复轮', async () => {
+  const harness = createHarness({ maxRounds: 2, verify: 'off' })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, { seq: 7, turn: 1, diff: '+const a = 1' })
+  harness.resolveNext(completed([{ ...FINDING_EVIDENCE, evidence: { snippet: 'const fake = 1' } }]))
+  await tick()
+
+  assert.equal(harness.state.follows.length, 0)
+  assert.ok(warnHas(harness.state, '证据片段不符'))
+})
+
+test('证据片段不符（enforce）：视为 invalid-result，不伪装成通过', async () => {
+  const harness = createHarness({ maxRounds: 2, evidenceMode: 'enforce', verify: 'off' })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, { seq: 7, turn: 1, diff: '+const a = 1' })
+  harness.resolveNext(completed([{ ...FINDING_EVIDENCE, evidence: { snippet: 'const fake = 1' } }]))
+  await tick()
+
+  assert.equal(harness.state.follows.length, 0)
+  assert.ok(debugHas(harness.state, 'review failed: invalid-result'))
+})
+
+test('coverage 申报有效时写入留痕，/review 脚注展示覆盖', async () => {
+  const harness = createHarness({ maxRounds: 2, verify: 'off' })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, { seq: 7, turn: 1, diff: '+const a = 1' })
+  harness.resolveNext({
+    stopReason: 'completed',
+    structured: {
+      findings: [FINDING_EVIDENCE],
+      coverage: { files: [{ path: 'm.js', status: 'reviewed' }] },
+    },
+  })
+  await waitFor(() => harness.state.follows.length === 1, { timeout: 1000 })
+
+  const result = await reviewFoot(harness, agent, [])
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /覆盖 1\/1/)
+})

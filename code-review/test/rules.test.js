@@ -461,3 +461,25 @@ test('loadRulesResilient 基础规则失败时不加载规则包（只用原则�
   assert.equal(result.principles, principles)
   assert.equal(packReads, 0)
 })
+
+test('可选 blocking/fixMode 字段校验', () => {
+  assert.doesNotThrow(() => validateRules([{ ...valid[0], blocking: false, fixMode: 'manual' }]))
+  assert.throws(
+    () => validateRules([{ ...valid[0], blocking: 'no' }]),
+    /rule "SEC-002" blocking must be a boolean/,
+  )
+  assert.throws(
+    () => validateRules([{ ...valid[0], fixMode: 'auto-fix' }]),
+    /rule "SEC-002" fixMode must be one of/,
+  )
+})
+
+test('composeRules 返回 fixMode/blocking 映射（只含有显式值的规则）', () => {
+  const rules = [
+    { ...valid[0], fixMode: 'manual', blocking: false },
+    { ...valid[0], id: 'SEC-003' },
+  ]
+  const composed = composeRules({ rules, principles, filePaths: ['src/a.ts'] })
+  assert.deepEqual([...composed.ruleFixModes], [['SEC-002', 'manual']])
+  assert.deepEqual([...composed.ruleBlocking], [['SEC-002', false]])
+})

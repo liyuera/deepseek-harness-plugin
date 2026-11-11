@@ -124,3 +124,38 @@ test('notifySeverities 校验非数组/非法严重度', () => {
   }
   assert.throws(() => resolveConfig({ notifySeverities: ['bogus'] }), /code-review: invalid severity "bogus"/)
 })
+
+test('v0.4 新配置默认值：证据/覆盖/复验/修复策略/抑制', () => {
+  const config = resolveConfig()
+  assert.equal(config.evidenceMode, 'warn')
+  assert.equal(config.coverageMode, 'warn')
+  assert.equal(config.verify, 'blocking')
+  assert.equal(config.maxVerifiedFindings, 3)
+  assert.equal(config.verifyTimeoutMs, 180000)
+  assert.equal(config.respectFixPolicy, true)
+  assert.ok(config.manualFixGlobs.includes('**/generated/**'))
+  assert.deepEqual(config.forbiddenFixGlobs, [])
+  assert.equal(config.suppressionsFile, '.dsh/code-review-suppressions.json')
+  assert.deepEqual(config.suppressions, [])
+  assert.ok(Object.isFrozen(config.suppressions))
+})
+
+test('v0.4 枚举/数值/数组配置校验', () => {
+  assert.throws(() => resolveConfig({ evidenceMode: 'strict' }), /evidenceMode must be one of/)
+  assert.throws(() => resolveConfig({ coverageMode: 'strict' }), /coverageMode must be one of/)
+  assert.throws(() => resolveConfig({ verify: 'always' }), /verify must be one of/)
+  assert.throws(() => resolveConfig({ maxVerifiedFindings: 0 }), /maxVerifiedFindings must be a positive integer/)
+  assert.throws(() => resolveConfig({ verifyTimeoutMs: -1 }), /verifyTimeoutMs must be a positive integer/)
+  assert.throws(() => resolveConfig({ respectFixPolicy: 'yes' }), /respectFixPolicy must be a boolean/)
+  assert.throws(() => resolveConfig({ manualFixGlobs: '**/x/**' }), /manualFixGlobs must be an array/)
+  assert.throws(() => resolveConfig({ forbiddenFixGlobs: [''] }), /forbiddenFixGlobs entries must be non-empty strings/)
+  assert.throws(() => resolveConfig({ suppressionsFile: '' }), /suppressionsFile must be a non-empty string/)
+})
+
+test('suppressions 配置校验并冻结副本', () => {
+  const suppressions = [{ ruleId: 'BEH-001', reason: '产品决策', disposition: 'wontfix' }]
+  const config = resolveConfig({ suppressions })
+  assert.equal(config.suppressions.length, 1)
+  assert.ok(Object.isFrozen(config.suppressions))
+  assert.throws(() => resolveConfig({ suppressions: [{ reason: '缺 matcher' }] }), /at least one of/)
+})

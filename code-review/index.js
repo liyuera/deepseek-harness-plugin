@@ -7,8 +7,11 @@ import { fileURLToPath } from 'node:url'
 import { resolveConfig } from './src/host/config.js'
 import { collect, fingerprint, isCodeFile } from './src/host/collect.js'
 import { composeRules, loadRulesResilient } from './src/host/rules.js'
-import { partition, renderFindings } from './src/host/render.js'
+import { classifyFindings, renderFindings } from './src/host/render.js'
 import { buildFullPrompt, buildPrompt, startReview } from './src/host/reviewer.js'
+import { finalizeFindings } from './src/host/finalize.js'
+import { loadSuppressions } from './src/host/suppress.js'
+import { readWorkspaceTexts } from './src/host/readfile.js'
 import { shouldReview } from './src/host/trigger.js'
 import { createTracker } from './src/host/loop.js'
 import { createReviewCommand } from './src/host/command.js'
@@ -114,6 +117,23 @@ export function apply(ctx, config) {
   }
 
   /**
+   * 全量模式需要读链内文件当前内容来校验证据；turn 模式直接复用已采的 hunks。
+   * 读不到的文件在 evidenceContext 里没有 text，校验时按「不可读」保留 finding。
+   */
+  const buildEvidenceContext = async (agent, filesForReview, fullRound, collected) => {
+    if (!fullRound) return { mode: 'turn', files: collected.files }
+    const cwd = agent.session?.header?.cwd
+    const texts = await readWorkspaceTexts({
+      cwd,
+      paths: filesForReview.map((file) => file.path),
+    })
+    return {
+      mode: 'full',
+      files: filesForReview.map((file) => ({ path: file.path, text: texts.get(file.path) })),
+    }
+  }
+
+  /**
    * 后台审查结算：先释放资源，再按结果回灌或静默丢弃。
    * 自己吞掉所有异常，绝不让后台 promise 变成 unhandled rejection。
    */
@@ -153,9 +173,50 @@ export function apply(ctx, config) {
         return
       }
 
+      let final
+      try {
+        final = await finalizeFindings({
+          findings: outcome.findings,
+          evidence: outcome.evidence,
+          ruleFixModes: meta.composed?.ruleFixModes,
+          ruleBlocking: meta.composed?.ruleBlocking,
+          config: resolved,
+          suppressions: meta.suppressions ?? [],
+          files: meta.filesForReview ?? [],
+          subagents: ctx.subagents,
+          agent: meta.agent,
+          preset: resolved.reviewerPreset,
+          signal: lifetime.signal,
+          logger: ctx.logger,
+          modelOverride: resolved.modelOverride,
+        })
+      } catch (error) {
+        // 收口失败（抑制/复验的意外异常）不能让留痕卡在 running，也不能丢已校验的 findings。
+        ctx.logger.warn(`[code-review] finalize failed: ${error.message}`)
+        final = {
+          findings: outcome.findings,
+          suppressed: [],
+          verification: { checked: 0, confirmed: 0, rejected: 0, unverified: 0 },
+        }
+      }
+      const findings = final.findings
+      // 复验可能耗时较长：期间会话关闭/插件卸载时 journal 已被 cancel，
+      // 这里不再把记录回写成 completed，也不回灌。
+      if (lifetime.signal.aborted || (generations.get(sessionId) ?? 0) !== meta.generation) {
+        ctx.logger.debug?.(`[code-review] drop: session ${sessionId} 的审查结果在收口期间失效`)
+        return
+      }
+
       const recordCompleted = (injected) => {
         journalKeys.delete(sessionId)
-        journal.settle(meta.journalKey, { status: 'completed', findings: outcome.findings, injected })
+        journal.settle(meta.journalKey, {
+          status: 'completed',
+          findings,
+          injected,
+          coverage: outcome.coverage,
+          verification: final.verification,
+          suppressed: final.suppressed.length,
+        })
       }
 
       tracker.recordSuccess(sessionId)
@@ -165,7 +226,7 @@ export function apply(ctx, config) {
       if (sameChain) {
         lastFingerprint.set(sessionId, meta.hash)
         if (meta.fullRound) chain.markFull(sessionId, meta.epoch)
-        lastFindings.set(sessionId, outcome.findings.slice(0, 20))
+        lastFindings.set(sessionId, findings.slice(0, 20))
       }
       const elapsed = Date.now() - meta.startedAt
       const totalFiles = meta.summary.total ?? meta.summary.files.length
@@ -173,7 +234,7 @@ export function apply(ctx, config) {
         '[code-review] reviewed rounds=%d files=%d findings=%d skipped=%d elapsed=%dms',
         meta.rounds,
         totalFiles,
-        outcome.findings.length,
+        findings.length,
         meta.collected.skipped.length,
         elapsed,
       )
@@ -182,35 +243,41 @@ export function apply(ctx, config) {
       }
 
       const scope = { files: totalFiles, added: meta.summary.added, deleted: meta.summary.deleted }
-      const blockingText = renderFindings({
-        findings: outcome.findings,
+      const baseRender = {
+        findings,
         skipped: meta.collected.skipped,
         blockingSeverities: resolved.blockingSeverities,
         notifySeverities: resolved.notifySeverities,
         summary: scope,
-        mode: 'steer',
-      })
+        coverage: outcome.coverage,
+        suppressed: final.suppressed,
+        respectFixPolicy: resolved.respectFixPolicy,
+      }
+      const buckets = classifyFindings(findings, resolved.blockingSeverities, resolved.respectFixPolicy)
       // 结算时实时读链轮次：人类重置链后 rounds=0，不能再用旧链的「最后一轮」口径。
       const lastRound = tracker.roundsOf(sessionId) >= resolved.maxRounds
       const note = lastRound
         ? '本轮已达到自动复审上限，修完不会再自动复审，请人工确认。'
         : '修完会再复审一次。'
       const notifySet = new Set(resolved.notifySeverities)
-      const notified = partition(outcome.findings, resolved.blockingSeverities).passive
-        .filter((finding) => notifySet.has(finding.severity))
+      const notified = buckets.passive.filter((finding) => notifySet.has(finding.severity))
       let payload = ''
-      if (blockingText !== '') {
+      if (buckets.auto.length > 0) {
+        const blockingText = renderFindings({ ...baseRender, mode: 'steer' })
         const suggest = notified.length > 0 ? '；非阻塞建议可选择性处理' : ''
-        payload = `${blockingText}\n\n请按上面每条阻塞 finding 修复${suggest}。${note}如与用户新指令冲突，以用户指令为准。`
+        const hints = []
+        if (buckets.manual.length > 0) hints.push('标注[人工]的问题需人工确认，不要自动修改')
+        if (buckets.unverified.length > 0) hints.push('标注[未复验]的问题仅作报告，不要据此修复')
+        payload = `${blockingText}\n\n请按上面每条阻塞 finding 修复${suggest}。${hints.length > 0 ? `${hints.join('；')}。` : ''}${note}如与用户新指令冲突，以用户指令为准。`
+      } else if (buckets.manual.length > 0) {
+        const manualText = renderFindings({ ...baseRender, mode: 'manual' })
+        if (manualText === '') {
+          recordCompleted(false)
+          return
+        }
+        payload = `${manualText}\n\n以上问题需人工确认，请勿自动修改。如与用户新指令冲突，以用户指令为准。`
       } else if (resolved.notifySeverities.length > 0) {
-        const notifyText = renderFindings({
-          findings: outcome.findings,
-          skipped: meta.collected.skipped,
-          blockingSeverities: resolved.blockingSeverities,
-          notifySeverities: resolved.notifySeverities,
-          summary: scope,
-          mode: 'notify',
-        })
+        const notifyText = renderFindings({ ...baseRender, mode: 'notify' })
         // 没有命中 notifySeverities 的建议（或本轮干净）：仍然静默。
         if (notifyText === '') {
           recordCompleted(false)
@@ -407,16 +474,27 @@ export function apply(ctx, config) {
     })
     journalKeys.set(sessionId, journalKey)
 
+    // 抑制记忆：profile 配置 + 仓库内 .dsh 文件；读取失败只 warn，不影响审查。
+    const cwd = agent.session?.header?.cwd
+    const suppressions = await loadSuppressions({
+      config: resolved,
+      cwd,
+      warn: (text) => ctx.logger.warn(text),
+    })
+
     // 启动阶段也要有界、可取消：独立控制信号，disposed/插件卸载会 abort 它。
     const control = new AbortController()
     starting.set(sessionId, control)
 
     let handle
     let startupTimer
+    let composed
+    let evidenceContext
     try {
       const loaded = await getRules()
       // 规则表、白名单、severity 权威表都按本次实际送审的文件过滤。
-      const composed = composeRules({ ...loaded, filePaths: filesForReview.map((file) => file.path) })
+      composed = composeRules({ ...loaded, filePaths: filesForReview.map((file) => file.path) })
+      evidenceContext = await buildEvidenceContext(agent, filesForReview, fullRound, collected)
       // 总预算从 handler 开始计：取材/读规则花掉的时间会挤占启动与审查的时间。
       const budget = Math.max(1, resolved.asyncReviewerTimeoutMs - (Date.now() - startedAt))
       const startupTimedOut = Symbol('startup-timeout')
@@ -441,6 +519,9 @@ export function apply(ctx, config) {
         allowedPaths: new Set(filesForReview.map((file) => file.path)),
         ruleSeverities: composed.ruleSeverities,
         logger: ctx.logger,
+        evidenceContext,
+        evidenceMode: resolved.evidenceMode,
+        coverageMode: resolved.coverageMode,
       })
       // 超时返回后 startReview 的迟到 reject 不得变成 unhandled rejection。
       startup.catch(() => {})
@@ -494,7 +575,10 @@ export function apply(ctx, config) {
     // 启动花掉的时间从总预算里扣，保证「启动 + 审查」不超过 asyncReviewerTimeoutMs。
     const reviewBudget = Math.max(1, resolved.asyncReviewerTimeoutMs - (Date.now() - startedAt))
     const timer = setTimeout(() => handle.cancel('timeout'), reviewBudget)
-    const meta = { agent, summary, collected, hash, rounds, epoch, fullRound, journalKey, startedAt, timer }
+    const meta = {
+      agent, summary, collected, hash, rounds, epoch, generation, fullRound, journalKey,
+      startedAt, timer, composed, suppressions, filesForReview, evidenceContext,
+    }
 
     // 后台结算：handler 到这里就返回，不等待审查结果。
     void handle.result

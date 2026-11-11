@@ -3,10 +3,23 @@
  * @module @liyuera/dsh-code-review/host/command
  */
 import { collect } from './collect.js'
+import { finalizeFindings } from './finalize.js'
 import { formatJournal } from './journal.js'
+import { readWorkspaceTexts } from './readfile.js'
 import { renderFindings, renderPass } from './render.js'
 import { buildFullPrompt, buildPrompt, runReview } from './reviewer.js'
 import { composeRules } from './rules.js'
+import { loadSuppressions } from './suppress.js'
+
+/** 把复验统计拼成一行，供报告脚注展示。 */
+function verificationLine(verification) {
+  if (verification === undefined || verification.checked === 0) return ''
+  const parts = [`复验 ${verification.checked} 条`]
+  if (verification.confirmed > 0) parts.push(`确认 ${verification.confirmed}`)
+  if (verification.rejected > 0) parts.push(`驳回 ${verification.rejected}`)
+  if (verification.unverified > 0) parts.push(`未证实 ${verification.unverified}`)
+  return `复验: ${parts.join('，')}`
+}
 
 /**
  * 组装命令定义。
@@ -24,6 +37,7 @@ export function createReviewCommand({
     async handler({ agent, rawInput, signal }) {
       try {
         const sessionId = agent.session.id
+        const cwd = agent.session?.header?.cwd
         // 自动审查的留痕通过命令输出回看；没有记录时不改变原有输出。
         const withJournal = (text) => {
           const footer = journal === undefined ? '' : formatJournal(journal.recent(sessionId, 5))
@@ -43,6 +57,8 @@ export function createReviewCommand({
           const loaded = await getRules()
           // 与自动全量同一口径：规则表与白名单按链内文件过滤。
           const composed = composeRules({ ...loaded, filePaths: chainFiles.map((file) => file.path) })
+          const suppressions = await loadSuppressions({ config, cwd, warn: logger?.warn })
+          const texts = await readWorkspaceTexts({ cwd, paths: chainFiles.map((file) => file.path) })
           const reviewed = await runReview({
             subagents,
             agent,
@@ -55,22 +71,51 @@ export function createReviewCommand({
             allowedPaths: new Set(chainFiles.map((file) => file.path)),
             ruleSeverities: composed.ruleSeverities,
             logger,
+            evidenceContext: {
+              mode: 'full',
+              files: chainFiles.map((file) => ({ path: file.path, text: texts.get(file.path) })),
+            },
+            evidenceMode: config.evidenceMode,
+            coverageMode: config.coverageMode,
           })
           if (!reviewed.ok) {
             logger.warn(`[code-review] /review --full failed: ${reviewed.reason}`)
             return { kind: 'error', text: withJournal(`全量审查未完成（${reviewed.reason}）。`) }
           }
-          const scope = { files: chainFiles.length, added: 0, deleted: 0 }
-          const text = renderFindings({
+          const final = await finalizeFindings({
             findings: reviewed.findings,
+            evidence: reviewed.evidence,
+            ruleFixModes: composed.ruleFixModes,
+            ruleBlocking: composed.ruleBlocking,
+            config,
+            suppressions,
+            files: chainFiles,
+            subagents,
+            agent,
+            preset: config.reviewerPreset,
+            signal,
+            logger,
+            modelOverride: config.modelOverride,
+          })
+          const scope = { files: chainFiles.length, added: 0, deleted: 0 }
+          const rendered = renderFindings({
+            findings: final.findings,
             skipped: [],
             blockingSeverities: config.blockingSeverities,
+            notifySeverities: config.notifySeverities ?? [],
             summary: scope,
             mode: 'report',
+            coverage: reviewed.coverage,
+            suppressed: final.suppressed,
+            respectFixPolicy: config.respectFixPolicy,
           })
+          const verification = verificationLine(final.verification)
+          const body = rendered === ''
+            ? renderPass({ summary: scope, skipped: [], coverage: reviewed.coverage })
+            : rendered
           return {
             kind: 'success',
-            text: withJournal(text === '' ? renderPass({ summary: scope, skipped: [] }) : text),
+            text: withJournal(verification === '' ? body : `${body}\n${verification}`),
           }
         }
         const seq = latestSeq(sessionId)
@@ -89,6 +134,7 @@ export function createReviewCommand({
         const loaded = await getRules()
         // 与自动审查同一口径：规则表、白名单、severity 权威表按本次变更文件过滤。
         const composed = composeRules({ ...loaded, filePaths: collected.files.map((file) => file.path) })
+        const suppressions = await loadSuppressions({ config, cwd, warn: logger?.warn })
 
         const scope = {
           files: summary.total ?? summary.files.length,
@@ -107,6 +153,9 @@ export function createReviewCommand({
           allowedPaths: new Set(collected.files.map((file) => file.path)),
           ruleSeverities: composed.ruleSeverities,
           logger,
+          evidenceContext: { mode: 'turn', files: collected.files },
+          evidenceMode: config.evidenceMode,
+          coverageMode: config.coverageMode,
         })
 
         if (!reviewed.ok) {
@@ -114,15 +163,39 @@ export function createReviewCommand({
           return { kind: 'error', text: withJournal(`审查未完成（${reviewed.reason}）。`) }
         }
 
-        const text = renderFindings({
+        const final = await finalizeFindings({
           findings: reviewed.findings,
+          evidence: reviewed.evidence,
+          ruleFixModes: composed.ruleFixModes,
+          ruleBlocking: composed.ruleBlocking,
+          config,
+          suppressions,
+          files: collected.files,
+          subagents,
+          agent,
+          preset: config.reviewerPreset,
+          signal,
+          logger,
+          modelOverride: config.modelOverride,
+        })
+        const rendered = renderFindings({
+          findings: final.findings,
           skipped: collected.skipped,
           blockingSeverities: config.blockingSeverities,
+          notifySeverities: config.notifySeverities ?? [],
           summary: scope,
+          mode: 'report',
+          coverage: reviewed.coverage,
+          suppressed: final.suppressed,
+          respectFixPolicy: config.respectFixPolicy,
         })
+        const verification = verificationLine(final.verification)
+        const body = rendered === ''
+          ? renderPass({ summary: scope, skipped: collected.skipped, coverage: reviewed.coverage })
+          : rendered
         return {
           kind: 'success',
-          text: withJournal(text === '' ? renderPass({ summary: scope, skipped: collected.skipped }) : text),
+          text: withJournal(verification === '' ? body : `${body}\n${verification}`),
         }
       } catch (error) {
         logger?.warn?.(`[code-review] /review 失败：${error.message}`)
