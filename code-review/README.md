@@ -88,6 +88,7 @@ dsh plugin --profile desktop remove @liyuera/dsh-code-review
 | `evidenceMode` | `"warn"` | finding 证据片段的处理：`warn` 下片段不符降级为「仅报告」（不阻塞、不触发修复），缺失证据保留；`enforce` 下片段不符/缺失都丢弃（全丢视为 `invalid-result`）。建议先观察一段 warn 再切 enforce。 |
 | `coverageMode` | `"warn"` | 审查者必须申报 `coverage.files`；`warn` 只记录未申报/无效，`enforce` 直接把未申报/无效 coverage 视为 `missing-coverage`/`invalid-coverage` 失败。 |
 | `verify` | `"blocking"` | 是否对阻塞级 finding 做证伪复验：`off` 关闭；`blocking` 只复验「阻塞 + 证据 ok」的 finding，`maxVerifiedFindings` 上限之外的不复验。 |
+| `retryInvalidReview` | `true` | 自动审查遇到模型输出类失败（`incomplete`/`provider-error`/`invalid-result`/coverage 校验失败）时，用同一份 prompt 静默重试一次；不额外占链轮次，重试仍失败才记 failed/熔断。超时类失败不重试（避免双倍等待）。 |
 | `maxVerifiedFindings` | `3` | 单次审查最多复验几条（按严重度取前 N 条）。复验每条一次模型调用，默认只在出现阻塞时付费。 |
 | `verifyTimeoutMs` | `180000` | 单次审查复验的总预算；超时的条目按「未证实」降级为仅报告。 |
 | `respectFixPolicy` | `true` | 是否启用 `manualFixGlobs`/`forbiddenFixGlobs` 修复策略。`false` 时所有阻塞项都按可自动修复处理。 |
@@ -198,7 +199,7 @@ node evaluation/run.mjs --json
 - **通过默认静默**：v2 不注入「结论: 通过」。修完是否干净要看审查子会话/`/review`；默认只有仍存在阻塞 findings 或达到链上限时才会回灌。配置 `notifySeverities` 后，非阻塞建议也会回灌，但文案明确「可选择不改」。
 - **注入消息是插件来源**：回灌消息的 `source.kind` 是 `plugin:code-review`（不是 `user`），不会被当成人类输入，也不会重置链预算。注意 v4 会话格式已退役旧的 `{kind:'plugin', plugin:…}` wrapper，用它会直接让 turn 变 error。
 - **一条人类消息 = 一条链，最多 `maxRounds` 次自动审查**：链只在人类消息到达时重置；插件自己注入的消息不会重置链，因此不存在自动无限循环。连续发消息会各开一条新链（预期交互）。
-- **fail-open 是静默的**：启动失败、超时、坏输出只写宿主日志（debug/warn 级，含失败原因分类），不会告诉用户，也不阻塞主代理；需要可见结果时用 `/review`。
+- **fail-open 是静默的**：启动失败、超时、坏输出只写宿主日志（debug/warn 级，含失败原因分类），不会告诉用户，也不阻塞主代理；`retryInvalidReview`（默认开）会让「模型这次没交好结果」的失败先静默重试一次，仍失败才计入熔断。需要可见结果时用 `/review`。
 - **同一链的同一份 diff 只审一次**：`workspace-changes` 每个 turn-stopping 都会用新 seq 重新宣告同一份未变 diff，插件按 `path + 渲染文本` 的内容指纹去重——重复的 stopping 跳过且不消耗轮次；只有 diff 真的变了才会复审。
 - **最后一轮不再承诺复审**：达到 `maxRounds` 的那次注入文案是「本轮已达到自动复审上限，修完不会再自动复审，请人工确认」。
 - **只审本 turn 的 workspace 变更**：不含历史提交、未变更文件或其它分支；`workspaceChanges` 缺失时插件根本不加载，没有 `git diff` 回退。作用域规则也只看**本次变更文件**，未改动的目录/文件名看不到。
@@ -241,11 +242,11 @@ node evaluation/run.mjs --json
    node --test
    ```
 
-   第一条应打印 `24`；第二条应全绿（当前 362 个用例）。再跑 `npm run eval` 应输出 `10/10 cases passed`。
+   第一条应打印 `24`；第二条应全绿（当前 365 个用例）。再跑 `npm run eval` 应输出 `10/10 cases passed`。
 
 ## 发布
 
-- 目标首发版本：**0.6.1**
+- 目标首发版本：**0.6.2**
 - 当前状态：**待发布**（npm 账号 2FA 恢复后首发；包里含 `index.js`、`src/`、`cordis.patch.yml`、`rules/`，不含 `test/`）
 
 首发之后日常发布走 GitHub Actions 的 npm **Trusted Publishing**（OIDC，无 NPM_TOKEN、无浏览器授权）：

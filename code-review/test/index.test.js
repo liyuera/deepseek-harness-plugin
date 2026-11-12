@@ -136,7 +136,8 @@ function createHarness(config = {}, options = {}) {
     },
   }
 
-  apply(ctx, config)
+  // 既有失败路径用例假定「一次失败即结算」；重试专项用例显式开启。
+  apply(ctx, { retryInvalidReview: false, ...config })
 
   const emit = (event, ...args) =>
     Promise.all((state.handlers[event] ?? []).map((handler) => handler(...args)))
@@ -1259,6 +1260,47 @@ test('notifySeverities 末轮：非阻塞回灌也声明不再自动复审', asy
 })
 
 // —— journal 留痕 ——
+
+test('自动审查遇到 incomplete 时重试一次并成功回灌', async () => {
+  const harness = createHarness({ maxRounds: 2, retryInvalidReview: true })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, { seq: 7, turn: 1 })
+  harness.resolveNext({ stopReason: 'incomplete' })
+  await waitFor(() => harness.state.starts.length === 2)
+  harness.resolveNext(completed([FINDING]))
+  await waitFor(() => harness.state.follows.length === 1)
+
+  assert.match(followText(harness.state, 0), /结论: 需修改/)
+  assert.ok(debugHas(harness.state, 'retry recovered'))
+})
+
+test('自动审查重试仍失败：只发起两次，记 failed 且不重复熔断', async () => {
+  const harness = createHarness({ maxRounds: 2, retryInvalidReview: true })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, { seq: 7, turn: 1 })
+  harness.resolveNext({ stopReason: 'incomplete' })
+  await waitFor(() => harness.state.starts.length === 2)
+  harness.resolveNext({ stopReason: 'incomplete' })
+  await waitFor(() => debugHas(harness.state, 'review failed: incomplete'))
+
+  assert.equal(harness.state.starts.length, 2)
+  assert.equal(harness.state.follows.length, 0)
+})
+
+test('人类消息重置链后不重试旧链审查', async () => {
+  const harness = createHarness({ maxRounds: 2, retryInvalidReview: true })
+  const agent = makeAgent(harness)
+
+  await harness.stop(agent, { seq: 7, turn: 1 })
+  harness.resolveNext({ stopReason: 'incomplete' })
+  harness.userMessage()
+  await waitFor(() => debugHas(harness.state, 'review failed: incomplete'))
+
+  assert.equal(harness.state.starts.length, 1, '旧链结果不应触发重试')
+  assert.equal(harness.state.follows.length, 0)
+})
 
 test('审查完成写留痕；/review 脚注显示自动审查记录', async () => {
   const harness = createHarness({ maxRounds: 2 })

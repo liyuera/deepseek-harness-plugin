@@ -404,3 +404,16 @@ wisdom 仓库的 live `/review --range HEAD~3..HEAD` 失败（`1/1 块失败/超
 3. **收紧探索与输出预算**：范围块 prompt 明确「diff 已完整提供，不要用 grep/read 探索无关文件」「finding ≤8 条、evidence 每行一条、尽快提交 structured_output」，降低慢查询与畸形输出的概率。
 4. **测试**：命令侧新增「单块失败拆半后成功、不记缺口」「重试仍失败时错误文案带原因、且单文件块只重试一次」用例；config 覆盖新键。362 用例 + 10 eval 全绿。
 
+### 11.8 0.6.2 自动审查失败重试（2026-11-12）
+
+用户反馈「每轮结束似乎不跑自动审查」。journal 取证：09:57/10:04 两次 completed（0 findings，按 v2 设计静默）、10:24 一次 `failed/incomplete`（fail-open 静默）；对应 reviewer 子会话 `turn/end = error, MALFORMED_RESPONSE: tool input is invalid JSON`。同类失败在 00:34（turn 77）也出现过，均为 deepseek 流式输出 tool input 畸形，属于模型侧偶发、非业务拒绝。
+
+修复（0.6.2）：新增 `retryInvalidReview`（默认 `true`）。自动审查结算时若失败原因是 `incomplete` / `provider-error` / `invalid-result` / `missing-coverage` / `invalid-coverage`，且仍在同一链/同一会话代次、剩余预算 >20s，则用同一份 prompt 静默重试一次：
+
+- 重试在「在途」槽位内进行，`/review` 不会看到空档；不额外占链轮次；
+- 重试期间 session/disposed/插件卸载通过新增的 `retrying` 表叫停，结果不回灌已关闭会话；
+- 重试成功仍是一次 completed 留痕；重试仍失败才计 failed 与熔断（只记一次）；
+- 超时类失败不重试，避免双倍等待；prompt 在 meta 中保留供重试复用。
+
+测试 +3（重试成功回灌、重试仍失败只发起两次、人类重置链后不重试）+ config 断言；365 用例 + 10 eval 全绿。`/review --range` 在 0.6.1 下已验证成功（wisdom 仓库 HEAD~3..HEAD，2 文件，1 阻塞 + 2 建议，覆盖 2/2）。
+

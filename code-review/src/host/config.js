@@ -25,6 +25,7 @@ export const DEFAULTS = Object.freeze({
   evidenceMode: 'warn',
   coverageMode: 'warn',
   verify: 'blocking',
+  retryInvalidReview: true,
   maxVerifiedFindings: 3,
   verifyTimeoutMs: 180000,
   respectFixPolicy: true,
@@ -78,7 +79,7 @@ export function resolveConfig(raw = {}) {
   }
   const merged = { ...DEFAULTS, ...raw }
 
-  for (const field of ['enabled', 'auto', 'fullReview', 'respectFixPolicy']) {
+  for (const field of ['enabled', 'auto', 'fullReview', 'respectFixPolicy', 'retryInvalidReview']) {
     if (typeof merged[field] !== 'boolean') throw new Error(`code-review: ${field} must be a boolean`)
   }
   assertPositiveInteger('maxRounds', merged.maxRounds)
@@ -175,6 +176,7 @@ export function resolveConfig(raw = {}) {
     evidenceMode: merged.evidenceMode,
     coverageMode: merged.coverageMode,
     verify: merged.verify,
+    retryInvalidReview: merged.retryInvalidReview,
     maxVerifiedFindings: merged.maxVerifiedFindings,
     verifyTimeoutMs: merged.verifyTimeoutMs,
     respectFixPolicy: merged.respectFixPolicy,

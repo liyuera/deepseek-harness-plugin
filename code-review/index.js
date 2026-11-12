@@ -63,6 +63,8 @@ export function apply(ctx, config) {
   const inflight = new Map()
   // 启动中的审查：`sessionId` → AbortController，用于 disposed/插件卸载时叫停 startReview。
   const starting = new Map()
+  // 自动审查失败后的重试句柄：`sessionId` → {cancel}，disposed/卸载时叫停。
+  const retrying = new Map()
   // 会话代次：disposed 时 +1，用于识别启动过程中被关闭的会话。
   const generations = new Map()
   // 后台审查的生命周期信号：不随 turn 结束/取消而中断。
@@ -87,6 +89,8 @@ export function apply(ctx, config) {
     inflight.clear()
     for (const control of starting.values()) control.abort()
     starting.clear()
+    for (const retry of retrying.values()) retry.cancel()
+    retrying.clear()
     generations.clear()
   }, 'code-review: dispose in-flight reviews')
 
@@ -135,12 +139,99 @@ export function apply(ctx, config) {
     }
   }
 
+  /** 可安全重试的失败原因：都属于「模型这次没交好结果」，不是业务性拒绝。 */
+  const RETRYABLE_REASONS = new Set([
+    'incomplete', 'provider-error', 'invalid-result', 'missing-coverage', 'invalid-coverage',
+  ])
+
+  /** 是否值得再跑一次 reviewer：仍在同一链/同一会话代次、预算充足、未重试过。 */
+  const canRetry = (sessionId, handle, meta, outcome) => (
+    resolved.retryInvalidReview === true
+    && meta.retried !== true
+    && RETRYABLE_REASONS.has(outcome?.reason)
+    && typeof meta.prompt === 'string'
+    && !lifetime.signal.aborted
+    && (generations.get(sessionId) ?? 0) === meta.generation
+    && meta.epoch === tracker.epochOf(sessionId)
+    && inflight.get(sessionId) === handle
+    && resolved.asyncReviewerTimeoutMs - (Date.now() - meta.startedAt) > 20000
+  )
+
+  /**
+   * 用同一份 prompt/上下文重试一次；超时或启动失败返回 undefined。
+   * 重试期间保留在途槽位，dispose/session-disposed 通过 retrying 表叫停。
+   */
+  const retryReview = async (sessionId, meta, remaining) => {
+    const control = new AbortController()
+    const retryRecord = { cancel: () => control.abort() }
+    retrying.set(sessionId, retryRecord)
+    let timer
+    try {
+      const retryHandle = await startReview({
+        subagents: ctx.subagents,
+        agent: meta.agent,
+        preset: resolved.reviewerPreset,
+        prompt: meta.prompt,
+        signal: control.signal,
+        modelOverride: resolved.modelOverride,
+        allowedRuleIds: meta.composed?.allowedRuleIds,
+        allowedPaths: new Set((meta.filesForReview ?? []).map((file) => file.path)),
+        ruleSeverities: meta.composed?.ruleSeverities,
+        logger: ctx.logger,
+        evidenceContext: meta.evidenceContext,
+        evidenceMode: resolved.evidenceMode,
+        coverageMode: resolved.coverageMode,
+      })
+      const timedOut = Symbol('retry-timeout')
+      const deadline = new Promise((resolve) => {
+        timer = setTimeout(() => {
+          retryHandle.cancel('timeout')
+          resolve(timedOut)
+        }, remaining)
+      })
+      const result = await Promise.race([retryHandle.result, deadline])
+      return result === timedOut ? undefined : result
+    } catch (error) {
+      ctx.logger.debug?.(`[code-review] retry start failed: ${error.message}`)
+      return undefined
+    } finally {
+      clearTimeout(timer)
+      if (retrying.get(sessionId) === retryRecord) retrying.delete(sessionId)
+    }
+  }
+
   /**
    * 后台审查结算：先释放资源，再按结果回灌或静默丢弃。
    * 自己吞掉所有异常，绝不让后台 promise 变成 unhandled rejection。
    */
   const settle = async (sessionId, handle, meta, outcome) => {
     clearTimeout(meta.timer)
+    // 模型这次没交好结果（provider 畸形流/输出不完整/全被校验丢弃）时重试一次：
+    // 仍在「在途」槽位内重试，/review 不会撞到空档；重试不额外占链轮次。
+    if (outcome?.ok !== true && canRetry(sessionId, handle, meta, outcome)) {
+      meta.retried = true
+      const remaining = resolved.asyncReviewerTimeoutMs - (Date.now() - meta.startedAt)
+      const firstReason = outcome.reason
+      const retried = await retryReview(sessionId, meta, remaining)
+      if (
+        lifetime.signal.aborted
+        || (generations.get(sessionId) ?? 0) !== meta.generation
+        || inflight.get(sessionId) !== handle
+      ) {
+        // 重试期间会话关闭/换链：留痕已由对应钩子取消，结果丢弃。
+        ctx.logger.debug?.(`[code-review] drop: session ${sessionId} 的审查重试期间失效`)
+        return
+      }
+      if (retried !== undefined) {
+        ctx.logger.debug?.(
+          `[code-review] retry ${retried.ok === true ? 'recovered' : 'failed'}`
+          + ` (first=${firstReason} second=${retried.ok === true ? 'ok' : retried.reason})`,
+        )
+        outcome = retried
+      } else {
+        ctx.logger.debug?.(`[code-review] retry skipped/timed-out (first=${firstReason})`)
+      }
+    }
     const active = inflight.get(sessionId) === handle
     if (active) {
       inflight.delete(sessionId)
@@ -365,6 +456,12 @@ export function apply(ctx, config) {
     // 启动尚未返回：叫停 startReview，拿到 activation 后它会自行 dispose。
     starting.get(session.id)?.abort()
     starting.delete(session.id)
+    // 失败重试仍在途：叫停，避免结果回灌到已关闭会话。
+    const retry = retrying.get(session.id)
+    if (retry !== undefined) {
+      retrying.delete(session.id)
+      retry.cancel()
+    }
     latestSeq.delete(session.id)
     lastFingerprint.delete(session.id)
     pendingChanges.delete(session.id)
@@ -519,6 +616,7 @@ export function apply(ctx, config) {
     let startupTimer
     let composed
     let evidenceContext
+    let prompt
     try {
       const loaded = await getRules()
       // 规则表、白名单、severity 权威表都按本次实际送审的文件过滤。
@@ -530,7 +628,7 @@ export function apply(ctx, config) {
       const deadline = new Promise((resolve) => {
         startupTimer = setTimeout(() => resolve(startupTimedOut), budget)
       })
-      const prompt = fullRound
+      prompt = fullRound
         ? buildFullPrompt({
             rulesPrompt: composed.prompt,
             files: filesForReview,
@@ -606,7 +704,7 @@ export function apply(ctx, config) {
     const timer = setTimeout(() => handle.cancel('timeout'), reviewBudget)
     const meta = {
       agent, summary, collected, hash, rounds, epoch, generation, fullRound, journalKey,
-      startedAt, timer, composed, suppressions, filesForReview, evidenceContext,
+      startedAt, timer, composed, suppressions, filesForReview, evidenceContext, prompt,
     }
 
     // 后台结算：handler 到这里就返回，不等待审查结果。
