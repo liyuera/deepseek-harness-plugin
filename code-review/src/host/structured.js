@@ -147,17 +147,64 @@ export function validateStructured(structured, {
   }
 }
 
+/** 输出形状的单一说明，prompt 与文档共用。 */
+export const OUTPUT_SHAPE = '{"findings":[{"ruleId","dimension","severity","location","problem","suggestion","evidence"}],'
+  + '"coverage":{"files":[{"path","status","reason?"}]}}'
+
 /**
- * 校验一次 activation 的结算结果：先要求正常跑完，再校验 structured。
+ * 从模型最终文本里提取第一个 JSON 对象：优先 ```json 围栏，其次整段里的首个 `{` 到末个 `}`。
+ * 文本模式下 provider 不会校验 JSON，这里必须容错（围栏外可有说明、围栏语言可省略）。
+ * @param {unknown} text
+ * @returns {object | undefined}
+ */
+export function extractJsonFromText(text) {
+  const source = String(text ?? '')
+  const candidates = [...source.matchAll(/```(?:json)?\s*\n?([\s\S]*?)```/gi)].map((match) => match[1])
+  candidates.push(source)
+  for (const candidate of candidates) {
+    const start = candidate.indexOf('{')
+    const end = candidate.lastIndexOf('}')
+    if (start === -1 || end <= start) continue
+    try {
+      const parsed = JSON.parse(candidate.slice(start, end + 1))
+      if (typeof parsed === 'object' && parsed !== null) return parsed
+    } catch {
+      // 尝试下一个候选
+    }
+  }
+  return undefined
+}
+
+/**
+ * 从 activation 结算结果里取结构化输出：
+ * - 工具模式（outputSchema）走 `result.structured`；
+ * - 文本模式从 `result.output` 的 text block 解析，避免 provider 校验 tool-call 参数 JSON。
+ * @param {unknown} result
+ * @returns {unknown | undefined}
+ */
+export function structuredFromResult(result) {
+  if (result?.structured !== undefined) return result.structured
+  const output = result?.output
+  const text = typeof output === 'string'
+    ? output
+    : Array.isArray(output)
+      ? output.filter((block) => block?.type === 'text').map((block) => String(block.text ?? '')).join('\n')
+      : ''
+  return extractJsonFromText(text)
+}
+
+/**
+ * 校验一次 activation 的结算结果：先要求正常跑完，再校验结构化输出
+ * （structured 优先，文本 JSON 回退）。
  *
  * @param {unknown} result
  * @param {object} options
  * @returns {{ok:true, findings: object[], evidence: string[], coverage: object} | {ok:false, reason:string}}
  */
 export function validateResult(result, options) {
-  if (result?.stopReason !== 'completed' || result.structured === undefined) {
-    return { ok: false, reason: 'incomplete' }
-  }
-  return validateStructured(result.structured, options)
+  if (result?.stopReason !== 'completed') return { ok: false, reason: 'incomplete' }
+  const structured = structuredFromResult(result)
+  if (structured === undefined) return { ok: false, reason: 'invalid-result' }
+  return validateStructured(structured, options)
 }
 

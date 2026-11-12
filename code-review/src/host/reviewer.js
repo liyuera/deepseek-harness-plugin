@@ -3,7 +3,7 @@
  * @module @liyuera/dsh-code-review/host/reviewer
  */
 import { RULE_DIMENSIONS } from './rules.js'
-import { MAX_FINDINGS, validateResult } from './structured.js'
+import { MAX_FINDINGS, OUTPUT_SHAPE, validateResult } from './structured.js'
 
 /** 审查者必须返回的结构。verdict 由插件推导，不由模型给。 */
 export const REVIEW_SCHEMA = Object.freeze({
@@ -76,6 +76,23 @@ const REVIEW_GUIDE = Object.freeze([
   '- 生成代码：命中 generated 目录/生成器的文件只报由生成器配置或契约导致的问题；能定位到源模板/配置的，引用源。',
 ])
 
+/** 输出指令：默认文本模式的 ```json 代码块，避免 provider 校验 tool-call 参数 JSON。 */
+function outputInstruction(outputMode) {
+  if (outputMode === 'tool') {
+    return [
+      '只返回 JSON：必须调用 `structured_output` 工具提交结果，参数形状为 '
+        + `${OUTPUT_SHAPE}；不要在最终文本里输出 JSON。`,
+      'JSON 字符串里禁止未转义换行；evidence 用单行代码片段。',
+    ]
+  }
+  return [
+    '只返回 JSON：把结果放在一个 ```json 代码块里作为最终回答（提交结果不需要调用工具），'
+      + `代码块形状为 ${OUTPUT_SHAPE}；代码块之外不要写任何其他内容。`,
+    'JSON 字符串里禁止出现未转义换行：evidence.snippet 必须是一行逐字代码'
+      + '（引号必须转义），一条 finding 只引一行。',
+  ]
+}
+
 /**
  * 组装审查者 prompt。
  *
@@ -85,7 +102,7 @@ const REVIEW_GUIDE = Object.freeze([
  * @param {{rulesPrompt: string, files: readonly object[], skipped: readonly {path:string,reason:string}[], header?: readonly string[]}} input
  * @returns {string}
  */
-export function buildPrompt({ rulesPrompt, files, skipped, header = [] }) {
+export function buildPrompt({ rulesPrompt, files, skipped, header = [], outputMode = 'text' }) {
   const listing = files.map((file) => `- ${file.path}（+${file.added} / -${file.deleted}）`).join('\n')
   const diffs = files
     .map((file) => `### ${file.path}\n\`\`\`\`diff\n${file.text}\n\`\`\`\``)
@@ -107,12 +124,10 @@ export function buildPrompt({ rulesPrompt, files, skipped, header = [] }) {
     diffs,
     '',
     '## 输出要求',
-    '只返回 JSON：必须调用 `structured_output` 工具提交结果，参数形状为 '
-      + '{"findings":[{"ruleId","dimension","severity","location","problem","suggestion","evidence"}],'
-      + '"coverage":{"files":[{"path","status","reason?"}]}}；不要在最终文本里输出 JSON。',
+    ...outputInstruction(outputMode),
     'ruleId 必须是上文硬规则里的 id，长尾问题用 PRINCIPLE-<dimension>；'
       + 'location 必须是 `路径:行号`（或 `路径:起-止`），路径取 diff 标题里的路径，且落在本次 diff 的文件内。',
-    'evidence.snippet 必须是来自本轮 diff 变更行的逐字代码片段（用反引号包裹也可），一次给一行或连续多行；'
+    'evidence.snippet 必须是来自本轮 diff 变更行的逐字代码片段（单行；用反引号包裹也可）；'
       + '给不出可核对片段说明证据不足，不要报该问题。'
       + '宿主会逐行校验，片段对不上的 finding 不会阻塞、不会触发修复。',
     'coverage.files 必须逐个列出本次送审文件的状态：reviewed=已完整读过，sampled=抽样看过，'
@@ -131,7 +146,7 @@ export function buildPrompt({ rulesPrompt, files, skipped, header = [] }) {
  * @param {{rulesPrompt: string, files: readonly {path:string, turns:number[], added:number, deleted:number}[], knownFindings?: readonly object[]}} input
  * @returns {string}
  */
-export function buildFullPrompt({ rulesPrompt, files, knownFindings = [] }) {
+export function buildFullPrompt({ rulesPrompt, files, knownFindings = [], outputMode = 'text' }) {
   const lines = [
     '## 本轮任务：链级全量复审',
     `本条链共改动 ${files.length} 个文件。请用只读工具（read / glob / grep）读取这些文件的**当前内容**，`
@@ -158,12 +173,10 @@ export function buildFullPrompt({ rulesPrompt, files, knownFindings = [] }) {
   lines.push(
     '',
     '## 输出要求',
-    '只返回 JSON：必须调用 `structured_output` 工具提交结果，参数形状为 '
-      + '{"findings":[{"ruleId","dimension","severity","location","problem","suggestion","evidence"}],'
-      + '"coverage":{"files":[{"path","status","reason?"}]}}；不要在最终文本里输出 JSON。',
+    ...outputInstruction(outputMode),
     'ruleId 必须是上文硬规则里的 id，长尾问题用 PRINCIPLE-<dimension>；'
       + 'location 必须是 `路径:行号`（或 `路径:起-止`），路径取上文文件清单里的路径。',
-    'evidence.snippet 必须是你在当前文件里读到的逐字代码片段（用反引号包裹也可）；'
+    'evidence.snippet 必须是你在当前文件里读到的逐字代码片段（单行；用反引号包裹也可）；'
       + '给不出可核对片段说明证据不足，不要报该问题。host 会与当前文件内容比对，对不上/缺失的 finding 不阻塞。',
     'coverage.files 必须逐个列出上文文件的状态：reviewed/sampled/skipped（skipped 必须给 reason）；'
       + '没有真读过就不要写 reviewed。',
@@ -187,7 +200,7 @@ export function buildFullPrompt({ rulesPrompt, files, knownFindings = [] }) {
  */
 export async function runReview({
   subagents, agent, preset, prompt, timeoutMs, modelOverride, signal, allowedRuleIds, allowedPaths,
-  ruleSeverities, logger, evidenceContext, evidenceMode, coverageMode,
+  ruleSeverities, logger, evidenceContext, evidenceMode, coverageMode, outputMode = 'text',
 }) {
   if (signal?.aborted) return { ok: false, reason: 'aborted' }
 
@@ -225,7 +238,7 @@ export async function runReview({
         request: {
           parent: agent,
           agentPreset: preset,
-          outputSchema: REVIEW_SCHEMA,
+          ...(outputMode === 'tool' ? { outputSchema: REVIEW_SCHEMA } : {}),
           ...(modelOverride === undefined ? {} : { agentOptions: modelOverride }),
           prompt: [{ type: 'text', text: prompt }],
         },
@@ -281,7 +294,7 @@ export async function runReview({
  * @returns {Promise<{childId: string, result: Promise<object>, cancel(reason?: string): void}>}
  */
 export async function startReview({
-  subagents, agent, preset, prompt, signal, modelOverride,
+  subagents, agent, preset, prompt, signal, modelOverride, outputMode = 'text',
   allowedRuleIds, allowedPaths, ruleSeverities, logger, evidenceContext, evidenceMode, coverageMode,
 }) {
   // 已取消的父级信号不启动子代理；返回一个已结算的句柄，调用方无需再区分。
@@ -343,7 +356,7 @@ export async function startReview({
       request: {
         parent: agent,
         agentPreset: preset,
-        outputSchema: REVIEW_SCHEMA,
+        ...(outputMode === 'tool' ? { outputSchema: REVIEW_SCHEMA } : {}),
         ...(modelOverride === undefined ? {} : { agentOptions: modelOverride }),
         prompt: [{ type: 'text', text: prompt }],
       },

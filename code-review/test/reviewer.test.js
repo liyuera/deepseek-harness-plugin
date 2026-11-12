@@ -12,7 +12,8 @@ test('buildPrompt 带变更清单与 diff', () => {
   assert.match(prompt, /@@ -1,1 \+1,1 @@/)
   assert.match(prompt, /x\.png（binary）/)
   assert.match(prompt, /只返回 JSON/)
-  assert.match(prompt, /structured_output/)
+  assert.match(prompt, /json 代码块/)
+  assert.doesNotMatch(prompt, /structured_output/)
 })
 
 test('buildFullPrompt 列出链内文件与已报问题，并要求读当前内容', () => {
@@ -28,7 +29,8 @@ test('buildFullPrompt 列出链内文件与已报问题，并要求读当前内�
   assert.match(prompt, /src\/a\.ts（第 1、2 轮，\+3 \/ -1）/)
   assert.match(prompt, /已报告过的问题/)
   assert.match(prompt, /MNT-004/)
-  assert.match(prompt, /structured_output/)
+  assert.match(prompt, /json 代码块/)
+  assert.doesNotMatch(prompt, /structured_output/)
 })
 
 test('两种 prompt 都内置评审准则：团队规范优先/证据边界/不重复治理/最小修复/数量上限', () => {

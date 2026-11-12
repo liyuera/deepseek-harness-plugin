@@ -21,7 +21,7 @@ DSH 会话运行时的「AI 生成代码自动审查」：主代理改完代码�
 1. **触发**：宿主在 `agent/turn-stopping` 事件上调用门禁。
 2. **门禁**（`src/host/trigger.js`，顺序短路）：`enabled` → `auto` → 来源不是 `subagent` → 当前没有同一会话的审查在跑 → 本链轮数未达 `maxRounds` → 本轮有 workspace 变更 → 熔断未打开。全部通过后再确认摘要属于本 turn 且确实有文件；取材后发现没有可审文件、或内容指纹与链内上一次成功审查相同，直接跳过（**不消耗轮次**）。
 3. **取材与规则过滤**（`src/host/collect.js` + `src/host/scope.js`）：只取后缀在 `codeExtensions` 里的源文件；把 hunk 渲染成 unified diff，按 UTF-8 字节数累计，超过 `maxDiffBytes` 后剩余文件标记 `budget` 跳过。二进制、超大、服务读不到、以及 diff 超时退化成整文件替换（`coarse`）的文件都记入 `skipped`，不会猜内容。取材完成后，按**本次实际变更的文件**过滤规则：带 `scope`（扩展名/路径 glob）的规则只对该类文件生效，没命中的规则不会进 prompt、也不允许被 finding 引用。与此同时，每个 `workspace/changes` 都会并入**链累积器**（`src/host/chain.js`）：即使某轮改动之后被 commit、工作区里已没有对应增量，链里仍留有该轮触达的文件清单，供链级全量复审使用。
-4. **后台审查**（`src/host/reviewer.js`）：`startReview` 经 `ctx.subagents.startActivation`（`delivery:'caller'`）在独立子代理里跑 `reviewerPreset`（默认 `code-review`），带结构化输出 schema；**拿到子代理句柄后立即返回**，不等待审查结果，当前 turn 正常结束。注意启动 `startActivation` 仍在 turn-stopping 的同步段里：启动受同一个 `asyncReviewerTimeoutMs` 总预算约束（超出即有界放弃并记失败，不会无限挂住 turn）；审查跑起来之后的取消信号来自插件生命周期，不随 turn 结束而中断。`asyncReviewerTimeoutMs` 默认 10 分钟。若本条链已到最后一轮（`rounds >= maxRounds`）且链内触达文件多于本轮 diff，本次自动改为**链级全量审查**（`buildFullPrompt`）：按链内文件清单读当前内容、以跨文件/跨轮次视角复审，每条链最多一次。v0.6 起**敏感路径**（`sensitiveGlobs`：`auth/**`、`migrations/**`、`*.sql`、`.github/workflows/**`）命中即强制本次切链级全量，不受 `fullReview:false` 降级，同样每条链只做一次。两种模式的 prompt 都内置团队评审口径（团队规范优先、证据边界、误报负向清单、禁止跨上下文推断、不重复治理、最小修复、最多 20 条 findings），校验层也会按严重度把 findings 截断到 20 条。v0.4 起 findings 必须带 `evidence.snippet`：turn 模式逐行比对 hunk 变更行，full 模式比对宿主读到的文件当前内容；location 必须落在 hunk 新侧范围内（旧代码冒充新问题直接丢弃）。证据状态会写进留痕：片段不符在 `evidenceMode: warn` 下降级为「仅报告」，`enforce` 下丢弃；缺少证据按模式处理（warn 保留、enforce 丢弃），读不到文件内容只记不可读、不影响 finding。
+4. **后台审查**（`src/host/reviewer.js`）：`startReview` 经 `ctx.subagents.startActivation`（`delivery:'caller'`）在独立子代理里跑 `reviewerPreset`（默认 `code-review`）；**拿到子代理句柄后立即返回**，不等待审查结果，当前 turn 正常结束。v0.6.3 起默认**文本 JSON 模式**：不挂 `outputSchema`，要求审查者在最终回答里输出一个 ```json 代码块，宿主宽松解析（围栏可省、围栏外可有说明）。这样 provider 不会对流式 tool-call 参数做 JSON 校验，避免模型把代码片段塞进工具参数时整轮报 `MALFORMED_RESPONSE`（此前结构性失败的主要来源）；需要严格工具模式时仍可显式传 `outputMode: 'tool'`。注意启动 `startActivation` 仍在 turn-stopping 的同步段里：启动受同一个 `asyncReviewerTimeoutMs` 总预算约束（超出即有界放弃并记失败，不会无限挂住 turn）；审查跑起来之后的取消信号来自插件生命周期，不随 turn 结束而中断。`asyncReviewerTimeoutMs` 默认 10 分钟。若本条链已到最后一轮（`rounds >= maxRounds`）且链内触达文件多于本轮 diff，本次自动改为**链级全量审查**（`buildFullPrompt`）：按链内文件清单读当前内容、以跨文件/跨轮次视角复审，每条链最多一次。v0.6 起**敏感路径**（`sensitiveGlobs`：`auth/**`、`migrations/**`、`*.sql`、`.github/workflows/**`）命中即强制本次切链级全量，不受 `fullReview:false` 降级，同样每条链只做一次。两种模式的 prompt 都内置团队评审口径（团队规范优先、证据边界、误报负向清单、禁止跨上下文推断、不重复治理、最小修复、最多 20 条 findings），校验层也会按严重度把 findings 截断到 20 条。v0.4 起 findings 必须带 `evidence.snippet`：turn 模式逐行比对 hunk 变更行，full 模式比对宿主读到的文件当前内容；location 必须落在 hunk 新侧范围内（旧代码冒充新问题直接丢弃）。证据状态会写进留痕：片段不符在 `evidenceMode: warn` 下降级为「仅报告」，`enforce` 下丢弃；缺少证据按模式处理（warn 保留、enforce 丢弃），读不到文件内容只记不可读、不影响 finding。
 5. **收口与回灌**（`index.js` + `src/host/finalize.js` + `src/host/render.js`）：审查结果先经过证据状态 → 修复策略（`src/host/fixmode.js`）→ 抑制（`src/host/suppress.js`）→ 复验（`src/host/verify.js`）：生成代码/契约/迁移/权限/支付类路径命中 `manualFixGlobs` 时标 `manual`（只要求人工确认、不自动修，全部 manual 时不触发修复轮）；配置与仓库内 `.dsh/code-review-suppressions.json` 命中的 finding 不阻塞但仍随报告输出；阻塞且证据 ok 的最多 `maxVerifiedFindings` 条交给独立只读 verifier「证伪」，确认的保留、明确反驳的丢弃、超时/失败的降级为「仅报告」。随后校验/渲染；`severity` 落在 `blockingSeverities` 的 findings 生成 `结论: 需修改...`，用 `agent.followup()` 以**插件来源消息**注入，开一个新 turn 让主代理修复。**默认**只有 low/nit 或完全干净时静默（v2 不注入「结论: 通过」）；配置 `notifySeverities` 后，命中的非阻塞建议也会回灌（结论为「通过（N 处建议）」，文案写明「可选择不改」，不要求修复）。最后一轮（`rounds >= maxRounds`）的文案改为「已达到自动复审上限，修完不会再自动复审，请人工确认」。每次审查尝试（完成/取消/超时/失败）都会写入 **journal**（`src/host/journal.js`，优先持久化到 storageDomain，缺失时内存降级），记录 coverage/复验统计/抑制数与每条 finding 的 fingerprint；`/review` 报告尾部会展示最近 5 条记录、近期合计（完成数/覆盖/复验确认/抑制），并提示「上次审查被取消、未出结论」。v0.5 的**跨轮账本**（`src/host/ledger.js`）从 journal 历史计算同一 fingerprint 的重复次数：第 2 次及以后在 finding 行尾标注「第 N 次报告，尚未修复」；历史上报过、且**连续 2 轮确实送审过该文件**仍未再出现的条目才会在 `/review` 报告里列为「未再见（观察，可人工确认后移出跟踪）」——journal 记录每轮实际送审路径，turn 轮只审当轮 diff，没送审的轮次不算缺席；**不自动关闭**，也不把「模型漏报」当成已修复。`/review` 报告末尾固定附一句边界声明（只覆盖本次改动与可读取文件，结论不构成合入批准）。
 6. **轮次与防循环**：一条**人类消息**开启一条「链」，链内最多自动审查 `maxRounds` 次（默认 2：首审 + 修复后复审）。链在以下约束下终止：人类消息重置链；同链内同一份 diff（内容指纹）只审一次且不占轮；单会话同时只有一个在途审查；插件注入的消息是 `plugin` 来源，**不会**重置链。失败路径由熔断兜底。
 7. **失败兜底**：启动失败、超时、子代理失败、输出不合 schema、finding 全部被二次校验丢弃、服务不可用都按 fail-open 处理——只写宿主日志（含失败原因），不注入、不阻塞；会话关闭/插件卸载不计为失败，`timeout` 取消按失败计数（用于熔断）。同一会话连续 2 次失败进入 5 分钟冷却（熔断），冷却后半开放行一次；成功即清零。状态只在内存，会话释放或重启后清空。
@@ -217,6 +217,7 @@ node evaluation/run.mjs --json
 - **范围模式受总预算约束**：`rangeTimeoutMs`（默认 15 分钟）用尽后未跑的块记失败，报告写「覆盖缺口，NOT clean」；单块超时 = `max(rangeChunkTimeoutMs, reviewerTimeoutMs + KB*perKb)`（默认下限 4 分钟），且不超过总预算。单块失败会**先拆半重试一次**（单文件块原样重试一次），provider 输出畸形/超时常见于大 diff，重试仍失败才计入覆盖缺口；失败原因（如 `timeout`、`provider-error`、`invalid-result`）会写进错误文案与覆盖缺口行。
 - **敏感路径强制全量有成本**：命中 `sensitiveGlobs` 时首轮就做链级全量（读文件当前内容而不是只读 diff），token 与时间更高；每条链只做一次，且全量失败不重试。
 - **分块审查可能出现边界遗漏**：块间按文件切分，跨块才成立的因果可能漏报；块合并只按 `(ruleId, path, problem)` 去重，不做跨块二次推断。
+- **审查者输出走文本 JSON**：默认不挂 `outputSchema`，模型最终文本里的 ```json 代码块由宿主解析；坏 JSON 只记 `invalid-result`（走 `retryInvalidReview` 重试一次，仍失败 fail-open），不会像工具模式那样让整轮 provider 报错。代价是严格要求「只给一个代码块」依赖 prompt 约束，围栏外文本会被忽略。
 - **证据校验不是语义正确性**：`evidence.snippet` 只保证「片段确实来自本次变更/当前文件」，不证明因果推断成立；真正的因果由复验（`verify: blocking`）兜一层，复验失败/超时仍会降级为仅报告而不是丢弃全部。
 - **复验有延迟与成本**：每条阻塞 finding 增加一次只读子代理调用，默认最多 3 条、总预算 180s；开启后从「审查完成」到「回灌」可能更慢。
 - **抑制文件不会自动同步 GitLab 裁决**：`#ai-wontfix`/`#ai-waive` 需要人工写进 `.dsh/code-review-suppressions.json`（或 profile `suppressions`）；插件不会读取 GitLab 评论。
@@ -242,11 +243,11 @@ node evaluation/run.mjs --json
    node --test
    ```
 
-   第一条应打印 `24`；第二条应全绿（当前 365 个用例）。再跑 `npm run eval` 应输出 `10/10 cases passed`。
+   第一条应打印 `24`；第二条应全绿（当前 372 个用例）。再跑 `npm run eval` 应输出 `10/10 cases passed`。
 
 ## 发布
 
-- 目标首发版本：**0.6.2**
+- 目标首发版本：**0.6.3**
 - 当前状态：**待发布**（npm 账号 2FA 恢复后首发；包里含 `index.js`、`src/`、`cordis.patch.yml`、`rules/`，不含 `test/`）
 
 首发之后日常发布走 GitHub Actions 的 npm **Trusted Publishing**（OIDC，无 NPM_TOKEN、无浏览器授权）：

@@ -44,8 +44,35 @@ test('startReview 正常路径返回 childId 与校验后的 findings，启动�
   assert.equal(spec.delivery, 'caller')
   assert.equal(spec.request.parent, agent)
   assert.equal(spec.request.agentPreset, 'code-review')
-  assert.equal(spec.request.outputSchema, REVIEW_SCHEMA)
+  assert.equal(spec.request.outputSchema, undefined, '默认文本模式不挂 outputSchema（避免 provider 校验 tool 参数 JSON）')
   assert.deepEqual(spec.request.prompt, [{ type: 'text', text: 'P' }])
+})
+
+test('startReview 显式 outputMode=tool 时仍挂 outputSchema（回退路径）', async () => {
+  const subagents = fakeSubagents({
+    stopReason: 'completed',
+    structured: { findings: [] },
+  })
+  const handle = await startReview({ ...startInput({ subagents }), outputMode: 'tool' })
+  assert.equal(subagents.calls[0].request.outputSchema, REVIEW_SCHEMA)
+  const outcome = await handle.result
+  assert.equal(outcome.ok, true)
+})
+
+test('startReview 文本模式从最终文本解析 json 代码块', async () => {
+  const subagents = fakeSubagents({
+    stopReason: 'completed',
+    output: [{
+      type: 'text',
+      text: '审查完成。\n```json\n{"findings":[],"coverage":{"files":[{"path":"src/a.ts","status":"reviewed"}]}}\n```\n',
+    }],
+  })
+  const handle = await startReview(startInput({ subagents }))
+  assert.equal(subagents.calls[0].request.outputSchema, undefined)
+  const outcome = await handle.result
+  assert.equal(outcome.ok, true)
+  assert.deepEqual(outcome.findings, [])
+  assert.equal(outcome.coverage.valid, true)
 })
 
 test('startReview cancel 以 cancelled 结算、dispose 一次且幂等', async () => {

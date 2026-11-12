@@ -417,3 +417,14 @@ wisdom 仓库的 live `/review --range HEAD~3..HEAD` 失败（`1/1 块失败/超
 
 测试 +3（重试成功回灌、重试仍失败只发起两次、人类重置链后不重试）+ config 断言；365 用例 + 10 eval 全绿。`/review --range` 在 0.6.1 下已验证成功（wisdom 仓库 HEAD~3..HEAD，2 文件，1 阻塞 + 2 建议，覆盖 2/2）。
 
+### 11.9 0.6.3 审查输出改文本 JSON（MALFORMED_RESPONSE 根因修复）（2026-11-12）
+
+用户多次遇到 reviewer 子会话「本轮运行失败：DeepSeek Messages stream: tool input is invalid JSON」。定位：DSH 的 `structured_output` 是普通工具，**provider 会对流式 tool-call 参数强制 JSON 解析**；审查 prompt 要求逐字引用代码片段（含换行/引号/反引号），模型一旦转义出错，整个 activation 以 `MALFORMED_RESPONSE` 失败——重试只是缓解，不是根因修复。
+
+修复（0.6.3）：审查者默认改为**文本 JSON 模式**：
+
+1. `startReview`/`runReview` 默认 `outputMode: 'text'`，不向 subagent 传 `outputSchema`（该工具不再挂载）；prompt 要求「把结果放在一个 ```json 代码块里作为最终回答，提交结果不需要调用工具」，并明确「JSON 字符串禁止未转义换行、evidence 必须单行」。
+2. `structured.js` 新增 `extractJsonFromText`（```json 围栏优先、可省语言、容忍围栏外说明，退化为首个 `{` 到末个 `}`）与 `structuredFromResult`（structured 优先、文本 output 回退）；`validateResult` 在文本坏 JSON 时返回 `invalid-result`，不再有 provider 级整轮失败。
+3. 保留 `outputMode: 'tool'` 回退路径与 `structured_output` guard 白名单；`REVIEW_SCHEMA` 与 OUTPUT_SHAPE 仍作为形状单一来源。
+4. 测试：新增 `test/structured-text.test.js`（围栏/无围栏/围栏外说明、structured 优先、坏 JSON → invalid-result、未完成 → incomplete）；更新 reviewer prompt/startReview 断言；372 用例 + 10 eval 全绿。
+

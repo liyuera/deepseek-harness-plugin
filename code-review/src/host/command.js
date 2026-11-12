@@ -116,7 +116,7 @@ export function createReviewCommand({
                   `${label} 的第 ${index + 1}/${chunks.length} 块（本块 ${chunk.length} 个文件${retry ? '，重试' : ''}）。`,
                   '只审查本块内出现的 diff；不要推测未提供的文件，也不要跨块重复报告同一问题。',
                   '本块 diff 已完整提供：不要用 grep/read 探索无关文件；只在必须核对被 diff 引用的定义时读文件。',
-                  'finding 控制在 8 条以内、阻塞项优先；evidence 每个只引一行片段，尽快提交 structured_output。',
+                  'finding 控制在 8 条以内、阻塞项优先；evidence 每个只引一行片段，最后输出 json 代码块即可。',
                 ],
               }),
               timeoutMs: Math.min(remaining, base),
