@@ -1,0 +1,3 @@
+- insert:
+    - id: mr-loop
+      name: '@liyuera/dsh-mr-loop'
