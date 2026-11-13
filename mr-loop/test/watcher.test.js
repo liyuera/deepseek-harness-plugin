@@ -111,6 +111,42 @@ test('gatesChanged 单独触发唤醒；与 reviewArrived 同时为真时只唤�
   assert.equal(both.notified.length, 1)
 })
 
+test('gatesChanged：新 sha 只有门禁、评审未出 → 不唤醒（避免每次 push 多一条报告）', async () => {
+  const h = harness({
+    snapshot: ({ mr: nextMr, setState }) => ({
+      state: setState({
+        mr: nextMr,
+        round: { sha: OTHER, n: 2, observedAt: 2, review: null, sensitive: { verdict: 'pass' }, mandatory: null },
+      }),
+      newRound: true,
+      reviewArrived: false,
+      gatesChanged: true,
+      becameMergeable: false,
+    }),
+  })
+
+  await h.watcher.tick('s')
+  assert.equal(h.notified.length, 0)
+  assert.equal(h.timers.length, 1) // 继续等评审，不是停表
+})
+
+test('gatesChanged：同 sha 评审在场、敏感门禁翻面 → 唤醒一次', async () => {
+  const round = { sha: SHA, n: 1, observedAt: 1, review: { verdict: 'pass' }, sensitive: null, mandatory: null }
+  const h = harness({
+    stateOver: { round },
+    snapshot: ({ mr: nextMr, setState }) => ({
+      state: setState({ mr: nextMr, round: { ...round, sensitive: { verdict: 'block' } } }),
+      newRound: false,
+      reviewArrived: false,
+      gatesChanged: true,
+      becameMergeable: false,
+    }),
+  })
+
+  await h.watcher.tick('s')
+  assert.equal(h.notified.filter((text) => /REPORT/.test(text)).length, 1)
+})
+
 test('守卫触发 → pause 且不再排下一次', async () => {
   const h = harness({ stateOver: { stallStreak: 99 } })
   await h.watcher.tick('s')
@@ -418,12 +454,12 @@ test('roundTimeoutMs：观测到新 sha 后重新计时，不继承上一轮的�
   assert.match(wakes[0], new RegExp(`sha ${OTHER.slice(0, 8)}`))
 })
 
-test('gateSettleMs：评审已到、敏感/必过未出，窗口到点只唤醒一次「门禁未出」', async () => {
+test('gateSettleMs：评审已到、敏感门禁未出，窗口到点只唤醒一次「门禁未出」', async () => {
   const h = harness({
     mr: mrOf({ head_pipeline: { status: 'success', id: 9 } }),
     stateOver: {
       pipelineStatus: 'success',
-      round: { sha: SHA, n: 1, observedAt: 1, review: { verdict: 'changes' }, sensitive: null, mandatory: null },
+      round: { sha: SHA, n: 1, observedAt: 1, review: { verdict: 'changes' }, sensitive: null, mandatory: { verdict: 'pass' } },
     },
     snapshot: pinnedSnapshot,
   })
@@ -440,11 +476,32 @@ test('gateSettleMs：评审已到、敏感/必过未出，窗口到点只唤醒�
   await h.watcher.tick('s')
   const wakes = h.notified.filter((text) => /门禁未出/.test(text))
   assert.equal(wakes.length, 1)
-  assert.match(wakes[0], /3 分钟仍无结论（敏感\/必过）/)
+  assert.match(wakes[0], /3 分钟仍无结论（敏感）/)
 
   h.advance(cfg.gateSettleMs)
   await h.watcher.tick('s')
   assert.equal(h.notified.filter((text) => /门禁未出/.test(text)).length, 1)
+})
+
+test('gateSettleMs：敏感门禁已出、必过缺失 → 窗口关闭，不唤醒「门禁未出」', async () => {
+  const h = harness({
+    mr: mrOf({ head_pipeline: { status: 'success', id: 9 } }),
+    stateOver: {
+      pipelineStatus: 'success',
+      round: { sha: SHA, n: 1, observedAt: 1, review: { verdict: 'changes' }, sensitive: { verdict: 'pass' }, mandatory: null },
+    },
+    snapshot: pinnedSnapshot,
+  })
+
+  await h.watcher.tick('s')
+  assert.equal(h.timers.at(-1).ms, cfg.pollWatchingMs) // 敏感门禁已出：不进入 settle 窗口
+
+  h.advance(cfg.gateSettleMs)
+  await h.watcher.tick('s')
+  h.advance(cfg.gateSettleMs)
+  await h.watcher.tick('s')
+  assert.equal(h.notified.filter((text) => /门禁未出/.test(text)).length, 0)
+  assert.equal(h.timers.at(-1).ms, cfg.pollWatchingMs)
 })
 
 test('pollWatchingMs：评审与门禁都已出、不可合 → 用等新 sha 的间隔', async () => {

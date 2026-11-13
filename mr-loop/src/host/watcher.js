@@ -214,6 +214,7 @@ export function createWatcher({ cfg, gitlab, service, notify, logger = undefined
     const next = result.state
 
     const reviewVerdict = next.round?.review?.verdict
+    const reviewPresent = next.round?.review !== null && next.round?.review !== undefined
     const reviewArrived = reviewVerdict !== undefined && reviewVerdict !== null && (result.newRound || result.reviewArrived)
     // 可合并是终点：无论是否在本次 tick 里「变成」可合并，都必须停表；
     // 但只有状态真的发生变化时才唤醒，避免 bind 已经给过报告后又重复推一遍。
@@ -228,12 +229,13 @@ export function createWatcher({ cfg, gitlab, service, notify, logger = undefined
     if (reviewArrived) wake(sessionId, service.report(next), wakeKey(next.round))
     // 评审已经到、门禁后来才翻面（同 sha）时 reviewArrived 为假：单独补一条门禁唤醒。
     // 两个条件同时为真时只走上面那条，wake key 已含三套 verdict，不会双唤醒。
-    else if (result.gatesChanged === true) wake(sessionId, service.report(next), wakeKey(next.round))
+    // 新 sha 的首个快照还没有本轮评审：门禁只是先到，不能当成「门禁变化」唤醒，
+    // 否则每次 push 都可能多一条「评审未出」的噪声；评审到达走上面的 reviewArrived。
+    else if (result.gatesChanged === true && reviewPresent) wake(sessionId, service.report(next), wakeKey(next.round))
 
     // 单轮计时：新 sha 观测到就重开；评审首次出现记 reviewSettledAt。
     const tickAt = now()
     const clock = roundClock(sessionId, next.round)
-    const reviewPresent = next.round?.review !== null && next.round?.review !== undefined
     if (reviewPresent) {
       if (clock.reviewSettledAt === null) clock.reviewSettledAt = tickAt
     } else {
@@ -241,7 +243,9 @@ export function createWatcher({ cfg, gitlab, service, notify, logger = undefined
       clock.reviewSettledAt = null
       clock.gateSettleWoken = false
     }
-    const gatesMissing = next.round?.sensitive == null || next.round?.mandatory == null
+    // 设计 §5.6 第 4 条：mandatory 是建议性的（常只在早期出现一次），不参与 settle 判定；
+    // 窗口只盯 sensitive，任何 verdict（含 pass/block）出现即关闭窗口。
+    const gatesMissing = next.round?.sensitive == null
 
     // 设计 §5.7：单轮兜底超时只唤醒一次；不停表，下一 tick 继续等。
     // key 带上 roundTimeout:<sha>，同一 sha 的重复 tick 不会重复提醒。
@@ -256,11 +260,11 @@ export function createWatcher({ cfg, gitlab, service, notify, logger = undefined
       clock.timeoutWoken = true
     }
 
-    // 设计 §5.4：评审已到、敏感/必过仍未出时，等满 gateSettleMs 只提醒一次；
+    // 设计 §5.4：评审已到、敏感门禁仍未出时，等满 gateSettleMs 只提醒一次；
     // key 与评审唤醒分开，避免被 30s 节流吞掉。
     if (reviewPresent && clock.gateSettleWoken === false && gatesMissing && tickAt - clock.reviewSettledAt >= cfg.gateSettleMs) {
       const minutes = Math.max(1, Math.round((tickAt - clock.reviewSettledAt) / 60000))
-      wake(sessionId, `门禁未出：${minutes} 分钟仍无结论（敏感/必过）。`, `gateSettle:${clock.sha}`)
+      wake(sessionId, `门禁未出：${minutes} 分钟仍无结论（敏感）。`, `gateSettle:${clock.sha}`)
       clock.gateSettleWoken = true
     }
 

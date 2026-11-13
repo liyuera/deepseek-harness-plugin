@@ -198,6 +198,52 @@ test('同 sha 门禁翻面：gatesChanged 触发一次唤醒，报告带敏感�
   await rm(dir, { recursive: true, force: true })
 })
 
+test('新 sha 门禁先到、评审未出：gatesChanged 为真也不唤醒', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mrloop-service-'))
+  const SHA2 = 'c'.repeat(40)
+  const reviewNote = { id: 11, system: false, created_at: '2026-11-13T10:02:00Z', body: reviewPass(SHA) }
+  const gateNote = { id: 12, system: false, created_at: '2026-11-13T10:05:00Z', body: sensitivePass }
+  let currentMr = mr({ user_notes_count: 1 })
+  let currentNotes = [reviewNote]
+  const gitlab = { getMergeRequest: async () => currentMr, listNotes: async () => currentNotes, listDiscussions: async () => [], listPipelines: async () => [] }
+  const config = resolveConfig({ baseUrl: 'https://git.x.com' })
+  const service = createService({
+    config,
+    ledger: createLedger({ dir }),
+    gitlab,
+    repoState: async () => ({ root: '/r', host: 'git.x.com', projectPath: 'g/p', branch: 'feat-x' }),
+    now: () => NOW,
+  })
+  const url = 'https://git.x.com/g/p/-/merge_requests/240'
+  await service.bind({ sessionId: 's', url, repoRoot: '/r' })
+
+  // 新 sha 的首个快照只有门禁 note：评审还没出，gatesChanged 只是门禁「先到」。
+  currentMr = mr({ sha: SHA2, user_notes_count: 1 })
+  currentNotes = [gateNote]
+  let snapshot
+  const applySnapshot = service.applySnapshot
+  service.applySnapshot = (input) => { snapshot = applySnapshot(input); return snapshot }
+
+  const notified = []
+  const watcher = createWatcher({
+    cfg: config,
+    gitlab,
+    service,
+    notify: ({ text }) => { notified.push(text); return true },
+    now: () => NOW,
+    setTimer: () => 1,
+    clearTimer: () => {},
+  })
+  await watcher.tick('s')
+
+  assert.equal(snapshot.newRound, true)
+  assert.equal(snapshot.state.round.review, null)
+  assert.equal(snapshot.gatesChanged, true)
+  assert.equal(notified.length, 0)
+  await service.stop({ sessionId: 's' })
+  await rm(dir, { recursive: true, force: true })
+})
+
 test('未绑定 → not-bound；重复绑定同 MR 会新增一轮', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'mrloop-service-'))
   const service = createService({ config: resolveConfig({ baseUrl: 'https://git.x.com' }), ledger: createLedger({ dir }), gitlab: harness().gitlab, repoState: harness().repoImpl, now: () => Date.parse('2026-11-13T10:10:00Z') })
