@@ -27,15 +27,25 @@ export function createLedger({ dir, keepRounds = 50, keepDecisions = MAX_DECISIO
 
   const pathOf = ({ projectPath, iid }) => join(root, `${slug(projectPath)}-${iid}.json`)
 
+  /** 同一文件的写/删共用一条队列：调用顺序即落盘顺序。前一次失败也继续下一次。 */
+  const enqueue = (file, task) => {
+    const previous = queues.get(file) ?? Promise.resolve()
+    const next = previous.then(task, task)
+    queues.set(file, next.catch(() => {}))
+    return next
+  }
+
   const trim = (record) => {
     const rounds = Array.isArray(record.rounds) ? record.rounds : []
     const decisions = record.decisions !== null && typeof record.decisions === 'object' ? record.decisions : {}
     const entries = Object.entries(decisions).sort((a, b) => String(b[1]?.at ?? '').localeCompare(String(a[1]?.at ?? '')))
     const keptEntries = entries.slice(0, keepDecisions)
-    const dropped = Math.max(0, rounds.length - keepRounds) + Math.max(0, entries.length - keptEntries.length)
+    // slice(-0) 等于整段，会把「不留历史」变成「全留」；0 必须显式清空。
+    const keptRounds = keepRounds > 0 ? rounds.slice(-keepRounds) : []
+    const dropped = Math.max(0, rounds.length - keptRounds.length) + Math.max(0, entries.length - keptEntries.length)
     return {
       ...record,
-      rounds: rounds.slice(-keepRounds),
+      rounds: keptRounds,
       decisions: Object.fromEntries(keptEntries),
       ...(dropped > 0 ? { trimmed: dropped } : {}),
     }
@@ -59,24 +69,26 @@ export function createLedger({ dir, keepRounds = 50, keepDecisions = MAX_DECISIO
       }
       return payload
     }
-    const previous = queues.get(file) ?? Promise.resolve()
-    const next = previous.then(task, task)
-    queues.set(file, next.catch(() => {}))
-    return next
+    return enqueue(file, task)
   }
 
   const load = async ({ projectPath, iid }) => {
     try {
       const text = await readFile(pathOf({ projectPath, iid }), 'utf8')
       const parsed = JSON.parse(text)
-      return parsed !== null && typeof parsed === 'object' ? parsed : null
+      // 数组也是 object：账本必须是对象，否则调用方会拿到 undefined.binding。
+      return parsed !== null && typeof parsed === 'object' && Array.isArray(parsed) === false ? parsed : null
     } catch {
       return null
     }
   }
 
-  const forget = async ({ projectPath, iid }) => {
-    await rm(pathOf({ projectPath, iid }), { force: true })
+  const forget = ({ projectPath, iid }) => {
+    const file = pathOf({ projectPath, iid })
+    // 删除也入队：save 在途时 forget 不会被随后的 rename 写回。
+    return enqueue(file, async () => {
+      await rm(file, { force: true })
+    })
   }
 
   return { pathOf, save, load, forget }

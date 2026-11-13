@@ -71,3 +71,25 @@ test('forget 删除文件且幂等', async () => {
   assert.equal(raw, 'missing')
   await rm(dir, { recursive: true, force: true })
 })
+
+test('forget 走同一队列：在途 save 不会把文件写回来', async () => {
+  const dir = await tmp()
+  const ledger = createLedger({ dir })
+  const pending = ledger.save(rec())
+  await ledger.forget({ projectPath: 'g/p', iid: 240 })
+  await pending
+  assert.equal(await ledger.load({ projectPath: 'g/p', iid: 240 }), null)
+  await rm(dir, { recursive: true, force: true })
+})
+
+test('keepRounds=0 表示不留历史；数组内容按坏文件处理', async () => {
+  const dir = await tmp()
+  const ledger = createLedger({ dir, keepRounds: 0 })
+  await ledger.save(rec({ rounds: [{ n: 1 }, { n: 2 }] }))
+  const loaded = await ledger.load({ projectPath: 'g/p', iid: 240 })
+  assert.deepEqual(loaded.rounds, [])
+  assert.equal(loaded.trimmed, 2)
+  await writeFile(ledger.pathOf({ projectPath: 'g/p', iid: 9 }), '[]', 'utf8')
+  assert.equal(await ledger.load({ projectPath: 'g/p', iid: 9 }), null)
+  await rm(dir, { recursive: true, force: true })
+})
