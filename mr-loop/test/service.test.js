@@ -90,6 +90,9 @@ test('status 重新拉取；review 返回当前轮与处置', async () => {
   const { round, decisions } = service.review({ sessionId: 's' })
   assert.equal(round.review.verdict, 'pass')
   assert.deepEqual(decisions, {})
+  // status 内部 applySnapshot 的落盘是 fire-and-forget；stop 的 await persist 排在队列后面，
+  // 等它完成即可排空写队列，避免 rm 与在途写竞争（ENOTEMPTY 抖动）。
+  await service.stop({ sessionId: 's' })
   await rm(dir, { recursive: true, force: true })
 })
 
@@ -121,6 +124,7 @@ test('applySnapshot：同 sha 只刷新，新 sha 开新一轮，评审到达可
   const arrived = service.applySnapshot({ sessionId: 's', mr: current, notes: notes() })
   assert.equal(arrived.newRound, false)
   assert.equal(arrived.reviewArrived, true)
+  await service.stop({ sessionId: 's' })
   await rm(dir, { recursive: true, force: true })
 })
 
@@ -132,5 +136,66 @@ test('未绑定 → not-bound；重复绑定同 MR 会新增一轮', async () =>
   await service.bind({ sessionId: 's', url, repoRoot: '/r' })
   await service.bind({ sessionId: 's', url, repoRoot: '/r' })
   assert.equal(service.getState('s').round.n, 2)
+  await rm(dir, { recursive: true, force: true })
+})
+
+test('账本裁剪后轮次号仍单调：取已有最大 n + 1', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mrloop-service-'))
+  const ledger = createLedger({ dir })
+  await ledger.save({
+    binding: { projectPath: 'g/p', iid: 240 },
+    rounds: [{ n: 50, sha: 'a'.repeat(40) }, { n: 51, sha: 'b'.repeat(40) }],
+    decisions: {},
+  })
+  const service = createService({
+    config: resolveConfig({ baseUrl: 'https://git.x.com' }),
+    ledger,
+    gitlab: harness().gitlab,
+    repoState: harness().repoImpl,
+    now: () => Date.parse('2026-11-13T10:10:00Z'),
+  })
+  await service.bind({ sessionId: 's', url: 'https://git.x.com/g/p/-/merge_requests/240', repoRoot: '/r' })
+  assert.equal(service.getState('s').round.n, 52)
+  assert.deepEqual(service.getState('s').rounds.map((item) => item.n), [50, 51, 52])
+  await rm(dir, { recursive: true, force: true })
+})
+
+test('账本写入失败 → storage-failed，且不留半绑定', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mrloop-service-'))
+  const ledger = createLedger({ dir })
+  const service = createService({
+    config: resolveConfig({ baseUrl: 'https://git.x.com' }),
+    ledger: { ...ledger, save: async () => { throw new Error('EACCES') } },
+    gitlab: harness().gitlab,
+    repoState: harness().repoImpl,
+    now: () => 1,
+  })
+  await assert.rejects(
+    service.bind({ sessionId: 's', url: 'https://git.x.com/g/p/-/merge_requests/240', repoRoot: '/r' }),
+    { name: 'ServiceError', code: 'storage-failed', message: /账本写入失败/ },
+  )
+  assert.equal(service.getState('s'), null)
+  await rm(dir, { recursive: true, force: true })
+})
+
+test('并发绑定同一会话：串行执行、轮次连续、只留一个 state', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mrloop-service-'))
+  const service = createService({
+    config: resolveConfig({ baseUrl: 'https://git.x.com' }),
+    ledger: createLedger({ dir }),
+    gitlab: harness().gitlab,
+    repoState: harness().repoImpl,
+    now: () => Date.parse('2026-11-13T10:10:00Z'),
+  })
+  const url = 'https://git.x.com/g/p/-/merge_requests/240'
+  const results = await Promise.allSettled([
+    service.bind({ sessionId: 's', url, repoRoot: '/r' }),
+    service.bind({ sessionId: 's', url, repoRoot: '/r' }),
+  ])
+  assert.deepEqual(results.map((item) => item.status), ['fulfilled', 'fulfilled'])
+  assert.deepEqual(service.getState('s').rounds.map((item) => item.n), [1, 2])
+  assert.equal(service.getState('s').round.n, 2)
+  const saved = await service.ledger.load({ projectPath: 'g/p', iid: 240 })
+  assert.deepEqual(saved.rounds.map((item) => item.n), [1, 2])
   await rm(dir, { recursive: true, force: true })
 })
