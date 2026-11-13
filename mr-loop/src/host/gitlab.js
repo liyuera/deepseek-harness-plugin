@@ -6,7 +6,8 @@
  *   GET /projects/:p/merge_requests/:iid/pipelines?per_page=1
  *
  * 安全不变量：token 只进 PRIVATE-TOKEN 头；redirect:'error' 防转发到别的主机；
- * 响应体上限 1MiB；错误消息是静态模板，不含 token / URL / 上游原文。
+ * 响应体上限 1MiB（流式累计，超限立即中断，不会先整体缓冲）；超时覆盖整个请求
+ * （含响应体读取）；错误消息是静态模板，不含 token / URL / 上游原文。
  * 纯依赖注入（fetchImpl / tokenProvider），可直接单测。
  */
 const API_PREFIX = '/api/v4'
@@ -66,6 +67,51 @@ function statusToCode(status) {
   return 'bad-response'
 }
 
+/** 内部 signal 中止（超时或调用方取消）时立即拒绝，供 body 读取 race 使用。 */
+function abortRejection(signal) {
+  return new Promise((_, reject) => {
+    if (signal.aborted) return reject(new GitlabError('timeout'))
+    signal.addEventListener('abort', () => reject(new GitlabError('timeout')), { once: true })
+  })
+}
+
+/**
+ * 流式读取响应体：累计字节一旦超过上限立即取消底层流并抛 bad-response，
+ * 不会先把超大响应整体缓冲进内存。signal 中止时取消读取，由调用方 race 判超时。
+ * `response.body` 为 null 时视为空体（后续 JSON.parse 失败 → bad-response）。
+ */
+async function readBody(response, signal) {
+  if (response.body === null || response.body === undefined) return ''
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  const onAbort = () => {
+    reader.cancel().catch(() => {})
+  }
+  signal.addEventListener('abort', onAbort, { once: true })
+  let total = 0
+  let text = ''
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      total += value.byteLength
+      if (total > MAX_RESPONSE_BYTES) {
+        await reader.cancel().catch(() => {})
+        throw new GitlabError('bad-response')
+      }
+      text += decoder.decode(value, { stream: true })
+    }
+    return text + decoder.decode()
+  } finally {
+    signal.removeEventListener('abort', onAbort)
+    try {
+      reader.releaseLock()
+    } catch {
+      // 读取已结束，忽略 release 失败
+    }
+  }
+}
+
 /**
  * @param {{ baseUrl: string, tokenProvider: () => (string|Promise<string>), fetchImpl?: typeof fetch, timeoutMs?: number }} options
  */
@@ -92,38 +138,40 @@ export function createGitlabClient({ baseUrl, tokenProvider, fetchImpl = globalT
       if (signal.aborted) forward()
       else signal.addEventListener('abort', forward, { once: true })
     }
-    const timer = setTimeout(() => controller.abort(new Error('timeout')), timeoutMs)
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
 
-    let response
+    // 定时器与调用方 abort 监听器保持到响应体读完，整请求共用同一超时预算。
     try {
-      response = await fetchImpl(url, {
-        method: 'GET',
-        headers: { [AUTH_HEADER]: token, accept: 'application/json' },
-        redirect: 'error',
-        signal: controller.signal,
-      })
-    } catch (error) {
-      if (signal?.aborted) throw new GitlabError('timeout', undefined)
-      if (error?.name === 'AbortError' || controller.signal.aborted) throw new GitlabError('timeout')
-      throw new GitlabError('network')
+      let response
+      try {
+        response = await fetchImpl(url, {
+          method: 'GET',
+          headers: { [AUTH_HEADER]: token, accept: 'application/json' },
+          redirect: 'error',
+          signal: controller.signal,
+        })
+      } catch (error) {
+        if (controller.signal.aborted || error?.name === 'AbortError') throw new GitlabError('timeout')
+        throw new GitlabError('network')
+      }
+
+      if (!response.ok) throw new GitlabError(statusToCode(response.status), response.status)
+
+      let text
+      try {
+        text = await Promise.race([readBody(response, controller.signal), abortRejection(controller.signal)])
+      } catch (error) {
+        if (error instanceof GitlabError) throw error
+        throw new GitlabError('network')
+      }
+      try {
+        return JSON.parse(text)
+      } catch {
+        throw new GitlabError('bad-response')
+      }
     } finally {
       clearTimeout(timer)
       if (signal) signal.removeEventListener?.('abort', forward)
-    }
-
-    if (!response.ok) throw new GitlabError(statusToCode(response.status), response.status)
-
-    let text
-    try {
-      text = await response.text()
-    } catch {
-      throw new GitlabError('bad-response')
-    }
-    if (Buffer.byteLength(text, 'utf8') > MAX_RESPONSE_BYTES) throw new GitlabError('bad-response')
-    try {
-      return JSON.parse(text)
-    } catch {
-      throw new GitlabError('bad-response')
     }
   }
 
