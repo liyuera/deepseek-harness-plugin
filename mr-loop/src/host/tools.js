@@ -39,7 +39,7 @@ const unknownArgument = (parameters, args) => {
 export function createTools({ service }) {
   const bind = {
     name: 'mr_bind',
-    description: '绑定一个 GitLab MR，立即返回首轮门禁报告。之后由 watcher 在评审出结论时唤醒你，不要用 sleep 轮询。',
+    description: '绑定一个 GitLab MR，立即返回首轮门禁报告。之后用 mr_status 取最新结论；不要用 sleep 轮询。',
     parameters: objectSchema({
       url: MR_URL,
       repo: { type: 'string', description: '可选：仓库根目录（默认用当前会话工作目录）' },

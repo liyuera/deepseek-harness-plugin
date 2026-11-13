@@ -14,6 +14,11 @@ export function createCommand({ service }) {
           const { report } = await service.status({ sessionId })
           return { kind: 'success', text: report }
         }
+        if (input === 'resume') {
+          service.resume({ sessionId })
+          const { report } = await service.status({ sessionId })
+          return { kind: 'success', text: report }
+        }
         if (input === 'stop' || input === 'stop --forget') {
           const forget = input.endsWith('--forget')
           const result = await service.stop({ sessionId, forget })
