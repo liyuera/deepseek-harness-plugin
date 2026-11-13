@@ -212,7 +212,7 @@ idle ──bind──▶ watching(sha) ──head sha 变化──▶ awaiting(s
 2. 已完成绑定的那个 sha 的评审：`verdict === 'pass'`；且**每一条**列在「需要关注的问题 / 历史未收敛问题」里的阻塞项，要么已被本轮证明修复（不再出现），要么有 `waive` / `skip` / `wontfix` 处置记录。`verdict === 'changes'` 一律不可合并；
 3. 敏感门禁**本轮**（基线之后）`verdict === 'pass'`（`当前有效 0 条`）；该 sha 上还没有 → 还在 settle 窗口，不算可合并；
 4. 必过项是**建议性**的：只有存在基线之后的 note 才计入；没有则忽略并在报告里标「无本轮结论」，最终由 `detailed_merge_status` 兜底（该 notes 只在早期出现一次，若强制要求 pass 会让可合并永远判不出来）；
-5. `detailed_merge_status === 'mergeable'`（GitLab 15.6+）；字段不存在时降级为 `merge_status === 'can_be_merged'`，报告标注「降级判定」；
+5. GitLab 自己的合并态：有 `detailed_merge_status`（15.6+）时要求为 `'mergeable'`；14.9 实测**没有该字段**，降级为 `merge_status === 'can_be_merged'` + `blocking_discussions_resolved !== false`，报告标注「降级判定」——在本实例上降级是**常态**，不是例外；
 6. `has_conflicts === false`。
 
 满足后：唤醒一次，附收尾报告（§6.4），停 watcher，账本写 `mergeableAt`。**插件不合并**。
@@ -443,8 +443,8 @@ S0 不写产品代码；S1 起每期结束跑一次全量单测。
 
 | 风险 | 影响 | 对策 |
 |---|---|---|
-| `AI_REVIEW_SHA` 可能不存在 | 全轮次弱绑定，仍有 stale 误判可能 | S0 核实；缺标记时要求 `created_at >= observedAt` 且报告显式标注；必要时用「diff 规模 > 0」辅助 |
-| `detailed_merge_status` 取值与本 MR 的「合并被阻止」原因未必对应 | 可合并判定可能误判 | S0 抓红/绿两态；字段不可用时降级为 `merge_status` + 文本判定并标注 |
+| `AI_REVIEW_SHA` 可能不存在 | 全轮次弱绑定，仍有 stale 误判可能 | **已实测（MR !240）：存在**，每条评审 note 都带 `AI_REVIEW_SHA <40 位 sha>`；弱绑定只作为解析失败时的兜底 |
+| 实例是 GitLab 14.9，没有 `detailed_merge_status` | 可合并判定长期走降级路径 | 已实测：改用 `merge_status` + `blocking_discussions_resolved` + `head_pipeline.status` 组合，并在报告固定标注「⚠️ 降级判定」 |
 | 必过项检查只在早期出现一次 | 状态过期 | 报告标注 observedAt，不作为实时状态；最终以 `detailed_merge_status` 为准 |
 | 评审 bot 换代（模型/模板变化） | 解析 unknown | fail-closed + 唤醒带原文；标题与标记可配置 |
 | token 权限过大 | 误操作面 | 客户端只有 6 个固定方法和 2 个写端点，无 merge/approve 代码路径 |
