@@ -22,7 +22,7 @@ const notes = () => ([
   { id: 12, system: false, created_at: '2026-11-13T10:03:00Z', body: sensitivePass },
 ])
 
-function harness({ mrImpl = async () => mr(), notesImpl = async () => notes(), repoImpl = async () => ({ root: '/r', projectPath: 'g/p', branch: 'feat-x' }) } = {}) {
+function harness({ mrImpl = async () => mr(), notesImpl = async () => notes(), repoImpl = async () => ({ root: '/r', host: 'git.x.com', projectPath: 'g/p', branch: 'feat-x' }) } = {}) {
   return { gitlab: { getMergeRequest: mrImpl, listNotes: notesImpl, listDiscussions: async () => [], listPipelines: async () => [] }, repoImpl }
 }
 
@@ -56,8 +56,24 @@ test('错误码：invalid-url / mr-not-open / repo-mismatch', async () => {
 
   await assert.rejects(mkService().bind({ sessionId: 's', url: 'https://evil.com/g/p/-/merge_requests/1', repoRoot: '/r' }), (e) => e instanceof ServiceError && e.code === 'invalid-url')
   await assert.rejects(mkService({ mrImpl: async () => mr({ state: 'merged' }) }).bind({ sessionId: 's', url, repoRoot: '/r' }), (e) => e.code === 'mr-not-open')
-  await assert.rejects(mkService({ repoImpl: async () => ({ root: '/r', projectPath: 'other/repo', branch: 'x' }) }).bind({ sessionId: 's', url, repoRoot: '/r' }), (e) => e.code === 'repo-mismatch')
+  await assert.rejects(mkService({ repoImpl: async () => ({ root: '/r', host: 'git.x.com', projectPath: 'other/repo', branch: 'x' }) }).bind({ sessionId: 's', url, repoRoot: '/r' }), (e) => e.code === 'repo-mismatch')
   await assert.rejects(mkService({ repoImpl: async () => { throw new Error('nope') } }).bind({ sessionId: 's', url, repoRoot: '/r' }), (e) => e.code === 'repo-mismatch')
+  await rm(dir, { recursive: true, force: true })
+})
+
+test('origin host 与 baseUrl 不一致 → repo-mismatch', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mrloop-service-'))
+  const service = createService({
+    config: resolveConfig({ baseUrl: 'https://git.x.com' }),
+    ledger: createLedger({ dir }),
+    gitlab: harness().gitlab,
+    repoState: async () => ({ root: '/r', host: 'git.other.com', projectPath: 'g/p', branch: 'feat-x' }),
+    now: () => 1,
+  })
+  await assert.rejects(
+    service.bind({ sessionId: 's', url: 'https://git.x.com/g/p/-/merge_requests/240', repoRoot: '/r' }),
+    (e) => e instanceof ServiceError && e.code === 'repo-mismatch',
+  )
   await rm(dir, { recursive: true, force: true })
 })
 
@@ -84,7 +100,7 @@ test('applySnapshot：同 sha 只刷新，新 sha 开新一轮，评审到达可
     config: resolveConfig({ baseUrl: 'https://git.x.com' }),
     ledger: createLedger({ dir }),
     gitlab: { getMergeRequest: async () => current, listNotes: async () => notes(), listDiscussions: async () => [], listPipelines: async () => [] },
-    repoState: async () => ({ root: '/r', projectPath: 'g/p', branch: 'feat-x' }),
+    repoState: async () => ({ root: '/r', host: 'git.x.com', projectPath: 'g/p', branch: 'feat-x' }),
     now: () => Date.parse('2026-11-13T10:10:00Z'),
   })
   await service.bind({ sessionId: 's', url: 'https://git.x.com/g/p/-/merge_requests/240', repoRoot: '/r' })
@@ -108,7 +124,7 @@ test('applySnapshot：同 sha 只刷新，新 sha 开新一轮，评审到达可
   await rm(dir, { recursive: true, force: true })
 })
 
-test('未绑定 → not-bound；重复绑定同 MR 不重复计轮', async () => {
+test('未绑定 → not-bound；重复绑定同 MR 会新增一轮', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'mrloop-service-'))
   const service = createService({ config: resolveConfig({ baseUrl: 'https://git.x.com' }), ledger: createLedger({ dir }), gitlab: harness().gitlab, repoState: harness().repoImpl, now: () => Date.parse('2026-11-13T10:10:00Z') })
   await assert.rejects(service.status({ sessionId: 'nobody' }), (e) => e.code === 'not-bound')

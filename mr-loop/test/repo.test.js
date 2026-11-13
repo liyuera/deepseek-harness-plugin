@@ -22,10 +22,17 @@ test('readRepoState 调三条只读 git 命令', async () => {
   assert.deepEqual(calls.map((args) => args[0]), ['rev-parse', 'remote', 'rev-parse'])
 })
 
-test('不是仓库 / 没有 origin → RepoError', async () => {
+test('不是仓库 / 没有 origin / 读不到分支 → RepoError', async () => {
   const notRepo = async () => { throw new Error('fatal: not a git repository') }
   await assert.rejects(readRepoState({ cwd: '/x', exec: notRepo }), (e) => e instanceof RepoError && e.code === 'not-a-repo')
 
   const noRemote = async (args) => (args[1] === '--show-toplevel' ? '/repo' : (() => { throw new Error('No such remote') })())
   await assert.rejects(readRepoState({ cwd: '/repo', exec: noRemote }), (e) => e.code === 'no-remote')
+
+  const noBranch = async (args) => {
+    if (args[1] === '--show-toplevel') return '/repo'
+    if (args[0] === 'remote') return 'git@git.x.com:g/sub/p.git'
+    throw new Error('bad revision')
+  }
+  await assert.rejects(readRepoState({ cwd: '/repo', exec: noBranch }), (e) => e instanceof RepoError && e.code === 'no-branch')
 })

@@ -72,8 +72,9 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
     } catch {
       throw new ServiceError('repo-mismatch', '当前目录不是可用的 git 仓库（需要可读的 origin）')
     }
-    if (!sameProject(repo.projectPath, parsed.project)) {
-      throw new ServiceError('repo-mismatch', `当前仓库是 ${repo.projectPath}，MR 属于 ${parsed.project}`)
+    const expectedHost = new URL(config.baseUrl).hostname.toLowerCase()
+    if (repo.host !== expectedHost || !sameProject(repo.projectPath, parsed.project)) {
+      throw new ServiceError('repo-mismatch', `当前仓库是 ${repo.host}/${repo.projectPath}，MR 属于 ${expectedHost}/${parsed.project}`)
     }
 
     const notes = await gitlab.listNotes({ project: parsed.project, iid: parsed.iid })

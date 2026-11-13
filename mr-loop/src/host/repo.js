@@ -60,6 +60,8 @@ export async function readRepoState({ cwd, exec = defaultExec }) {
   }
   const parsed = parseRemote(remoteUrl)
   if (parsed === null) throw new RepoError('no-remote', `无法解析 origin 地址：${root}`)
-  const branch = await exec(['rev-parse', '--abbrev-ref', 'HEAD'], root)
+  const branch = await exec(['rev-parse', '--abbrev-ref', 'HEAD'], root).catch(() => {
+    throw new RepoError('no-branch', `无法读取当前分支：${root}`)
+  })
   return { root, remoteUrl, host: parsed.host, projectPath: parsed.path, branch }
 }
