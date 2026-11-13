@@ -210,8 +210,8 @@ idle ──bind──▶ watching(sha) ──head sha 变化──▶ awaiting(s
 
 1. `state === 'opened'` 且非 draft；
 2. 已完成绑定的那个 sha 的评审：`verdict === 'pass'`；且**每一条**列在「需要关注的问题 / 历史未收敛问题」里的阻塞项，要么已被本轮证明修复（不再出现），要么有 `waive` / `skip` / `wontfix` 处置记录。`verdict === 'changes'` 一律不可合并；
-3. 敏感门禁最近一次 `verdict === 'pass'`（`当前有效 0 条`）；
-4. 必过项最近一次 `verdict === 'pass'`；从未出现过则记 `unknown`；
+3. 敏感门禁**本轮**（基线之后）`verdict === 'pass'`（`当前有效 0 条`）；该 sha 上还没有 → 还在 settle 窗口，不算可合并；
+4. 必过项是**建议性**的：只有存在基线之后的 note 才计入；没有则忽略并在报告里标「无本轮结论」，最终由 `detailed_merge_status` 兜底（该 notes 只在早期出现一次，若强制要求 pass 会让可合并永远判不出来）；
 5. `detailed_merge_status === 'mergeable'`（GitLab 15.6+）；字段不存在时降级为 `merge_status === 'can_be_merged'`，报告标注「降级判定」；
 6. `has_conflicts === false`。
 
