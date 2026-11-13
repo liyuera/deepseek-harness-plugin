@@ -34,9 +34,9 @@ const unknownArgument = (parameters, args) => {
 }
 
 /**
- * @param {{ service: object }} deps
+ * @param {{ service: object, watcher?: { start: Function, stop: Function } }} deps
  */
-export function createTools({ service }) {
+export function createTools({ service, watcher = undefined }) {
   const bind = {
     name: 'mr_bind',
     description: '绑定一个 GitLab MR，立即返回首轮门禁报告。之后用 mr_status 取最新结论；不要用 sleep 轮询。',
@@ -127,5 +127,44 @@ export function createTools({ service }) {
     },
   }
 
-  return [bind, status, review]
+  const stop = {
+    name: 'mr_stop',
+    description: '停止跟踪当前 MR（保留账本）；forget=true 同时解绑并删除账本。',
+    parameters: objectSchema({ forget: { type: 'boolean', description: '默认 false' } }),
+    output: { schema: {}, render: (_args, value) => text(value) },
+    async execute(args, exec) {
+      const unknown = unknownArgument(stop.parameters, args)
+      if (unknown !== null) return fail('invalid-arguments', `未知参数：${unknown}`)
+      const sessionId = exec?.agent?.session?.id
+      try {
+        // 先停定时器再解绑：避免解绑后还有一 tick 在途。
+        watcher?.stop(sessionId)
+        const result = await service.stop({ sessionId, forget: args?.forget === true })
+        return ok(result.stopped ? '已停止跟踪。' : '当前会话没有绑定 MR。', result)
+      } catch (error) {
+        return fail(errorOf(error), String(error?.message ?? error))
+      }
+    },
+  }
+
+  const resume = {
+    name: 'mr_resume',
+    description: '从暂停状态恢复监视（守卫暂停、空闲暂停、token 修好后）。',
+    parameters: objectSchema({}),
+    output: { schema: {}, render: (_args, value) => text(value) },
+    async execute(args, exec) {
+      const unknown = unknownArgument(resume.parameters, args)
+      if (unknown !== null) return fail('invalid-arguments', `未知参数：${unknown}`)
+      const sessionId = exec?.agent?.session?.id
+      try {
+        service.resume({ sessionId })
+        watcher?.start(sessionId)
+        return ok('已恢复监视。', service.getState(sessionId))
+      } catch (error) {
+        return fail(errorOf(error), String(error?.message ?? error))
+      }
+    },
+  }
+
+  return [bind, status, review, stop, resume]
 }
