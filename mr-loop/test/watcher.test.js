@@ -102,7 +102,9 @@ test('两次唤醒间隔不足 30s：第二次挂起，下一个 tick 补发', a
   const mrs = [
     mrOf({ sha: 'a'.repeat(40) }),
     mrOf({ sha: 'b'.repeat(40), user_notes_count: 3 }),
-    mrOf({ sha: 'b'.repeat(40), user_notes_count: 3 }),
+    // 第三次 tick 故意换新 sha c：如果没有 flush，普通 review 唤醒会推出 REPORT c；
+    // 只有真的补发了挂起的 b，第二个通知才是 REPORT b。断言因此有判别力。
+    mrOf({ sha: 'c'.repeat(40), user_notes_count: 4 }),
   ]
   const h = harness({
     report: (state) => `REPORT ${String(state.round?.sha ?? '').slice(0, 1)}`,
@@ -135,7 +137,8 @@ test('两次唤醒间隔不足 30s：第二次挂起，下一个 tick 补发', a
   h.advance(40000) // 距上次唤醒 41s：下一个 tick 开头补发
   await h.watcher.tick('s')
   assert.equal(h.notified.length, 2)
-  assert.match(h.notified[1], /REPORT b/) // 补发的就是第二次那份报告
+  // 必须是挂起的 b；若删掉 flush，这里会是 c（第三次 tick 自己的普通 review 唤醒）。
+  assert.equal(h.notified[1], 'REPORT b')
 })
 
 test('getMergeRequest 期间被 rebind → 旧 tick 不写新绑定', async () => {

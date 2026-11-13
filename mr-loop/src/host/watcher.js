@@ -199,6 +199,8 @@ export function createWatcher({ cfg, gitlab, service, notify, now = Date.now, se
   return {
     tick,
     start(sessionId) {
+      // 重新开始盯时丢掉旧的挂起报告：rebind 后它可能属于上一个 MR。
+      pendingWake.delete(sessionId)
       const state = service.getState(sessionId)
       if (state === null || state === undefined) { clear(sessionId); return }
       if (state.paused !== null && state.paused !== undefined) { clear(sessionId); return }
