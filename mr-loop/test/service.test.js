@@ -199,3 +199,23 @@ test('并发绑定同一会话：串行执行、轮次连续、只留一个 stat
   assert.deepEqual(saved.rounds.map((item) => item.n), [1, 2])
   await rm(dir, { recursive: true, force: true })
 })
+
+test('forget 删除账本失败 → storage-failed 且保留绑定', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mrloop-service-'))
+  const service = createService({
+    config: resolveConfig({ baseUrl: 'https://git.x.com' }),
+    ledger: createLedger({ dir }),
+    gitlab: harness().gitlab,
+    repoState: harness().repoImpl,
+    now: () => Date.parse('2026-11-13T10:10:00Z'),
+  })
+  await service.bind({ sessionId: 's', url: 'https://git.x.com/g/p/-/merge_requests/240', repoRoot: '/r' })
+  service.ledger.forget = async () => { throw new Error('EPERM: operation not permitted') }
+  await assert.rejects(
+    service.stop({ sessionId: 's', forget: true }),
+    { name: 'ServiceError', code: 'storage-failed', message: /账本删除失败/ },
+  )
+  assert.ok(service.getState('s') !== null)
+  assert.equal(service.getState('s').binding.iid, 240)
+  await rm(dir, { recursive: true, force: true })
+})

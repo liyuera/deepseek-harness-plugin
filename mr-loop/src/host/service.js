@@ -209,11 +209,19 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
 
   async function stop({ sessionId, forget = false }) {
     const state = bindings.get(sessionId)
-    if (state !== undefined) bindings.delete(sessionId)
     if (forget) {
-      if (state !== undefined) await ledger.forget({ projectPath: state.binding.projectPath, iid: state.binding.iid })
+      if (state !== undefined) {
+        try {
+          await ledger.forget({ projectPath: state.binding.projectPath, iid: state.binding.iid })
+        } catch {
+          // 删除失败就别先把状态丢掉：调用方拿到 storage-failed，可以重试。
+          throw new ServiceError('storage-failed', '账本删除失败，检查 ~/.dsh/mr-loop 的磁盘权限')
+        }
+      }
+      bindings.delete(sessionId)
       return { stopped: state !== undefined, forgotten: true }
     }
+    bindings.delete(sessionId)
     if (state !== undefined) await persist(state).catch(() => {})
     return { stopped: state !== undefined, forgotten: false }
   }
