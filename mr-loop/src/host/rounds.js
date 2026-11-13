@@ -39,16 +39,18 @@ const shaMatches = (marker, sha) => {
 }
 
 /**
- * @returns {{ binding: 'strong'|'weak' } | { stale: true, reason: 'other-sha'|'before-baseline' }}
+ * @returns {{ binding: 'strong'|'weak' } | { stale: true, reason: 'other-sha'|'no-baseline'|'before-baseline'|'title-mismatch' }}
  */
 export function classifyReviewNote({ note, sha, baselineAt, cfg }) {
   const marker = reviewShaOf(note?.body)
   if (marker) return shaMatches(marker, sha) ? { binding: 'strong' } : { stale: true, reason: 'other-sha' }
+  // 没有基线就无法证明「晚于本轮」：宁可判 stale，也不 fail-open 成弱绑定。
+  if (!Number.isFinite(baselineAt)) return { stale: true, reason: 'no-baseline' }
   const createdAt = Date.parse(note?.created_at ?? '')
   if (!Number.isFinite(createdAt)) return { stale: true, reason: 'before-baseline' }
-  if (createdAt < (baselineAt ?? 0)) return { stale: true, reason: 'before-baseline' }
-  const body = String(note?.body ?? '')
-  if (!body.includes(cfg.reviewTitlePrefix)) return { stale: true, reason: 'before-baseline' }
+  if (createdAt < baselineAt) return { stale: true, reason: 'before-baseline' }
+  // 标题必须起始首行：正文里顺口提到 `AI Code Review (` 的人话不算评审。
+  if (!startsWithTitle(note?.body, cfg.reviewTitlePrefix)) return { stale: true, reason: 'title-mismatch' }
   return { binding: 'weak' }
 }
 
@@ -57,9 +59,10 @@ export function classifyReviewNote({ note, sha, baselineAt, cfg }) {
  * 人在回复里整段引用一条门禁 note（以 `>` 开头）时，包含关系会成立，
  * 于是引用文本会被误当成新的门禁结论。
  */
-const startsWithTitle = (body, title) => {
+function startsWithTitle(body, title) {
   const firstLine = String(body ?? '').split('\n').find((line) => line.trim() !== '') ?? ''
-  return firstLine.replace(/^#+\s*/, '').trim().startsWith(title)
+  // 允许行首缩进与 `## ` 标题前缀；不 strip `>`，引用文本因此不会被当成结论。
+  return firstLine.replace(/^\s*#+\s*/, '').trim().startsWith(title)
 }
 const isSensitiveNote = (body, cfg) => startsWithTitle(body, cfg.sensitiveTitle)
 const isMandatoryNote = (body, cfg) => startsWithTitle(body, cfg.mandatoryTitle)
@@ -72,8 +75,10 @@ const latestBy = (items) => items.reduce((best, item) => (best === null || item.
  * @param {{ mr: object, notes: object[], cfg: object, observedAt: number }} input
  */
 export function buildRound({ mr, notes, cfg, observedAt }) {
-  const sha = mr.sha
-  const baselineAt = baselineOf(mr) || observedAt || 0
+  const sha = mr?.sha
+  const observed = Number.isFinite(observedAt) && observedAt > 0 ? observedAt : null
+  // 基线 = 该 sha 的流水线创建时间；拿不到就用本轮首次观测时间；两者都没有就是 null（禁止弱绑定）。
+  const baselineAt = baselineOf(mr) || observed
   const dropped = []
   const reviewHits = []
   const sensitiveHits = []

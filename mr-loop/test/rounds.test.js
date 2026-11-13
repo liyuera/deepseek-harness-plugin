@@ -42,6 +42,27 @@ test('无标记：晚于基线 → weak；早于基线 → stale', () => {
   assert.equal(classifyReviewNote({ note: old, sha: SHA, baselineAt: baseline, cfg }).stale, true)
 })
 
+test('人话里提到评审标题不算评审', () => {
+  const mr = { sha: SHA, head_pipeline: { created_at: '2026-11-13T09:59:00Z' } }
+  const mention = note({
+    id: 30,
+    created_at: '2026-11-13T10:20:00Z',
+    body: '注意到 AI Code Review (feat-x) 的结论\n\n结论: 这条不用改',
+  })
+  const real = note({ id: 11, created_at: '2026-11-13T10:02:00Z' })
+  const round = buildRound({ mr, notes: [mention, real], cfg, observedAt: Date.parse('2026-11-13T10:10:00Z') })
+  assert.equal(round.review.noteId, 11)
+  assert.equal(round.dropped.some((item) => item.noteId === 30 && item.detail === 'title-mismatch'), true)
+})
+
+test('没有基线时不做弱绑定', () => {
+  const mr = { sha: SHA }
+  const round = buildRound({ mr, notes: [note()], cfg, observedAt: undefined })
+  assert.equal(round.baselineAt, null)
+  assert.equal(round.review, null)
+  assert.equal(round.dropped[0].detail, 'no-baseline')
+})
+
 test('人引用门禁文本不算门禁 note', () => {
   const mr = { sha: SHA, head_pipeline: { created_at: '2026-11-13T09:59:00Z' } }
   const quoted = note({
