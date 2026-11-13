@@ -37,6 +37,7 @@
 3. 三套门禁统一成一个状态面，`unknown` 不当 `pass`（fail-closed）。
 4. 豁免回帖是唯一对外写动作，必须**先草稿、再经用户一轮发言、才允许发送**。
 5. 账本落盘，重开会话能查：每个 MR 的轮次、FID 处置、门禁历史。
+6. **轮次不设上限**：跟到「可合并且没有待修问题」为止；没有进展时自动暂停并交回人，`/mr stop` 是随时可用的人工出口。
 
 非目标（v1 明确不做）：
 
@@ -66,7 +67,7 @@
 ```
                     ┌──────────── Host 半边（无 client）────────────┐
   /mr <url> ───────▶│ command.js   绑定 + 首轮报告 + status/stop    │
-  mr_* tools ──────▶│ tools.js     6 个 intent 工具                 │
+  mr_* tools ──────▶│ tools.js     7 个 intent 工具                 │
                     ├──────────────────────────────────────────────┤
                     │ watcher.js   轮询 head sha / notes / gates    │──GET──▶ GitLab /api/v4
                     │ rounds.js    sha 绑定矩阵 + 轮次归并          │◀─JSON──
@@ -127,23 +128,48 @@
 
 ### 5.4 等待与唤醒
 
-watcher 只在有绑定时运行，状态机：
+不是 `sleep`，也不是「只能等」：GitLab 不提供可订阅的推送通道（没有 WebSocket / GraphQL subscription；webhook 要求 **GitLab 服务端能访问你的机器** 且你至少有项目 Maintainer 权限，见 ADR-9），所以唯一可靠通道是**查询**。本插件把查询做成「一个便宜 tick + 变化才拉详情」：
+
+每次 tick 只发 **1 个请求**：`GET /merge_requests/:iid`，它同时带回 `sha`、`head_pipeline.status`、`detailed_merge_status`、`user_notes_count`。只有下列之一变化才追加拉 `notes`（必要时再拉 `discussions` / `pipelines`）：
+
+- `sha` 变了（有新提交）；
+- `user_notes_count` 变了（有新评论）；
+- `head_pipeline.status` 变成终态；
+- `detailed_merge_status` 变了。
+
+节拍随状态变（可配，§6.5）：
+
+| 状态 | 间隔 | 说明 |
+|---|---|---|
+| 等新 sha（watching） | 60s | 主代理在改代码，MR 不会变 |
+| 等评审（awaiting） | 10s | 流水线在跑 |
+| 门禁 settle / 回帖后复判 | 15s | 通常 30–90s 出结论 |
+| 兜底超时 | 15min | 只在「流水线没跑 / 评审 job 挂了」时用得上 |
+
+流水线信号优先于时间：
+
+- `head_pipeline.status ∈ {failed, canceled}` → **立刻**唤醒，附 job 名与失败原因（评审可能根本没跑，不必等到超时）；
+- `success` 且 60s 内没有本轮评审 note → 唤醒「流水线通过但评审未产出」；
+- MR 没有挂 CI（无 `head_pipeline`）→ 直接按 notes 轮询，间隔 20s。
+
+状态机：
 
 ```
 idle ──bind──▶ watching(sha) ──head sha 变化──▶ awaiting(sha, since)
                     │                                   │
                     │                                   ├─ 评审 note 到位 ──▶ settled ──▶ wake ──▶ watching
                     │                                   ├─ 其余门禁未定 ──▶ gateSettle 窗口（≤3min）──▶ wake
-                    │                                   └─ 超时 roundTimeoutMs ──▶ wake(超时) ──▶ watching
+                    │                                   └─ 流水线失败 / 超时 ──▶ wake ──▶ watching
                     └──任一状态满足可合并条件──▶ mergeable ──▶ wake(收尾) ──▶ idle
 ```
 
-- 轮询间隔 `pollIntervalMs` 默认 20s；连续失败退避 20→40→60s；401/403 立即停并唤醒一次说明 token 问题。
-- **唤醒条件去抖**：同一 `sha + verdict + 门禁状态` 只唤醒一次；两次唤醒最小间隔 30s。唤醒用 `agent.followup(message)`，`source.kind = 'plugin:mr-loop'`。
+其余规则：
+
+- **唤醒去抖**：同一 `sha + verdict + 门禁状态` 只唤醒一次；两次唤醒最小间隔 30s。唤醒用 `agent.followup(message)`，`source.kind = 'plugin:mr-loop'`。
 - 唤醒消息只含结构化摘要（§6.4），不含「请修复」这类指令；修不修由主代理判断。
-- 空闲停止：连续 `idleStopMs`（默认 30min）既无新 sha 也无门禁变化 → 自动停 watcher，唤醒一次说明「已停止监视」，需要时 `/mr status` 续。
+- 连续请求失败退避 10→20→40→60s；401/403 立即暂停并唤醒一次说明 token 问题。
 - 会话销毁（`session/disposed`）与插件卸载（`ctx.effect`）必须 abort 定时器；不得对已关闭会话 `followup`。
-- watcher 不产生任何 LLM 调用；每 tick 最多 3 个只读请求（MR + notes，需要时加 pipelines 或 discussions）。
+- watcher 不产生任何 LLM 调用；稳态每 tick 1 个只读请求，仅在信号变化时追加。
 
 ### 5.5 豁免
 
@@ -189,17 +215,29 @@ idle ──bind──▶ watching(sha) ──head sha 变化──▶ awaiting(s
 
 满足后：唤醒一次，附收尾报告（§6.4），停 watcher，账本写 `mergeableAt`。**插件不合并**。
 
-### 5.7 失败与停止条件
+### 5.7 无限轮次、进度守卫与手动终结
 
-| 情况 | 处理 |
+**轮次不设上限**（`maxRounds: 0`，0 = 不限）：只要还在改善，就一直跟到「可合并、且没有待修问题」为止。防死循环不靠轮数，靠「有没有进展」——真正该停的是「没在改善」，不是「轮数多」。
+
+| 守卫 | 默认 | 判据 | 触发后 |
+|---|---|---|---|
+| `stallRounds` | 3 | 连续 3 轮的阻塞 FID 集合完全相同（说明推了但没修掉，或评审在复读） | `paused(stalled)` |
+| `reverifyStreak` | 3 | 同一 FID 的 `复验次数` 连续 3 轮递增（改了但没改对） | `paused(stalled)`，报告里点名该 FID |
+| `wallClockMs` | 12h | 从绑定起的墙钟时长 | `paused(budget)` |
+| `idleStopMs` | 30min | 无新 sha 也无门禁变化 | `paused(idle)` |
+
+- 守卫触发只**暂停**，不销毁绑定：watcher 停、唤醒一次说明原因（含已用轮次与剩余问题）、账本保留；`/mr resume` 从当前 sha 继续。
+- **手动终结**是唯一的人工出口：`/mr stop` 或 `mr_stop` 随时可停（保留绑定与账本）；`/mr stop --forget` 解绑并删账本。用户说「不用改了」时主代理必须调它，插件不会自己决定放弃。
+- 硬退出只有四种：可合并（成功）、MR closed/merged（终态）、手动终结、守卫暂停（可恢复）。
+
+| 其它情况 | 处理 |
 |---|---|
-| 满 `maxRounds`（默认 5）仍未可合并 | 唤醒一次，列剩余阻塞项与已用轮次，停 watcher；不自动续轮 |
-| 单轮超时 `roundTimeoutMs`（默认 10min）未出评审 | 唤醒说明「评审未出」，附 pipeline 状态；继续等待到下一轮上限 |
-| token 缺失/401/403 | 立即停，唤醒附「token 怎么配」的一行命令 |
-| 解析 `unknown` | 唤醒附原文片段；不算通过 |
-| 网络连续失败 ≥5 次 | 退避到 60s；达 `idleStopMs` 停 |
-| MR 被 closed/merged | 停 watcher，账本记终态，唤醒一次 |
-| 绑定会话被销毁 | 静默停，账本保留 |
+| token 缺失 / 401 / 403 | 立即 `paused(token)`，唤醒附配置命令；不重试 |
+| 单轮兜底超时 `roundTimeoutMs`（15min） | 唤醒说明「评审未出」并附 pipeline / job 状态；继续下一 tick，不算失败 |
+| 解析 `unknown` | 唤醒附原文片段；不算通过，也不推进轮次 |
+| 网络连续失败 ≥5 次 | 退避到 60s；达 `idleStopMs` 暂停 |
+| MR 被 closed / merged | 停 watcher，账本记终态，唤醒一次 |
+| 绑定会话被销毁 | 静默停，账本保留；重开后可 `/mr resume` |
 
 ## 6. 数据契约
 
@@ -232,6 +270,7 @@ Finding = { fid, file, level, gateCategory, location, problem, suggestion, rever
   "decisions": { "<fid>": { "kind": "waive", "reason": "...", "noteId": 123, "at": "..." } },
   "mergeableAt": null,
   "terminal": null,
+  "paused": null,
   "updatedAt": "..."
 }
 ```
@@ -265,17 +304,23 @@ feat-V1.7.0.20261119-ly → feature-V1.7.0.20261119 · 第 3 轮 · sha 0e2a9007
 |---|---|---|
 | `baseUrl` | `https://git.htwisdom.cn` | 只允许 http/https，不含凭据/query |
 | `tokenFile` | `~/.dsh/mr-loop/gitlab-token` | 0600 文件；环境变量 `MR_LOOP_GITLAB_TOKEN` 优先 |
-| `pollIntervalMs` | `20000` | 最小 5000 |
-| `roundTimeoutMs` | `600000` | 单轮等评审上限 |
+| `pollWatchingMs` | `60000` | 等新 sha 的间隔（最小 5000） |
+| `pollAwaitingMs` | `10000` | 等评审的间隔 |
+| `pollSettleMs` | `15000` | 门禁 settle / 回帖复判 |
+| `pollNoPipelineMs` | `20000` | MR 没挂 CI 时的兜底间隔 |
+| `roundTimeoutMs` | `900000` | 单轮兜底超时（15min），只在流水线无信号时生效 |
 | `gateSettleMs` | `180000` | 评审出后等其余门禁的窗口 |
-| `idleStopMs` | `1800000` | 无变化自动停 |
-| `maxRounds` | `5` | 撞上限即停 |
+| `maxRounds` | `0` | 0 = 不限轮次（默认）；>0 才启用轮次上限 |
+| `stallRounds` | `3` | 阻塞集合连续不变即暂停 |
+| `reverifyStreak` | `3` | 同一 FID 复验次数连续递增即暂停 |
+| `wallClockMs` | `43200000` | 总时长预算（12h） |
+| `idleStopMs` | `1800000` | 无变化暂停（30min） |
 | `requestTimeoutMs` | `15000` | 单请求 |
 | `reviewMarker` | `AI Code Review` | note 正文标记 |
 | `reviewTitlePrefix` | `AI Code Review (` | 弱绑定标题匹配 |
 | `sensitiveTitle` | `Sensitive Content Gate` | 门禁 note 标题 |
 | `mandatoryTitle` | `必过项完整性检查` | 门禁 note 标题 |
-| `ledgerKeepRounds` | `20` | 账本裁剪 |
+| `ledgerKeepRounds` | `50` | 账本裁剪 |
 | `enabled` | `true` | 关闭后只有工具与命令、无 watcher |
 
 ### 6.6 命令与工具面
@@ -286,18 +331,21 @@ feat-V1.7.0.20261119-ly → feature-V1.7.0.20261119 · 第 3 轮 · sha 0e2a9007
 |---|---|
 | `/mr <url>` | 绑定 + 首轮报告（同 `mr_bind`） |
 | `/mr status` | 输出当前绑定与状态的完整报告 |
-| `/mr stop` | 停 watcher，保留账本 |
+| `/mr resume` | 从 `paused` 恢复监视（守卫暂停、空闲暂停、token 修好后） |
+| `/mr stop` | 停 watcher，保留绑定与账本 |
+| `/mr stop --forget` | 解绑并删除账本 |
 
 工具（`ctx.tools.register`，参数为 object-rooted JSON Schema，`additionalProperties: false`）：
 
 | 工具 | 参数 | 返回 `data` |
 |---|---|---|
 | `mr_bind` | `url`（必填）、`repo`（可选，覆盖 cwd） | `{ binding, round, report, warnings }` |
-| `mr_status` | 无 | `{ binding, headSha, round, gates, decisions, mergeable, nextWakeAt, stalled: null \| { reason: 'idle'\|'rounds-exhausted'\|'token'\|'timeout', at } }` |
+| `mr_status` | 无 | `{ binding, headSha, round, gates, decisions, mergeable, nextWakeAt, paused: null \| { reason: 'stalled'\|'budget'\|'idle'\|'token', at } }` |
 | `mr_review` | `history?: boolean`（默认 false） | `{ round, review, sensitive, mandatory }`；`history: true` 时附账本内最近 `ledgerKeepRounds` 轮的摘要 |
 | `mr_waive` | `items: [{ fid, kind, reason }]`（至少 1 条） | `{ draft, approvalToken, expiresAt, rejected?: [...] }` |
 | `mr_waive_send` | `approvalToken`（必填）、`resolve?: boolean`（默认 true） | `{ posted: [{ fid, noteId }], resolved: [discussionId], duplicates: [fid], gateVerdict }` |
-| `mr_stop` | 无 | `{ stopped: boolean }` |
+| `mr_stop` | `forget?: boolean`（默认 false） | `{ stopped: boolean, forgotten: boolean }` |
+| `mr_resume` | 无 | `{ resumed: boolean, state }` |
 
 约束：`mr_bind` 之外的工具在无绑定时返回 `not-bound`；**只有 `mr_waive_send` 会写 GitLab**，其余全部只读。工具不抛异常，一律走 §6.3 的 `{ ok, code, message, data }` 返回。
 
@@ -350,7 +398,7 @@ mr-loop/
   src/host/watcher.js      轮询状态机、退避、唤醒去抖、abort（≤320）
   src/host/waive.js        草稿校验、approvalToken、回帖、resolve（≤280）
   src/host/report.js       固定模板渲染（≤200）
-  src/host/tools.js        6 个工具定义与参数校验（≤420）
+  src/host/tools.js        7 个工具定义与参数校验（≤440）
   src/host/command.js      /mr handler（≤180）
   src/host/skill.js        mr-loop 技能正文（教主代理何时用、怎么用）
   src/host/token.js        token 读取（env → 0600 文件）与来源说明（≤80）
@@ -366,7 +414,7 @@ mr-loop/
 - `parse-review`：移植 bug-workflow 的边界表（引用行、代码块、缩进代码、坏输出、pass 无条目、`历史未收敛: 0 条`）。
 - `parse-gates`：敏感门禁通过/阻止两种正文；必过项三子项；缺字段降级。
 - `rounds`：sha 绑定矩阵全枚举（强 / 弱 / 丢弃（stale）/ 多命中），至少 12 个用例，含「push 后立刻读到上一轮 note」这一现场 failure 模式。
-- `watcher`：假定时器 + 假 fetch，覆盖 head 变化、评审先到、门禁后到、超时、401、连续失败退避、唤醒去抖、会话销毁。
+- `watcher`：假定时器 + 假 fetch，覆盖 head 变化、评审先到、门禁后到、流水线失败、兜底超时、401、连续失败退避、唤醒去抖、会话销毁、四类守卫暂停（stall / reverify / wallClock / idle）与 `/mr resume`；另断言稳态 tick 只发 1 个请求、`user_notes_count` 不变时不拉 notes。
 - `waive`：token 过期 / 无用户发言 / 内容变更 / sha 变化 / FID 不属于本轮 / kind 不匹配 / reason 非法 / 重复发送。
 - `ledger`：原子写（写一半崩溃不留坏文件）、裁剪、并发写串行化。
 - `report`：强/弱绑定、unknown 门禁、降级判定各一份快照。
@@ -381,11 +429,11 @@ Live 验收（用户执行）：真 MR 上跑一轮完整闭环，确认报告�
 
 | 期 | 内容 | 验收标准 |
 |---|---|---|
-| **S0** | spike：真 MR 上核实 ① notes 是否带 `AI_REVIEW_SHA` ② `detailed_merge_status` 在门禁红/绿两态的取值 ③ discussions 的 `resolvable/resolved` 结构 ④ POST note 与 resolve 权限 ⑤ 门禁 bot 能否解析「一条 note 内多行 `#ai-waive`」 | 一份 JSON 证据贴给用户；结论回填本文档 §5.2 / §5.6；⑤ 若 bot 只认单行，则改为逐条一条 note |
+| **S0** | spike：真 MR 上核实 ① notes 是否带 `AI_REVIEW_SHA` ② `detailed_merge_status` 在门禁红/绿两态的取值 ③ discussions 的 `resolvable/resolved` 结构 ④ POST note 与 resolve 权限 ⑤ 门禁 bot 能否解析「一条 note 内多行 `#ai-waive`」 ⑥ `user_notes_count` 是否随 bot 评论变化、`head_pipeline` 是否存在（决定「1 个请求 tick」是否成立） | 一份 JSON 证据贴给用户；结论回填本文档 §5.2 / §5.6；⑤ 若 bot 只认单行，则改为逐条一条 note |
 | **S1** | 只读：`mr_bind` / `mr_status` / `mr_review` + 报告 | 与 GitLab 网页对同一 MR 的结论、FID、门禁逐条一致；stale 矩阵单测全绿 |
 | **S2** | watcher + followup | 真 MR 上完成一次「需要修改 → 修 → 推 → 可合并」，全程无 `sleep` |
 | **S3** | 豁免：草稿 / 确认 / 回帖 / resolve + 账本 | 没有用户发言时发送被拒（单测 + 手动验证各一）；重复发送幂等；在一个测试 MR 上完成一次真实回帖 + resolve |
-| **S4** | 护栏与收尾：轮次上限、失败矩阵、README、skill | 断 token、评审超时、解析 unknown、轮次耗尽四条路径都能说清「卡在哪、你该做什么」 |
+| **S4** | 护栏与收尾：进度守卫、暂停/恢复、失败矩阵、README、skill | 断 token、评审超时、解析 unknown、无进展暂停四条路径都能说清「卡在哪、你该做什么」；`/mr stop` 与 `/mr resume` 真实可用 |
 
 S0 不写产品代码；S1 起每期结束跑一次全量单测。
 
@@ -398,7 +446,8 @@ S0 不写产品代码；S1 起每期结束跑一次全量单测。
 | 必过项检查只在早期出现一次 | 状态过期 | 报告标注 observedAt，不作为实时状态；最终以 `detailed_merge_status` 为准 |
 | 评审 bot 换代（模型/模板变化） | 解析 unknown | fail-closed + 唤醒带原文；标题与标记可配置 |
 | token 权限过大 | 误操作面 | 客户端只有 6 个固定方法和 2 个写端点，无 merge/approve 代码路径 |
-| watcher 空转 | 无谓请求 | 空闲 30min 自动停 + `/mr stop` |
+| watcher 空转 | 无谓请求 | 稳态每 tick 1 个请求；空闲 30min 暂停 + `/mr stop` |
+| 轮次不限、反复推送 | 反复占用 CI 与远端审查 bot | 用「无改善」守卫暂停（§5.7）+ 12h 预算 + 人工终结；不设轮次硬上限 |
 | 同一 MR 两会话同时绑 | 重复回帖 | 进程内绑定 registry + 账本；写操作要求绑定会话，非绑定会话拒绝 |
 | 两个 DSH 进程同时写同一账本文件 | 后写覆盖先写 | v1 已知限制（单机单实例）；`updatedAt` 只用于诊断，不做合并 |
 | 主代理未推就等 | 空等一轮 | watcher 只认 head sha 变化，不认 agent 自述 |
@@ -417,3 +466,5 @@ S0 不写产品代码；S1 起每期结束跑一次全量单测。
 | 5 | 账本用 JSON 文件而非 storageDomain | 免 peer 依赖、可人肉查看；bug-workflow 的 v2 domain 迁移踩过版本兼容坑 | 多进程并发写需要文件锁（v1 只在单进程内串行化，见 §12） |
 | 6 | v1 无 client 半边 | 价值在正确性与唤醒，不在可视化；先跑顺再谈状态行/看板 | 一眼可见的常驻状态 |
 | 7 | token 放 0600 文件（env 优先） | 无设置页时最省事的方案，且不进对话/日志 | 与 DSH credentials 服务统一管理（v2 迁移） |
+| 8 | 轮次不限，用「无进展」守卫代替轮次上限 | 需求是「跟到可合为止」；轮数多不等于有问题，同一问题反复不清才是 | 极端情况下 CI 被长时间占用（12h 预算 + 暂停兜底） |
+| 9 | 等待用轮询，不做 webhook | GitLab 没有 WebSocket / GraphQL 订阅；webhook 要求服务端能访问本机且至少 Maintainer 权限，内网笔记本不成立 | 事件驱动的实时性：评审出结论到唤醒最慢约一个 tick（10s） |
