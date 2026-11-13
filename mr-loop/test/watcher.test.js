@@ -86,6 +86,31 @@ test('已有本轮评审且计数不变 → 不拉 notes、不唤醒', async () 
   assert.equal(h.notified.length, 0)
 })
 
+test('gatesChanged 单独触发唤醒；与 reviewArrived 同时为真时只唤醒一次', async () => {
+  const stateOver = { round: { sha: SHA, n: 1, observedAt: 1, review: { verdict: 'pass' }, sensitive: null, mandatory: null } }
+  const run = async (reviewArrived) => {
+    const h = harness({
+      stateOver,
+      snapshot: ({ mr: nextMr, setState }) => ({
+        state: setState({ mr: nextMr }),
+        newRound: false,
+        reviewArrived,
+        gatesChanged: true,
+        becameMergeable: false,
+      }),
+    })
+    await h.watcher.tick('s')
+    return h
+  }
+
+  const gateOnly = await run(false)
+  assert.equal(gateOnly.notified.length, 1)
+
+  // 两个条件同时为真时走 reviewArrived 分支，不能各唤醒一次。
+  const both = await run(true)
+  assert.equal(both.notified.length, 1)
+})
+
 test('守卫触发 → pause 且不再排下一次', async () => {
   const h = harness({ stateOver: { stallStreak: 99 } })
   await h.watcher.tick('s')

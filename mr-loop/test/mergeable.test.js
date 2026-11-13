@@ -4,6 +4,7 @@ import { evaluateMergeable } from '../src/host/mergeable.js'
 
 const mr = (over = {}) => ({ state: 'opened', draft: false, has_conflicts: false, detailed_merge_status: 'mergeable', ...over })
 const round = (over = {}) => ({
+  binding: 'strong',
   review: { verdict: 'pass', blocking: [], nonBlocking: [] },
   sensitive: { verdict: 'pass' },
   mandatory: null,
@@ -15,6 +16,18 @@ test('全绿 → 可合并', () => {
   assert.equal(r.mergeable, true)
   assert.deepEqual(r.missing, [])
   assert.equal(r.degraded, false)
+})
+
+test('强绑定 + pass → 可合并', () => {
+  const r = evaluateMergeable({ mr: mr(), round: round({ binding: 'strong' }), decisions: {} })
+  assert.equal(r.mergeable, true)
+  assert.deepEqual(r.missing, [])
+})
+
+test('弱绑定 + pass → 不可合并，要求人工确认', () => {
+  const r = evaluateMergeable({ mr: mr(), round: round({ binding: 'weak' }), decisions: {} })
+  assert.equal(r.mergeable, false)
+  assert.deepEqual(r.missing, ['AI 评审为弱绑定（无 SHA 证明），需人工确认'])
 })
 
 test('评审 changes / 敏感未过 / 冲突 / 合并态不许', () => {

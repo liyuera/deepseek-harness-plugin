@@ -211,6 +211,9 @@ export function createWatcher({ cfg, gitlab, service, notify, logger = undefined
       return
     }
     if (reviewArrived) wake(sessionId, service.report(next), wakeKey(next.round))
+    // 评审已经到、门禁后来才翻面（同 sha）时 reviewArrived 为假：单独补一条门禁唤醒。
+    // 两个条件同时为真时只走上面那条，wake key 已含三套 verdict，不会双唤醒。
+    else if (result.gatesChanged === true) wake(sessionId, service.report(next), wakeKey(next.round))
 
     const delay = !terminal(pipelineStatus)
       ? (pipelineStatus === null ? cfg.pollNoPipelineMs : cfg.pollAwaitingMs)

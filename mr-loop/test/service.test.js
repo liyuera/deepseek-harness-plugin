@@ -10,8 +10,9 @@ import { createWatcher } from '../src/host/watcher.js'
 
 const SHA = 'a'.repeat(40)
 const NOW = Date.parse('2026-11-13T10:10:00Z')
-const reviewPass = `## AI Code Review (feat-x -> feature-y)\n\n结论: **可直接合并**\n\n历史未收敛: \`0\` 条\n\n未发现必须修改的代码问题。\n`
+const reviewPass = (sha) => `## AI Code Review (feat-x -> feature-y)\n\n结论: **可直接合并**\n\n历史未收敛: \`0\` 条\n\n未发现必须修改的代码问题。\n\n<!-- AI_REVIEW_SHA ${sha} -->\n`
 const sensitivePass = 'Sensitive Content Gate\n\n结论: 门禁通过\n\n扫描结果：共 15 条命中；历史豁免 15 条；当前有效 0 条。\n'
+const sensitiveBlock = 'Sensitive Content Gate\n\n结论: **阻止合并**\n\n扫描结果：共 15 条命中；历史豁免 0 条；当前有效 15 条。\n阻断项: 15 条\n'
 /** 构造一条「需要修改」评审，blocking 的 FID 由调用方给定（可重复、可乱序）。 */
 const blockingReview = (fids) => {
   const items = fids.map((fid, index) => [
@@ -36,8 +37,8 @@ const mr = (over = {}) => ({
   source_branch: 'feat-x', target_branch: 'feature-y',
   head_pipeline: { status: 'success', created_at: '2026-11-13T09:59:00Z' }, ...over,
 })
-const notes = () => ([
-  { id: 11, system: false, created_at: '2026-11-13T10:02:00Z', body: reviewPass },
+const notes = (sha = SHA) => ([
+  { id: 11, system: false, created_at: '2026-11-13T10:02:00Z', body: reviewPass(sha) },
   { id: 12, system: false, created_at: '2026-11-13T10:03:00Z', body: sensitivePass },
 ])
 
@@ -140,9 +141,59 @@ test('applySnapshot：同 sha 只刷新，新 sha 开新一轮，评审到达可
   assert.equal(next.state.mergeability.mergeable, false)
   assert.equal(next.becameMergeable, false)
 
-  const arrived = service.applySnapshot({ sessionId: 's', mr: current, notes: notes() })
+  const arrived = service.applySnapshot({ sessionId: 's', mr: current, notes: notes(current.sha) })
   assert.equal(arrived.newRound, false)
   assert.equal(arrived.reviewArrived, true)
+  await service.stop({ sessionId: 's' })
+  await rm(dir, { recursive: true, force: true })
+})
+
+test('同 sha 门禁翻面：gatesChanged 触发一次唤醒，报告带敏感行', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mrloop-service-'))
+  const reviewNote = { id: 11, system: false, created_at: '2026-11-13T10:02:00Z', body: reviewPass(SHA) }
+  const blockNote = { id: 12, system: false, created_at: '2026-11-13T10:05:00Z', body: sensitiveBlock }
+  let currentMr = mr({ user_notes_count: 1 })
+  let currentNotes = [reviewNote]
+  const gitlab = { getMergeRequest: async () => currentMr, listNotes: async () => currentNotes, listDiscussions: async () => [], listPipelines: async () => [] }
+  const config = resolveConfig({ baseUrl: 'https://git.x.com' })
+  const service = createService({
+    config,
+    ledger: createLedger({ dir }),
+    gitlab,
+    repoState: async () => ({ root: '/r', host: 'git.x.com', projectPath: 'g/p', branch: 'feat-x' }),
+    now: () => NOW,
+  })
+  const { report } = await service.bind({ sessionId: 's', url: 'https://git.x.com/g/p/-/merge_requests/240', repoRoot: '/r' })
+  assert.match(report, /评审 {3}✅ 可直接合并/)
+
+  // 同一份 notes 再并一次：三套门禁都没变。
+  const unchanged = service.applySnapshot({ sessionId: 's', mr: currentMr, notes: currentNotes })
+  assert.equal(unchanged.reviewArrived, false)
+  assert.equal(unchanged.gatesChanged, false)
+
+  // 评审先到、敏感门禁后到且翻成 block：reviewArrived 为假，只有 gatesChanged 为真。
+  currentNotes = [reviewNote, blockNote]
+  currentMr = mr({ user_notes_count: 2 })
+  let snapshot
+  const applySnapshot = service.applySnapshot
+  service.applySnapshot = (input) => { snapshot = applySnapshot(input); return snapshot }
+
+  const notified = []
+  const watcher = createWatcher({
+    cfg: config,
+    gitlab,
+    service,
+    notify: ({ text }) => { notified.push(text); return true },
+    now: () => NOW,
+    setTimer: () => 1,
+    clearTimer: () => {},
+  })
+  await watcher.tick('s')
+
+  assert.equal(snapshot.gatesChanged, true)
+  assert.equal(snapshot.reviewArrived, false)
+  assert.equal(notified.length, 1)
+  assert.match(notified[0], /敏感 {3}⛔ 阻止合并/)
   await service.stop({ sessionId: 's' })
   await rm(dir, { recursive: true, force: true })
 })

@@ -21,8 +21,17 @@ export function evaluateMergeable({ mr, round, decisions = {} }) {
   // 14.9 没有 detailed_merge_status，但给了这个字段；false 就是明确不可合。
   if (mr?.blocking_discussions_resolved === false) missing.push('仍有未解决的阻塞讨论')
 
-  const verdict = round?.review?.verdict ?? 'unknown'
-  if (verdict !== 'pass') missing.push(verdict === 'changes' ? 'AI 评审结论为需要修改' : 'AI 评审结论未知（未出或解析失败）')
+  // 设计 §5.2：弱绑定（无 SHA 证明）只能当 unknown 参与判定，正文写 pass 也不能进可合。
+  // 强绑定是接受评审结论的前提；评审缺失时仍按「未知」拦。
+  const review = round?.review ?? null
+  const verdict = review?.verdict ?? 'unknown'
+  if (review === null) {
+    missing.push('AI 评审结论未知（未出或解析失败）')
+  } else if (round?.binding !== 'strong') {
+    missing.push('AI 评审为弱绑定（无 SHA 证明），需人工确认')
+  } else if (verdict !== 'pass') {
+    missing.push(verdict === 'changes' ? 'AI 评审结论为需要修改' : 'AI 评审结论未知（未出或解析失败）')
+  }
 
   const blocking = Array.isArray(round?.review?.blocking) ? round.review.blocking : []
   // 只有这三种处置才算「对外终结」；fix/pending/空壳对象都不能顶掉阻塞项（fail-closed）。

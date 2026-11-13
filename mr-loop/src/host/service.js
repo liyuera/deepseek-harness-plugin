@@ -21,6 +21,13 @@ const sameProject = (a, b) => String(a ?? '').toLowerCase() === String(b ?? '').
 // 集合键：排序 + 去重，顺序与重复项都不影响「阻塞集合是否相同」的判定。
 const blockingKey = (round) => [...new Set((round?.review?.blocking ?? []).map((item) => item?.fid))].sort().join(',')
 
+/** 三套门禁的结论元组：评审先到、门禁后翻面的同 sha 场景靠它触发唤醒（设计 §5.4）。 */
+const gatesKey = (round) => [
+  round?.review?.verdict ?? 'none',
+  round?.sensitive?.verdict ?? 'none',
+  round?.mandatory?.verdict ?? 'none',
+].join('|')
+
 /** 同一 FID 的复验次数比上一轮上升（且已到触发门槛 2）才算「复验未收敛」。 */
 function reverifyIncreased(previousRound, round) {
   const before = new Map((previousRound?.review?.blocking ?? []).map((item) => [item?.fid, item?.reverifyCount ?? 0]))
@@ -175,6 +182,7 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
     const state = requireState(sessionId)
     const beforeMergeable = state.mergeability?.mergeable === true
     const beforeVerdict = state.round?.review?.verdict ?? null
+    const beforeGates = gatesKey(state.round)
     let newRound = false
 
     if (mr.sha !== state.round?.sha) {
@@ -208,6 +216,8 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
       state,
       newRound,
       reviewArrived: newRound === false && beforeVerdict !== (state.round?.review?.verdict ?? null),
+      // 评审 verdict 的变化也包含在内；watcher 先判 reviewArrived，不会重复唤醒。
+      gatesChanged: beforeGates !== gatesKey(state.round),
       becameMergeable: beforeMergeable === false && state.mergeability.mergeable === true,
     }
   }
