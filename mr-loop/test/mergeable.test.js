@@ -33,6 +33,11 @@ test('pass 但仍有阻塞项 → 只有豁免过才可合并', () => {
   assert.match(r1.missing[0], /2 条阻塞/)
   const r2 = evaluateMergeable({ mr: mr(), round: round({ review: { verdict: 'pass', blocking, nonBlocking: [] } }), decisions: { aa: { kind: 'waive' }, bb: { kind: 'skip' } } })
   assert.equal(r2.mergeable, true)
+  // 中间态不是处置记录：只要账本里出现 fix / pending / 未知 kind 就 fail-open，只有三种终结算数。
+  const notDisposed = (decisions) => evaluateMergeable({ mr: mr(), round: round({ review: { verdict: 'pass', blocking, nonBlocking: [] } }), decisions })
+  assert.equal(notDisposed({ aa: { kind: 'fix' }, bb: { kind: 'wontfix' } }).mergeable, false)
+  assert.equal(notDisposed({ aa: { kind: 'pending' }, bb: { kind: 'waive' } }).mergeable, false)
+  assert.equal(notDisposed({ aa: { kind: 'wontfix-later' }, bb: { kind: 'skip' } }).mergeable, false)
 })
 
 test('必过项只在有本轮结论时计入', () => {

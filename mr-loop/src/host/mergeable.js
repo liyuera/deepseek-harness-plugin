@@ -2,7 +2,10 @@
  * 可合并判定（设计 §5.6）。全部满足才算；缺哪项用中文写进 missing，报告直接展示。
  * 反模式：只盯 AI 评审。三套门禁 + GitLab 自己的详细合并态一起看，unknown 不当 pass。
  * 必过项是建议性的：只在有本轮结论时计入（它通常只在 MR 早期出现一次）。
+ * 阻塞项处置只认终态：fix / pending / 未知 kind 都不算，避免账本中间态把判定放过去。
  */
+const DISPOSED_KINDS = new Set(['waive', 'skip', 'wontfix'])
+
 export function evaluateMergeable({ mr, round, decisions = {} }) {
   const missing = []
   let degraded = false
@@ -18,8 +21,8 @@ export function evaluateMergeable({ mr, round, decisions = {} }) {
 
   const blocking = Array.isArray(round?.review?.blocking) ? round.review.blocking : []
   const unresolved = blocking.filter((item) => {
-    const decision = decisions?.[item?.fid]
-    return decision === undefined || decision === null
+    const kind = decisions?.[item?.fid]?.kind
+    return typeof kind !== 'string' || DISPOSED_KINDS.has(kind) === false
   })
   if (unresolved.length > 0) missing.push(`有 ${unresolved.length} 条阻塞问题未处置`)
 
