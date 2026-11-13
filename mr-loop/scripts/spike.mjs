@@ -165,7 +165,10 @@ async function main() {
       notes: (discussion.notes ?? []).map((note) => ({ id: note.id, resolvable: note.resolvable, resolved: note.resolved, system: note.system })),
     })),
     checks: {
-      hasAiReviewShaMarker: notes.some((note) => markersOf(note.body).some((m) => m.name === 'AI_REVIEW_SHA')),
+      // 同样只扫首页：pageComplete=false 时更早的 note 可能带标记，false 会是假阴性，记为 null。
+      hasAiReviewShaMarker: pageComplete
+        ? notes.some((note) => markersOf(note.body).some((m) => m.name === 'AI_REVIEW_SHA'))
+        : null,
       hasHeadPipeline: mr.head_pipeline !== null && mr.head_pipeline !== undefined,
       hasDetailedMergeStatus: typeof mr.detailed_merge_status === 'string',
       hasBlockingDiscussionsResolved: typeof mr.blocking_discussions_resolved === 'boolean',
