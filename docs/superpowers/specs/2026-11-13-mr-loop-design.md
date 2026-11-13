@@ -111,7 +111,7 @@ watcher 每 tick 拉 `notes?per_page=50&sort=desc`（过滤 `system: true`），
 | 无标记，`created_at < observedAt` | 丢弃 | `stale` |
 | 多条命中同一 sha | 取 `note.id` 最大的一条 | — |
 
-弱绑定在报告里显式标注「弱绑定（无 SHA 证明）」，并作为 `unknown` 参与门禁判定的一部分（§5.3 的 fail-closed 规则）。sha 标记是否真实存在由 S0 spike 核实；缺失时全轮次都会走弱绑定，功能仍可用，但报告会一直提示。
+弱绑定在报告里显式标注「弱绑定（无 SHA 证明）」，并在可合并判定里按 `unknown` 处理——**弱绑定的 `pass` 不能单独授权合并**（§5.3 的 fail-closed 规则）。sha 标记是否真实存在由 S0 spike 核实；缺失时全轮次都会走弱绑定，功能仍可用，但报告会一直提示。
 
 ### 5.3 门禁解析
 
@@ -212,7 +212,7 @@ idle ──bind──▶ watching(sha) ──head sha 变化──▶ awaiting(s
 2. 已完成绑定的那个 sha 的评审：`verdict === 'pass'`；且**每一条**列在「需要关注的问题 / 历史未收敛问题」里的阻塞项，要么已被本轮证明修复（不再出现），要么有 `waive` / `skip` / `wontfix` 处置记录。`verdict === 'changes'` 一律不可合并；
 3. 敏感门禁**本轮**（基线之后）`verdict === 'pass'`（`当前有效 0 条`）；该 sha 上还没有 → 还在 settle 窗口，不算可合并；
 4. 必过项是**建议性**的：只有存在基线之后的 note 才计入；没有则忽略并在报告里标「无本轮结论」，最终由 `detailed_merge_status` 兜底（该 notes 只在早期出现一次，若强制要求 pass 会让可合并永远判不出来）；
-5. GitLab 自己的合并态：有 `detailed_merge_status`（15.6+）时要求为 `'mergeable'`；14.9 实测**没有该字段**，降级为 `merge_status === 'can_be_merged'` + `blocking_discussions_resolved !== false`，报告标注「降级判定」——在本实例上降级是**常态**，不是例外；
+5. GitLab 自己的合并态：有 `detailed_merge_status`（15.6+）时要求为 `'mergeable'`；14.9 实测**没有该字段**，降级为 `merge_status === 'can_be_merged'` + `blocking_discussions_resolved !== false` + **`head_pipeline.status === 'success'`**（14.9 的 `merge_status` 只反映冲突，不看 CI；没有流水线时视为「无 CI」放行），报告标注「降级判定」——在本实例上降级是**常态**，不是例外；
 6. `has_conflicts === false`。
 
 满足后：唤醒一次，附收尾报告（§6.4），停 watcher，账本写 `mergeableAt`。**插件不合并**。
@@ -223,8 +223,8 @@ idle ──bind──▶ watching(sha) ──head sha 变化──▶ awaiting(s
 
 | 守卫 | 默认 | 判据 | 触发后 |
 |---|---|---|---|
-| `stallRounds` | 3 | 连续 3 轮的阻塞 FID 集合完全相同（说明推了但没修掉，或评审在复读） | `paused(stalled)` |
-| `reverifyStreak` | 3 | 同一 FID 的 `复验次数` 连续 3 轮递增（改了但没改对） | `paused(stalled)`，报告里点名该 FID |
+| `stallRounds` | 3 | 连续 3 **轮**（新 sha）的阻塞 FID 集合完全相同（说明推了但没修掉，或评审在复读）；同 sha 的轮询 tick 不计数 | `paused(stalled)` |
+| `reverifyStreak` | 3 | 同一 FID 的 `复验次数` 在连续 3 轮之间逐轮变大（改了但没改对）；同样只在轮次边界比较 | `paused(stalled)`，报告里点名该 FID |
 | `wallClockMs` | 12h | 从绑定起的墙钟时长 | `paused(budget)` |
 | `idleStopMs` | 30min | 无新 sha 也无门禁变化 | `paused(idle)` |
 
