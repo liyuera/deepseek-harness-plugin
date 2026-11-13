@@ -1,0 +1,37 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { parseReview, isReviewBody } from '../src/host/parse-review.js'
+
+const fixture = (name) => readFileSync(new URL(`./fixtures/${name}`, import.meta.url), 'utf8')
+
+test('需要修改的 note → changes + 阻塞/非阻塞分组 + 复验次数', () => {
+  const result = parseReview(fixture('review-needs-fix.md'))
+  assert.equal(result.verdict, 'changes')
+  assert.equal(result.blocking.length, 1)
+  assert.equal(result.nonBlocking.length, 1)
+  assert.equal(result.blocking[0].fid, 'aaaaaaaaaa')
+  assert.equal(result.blocking[0].level, '中')
+  assert.equal(result.blocking[0].reverifyCount, 1)
+  assert.match(result.blocking[0].location, /useExampleForm\.ts:100-120/)
+})
+
+test('可直接合并的 note → pass，历史未收敛项归非阻塞', () => {
+  const result = parseReview(fixture('review-pass.md'))
+  assert.equal(result.verdict, 'pass')
+  assert.equal(result.blocking.length, 0)
+  assert.equal(result.nonBlocking.length, 1)
+})
+
+test('引用别人结论的回复不算评审', () => {
+  const quoted = fixture('review-pass.md').split('\n').map((line) => `> ${line}`).join('\n')
+  assert.equal(parseReview(quoted).verdict, 'unknown')
+  assert.equal(isReviewBody(quoted), false)
+})
+
+test('坏输出一律 unknown，不猜', () => {
+  assert.deepEqual(parseReview(''), { verdict: 'unknown', blocking: [], nonBlocking: [] })
+  assert.equal(parseReview('AI Code Review\n结论: 需要修改').verdict, 'unknown')
+  assert.equal(parseReview('AI Code Review\n结论: 新格式结论').verdict, 'unknown')
+  assert.equal(isReviewBody('AI Code Review\n\n结论: 可直接合并'), true)
+})
