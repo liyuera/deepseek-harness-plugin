@@ -29,6 +29,13 @@ test('引用别人结论的回复不算评审', () => {
   assert.equal(isReviewBody(quoted), false)
 })
 
+test('复验次数：缺失 / 0 / 非数字三种边界', () => {
+  const body = (field) => `## AI Code Review (a -> b)\n\n结论: **需要修改**\n\n### 需要关注的问题\n1. **文件**: \`x.ts\`\n   - FID: \`ff\`\n${field}   - 级别: 中\n   - 问题: boom\n`
+  assert.equal(parseReview(body('')).blocking[0].reverifyCount, null)
+  assert.equal(parseReview(body('   - 复验次数: \`0\`\n')).blocking[0].reverifyCount, 0)
+  assert.equal(parseReview(body('   - 复验次数: \`abc\`\n')).blocking[0].reverifyCount, null)
+})
+
 test('坏输出一律 unknown，不猜', () => {
   assert.deepEqual(parseReview(''), { verdict: 'unknown', blocking: [], nonBlocking: [] })
   assert.equal(parseReview('AI Code Review\n结论: 需要修改').verdict, 'unknown')

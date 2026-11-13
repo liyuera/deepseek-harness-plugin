@@ -6,7 +6,7 @@
  *
  * Contract: `parseReview(noteBody) -> { verdict, blocking, nonBlocking }` where
  * `verdict` is `'pass' | 'changes' | 'unknown'` and every issue has the shape
- * `{ file, fid, level, gateCategory, location, problem, suggestion }`.
+ * `{ file, fid, level, gateCategory, location, problem, suggestion, reverifyCount }`.
  *
  * Rules (see docs/superpowers/spikes/2026-11-06-p0-findings.md, Spike C):
  *   1. A note is a review only when its own top-level lines contain both
@@ -15,7 +15,7 @@
  *      the JSON inside that hidden block never reaches the returned issues.
  *   3. `结论: 可直接合并` -> pass, `结论: 需要修改` -> changes.
  *   4. Items are read from `需要关注的问题` and `历史未收敛问题`: `文件`, `FID`,
- *      `级别`, `门禁分类`, `位置`, `问题`, `建议` (other fields are ignored).
+ *      `复验次数`, `级别`, `门禁分类`, `位置`, `问题`, `建议` (other fields are ignored).
  *   5. `门禁分类 = 非阻塞建议` or `级别 = 低` -> nonBlocking, everything else -> blocking.
  *   6. Never guess: a `需要修改` verdict with no parsable item, a malformed item, a
  *      recognized issue section with text but no parsable item (format drift), or a
@@ -201,7 +201,11 @@ function parseSection(lines) {
       location: (current.location ?? '').trim(),
       problem: (current.problem ?? '').trim(),
       suggestion: (current.suggestion ?? '').trim(),
-      reverifyCount: Number.parseInt((current.reverifyCount ?? '').trim(), 10) || null,
+      // 0 是合法值（'还没复验过'），不能与缺失混为一谈；|| null 会把 0 吃掉。
+      reverifyCount: (() => {
+        const parsed = Number.parseInt(String(current.reverifyCount ?? '').trim(), 10)
+        return Number.isNaN(parsed) ? null : parsed
+      })(),
     };
     if (!issue.file || !issue.problem) malformed = true;
     items.push(issue);
