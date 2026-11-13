@@ -41,3 +41,17 @@ test('expandHome 只展开 ~/ 前缀', () => {
   assert.ok(expandHome('~/x').endsWith('/x'))
   assert.equal(expandHome('/abs/x'), '/abs/x')
 })
+
+test('读取失败一律 TokenError，且不透传上游原文', async () => {
+  const fakeStat = async () => ({ isFile: () => true, mode: 0o100600 })
+  const eacces = Object.assign(new Error('EACCES: permission denied, open /x'), { code: 'EACCES' })
+  await assert.rejects(
+    readToken({ tokenFile: '/x', env: {}, statImpl: fakeStat, readFileImpl: async () => { throw eacces } }),
+    (err) => err instanceof TokenError && err.code === 'no-token' && err.message.includes('EACCES') && !err.message.includes('permission denied'),
+  )
+  const notDir = Object.assign(new Error('ENOTDIR: not a directory'), { code: 'ENOTDIR' })
+  await assert.rejects(
+    readToken({ tokenFile: '/x', env: {}, statImpl: async () => { throw notDir } }),
+    (err) => err instanceof TokenError && err.code === 'no-token' && /ENOTDIR/.test(err.message) && !/不存在/.test(err.message),
+  )
+})

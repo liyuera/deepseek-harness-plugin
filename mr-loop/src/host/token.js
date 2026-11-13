@@ -38,13 +38,21 @@ export async function readToken({ tokenFile, env = process.env, readFileImpl = n
   let info
   try {
     info = await statImpl(file)
-  } catch {
-    throw new TokenError('no-token', `未配置 GitLab token：${file} 不存在`)
+  } catch (error) {
+    // ENOENT 是「没配」，EACCES/ENOTDIR/EIO 是「读不到」：文案要能区分，错误码统一 no-token。
+    const reason = error?.code === 'ENOENT' ? '不存在' : `无法访问（${error?.code ?? 'unknown'}）`
+    throw new TokenError('no-token', `未配置 GitLab token：${file} ${reason}`)
   }
   if (!info.isFile()) throw new TokenError('no-token', `GitLab token 路径不是文件：${file}`)
 
   const warning = (info.mode & 0o077) !== 0 ? `token 文件权限过宽（建议 chmod 600）：${file}` : undefined
-  const text = await readFileImpl(file, 'utf8')
+  let text
+  try {
+    text = await readFileImpl(file, 'utf8')
+  } catch (error) {
+    // 只透传 errno 代号，不透传上游 message（可能含路径细节）。
+    throw new TokenError('no-token', `GitLab token 文件无法读取：${file}（${error?.code ?? 'unknown'}）`)
+  }
   const token = String(text).trim()
   if (!token) throw new TokenError('no-token', `GitLab token 文件为空：${file}`)
   if (token.length > MAX_TOKEN_LENGTH) throw new TokenError('no-token', `GitLab token 过长：${file}`)
