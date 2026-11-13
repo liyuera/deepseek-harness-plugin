@@ -58,8 +58,9 @@ function harness({ mr = mrOf(), notes = [], stateOver = {}, snapshot, report = (
   const watcher = createWatcher({
     cfg, gitlab, service, logger,
     notify: ({ text }) => {
-      if (notifyImpl !== undefined) { notifyImpl(text, notified); return }
+      if (notifyImpl !== undefined) return notifyImpl(text, notified)
       notified.push(text)
+      return true
     },
     now,
     setTimer: (fn, ms) => { const id = ++timerSeq; timers.push({ id, fn, ms }); return id },
@@ -216,7 +217,42 @@ test('merged / 可合 → 唤醒后不再排下一次', async () => {
   assert.equal(mergeable.timers.length, 0)
 })
 
-test('notify 抛错 → 不推进 lastWake/pendingWake，下一次 tick 补发同一份报告', async () => {
+test('notify 返回 false → 不推进 lastWake，下一次 tick 补发同一份报告', async () => {
+  const attempted = []
+  const h = harness({
+    notes: [{ id: 1, body: 'AI Code Review' }],
+    notifyImpl: (text, out) => {
+      attempted.push(text)
+      if (attempted.length === 1) return false
+      out.push(text)
+      return true
+    },
+  })
+
+  await h.watcher.tick('s')
+  assert.equal(h.notified.length, 0) // 没送达
+  // 没送达就不能记账：pendingWake 必须留着，否则这份报告永远丢了。
+  h.advance(31000) // 越过 30s 补发窗口
+  await h.watcher.tick('s')
+  assert.equal(h.notified.length, 1)
+  assert.equal(h.notified[0], attempted[0]) // 补发的是同一份报告
+})
+
+test('notify 返回 true → 记账落定，下一个 tick 不重复投递', async () => {
+  const h = harness({
+    notes: [{ id: 1, body: 'AI Code Review' }],
+    notifyImpl: (text, out) => { out.push(text); return true },
+  })
+
+  await h.watcher.tick('s')
+  assert.equal(h.notified.length, 1)
+
+  h.advance(31000) // 即使过了补发窗口，已送达的报告也不该再来一次
+  await h.watcher.tick('s')
+  assert.equal(h.notified.length, 1)
+})
+
+test('notify 抛错 → tick 不崩、不推进 lastWake，下一次 tick 补发同一份报告', async () => {
   let attempts = 0
   const h = harness({
     notes: [{ id: 1, body: 'AI Code Review' }],
@@ -224,17 +260,40 @@ test('notify 抛错 → 不推进 lastWake/pendingWake，下一次 tick 补发�
       attempts += 1
       if (attempts === 1) throw new Error('channel closed')
       out.push(text)
+      return true
     },
   })
 
-  await assert.rejects(h.watcher.tick('s'), /channel closed/)
+  // notify 的异常在 deliver 里被吞掉：tick 正常收工，不把 rejection 抛给定时器。
+  await h.watcher.tick('s')
   assert.equal(h.notified.length, 0)
-  assert.equal(h.timers.length, 0) // tick 在唤醒处抛出，没排下一次
+  assert.equal(h.timers.length, 1) // 照常排下一次
 
   // 失败不能把唤醒记成「已送达」：没有 lastWake 记录，下一次 tick 开头会补发挂起的报告。
+  h.advance(31000)
   await h.watcher.tick('s')
   assert.equal(h.notified.length, 1)
   assert.match(h.notified[0], /REPORT/)
+})
+
+test('定时器回调里 tick 失败 → 记一行日志并停表', async () => {
+  const warnings = []
+  const h = harness({
+    logger: { warn: (line) => warnings.push(line) },
+    notes: [{ id: 1, body: 'AI Code Review' }],
+    // report 在 tick 里没有被 try/catch 包住：用它制造一条最简单的可达 reject。
+    report: () => { throw new Error('report boom') },
+  })
+
+  h.watcher.start('s')
+  assert.equal(h.timers.length, 1)
+
+  h.timers[0].fn() // 直接触发定时回调，内部 tick 会 reject
+  await new Promise((resolve) => setImmediate(resolve))
+
+  assert.deepEqual(h.cleared, [h.timers[0].id]) // 仍然停表，不改变 no-throw 行为
+  assert.equal(warnings.length, 1)
+  assert.equal(warnings[0], '[mr-loop] tick 失败，停止监视：report boom')
 })
 
 test('listNotes 失败 → 记一行日志并继续排下一次', async () => {

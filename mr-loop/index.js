@@ -56,6 +56,7 @@ export function apply(ctx, rawConfig = {}) {
         service,
         logger: ctx.logger,
         // 唤醒 = 往会话里塞一条插件来源的消息；会话已关闭时 agent 取不到，必须静默。
+        // 返回值是 watcher 的唯一送达凭据：只有 followup 真的没抛错才算送到。
         notify: ({ sessionId, text }) => {
           let agent
           try {
@@ -64,7 +65,7 @@ export function apply(ctx, rawConfig = {}) {
           } catch {
             agent = undefined
           }
-          if (agent === undefined || agent === null) return
+          if (agent === undefined || agent === null) return false
           try {
             agent.followup({
               id: crypto.randomUUID(),
@@ -73,8 +74,11 @@ export function apply(ctx, rawConfig = {}) {
               content: [{ type: 'text', text }],
             })
           } catch (error) {
+            // 日志只带错误信息，永远不包含 token 或报告正文。
             ctx.logger?.warn?.(`[mr-loop] followup 失败：${error.message}`)
+            return false
           }
+          return true
         },
       })
     // enabled=false：只留工具与命令（设计 §6.5），所有 watcher 入口都是空操作。

@@ -24,7 +24,7 @@ function wakeKey(round) {
 }
 
 /**
- * @param {{ cfg: object, gitlab: object, service: object, notify: (input: { sessionId: string, text: string }) => void,
+ * @param {{ cfg: object, gitlab: object, service: object, notify: (input: { sessionId: string, text: string }) => boolean,
  *           logger?: { warn?: Function }, now?: () => number, setTimer?: Function, clearTimer?: Function }} deps
  */
 export function createWatcher({ cfg, gitlab, service, notify, logger = undefined, now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout }) {
@@ -46,22 +46,35 @@ export function createWatcher({ cfg, gitlab, service, notify, logger = undefined
     clear(sessionId)
     if (!Number.isFinite(delayMs) || delayMs <= 0) return
     // 定时回调不 await tick：异步失败必须自己吞掉，否则会成为 unhandled rejection。
-    timers.set(sessionId, setTimer(() => { void tick(sessionId).catch(() => clear(sessionId)) }, delayMs))
+    // 但「吞掉」不等于静默：记一行日志再停表，否则监视会无声无息地消失。
+    timers.set(sessionId, setTimer(() => {
+      void tick(sessionId).catch((error) => {
+        logger?.warn?.('[mr-loop] tick 失败，停止监视：' + (error?.message ?? error))
+        clear(sessionId)
+      })
+    }, delayMs))
   }
 
+  /** @returns {boolean} 是否真的送达（notify 返回假值或抛错都算没送达）。 */
   function deliver(sessionId, { text, key }) {
+    let delivered = false
     try {
-      notify({ sessionId, text })
-    } catch (error) {
-      // 投递失败：把这次唤醒挂回 pendingWake，且不推进 lastWakeAt / lastWakeKey。
-      // 这里拿不到 ctx.logger；原样抛给调用方，状态保持可重试（下一次 tick 的 flush 补发）。
-      pendingWake.set(sessionId, { text, key })
-      throw error
+      delivered = Boolean(notify({ sessionId, text }))
+    } catch {
+      // notify 自身的异常不能中断 tick：按「没送达」处理，报告留在 pendingWake 里补发。
+      delivered = false
     }
-    // 只有 notify 真的返回了才记「已唤醒」：失败时下一次 tick 仍会尝试补发。
+    if (!delivered) {
+      // 投递失败：把这次唤醒挂回 pendingWake，且不推进 lastWakeAt / lastWakeKey。
+      // 没有记账，下一次 tick 的 flush 会把同一份报告再送一次。
+      pendingWake.set(sessionId, { text, key })
+      return false
+    }
+    // 只有 notify 真的返回真值才记「已唤醒」。
     lastWakeAt.set(sessionId, now())
     if (key !== undefined) lastWakeKey.set(sessionId, key)
     pendingWake.delete(sessionId)
+    return true
   }
 
   /**
@@ -79,8 +92,7 @@ export function createWatcher({ cfg, gitlab, service, notify, logger = undefined
         return false
       }
     }
-    deliver(sessionId, { text, key })
-    return true
+    return deliver(sessionId, { text, key })
   }
 
   /** tick 开头补发：只有距上次唤醒已满 30s 才发，否则继续等。 */
