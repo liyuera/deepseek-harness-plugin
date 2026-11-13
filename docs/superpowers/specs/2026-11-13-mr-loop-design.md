@@ -99,13 +99,15 @@
 
 ### 5.2 轮次与 SHA 绑定（本插件的核心）
 
-每轮记录 `{ n, sha, observedAt, notes: { review?, sensitive?, mandatory? } }`。watcher 每 tick 拉 `notes?per_page=50&sort=desc`（过滤 `system: true`），按下列矩阵归属：
+每轮记录 `{ n, sha, observedAt, baselineAt, notes: { review?, sensitive?, mandatory? } }`。`baselineAt` 是本轮的时间基线：优先取该 sha 的 `head_pipeline.created_at`（流水线只为当前 sha 跑，等价于 push 时间），取不到时退回 `observedAt`（本轮 sha 首次观测时间）。这样「绑定前评审就已存在」的 MR 也能被正确归属，而不是一律判 stale。
+
+watcher 每 tick 拉 `notes?per_page=50&sort=desc`（过滤 `system: true`），按下列矩阵归属：
 
 | 证据 | 判定 | 标记 |
 |---|---|---|
 | note 含 `<!-- AI_REVIEW_SHA <sha> -->` 且等于本轮 sha | 属于本轮 | 强绑定 |
 | note 含该标记但不等于本轮 sha | 丢弃 | `stale` |
-| 无标记，`created_at >= observedAt`（本轮 sha 首次观测时间），且标题匹配 `AI Code Review (src -> target)` | 属于本轮 | 弱绑定 |
+| 无标记，`created_at >= baselineAt`，且标题匹配 `AI Code Review (src -> target)` | 属于本轮 | 弱绑定 |
 | 无标记，`created_at < observedAt` | 丢弃 | `stale` |
 | 多条命中同一 sha | 取 `note.id` 最大的一条 | — |
 
