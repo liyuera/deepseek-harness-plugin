@@ -1,7 +1,9 @@
 /**
  * 每会话一个 watcher。节拍：守卫 → 1 个 MR 请求 → 必要时拉 notes → 并快照 → 判断唤醒 → 排下一次。
  * 没有 LLM 调用；所有定时器可注入，单测里用假时钟。
- * 唤醒去抖：同一 (sha, verdict, 门禁摘要) 只唤醒一次，两次唤醒最小间隔 30s。
+ * 唤醒去抖：同一 (sha, verdict, 门禁摘要) 只唤醒一次，两次唤醒最小间隔 30s；
+ * 被 30s 节流压住的报告不能丢——挂进 pendingWake，由下一个 tick 开头补发。
+ * 终止路径（守卫暂停 / token / merged / closed / 可合）没有下一个 tick，唤醒立即送达。
  */
 import { evaluateGuards } from './guards.js'
 
@@ -31,6 +33,8 @@ export function createWatcher({ cfg, gitlab, service, notify, now = Date.now, se
   const lastWakeAt = new Map()
   /** sessionId → 上次唤醒的去抖 key（同一评审只唤醒一次）。 */
   const lastWakeKey = new Map()
+  /** sessionId → 被 30s 节流压住、等待下一个 tick 补发的唤醒（`{ text, key }`）。 */
+  const pendingWake = new Map()
 
   function clear(sessionId) {
     const timer = timers.get(sessionId)
@@ -45,22 +49,47 @@ export function createWatcher({ cfg, gitlab, service, notify, now = Date.now, se
     timers.set(sessionId, setTimer(() => { void tick(sessionId).catch(() => clear(sessionId)) }, delayMs))
   }
 
-  function wake(sessionId, text, key = undefined) {
-    const nowMs = now()
-    const previous = lastWakeAt.get(sessionId)
-    // 从没唤醒过时不能把「0」当成上次唤醒时刻：假时钟（now=1000）会把第一次唤醒也拒掉。
-    if (previous !== undefined && nowMs - previous < WAKE_MIN_GAP_MS) return false
-    if (key !== undefined && lastWakeKey.get(sessionId) === key) return false
-    lastWakeAt.set(sessionId, nowMs)
+  function deliver(sessionId, { text, key }) {
+    lastWakeAt.set(sessionId, now())
     if (key !== undefined) lastWakeKey.set(sessionId, key)
+    pendingWake.delete(sessionId)
     notify({ sessionId, text })
+  }
+
+  /**
+   * @param {boolean} immediate 终止路径用：没有下一个 tick 可补发，绕过 30s 间隔直接送达。
+   *   同 key 的去重仍然生效（merged/closed 被会话重新拉起时不会重复推）。
+   */
+  function wake(sessionId, text, key = undefined, immediate = false) {
+    if (key !== undefined && lastWakeKey.get(sessionId) === key) return false
+    if (!immediate) {
+      const previous = lastWakeAt.get(sessionId)
+      // 从没唤醒过时不能把「0」当成上次唤醒时刻：假时钟（now=1000）会把第一次唤醒也拒掉。
+      if (previous !== undefined && now() - previous < WAKE_MIN_GAP_MS) {
+        // 报告已经算出、状态也可能已推进，下一 tick 不会再触发：必须挂起补发，不能丢。
+        pendingWake.set(sessionId, { text, key })
+        return false
+      }
+    }
+    deliver(sessionId, { text, key })
     return true
+  }
+
+  /** tick 开头补发：只有距上次唤醒已满 30s 才发，否则继续等。 */
+  function flushPendingWake(sessionId) {
+    const pending = pendingWake.get(sessionId)
+    if (pending === undefined) return
+    const previous = lastWakeAt.get(sessionId)
+    if (previous !== undefined && now() - previous < WAKE_MIN_GAP_MS) return
+    deliver(sessionId, pending)
   }
 
   async function tick(sessionId) {
     const state = service.getState(sessionId)
     if (state === null || state === undefined) { clear(sessionId); return }
     if (state.paused !== null && state.paused !== undefined) { clear(sessionId); return }
+    // 上一个 tick 被 30s 节流压住的报告在这里补发（此时绑定仍在、会话仍活着）。
+    flushPendingWake(sessionId)
 
     const guard = evaluateGuards({ state, now: now(), cfg })
     if (guard !== null) {
@@ -71,7 +100,8 @@ export function createWatcher({ cfg, gitlab, service, notify, now = Date.now, se
         clear(sessionId)
         return
       }
-      wake(sessionId, `已暂停监视（${guard.reason}）。用 /mr resume 继续。`)
+      // 暂停后没有下一个 tick：立即送达，不能被 30s 节流压住。
+      wake(sessionId, `已暂停监视（${guard.reason}）。用 /mr resume 继续。`, undefined, true)
       clear(sessionId)
       return
     }
@@ -90,7 +120,8 @@ export function createWatcher({ cfg, gitlab, service, notify, now = Date.now, se
           clear(sessionId)
           return
         }
-        wake(sessionId, `GitLab token 不可用（${code}）。放好 token 后 /mr resume。`)
+        // token 暂停后没有下一个 tick：立即送达。
+        wake(sessionId, `GitLab token 不可用（${code}）。放好 token 后 /mr resume。`, undefined, true)
         clear(sessionId)
         return
       }
@@ -99,14 +130,23 @@ export function createWatcher({ cfg, gitlab, service, notify, now = Date.now, se
       return
     }
 
+    // await 期间可能被 rebind / stop：旧 tick 不能拿旧 MR 去写新绑定。
+    const latest = service.getState(sessionId)
+    if (latest === null || latest === undefined || latest !== state) { clear(sessionId); return }
+
     if (mr.state === 'merged' || mr.state === 'closed') {
       // 终态是永久的：同一个 (state, sha) 只唤醒一次，避免用户下一句话又把 watcher 拉起来重复唤醒。
-      wake(sessionId, `MR 已 ${mr.state}，停止监视。`, `mr:${mr.state}:${String(mr.sha ?? '')}`)
+      // 终态后没有下一个 tick：立即送达。
+      wake(sessionId, `MR 已 ${mr.state}，停止监视。`, `mr:${mr.state}:${String(mr.sha ?? '')}`, true)
       clear(sessionId)
       return
     }
 
     const pipelineStatus = mr.head_pipeline?.status ?? null
+    // 设计 §5.4：流水线 failed/canceled 立刻唤醒（评审可能根本没产出，不要静默等到超时）。
+    if ((pipelineStatus === 'failed' || pipelineStatus === 'canceled') && pipelineStatus !== state.pipelineStatus) {
+      wake(sessionId, `流水线 ${pipelineStatus}（#${mr.head_pipeline?.id ?? '?'}）：评审可能没有产出，先看 job 日志或等下一轮。`)
+    }
     const hasReview = state.round?.review !== null && state.round?.review !== undefined
     const shouldFetchNotes = hasReview === false
       || mr.sha !== state.round?.sha
@@ -121,6 +161,9 @@ export function createWatcher({ cfg, gitlab, service, notify, now = Date.now, se
         schedule(sessionId, cfg.pollAwaitingMs)
         return
       }
+      // 拉 notes 也是 await：期间同样可能被 rebind / stop，写快照前再复核一次。
+      const latestAfterNotes = service.getState(sessionId)
+      if (latestAfterNotes === null || latestAfterNotes === undefined || latestAfterNotes !== state) { clear(sessionId); return }
     }
 
     let result
@@ -139,12 +182,13 @@ export function createWatcher({ cfg, gitlab, service, notify, now = Date.now, se
     // 但只有状态真的发生变化时才唤醒，避免 bind 已经给过报告后又重复推一遍。
     if (next.mergeability?.mergeable === true) {
       if (result.becameMergeable === true) {
-        wake(sessionId, `${service.report(next)}\n\n可合并，监视结束。`, `mergeable:${String(next.round?.sha ?? '')}`)
+        // 可合并没有下一个 tick：立即送达。
+        wake(sessionId, `${service.report(next)}\n\n可合并，监视结束。`, `mergeable:${String(next.round?.sha ?? '')}`, true)
       }
       clear(sessionId)
       return
     }
-    if (reviewArrived) wake(sessionId, service.report(next), wakeKey(next))
+    if (reviewArrived) wake(sessionId, service.report(next), wakeKey(next.round))
 
     const delay = !terminal(pipelineStatus)
       ? (pipelineStatus === null ? cfg.pollNoPipelineMs : cfg.pollAwaitingMs)
@@ -160,7 +204,12 @@ export function createWatcher({ cfg, gitlab, service, notify, now = Date.now, se
       if (state.paused !== null && state.paused !== undefined) { clear(sessionId); return }
       schedule(sessionId, cfg.pollAwaitingMs)
     },
-    stop(sessionId) { clear(sessionId) },
+    stop(sessionId) {
+      // 显式停表（/mr stop、会话销毁、插件卸载）时丢弃未补发的报告：
+      // 绑定可能已经解绑/换 MR，旧报告的上下文不再成立。
+      pendingWake.delete(sessionId)
+      clear(sessionId)
+    },
     stopAll() { for (const sessionId of [...timers.keys()]) clear(sessionId) },
     isWatching(sessionId) { return timers.has(sessionId) },
   }
