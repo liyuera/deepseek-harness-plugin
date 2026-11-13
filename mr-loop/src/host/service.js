@@ -18,7 +18,18 @@ export class ServiceError extends Error {
 
 const sameProject = (a, b) => String(a ?? '').toLowerCase() === String(b ?? '').toLowerCase()
 
-const blockingKey = (round) => (round?.review?.blocking ?? []).map((item) => item.fid).sort().join(',')
+// 集合键：排序 + 去重，顺序与重复项都不影响「阻塞集合是否相同」的判定。
+const blockingKey = (round) => [...new Set((round?.review?.blocking ?? []).map((item) => item?.fid))].sort().join(',')
+
+/** 同一 FID 的复验次数比上一轮上升（且已到触发门槛 2）才算「复验未收敛」。 */
+function reverifyIncreased(previousRound, round) {
+  const before = new Map((previousRound?.review?.blocking ?? []).map((item) => [item?.fid, item?.reverifyCount ?? 0]))
+  return (round?.review?.blocking ?? []).some((item) => {
+    const previous = before.get(item?.fid)
+    const current = item?.reverifyCount ?? 0
+    return previous !== undefined && current > previous && current >= 2
+  })
+}
 
 /**
  * @param {{ config: object, ledger: object, gitlab: object, repoState?: Function, now?: () => number }} deps
@@ -168,13 +179,17 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
 
     if (mr.sha !== state.round?.sha) {
       newRound = true
+      const previousRound = state.round
       const observedAt = now()
       const round = { ...buildRound({ mr, notes, cfg: config, observedAt }), n: (state.round?.n ?? 0) + 1 }
+      // 守卫计数按「轮」推进：只有新 sha 开新一轮时才比较上一轮。
+      // 同 sha 的快照（watcher 每 tick、/mr status）不碰 streak / stallKey。
+      const key = blockingKey(round)
+      state.stallStreak = key !== '' && key === state.stallKey ? state.stallStreak + 1 : 0
+      state.stallKey = key
+      state.reverifyStreak = reverifyIncreased(previousRound, round) ? state.reverifyStreak + 1 : 0
       state.round = round
       state.rounds = [...state.rounds, round].slice(-config.ledgerKeepRounds)
-      state.stallStreak = 0
-      state.reverifyStreak = 0
-      state.stallKey = blockingKey(round)
       state.lastProgressAt = observedAt
     } else if (Array.isArray(notes)) {
       state.round = { ...buildRound({ mr, notes, cfg: config, observedAt: state.round.observedAt }), n: state.round.n }
@@ -185,16 +200,6 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
     state.notesCount = mr.user_notes_count ?? state.notesCount
     state.pipelineStatus = mr.head_pipeline?.status ?? null
     state.mergeability = evaluateMergeable({ mr, round: state.round, decisions: state.decisions })
-
-    const key = blockingKey(state.round)
-    if (key === state.stallKey && key !== '') {
-      state.stallStreak += 1
-    } else {
-      state.stallStreak = 0
-      state.stallKey = key
-    }
-    const maxReverify = Math.max(0, ...(state.round?.review?.blocking ?? []).map((item) => item.reverifyCount ?? 0))
-    state.reverifyStreak = maxReverify >= 2 ? state.reverifyStreak + 1 : 0
 
     if (state.mergeability.mergeable && state.mergeableAt === undefined) state.mergeableAt = new Date(now()).toISOString()
 
@@ -233,10 +238,18 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
     return state
   }
 
-  function resume({ sessionId }) {
+  async function resume({ sessionId }) {
     const state = requireState(sessionId)
+    const observedAt = now()
+    // 恢复必须连守卫计数一起清：否则停表前的 streak 会让下一个 tick 立刻再次暂停。
     state.paused = null
-    state.lastProgressAt = now()
+    state.startedAt = observedAt
+    state.lastProgressAt = observedAt
+    state.stallStreak = 0
+    state.reverifyStreak = 0
+    state.stallKey = blockingKey(state.round)
+    // 先改内存再落盘：写失败对外是 storage-failed，但内存里不能留下「仍在暂停」的假象。
+    await persist(state)
     return state
   }
 

@@ -68,8 +68,18 @@ test('整份报告逐字快照：行序与完整性一次钉死', () => {
     '必过   ⏳ 无本轮结论',
     '阻塞   无',
     '待点头  （无）',
-    '合并   ✅ 可合',
+    '合并   ✅ 可合 · 无流水线',
   ].join('\n'))
+})
+
+test('合并行展示流水线现状：预绑定失败不再被降级判定掩盖', () => {
+  const base = { binding, round, decisions: {}, paused: null, now: Date.parse('2026-11-13T10:00:30Z') }
+  const failed = renderReport({ ...base, mr: { ...mr, head_pipeline: { id: 7181, status: 'failed' } }, mergeability: { mergeable: false, missing: ['流水线未通过（failed）'], degraded: true } })
+  assert.match(failed, /合并 {3}⛔ 差 1 项：流水线未通过（failed）（⚠️ 降级判定） · 流水线 #7181 failed/)
+  const ok = renderReport({ ...base, mr: { ...mr, head_pipeline: { id: 7181, status: 'success' } }, mergeability: { mergeable: true, missing: [], degraded: false } })
+  assert.match(ok, /合并 {3}✅ 可合 · 流水线 #7181 success/)
+  const none = renderReport({ ...base, mr, mergeability: { mergeable: true, missing: [], degraded: false } })
+  assert.match(none, /合并 {3}✅ 可合 · 无流水线/)
 })
 
 test('阻塞行用处置白名单：pending 不算已处置，待点头统计草稿', () => {

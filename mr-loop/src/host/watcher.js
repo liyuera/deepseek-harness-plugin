@@ -25,9 +25,9 @@ function wakeKey(round) {
 
 /**
  * @param {{ cfg: object, gitlab: object, service: object, notify: (input: { sessionId: string, text: string }) => void,
- *           now?: () => number, setTimer?: Function, clearTimer?: Function }} deps
+ *           logger?: { warn?: Function }, now?: () => number, setTimer?: Function, clearTimer?: Function }} deps
  */
-export function createWatcher({ cfg, gitlab, service, notify, now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout }) {
+export function createWatcher({ cfg, gitlab, service, notify, logger = undefined, now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout }) {
   const timers = new Map()
   /** sessionId → 上次唤醒时刻（最小间隔判据）。 */
   const lastWakeAt = new Map()
@@ -50,10 +50,18 @@ export function createWatcher({ cfg, gitlab, service, notify, now = Date.now, se
   }
 
   function deliver(sessionId, { text, key }) {
+    try {
+      notify({ sessionId, text })
+    } catch (error) {
+      // 投递失败：把这次唤醒挂回 pendingWake，且不推进 lastWakeAt / lastWakeKey。
+      // 这里拿不到 ctx.logger；原样抛给调用方，状态保持可重试（下一次 tick 的 flush 补发）。
+      pendingWake.set(sessionId, { text, key })
+      throw error
+    }
+    // 只有 notify 真的返回了才记「已唤醒」：失败时下一次 tick 仍会尝试补发。
     lastWakeAt.set(sessionId, now())
     if (key !== undefined) lastWakeKey.set(sessionId, key)
     pendingWake.delete(sessionId)
-    notify({ sessionId, text })
   }
 
   /**
@@ -157,7 +165,8 @@ export function createWatcher({ cfg, gitlab, service, notify, now = Date.now, se
     if (shouldFetchNotes) {
       try {
         notes = await gitlab.listNotes({ project, iid })
-      } catch {
+      } catch (error) {
+        logger?.warn?.(`[mr-loop] 拉取 notes 失败（${error?.code ?? 'network'}），${sleepSeconds(cfg.pollAwaitingMs)}s 后重试。`)
         schedule(sessionId, cfg.pollAwaitingMs)
         return
       }
@@ -169,8 +178,9 @@ export function createWatcher({ cfg, gitlab, service, notify, now = Date.now, se
     let result
     try {
       result = service.applySnapshot({ sessionId, mr, notes })
-    } catch {
-      // 快照期间被 stop/解绑：静默收工，别把异常抛给定时器。
+    } catch (error) {
+      // 快照期间被 stop/解绑：记一条日志再收工，别把异常抛给定时器。
+      logger?.warn?.(`[mr-loop] 应用快照失败，停止本会话监视：${error?.message ?? error}`)
       clear(sessionId)
       return
     }

@@ -157,7 +157,7 @@ export function createTools({ service, watcher = undefined }) {
       if (unknown !== null) return fail('invalid-arguments', `未知参数：${unknown}`)
       const sessionId = exec?.agent?.session?.id
       try {
-        service.resume({ sessionId })
+        await service.resume({ sessionId })
         watcher?.start(sessionId)
         return ok('已恢复监视。', service.getState(sessionId))
       } catch (error) {

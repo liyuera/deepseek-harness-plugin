@@ -70,9 +70,14 @@ export function renderReport({ binding, mr, round, decisions = {}, mergeability,
 
   // 降级是「GitLab 合并态口径」的事实，与结论是否可合无关：可合、不可合都要标出来。
   const degradedSuffix = mergeability.degraded ? `（${WARN} 降级判定）` : ''
+  // 流水线现状单独陈述：降级判定时 merge_status 只反映冲突，预绑定的失败要靠这一行才看得见。
+  const pipeline = mr?.head_pipeline
+  const pipelineLabel = pipeline === null || pipeline === undefined
+    ? '无流水线'
+    : `流水线 #${pipeline.id ?? '?'} ${pipeline.status ?? 'unknown'}`
   const mergeLine = mergeability.mergeable
-    ? `${OK} 可合${degradedSuffix}`
-    : `${BAD} 差 ${mergeability.missing.length} 项：${mergeability.missing.join('；')}${degradedSuffix}`
+    ? `${OK} 可合${degradedSuffix} · ${pipelineLabel}`
+    : `${BAD} 差 ${mergeability.missing.length} 项：${mergeability.missing.join('；')}${degradedSuffix} · ${pipelineLabel}`
   lines.push(`${pad('合并')}${mergeLine}`)
 
   if (paused !== null && paused !== undefined) {

@@ -34,6 +34,13 @@ export function evaluateMergeable({ mr, round, decisions = {} }) {
 
   if (round?.mandatory?.verdict === 'block') missing.push('必过项完整性检查未通过')
 
+  // 14.9 的 merge_status 只看冲突，不反映流水线：有 head_pipeline 时必须单独要求 success。
+  // 字段缺失 / null 是文档里的「没有挂 CI」路径，不拦。
+  const pipeline = mr?.head_pipeline
+  if (pipeline !== null && pipeline !== undefined && pipeline.status !== 'success') {
+    missing.push(`流水线未通过（${pipeline.status ?? 'unknown'}）`)
+  }
+
   if (typeof mr?.detailed_merge_status === 'string') {
     if (mr.detailed_merge_status !== 'mergeable') missing.push(`GitLab 合并态：${mr.detailed_merge_status}`)
   } else {

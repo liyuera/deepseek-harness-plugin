@@ -14,7 +14,7 @@ const mrOf = (over = {}) => ({
  * 假时钟 + 假定时器：`advance` 推进 now，`timers` 记录所有 setTimer 调用，
  * 这样「不再排下一次」是真的计数断言，30s 节流也能被测到。
  */
-function harness({ mr = mrOf(), notes = [], stateOver = {}, snapshot, report = () => 'REPORT', gitlabOver = {}, clock = 1000 } = {}) {
+function harness({ mr = mrOf(), notes = [], stateOver = {}, snapshot, report = () => 'REPORT', gitlabOver = {}, clock = 1000, notifyImpl, logger } = {}) {
   const notified = []
   const calls = { mr: 0, notes: 0 }
   const timers = []
@@ -56,8 +56,11 @@ function harness({ mr = mrOf(), notes = [], stateOver = {}, snapshot, report = (
     ...gitlabOver,
   }
   const watcher = createWatcher({
-    cfg, gitlab, service,
-    notify: ({ text }) => notified.push(text),
+    cfg, gitlab, service, logger,
+    notify: ({ text }) => {
+      if (notifyImpl !== undefined) { notifyImpl(text, notified); return }
+      notified.push(text)
+    },
     now,
     setTimer: (fn, ms) => { const id = ++timerSeq; timers.push({ id, fn, ms }); return id },
     clearTimer: (id) => { cleared.push(id) },
@@ -211,4 +214,49 @@ test('merged / 可合 → 唤醒后不再排下一次', async () => {
   assert.equal(mergeable.notified.length, 1)
   assert.match(mergeable.notified[0], /可合并/)
   assert.equal(mergeable.timers.length, 0)
+})
+
+test('notify 抛错 → 不推进 lastWake/pendingWake，下一次 tick 补发同一份报告', async () => {
+  let attempts = 0
+  const h = harness({
+    notes: [{ id: 1, body: 'AI Code Review' }],
+    notifyImpl: (text, out) => {
+      attempts += 1
+      if (attempts === 1) throw new Error('channel closed')
+      out.push(text)
+    },
+  })
+
+  await assert.rejects(h.watcher.tick('s'), /channel closed/)
+  assert.equal(h.notified.length, 0)
+  assert.equal(h.timers.length, 0) // tick 在唤醒处抛出，没排下一次
+
+  // 失败不能把唤醒记成「已送达」：没有 lastWake 记录，下一次 tick 开头会补发挂起的报告。
+  await h.watcher.tick('s')
+  assert.equal(h.notified.length, 1)
+  assert.match(h.notified[0], /REPORT/)
+})
+
+test('listNotes 失败 → 记一行日志并继续排下一次', async () => {
+  const warnings = []
+  const h = harness({
+    logger: { warn: (line) => warnings.push(line) },
+    gitlabOver: { listNotes: async () => { throw new Error('boom') } },
+  })
+  await h.watcher.tick('s')
+  assert.equal(h.timers.length, 1)
+  assert.equal(warnings.length, 1)
+  assert.match(warnings[0], /\[mr-loop\] 拉取 notes 失败/)
+})
+
+test('applySnapshot 失败 → 记一行日志并停表', async () => {
+  const warnings = []
+  const h = harness({
+    logger: { warn: (line) => warnings.push(line) },
+    snapshot: () => { throw new Error('boom') },
+  })
+  await h.watcher.tick('s')
+  assert.equal(h.timers.length, 0)
+  assert.equal(warnings.length, 1)
+  assert.match(warnings[0], /\[mr-loop\] 应用快照失败/)
 })

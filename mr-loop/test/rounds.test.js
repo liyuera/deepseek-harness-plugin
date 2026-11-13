@@ -87,6 +87,29 @@ test('人引用门禁文本不算门禁 note', () => {
   assert.equal(round.sensitive.verdict, 'pass')
 })
 
+test('4 空格缩进的门禁引用不算门禁 note；0–3 空格仍接受', () => {
+  const mr = { sha: SHA, head_pipeline: { created_at: '2026-11-13T09:59:00Z' } }
+  const gateBody = (firstLine) => [
+    firstLine,
+    '',
+    '结论: 门禁通过',
+    '',
+    '扫描结果：共 15 条命中；历史豁免 15 条；当前有效 0 条。',
+  ].join('\n')
+  // 4 空格 = CommonMark 缩进代码块：看起来像门禁，但只是引用/粘贴，不能当结论。
+  const indented4 = note({ id: 41, created_at: '2026-11-13T10:21:00Z', body: gateBody('    ## Sensitive Content Gate') })
+  const accepted3 = note({ id: 40, created_at: '2026-11-13T10:20:00Z', body: gateBody('   ## Sensitive Content Gate') })
+  const observedAt = Date.parse('2026-11-13T10:30:00Z')
+
+  const onlyIndented = buildRound({ mr, notes: [indented4], cfg, observedAt })
+  assert.equal(onlyIndented.sensitive, null)
+
+  // id 更大的缩进 note 若被误收，会顶掉真正的那条：用它做判别性断言。
+  const round = buildRound({ mr, notes: [indented4, accepted3], cfg, observedAt })
+  assert.equal(round.sensitive.noteId, 40)
+  assert.equal(round.sensitive.verdict, 'pass')
+})
+
 test('buildRound：最新一条评审 + 三套门禁 + stale 入 dropped', () => {
   const mr = { sha: SHA, head_pipeline: { created_at: '2026-11-13T09:59:00Z' } }
   const notes = [

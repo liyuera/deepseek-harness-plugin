@@ -61,8 +61,10 @@ export function classifyReviewNote({ note, sha, baselineAt, cfg }) {
  */
 function startsWithTitle(body, title) {
   const firstLine = String(body ?? '').split('\n').find((line) => line.trim() !== '') ?? ''
-  // 允许行首缩进与 `## ` 标题前缀；不 strip `>`，引用文本因此不会被当成结论。
-  return firstLine.replace(/^\s*#+\s*/, '').trim().startsWith(title)
+  // CommonMark 中 4 空格缩进即代码块：只容 0–3 格行首缩进（tab 不算），`#` 标题前缀可选。
+  // 除「缩进 + # 前缀」外不再 strip 任何字符：`>` 引用因此仍会被排除。
+  const prefix = /^ {0,3}(?:#+[ \t]*)?/.exec(firstLine)?.[0] ?? ''
+  return firstLine.slice(prefix.length).startsWith(title)
 }
 const isSensitiveNote = (body, cfg) => startsWithTitle(body, cfg.sensitiveTitle)
 const isMandatoryNote = (body, cfg) => startsWithTitle(body, cfg.mandatoryTitle)

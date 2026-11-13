@@ -53,3 +53,24 @@ test('缺 detailed_merge_status → 降级到 merge_status 并标注', () => {
   const r2 = evaluateMergeable({ mr: { state: 'opened', draft: false, has_conflicts: false, merge_status: 'cannot_be_merged' }, round: round(), decisions: {} })
   assert.equal(r2.mergeable, false)
 })
+
+test('降级判定的 head pipeline：failed / running 拦，success / 无流水线不拦', () => {
+  const degradedMr = (over = {}) => ({ state: 'opened', draft: false, has_conflicts: false, merge_status: 'can_be_merged', ...over })
+
+  const failed = evaluateMergeable({ mr: degradedMr({ head_pipeline: { status: 'failed' } }), round: round(), decisions: {} })
+  assert.equal(failed.mergeable, false)
+  assert.deepEqual(failed.missing, ['流水线未通过（failed）'])
+
+  const running = evaluateMergeable({ mr: degradedMr({ head_pipeline: { status: 'running' } }), round: round(), decisions: {} })
+  assert.equal(running.mergeable, false)
+  assert.deepEqual(running.missing, ['流水线未通过（running）'])
+
+  const success = evaluateMergeable({ mr: degradedMr({ head_pipeline: { status: 'success' } }), round: round(), decisions: {} })
+  assert.equal(success.mergeable, true)
+  assert.deepEqual(success.missing, [])
+  assert.equal(success.degraded, true)
+
+  // 没有挂 CI 是文档里的合法路径：字段缺失 / null 都不能拦。
+  assert.equal(evaluateMergeable({ mr: degradedMr(), round: round(), decisions: {} }).mergeable, true)
+  assert.equal(evaluateMergeable({ mr: degradedMr({ head_pipeline: null }), round: round(), decisions: {} }).mergeable, true)
+})

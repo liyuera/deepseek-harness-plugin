@@ -15,7 +15,7 @@ export function createCommand({ service, watcher = undefined }) {
           return { kind: 'success', text: report }
         }
         if (input === 'resume') {
-          service.resume({ sessionId })
+          await service.resume({ sessionId })
           // 命令不产生 user/message 事件，必须显式把 watcher 拉起来，否则「已恢复」只是句空话。
           watcher?.start(sessionId)
           const { report } = await service.status({ sessionId })

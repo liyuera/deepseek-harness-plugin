@@ -19,9 +19,18 @@ export const inject = ['tools', 'commands']
 export function apply(ctx, rawConfig = {}) {
   const config = resolveConfig(rawConfig)
   const ledger = createLedger({ dir: config.ledgerDir, keepRounds: config.ledgerKeepRounds })
+  // token 文件权限告警每个插件实例只记一次日志；告警文本只有路径，永远不含 token。
+  let tokenWarningLogged = false
   const gitlab = createGitlabClient({
     baseUrl: config.baseUrl,
-    tokenProvider: async () => (await readToken({ tokenFile: config.tokenFile })).token,
+    tokenProvider: async () => {
+      const { token, warning } = await readToken({ tokenFile: config.tokenFile })
+      if (warning !== undefined && tokenWarningLogged === false) {
+        tokenWarningLogged = true
+        ctx.logger?.warn?.('[mr-loop] ' + warning)
+      }
+      return token
+    },
     timeoutMs: config.requestTimeoutMs,
   })
   // 绑定成功时启动 watcher；service 先于 watcher 创建，所以用 ref 延后到实际调用时再取。
@@ -45,6 +54,7 @@ export function apply(ctx, rawConfig = {}) {
         cfg: config,
         gitlab,
         service,
+        logger: ctx.logger,
         // 唤醒 = 往会话里塞一条插件来源的消息；会话已关闭时 agent 取不到，必须静默。
         notify: ({ sessionId, text }) => {
           let agent
