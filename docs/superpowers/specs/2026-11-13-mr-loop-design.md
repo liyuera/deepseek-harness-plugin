@@ -283,7 +283,7 @@ Finding = { fid, file, level, gateCategory, location, problem, suggestion, rever
 
 统一返回 `{ ok: boolean, code?: string, message: string, data?: object }`；`message` 为静态中文，不含 token、URL、上游原文。
 
-错误码（稳定，调用方按 `code` 分支）：`no-token`、`unauthorized`、`forbidden`、`not-found`、`rate-limited`、`network`、`timeout`、`bad-response`、`invalid-url`、`mr-not-open`、`repo-mismatch`、`not-bound`、`bound-elsewhere`、`stale-round`、`approval-required`、`draft-changed`、`invalid-waiver`。`branch-mismatch` 只出现在 `warnings[].code`，不中断绑定。
+错误码（稳定，调用方按 `code` 分支）：`no-token`、`unauthorized`、`forbidden`、`not-found`、`rate-limited`、`network`、`timeout`、`bad-response`、`invalid-url`、`mr-not-open`、`repo-mismatch`、`not-bound`、`bound-elsewhere`、`storage-failed`、`stale-round`、`approval-required`、`draft-changed`、`invalid-waiver`。`branch-mismatch` 只出现在 `warnings[].code`，不中断绑定。
 
 ### 6.4 报告模板（固定，每轮同一形状）
 
