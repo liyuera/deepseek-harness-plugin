@@ -55,12 +55,19 @@ test('人话里提到评审标题不算评审', () => {
   assert.equal(round.dropped.some((item) => item.noteId === 30 && item.detail === 'title-mismatch'), true)
 })
 
-test('没有基线时不做弱绑定', () => {
+test('没有基线时不做弱绑定，旧门禁也不算本轮', () => {
   const mr = { sha: SHA }
-  const round = buildRound({ mr, notes: [note()], cfg, observedAt: undefined })
+  const oldGate = note({
+    id: 5,
+    created_at: '2020-01-01T00:00:00Z',
+    body: 'Sensitive Content Gate\n\n结论: 门禁通过\n\n扫描结果：共 15 条命中；历史豁免 15 条；当前有效 0 条。',
+  })
+  const round = buildRound({ mr, notes: [note(), oldGate], cfg, observedAt: undefined })
   assert.equal(round.baselineAt, null)
   assert.equal(round.review, null)
-  assert.equal(round.dropped[0].detail, 'no-baseline')
+  assert.equal(round.sensitive, null)
+  assert.equal(round.dropped.some((item) => item.noteId === 5 && item.reason === 'stale'), true)
+  assert.equal(round.dropped.some((item) => item.detail === 'no-baseline'), true)
 })
 
 test('人引用门禁文本不算门禁 note', () => {

@@ -99,7 +99,8 @@ export function buildRound({ mr, notes, cfg, observedAt }) {
     }
 
     const createdAt = Date.parse(note.created_at ?? '')
-    const fresh = Number.isFinite(createdAt) && createdAt >= baselineAt
+    // 基线为 null 时不能把任意旧门禁判成本轮结论（`createdAt >= null` 会被强转成 >= 0）。
+    const fresh = Number.isFinite(baselineAt) && Number.isFinite(createdAt) && createdAt >= baselineAt
 
     if (isSensitiveNote(body, cfg)) {
       if (!fresh) {
