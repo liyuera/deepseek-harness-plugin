@@ -42,3 +42,14 @@ test('弱绑定 + 降级 + 未处置阻塞 + 暂停', () => {
   assert.match(text, /暂停 {3}stalled/)
   assert.match(text, /合并 {3}⛔ 差 1 项/)
 })
+
+test('阻塞行与可合并判定共用处置口径：中间态不算已处置', () => {
+  const text = renderReport({
+    binding, mr, round: { ...round, review: { verdict: 'changes', blocking: [{ fid: 'aa', level: '高' }], nonBlocking: [], historicalUnresolved: 0, verifiedFixed: 0, jobDuration: '48s' } },
+    decisions: { aa: { kind: 'pending' } },
+    mergeability: { mergeable: false, missing: ['有 1 条阻塞问题未处置'], degraded: false },
+    paused: null, now: Date.parse('2026-11-13T10:00:30Z'),
+  })
+  assert.match(text, /^阻塞 {3}#aa · 高$/m)
+  assert.doesNotMatch(text, /^阻塞 {3}无$/m)
+})

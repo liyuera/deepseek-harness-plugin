@@ -1,7 +1,10 @@
 /**
  * 报告渲染：纯函数、固定形状。每轮长得一样，才好扫。
  * 只陈述事实（含 unknown 与取证片段），不写「请修复」这类指令——修不修由主代理判断。
+ * 「阻塞」与「可合并」共用 mergeable.js 的处置口径，避免两处说法不一致。
  */
+import { isDisposed } from './mergeable.js'
+
 const OK = '✅'
 const BAD = '⛔'
 const PENDING = '⏳'
@@ -59,7 +62,7 @@ export function renderReport({ binding, mr, round, decisions = {}, mergeability,
   lines.push(`${pad('必过')}${mandatoryLine}`)
 
   const blocking = Array.isArray(review?.blocking) ? review.blocking : []
-  const openItems = blocking.filter((item) => decisions[item.fid] === undefined)
+  const openItems = blocking.filter((item) => isDisposed(decisions[item.fid]) === false)
   lines.push(`${pad('阻塞')}${openItems.length === 0 ? '无' : openItems.map((item) => `#${item.fid} · ${item.level ?? '?'}`).join('；')}`)
 
   const pendingWaives = Object.values(decisions).filter((decision) => decision?.kind === 'waive' && decision?.noteId === undefined)

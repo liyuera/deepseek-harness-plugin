@@ -2,9 +2,14 @@
  * 可合并判定（设计 §5.6）。全部满足才算；缺哪项用中文写进 missing，报告直接展示。
  * 反模式：只盯 AI 评审。三套门禁 + GitLab 自己的详细合并态一起看，unknown 不当 pass。
  * 必过项是建议性的：只在有本轮结论时计入（它通常只在 MR 早期出现一次）。
- * 阻塞项处置只认终态：fix / pending / 未知 kind 都不算，避免账本中间态把判定放过去。
  */
-const DISPOSED_KINDS = new Set(['waive', 'skip', 'wontfix'])
+/** 只有这三种处置算「对外终结」；fix/pending/空壳对象都不算（fail-closed）。 */
+export const DISPOSED_KINDS = new Set(['waive', 'skip', 'wontfix'])
+
+/** 报告与判定共用同一口径，避免「报告说无阻塞、判定说不能合」。 */
+export function isDisposed(decision) {
+  return typeof decision?.kind === 'string' && DISPOSED_KINDS.has(decision.kind)
+}
 
 export function evaluateMergeable({ mr, round, decisions = {} }) {
   const missing = []
@@ -20,10 +25,8 @@ export function evaluateMergeable({ mr, round, decisions = {} }) {
   if (verdict !== 'pass') missing.push(verdict === 'changes' ? 'AI 评审结论为需要修改' : 'AI 评审结论未知（未出或解析失败）')
 
   const blocking = Array.isArray(round?.review?.blocking) ? round.review.blocking : []
-  const unresolved = blocking.filter((item) => {
-    const kind = decisions?.[item?.fid]?.kind
-    return typeof kind !== 'string' || DISPOSED_KINDS.has(kind) === false
-  })
+  // 只有这三种处置才算「对外终结」；fix/pending/空壳对象都不能顶掉阻塞项（fail-closed）。
+  const unresolved = blocking.filter((item) => isDisposed(decisions?.[item?.fid]) === false)
   if (unresolved.length > 0) missing.push(`有 ${unresolved.length} 条阻塞问题未处置`)
 
   const sensitive = round?.sensitive?.verdict ?? 'unknown'
