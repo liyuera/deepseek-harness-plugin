@@ -21,6 +21,19 @@ const text = (value) => [{ type: 'text', text: typeof value === 'string' ? value
 const errorOf = (error) => (typeof error?.code === 'string' ? error.code : 'internal')
 
 /**
+ * 普通注册定义不走宿主的参数预校验（见 wx-mp-tools 的相同说明），
+ * 所以 `additionalProperties: false` 要在这里落成真实拒绝，而不是只写在 schema 上。
+ */
+const unknownArgument = (parameters, args) => {
+  if (args === null || typeof args !== 'object' || Array.isArray(args)) return null
+  const allowed = new Set(Object.keys(parameters?.properties ?? {}))
+  for (const key of Object.keys(args)) {
+    if (!allowed.has(key)) return key
+  }
+  return null
+}
+
+/**
  * @param {{ service: object }} deps
  */
 export function createTools({ service }) {
@@ -33,13 +46,15 @@ export function createTools({ service }) {
     }, ['url']),
     output: { schema: {}, render: (_args, value) => text(value) },
     async execute(args, exec) {
+      const unknown = unknownArgument(bind.parameters, args)
+      if (unknown !== null) return fail('invalid-arguments', `未知参数：${unknown}`)
       const url = typeof args?.url === 'string' ? args.url.trim() : ''
       if (url === '') return fail('invalid-arguments', 'url 必填')
       try {
         const result = await service.bind({
           sessionId: exec?.agent?.session?.id,
           url,
-          repoRoot: typeof args?.repo === 'string' ? args.repo : exec?.agent?.session?.header?.cwd,
+          repoRoot: typeof args?.repo === 'string' && args.repo.trim() !== '' ? args.repo : exec?.agent?.session?.header?.cwd,
         })
         const warningText = (result.warnings ?? []).map((item) => `⚠️ ${item.message}`).join('\n')
         return ok(warningText === '' ? result.report : `${result.report}\n\n${warningText}`, { report: result.report, warnings: result.warnings ?? [] })
@@ -55,6 +70,8 @@ export function createTools({ service }) {
     parameters: objectSchema({}),
     output: { schema: {}, render: (_args, value) => text(value) },
     async execute(_args, exec) {
+      const unknown = unknownArgument(status.parameters, _args)
+      if (unknown !== null) return fail('invalid-arguments', `未知参数：${unknown}`)
       try {
         const result = await service.status({ sessionId: exec?.agent?.session?.id })
         const state = result.state
@@ -84,8 +101,12 @@ export function createTools({ service }) {
     parameters: objectSchema({
       history: { type: 'boolean', description: '可选：附带账本里的历史轮次摘要（默认 false）' },
     }),
-    output: { schema: {}, render: (_args, value) => text(value) },
+    // 工具描述承诺「每条 FID 的文件/级别/位置/问题/建议」，模型看到的就是 render 的文本，
+    // 所以这里必须把 data 渲染出来，而不是只回一句摘要。
+    output: { schema: {}, render: (_args, value) => text(JSON.stringify(value?.data ?? value, null, 2)) },
     async execute(args, exec) {
+      const unknown = unknownArgument(review.parameters, args)
+      if (unknown !== null) return fail('invalid-arguments', `未知参数：${unknown}`)
       try {
         const sessionId = exec?.agent?.session?.id
         const { round, decisions } = service.review({ sessionId })

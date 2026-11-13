@@ -41,6 +41,21 @@ test('参数校验：url 必填、未知字段拒绝', async () => {
   const bad = await def.execute({ url: '' }, exec)
   assert.equal(bad.ok, false)
   assert.equal(bad.code, 'invalid-arguments')
+  // schema 声明不等于运行时拒绝：普通注册定义不走宿主预校验，这里断言真的拒绝。
+  const extra = await def.execute({ url: 'https://git.x.com/g/p/-/merge_requests/1', bogus: true }, exec)
+  assert.equal(extra.ok, false)
+  assert.equal(extra.code, 'invalid-arguments')
+  assert.match(extra.message, /bogus/)
+})
+
+test('mr_bind 的 repo 空白串回落会话 cwd，非空才用显式目录', async () => {
+  const tools = createTools({ service: fakeService() })
+  const blank = await byName(tools, 'mr_bind').execute({ url: 'https://git.x.com/g/p/-/merge_requests/1', repo: '   ' }, exec)
+  assert.equal(blank.ok, true)
+  assert.match(blank.message, /merge_requests\/1 \/repo$/)
+  const custom = await byName(tools, 'mr_bind').execute({ url: 'https://git.x.com/g/p/-/merge_requests/1', repo: '/custom' }, exec)
+  assert.equal(custom.ok, true)
+  assert.match(custom.message, /merge_requests\/1 \/custom$/)
 })
 
 test('mr_status / mr_review 形状', async () => {
@@ -50,7 +65,12 @@ test('mr_status / mr_review 形状', async () => {
   assert.match(status.message, /STATUS s1/)
   assert.equal(status.data.headSha, 'abc')
   assert.equal(status.data.gates.review, null)
-  const review = await byName(tools, 'mr_review').execute({}, exec)
+  const reviewDef = byName(tools, 'mr_review')
+  const review = await reviewDef.execute({}, exec)
   assert.equal(review.ok, true)
   assert.equal(review.data.round.n, 2)
+  // 模型看到的只有 render 文本：data 必须真的进到文本里，不能只剩一句摘要。
+  const rendered = reviewDef.output.render({}, review).map((part) => part.text).join('')
+  assert.match(rendered, /"n": 2/)
+  assert.match(rendered, /"decisions": \{\}/)
 })

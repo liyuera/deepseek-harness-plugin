@@ -24,8 +24,17 @@ export function apply(ctx, rawConfig = {}) {
     timeoutMs: config.requestTimeoutMs,
   })
   const service = createService({ config, ledger, gitlab })
+  // 先挂释放钩子：后面任何一步注册失败，service 都不会留下绑定。
+  ctx.effect(() => () => service.dispose(), 'mr-loop: dispose bindings')
 
-  for (const definition of createTools({ service })) ctx.tools.register(definition)
+  // 工具重名会让 register 抛错并中断 apply：逐个兜住，坏一个不影响其余接线。
+  for (const definition of createTools({ service })) {
+    try {
+      ctx.tools.register(definition)
+    } catch (error) {
+      ctx.logger?.warn?.(`[mr-loop] 工具 ${definition?.name} 注册失败（可能重名）：${error.message}`)
+    }
+  }
 
   try {
     ctx.commands.register(createCommand({ service }))
@@ -34,6 +43,5 @@ export function apply(ctx, rawConfig = {}) {
   }
 
   registerMrLoopSkill(ctx)
-  ctx.effect(() => () => service.dispose(), 'mr-loop: dispose bindings')
   ctx.logger?.info?.(`[mr-loop] loaded baseUrl=${config.baseUrl}`)
 }

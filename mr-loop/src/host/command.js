@@ -1,11 +1,11 @@
-/** `/mr <url> | status | stop`：命令入口与工具共用同一个 service。 */
-const USAGE = '用法：/mr <MR 链接> | /mr status | /mr stop'
+/** `/mr <url> | status | resume | stop [--forget]`：命令入口与工具共用同一个 service。 */
+const USAGE = '用法：/mr <MR 链接> | /mr status | /mr resume | /mr stop [--forget]'
 
 export function createCommand({ service }) {
   return {
     name: 'mr',
     description: '绑定一个 GitLab MR 并跟踪它的评审门禁闭环',
-    input: { hint: '<MR 链接> | status | stop' },
+    input: { hint: '<MR 链接> | status | resume | stop [--forget]' },
     async handler({ agent, rawInput }) {
       const input = String(rawInput ?? '').trim()
       const sessionId = agent?.session?.id
