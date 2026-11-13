@@ -35,6 +35,21 @@ export function createWatcher({ cfg, gitlab, service, notify, logger = undefined
   const lastWakeKey = new Map()
   /** sessionId → 被 30s 节流压住、等待下一个 tick 补发的唤醒（`{ text, key }`）。 */
   const pendingWake = new Map()
+  /**
+   * sessionId → 单轮计时：当前 sha、从何时开始等这条 sha 的评审、评审首次出现的时刻，
+   * 以及 timeout / gateSettle 的一次性唤醒标记（同一个 sha 只提醒一次）。
+   */
+  const roundClocks = new Map()
+
+  /** 取当前 sha 的计时记录；sha 变了就重开一轮（awaitingSince 从「观测到新 sha」起算）。 */
+  function roundClock(sessionId, round) {
+    const sha = String(round?.sha ?? '')
+    const existing = roundClocks.get(sessionId)
+    if (existing !== undefined && existing.sha === sha) return existing
+    const fresh = { sha, awaitingSince: now(), reviewSettledAt: null, timeoutWoken: false, gateSettleWoken: false }
+    roundClocks.set(sessionId, fresh)
+    return fresh
+  }
 
   function clear(sessionId) {
     const timer = timers.get(sessionId)
@@ -215,9 +230,48 @@ export function createWatcher({ cfg, gitlab, service, notify, logger = undefined
     // 两个条件同时为真时只走上面那条，wake key 已含三套 verdict，不会双唤醒。
     else if (result.gatesChanged === true) wake(sessionId, service.report(next), wakeKey(next.round))
 
-    const delay = !terminal(pipelineStatus)
-      ? (pipelineStatus === null ? cfg.pollNoPipelineMs : cfg.pollAwaitingMs)
-      : cfg.pollSettleMs
+    // 单轮计时：新 sha 观测到就重开；评审首次出现记 reviewSettledAt。
+    const tickAt = now()
+    const clock = roundClock(sessionId, next.round)
+    const reviewPresent = next.round?.review !== null && next.round?.review !== undefined
+    if (reviewPresent) {
+      if (clock.reviewSettledAt === null) clock.reviewSettledAt = tickAt
+    } else {
+      // 评审从本轮消失（例如 note 被删除后重解析）：重新按「未出」计时。
+      clock.reviewSettledAt = null
+      clock.gateSettleWoken = false
+    }
+    const gatesMissing = next.round?.sensitive == null || next.round?.mandatory == null
+
+    // 设计 §5.7：单轮兜底超时只唤醒一次；不停表，下一 tick 继续等。
+    // key 带上 roundTimeout:<sha>，同一 sha 的重复 tick 不会重复提醒。
+    if (reviewPresent === false && clock.timeoutWoken === false && tickAt - clock.awaitingSince >= cfg.roundTimeoutMs) {
+      const shortSha = String(next.round?.sha ?? '').slice(0, 8)
+      const minutes = Math.max(1, Math.round((tickAt - clock.awaitingSince) / 60000))
+      wake(
+        sessionId,
+        `评审超时：sha ${shortSha} 已等待 ${minutes} 分钟仍未出结论。流水线 ${pipelineStatus ?? '无'}。`,
+        `roundTimeout:${clock.sha}`,
+      )
+      clock.timeoutWoken = true
+    }
+
+    // 设计 §5.4：评审已到、敏感/必过仍未出时，等满 gateSettleMs 只提醒一次；
+    // key 与评审唤醒分开，避免被 30s 节流吞掉。
+    if (reviewPresent && clock.gateSettleWoken === false && gatesMissing && tickAt - clock.reviewSettledAt >= cfg.gateSettleMs) {
+      const minutes = Math.max(1, Math.round((tickAt - clock.reviewSettledAt) / 60000))
+      wake(sessionId, `门禁未出：${minutes} 分钟仍无结论（敏感/必过）。`, `gateSettle:${clock.sha}`)
+      clock.gateSettleWoken = true
+    }
+
+    // 轮次静默后按 pollWatchingMs 等新 sha（设计 §6.5）；流水线/评审还在跑仍用等待间隔，
+    // 门禁 settle 窗口内用 pollSettleMs。没有流水线时保持 pollNoPipelineMs。
+    const gateSettlePending = reviewPresent && clock.gateSettleWoken === false && gatesMissing
+    let delay
+    if (pipelineStatus === null) delay = cfg.pollNoPipelineMs
+    else if (terminal(pipelineStatus) === false || reviewPresent === false) delay = cfg.pollAwaitingMs
+    else if (gateSettlePending) delay = cfg.pollSettleMs
+    else delay = cfg.pollWatchingMs
     schedule(sessionId, delay)
   }
 
@@ -229,12 +283,16 @@ export function createWatcher({ cfg, gitlab, service, notify, logger = undefined
       const state = service.getState(sessionId)
       if (state === null || state === undefined) { clear(sessionId); return }
       if (state.paused !== null && state.paused !== undefined) { clear(sessionId); return }
+      // 绑定即有评审时，从「开始盯」起算门禁 settle 窗口；同 sha 重启保留原计时。
+      const clock = roundClock(sessionId, state.round)
+      if (state.round?.review != null && clock.reviewSettledAt === null) clock.reviewSettledAt = now()
       schedule(sessionId, cfg.pollAwaitingMs)
     },
     stop(sessionId) {
       // 显式停表（/mr stop、会话销毁、插件卸载）时丢弃未补发的报告：
       // 绑定可能已经解绑/换 MR，旧报告的上下文不再成立。
       pendingWake.delete(sessionId)
+      roundClocks.delete(sessionId)
       clear(sessionId)
     },
     stopAll() { for (const sessionId of [...timers.keys()]) clear(sessionId) },

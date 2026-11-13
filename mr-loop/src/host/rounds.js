@@ -85,18 +85,21 @@ export function buildRound({ mr, notes, cfg, observedAt }) {
   const reviewHits = []
   const sensitiveHits = []
   const mandatoryHits = []
+  // 评审标记来自配置 reviewMarker：与 reviewTitlePrefix / sensitiveTitle 一样是
+  // 「评审机器人格式变了」时的可配置出口（设计 §12）。
+  const reviewOptions = { marker: cfg?.reviewMarker }
 
   for (const note of notes ?? []) {
     if (!note || note.system === true) continue
     const body = String(note.body ?? '')
 
-    if (isReviewBody(body)) {
+    if (isReviewBody(body, reviewOptions)) {
       const verdict = classifyReviewNote({ note, sha, baselineAt, cfg })
       if (verdict.stale) {
         dropped.push({ noteId: note.id, reason: 'stale', detail: verdict.reason })
         continue
       }
-      reviewHits.push({ note, binding: verdict.binding, parsed: parseReview(body) })
+      reviewHits.push({ note, binding: verdict.binding, parsed: parseReview(body, reviewOptions) })
       continue
     }
 

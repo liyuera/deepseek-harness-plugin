@@ -9,8 +9,9 @@
  * `{ file, fid, level, gateCategory, location, problem, suggestion, reverifyCount }`.
  *
  * Rules (see docs/superpowers/spikes/2026-11-06-p0-findings.md, Spike C):
- *   1. A note is a review only when its own top-level lines contain both
- *      `AI Code Review` and `结论:` (see `isReviewBody()`).
+ *   1. A note is a review only when its own top-level lines contain both the
+ *      review marker (default `AI Code Review`, overridable via `reviewMarker`)
+ *      and `结论:` (see `isReviewBody()`).
  *   2. Everything from `备注：以下隐藏数据仅用于统计` on is dropped before parsing;
  *      the JSON inside that hidden block never reaches the returned issues.
  *   3. `结论: 可直接合并` -> pass, `结论: 需要修改` -> changes.
@@ -34,6 +35,11 @@
  * harness when executed.
  */
 const AI_MARKER = 'AI Code Review';
+/** 配置项 reviewMarker 可改标记；空值/缺失回落到默认标记，避免 `includes('')` 恒真。 */
+const markerOf = (options) => {
+  const marker = options?.marker;
+  return typeof marker === 'string' && marker.trim() !== '' ? marker : AI_MARKER;
+};
 const HIDDEN_MARKER_RE = /备注\s*[:：]\s*以下隐藏数据仅用于统计/;
 const SECTION_RE = /^[ \t]*(?:#{2,4}[ \t]+)?(?:\*\*)?(需要关注的问题|历史未收敛问题)(?:\*\*)?[ \t]*(?:[（(].*[)）])?[ \t]*$/;
 const HEADING_RE = /^[ \t]*#{1,6}[ \t]+\S/;
@@ -276,32 +282,35 @@ function hasExplicitZeroIssues(own) {
  * `VERDICT_RE` is start-of-line anchored, so an inline "之前的结论: ..." in a
  * human reply is not a review (there is no inline-verdict fallback).
  */
-function hasReviewGate(own) {
-  return own.includes(AI_MARKER) && VERDICT_RE.test(own);
+function hasReviewGate(own, marker) {
+  return own.includes(marker) && VERDICT_RE.test(own);
 }
 
 /**
  * True when `body` is (structurally) an AI review note: a non-empty body whose
- * OWN top-level lines carry both the `AI Code Review` marker and a `结论:` line.
+ * OWN top-level lines carry both the review marker (default `AI Code Review`,
+ * configurable via `reviewMarker`) and a `结论:` line.
  * This is the exact same gate `parseReview()` applies before it looks at the
  * verdict, exported so consumers (the review service's note filter) never
  * re-implement it with a raw substring search: a human reply that quotes or
  * pastes a review inside a blockquote/fence/indented block is not a review.
  *
  * @param {unknown} body raw GitLab note body
+ * @param {{ marker?: string }} [options] `marker` 来自配置 reviewMarker
  * @returns {boolean}
  */
-export function isReviewBody(body) {
+export function isReviewBody(body, options = {}) {
   if (typeof body !== 'string' || !body.length) return false;
-  return hasReviewGate(ownLines(visibleBody(body)));
+  return hasReviewGate(ownLines(visibleBody(body)), markerOf(options));
 }
 
 /**
  * Parse one GitLab note body.
  * @param {string} body raw `body` field from the GitLab notes API (Markdown)
+ * @param {{ marker?: string }} [options] `marker` 来自配置 reviewMarker
  * @returns {{ verdict: 'pass'|'changes'|'unknown', blocking: object[], nonBlocking: object[] }}
  */
-export function parseReview(body) {
+export function parseReview(body, options = {}) {
   if (typeof body !== 'string' || !body.length) return unknownResult();
 
   const visible = visibleBody(body);
@@ -310,7 +319,7 @@ export function parseReview(body) {
   // zero-issue declaration and issue sections only count on the note's own top-level
   // lines (see ownLines and isReviewBody).
   const own = ownLines(visible);
-  if (!hasReviewGate(own)) return unknownResult();
+  if (!hasReviewGate(own, markerOf(options))) return unknownResult();
 
   const verdict = extractVerdict(own);
   if (verdict === 'unknown') return unknownResult();

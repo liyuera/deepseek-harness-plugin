@@ -42,3 +42,13 @@ test('坏输出一律 unknown，不猜', () => {
   assert.equal(parseReview('AI Code Review\n结论: 新格式结论').verdict, 'unknown')
   assert.equal(isReviewBody('AI Code Review\n\n结论: 可直接合并'), true)
 })
+
+test('reviewMarker 可配置：标记改名后可解析，默认标记下仍是 unknown', () => {
+  const body = 'AI Review\n\n结论: 可直接合并\n\n历史未收敛: 0 条'
+  assert.equal(parseReview(body, { marker: 'AI Review' }).verdict, 'pass')
+  assert.equal(isReviewBody(body, { marker: 'AI Review' }), true)
+  assert.equal(parseReview(body).verdict, 'unknown')
+  assert.equal(isReviewBody(body), false)
+  // 空 marker 不能 fail-open 成「任意结论行都是评审」。
+  assert.equal(isReviewBody('结论: 可直接合并', { marker: '' }), false)
+})

@@ -131,3 +131,19 @@ test('buildRound：最新一条评审 + 三套门禁 + stale 入 dropped', () =>
   assert.equal(round.dropped[0].reason, 'stale')
   assert.equal(round.binding, 'weak')
 })
+
+test('reviewMarker 贯通 buildRound：自定义标记的 note 才解析出结论', () => {
+  const mr = { sha: SHA, head_pipeline: { created_at: '2026-11-13T09:59:00Z' } }
+  // 强绑定（带 sha 注释），把 reviewMarker 的影响与标题前缀解耦。
+  const body = `## AI Review (feat-x -> feature-y)\n\n结论: **可直接合并**\n\n历史未收敛: \`0\` 条\n\n<!-- AI_REVIEW_SHA ${SHA} -->`
+  const custom = note({ id: 51, body, created_at: '2026-11-13T10:02:00Z' })
+  const observedAt = Date.parse('2026-11-13T10:10:00Z')
+
+  const withMarker = buildRound({ mr, notes: [custom], cfg: resolveConfig({ reviewMarker: 'AI Review' }), observedAt })
+  assert.equal(withMarker.binding, 'strong')
+  assert.equal(withMarker.review.verdict, 'pass')
+
+  // 默认标记下这条 note 根本不是评审，无法解析出结论。
+  const withDefault = buildRound({ mr, notes: [custom], cfg, observedAt })
+  assert.equal(withDefault.review, null)
+})

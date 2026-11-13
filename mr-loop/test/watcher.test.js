@@ -39,7 +39,7 @@ function harness({ mr = mrOf(), notes = [], stateOver = {}, snapshot, report = (
     report: () => report(state),
     // 只为测试用的最小快照语义：拉过 notes 才算「有新评审」，否则保持原样。
     applySnapshot: ({ mr: nextMr, notes: fetched }) => {
-      if (snapshot !== undefined) return snapshot({ mr: nextMr, notes: fetched, getState: () => state, setState })
+      if (snapshot !== undefined) return snapshot({ mr: nextMr, notes: fetched, getState: () => state, getNow: () => current, setState })
       const hadReview = state.round.review !== null && state.round.review !== undefined
       const next = setState({
         mr: nextMr,
@@ -66,7 +66,7 @@ function harness({ mr = mrOf(), notes = [], stateOver = {}, snapshot, report = (
     setTimer: (fn, ms) => { const id = ++timerSeq; timers.push({ id, fn, ms }); return id },
     clearTimer: (id) => { cleared.push(id) },
   })
-  return { watcher, service, notified, calls, timers, cleared, setState, advance, getState: () => state }
+  return { watcher, service, notified, calls, timers, cleared, setState, advance, getState: () => state, getNow: () => current }
 }
 
 test('每 tick 只发 1 个请求；有评审变化才拉 notes 并唤醒', async () => {
@@ -343,4 +343,148 @@ test('applySnapshot 失败 → 记一行日志并停表', async () => {
   assert.equal(h.timers.length, 0)
   assert.equal(warnings.length, 1)
   assert.match(warnings[0], /\[mr-loop\] 应用快照失败/)
+})
+
+// ---------------------------------------------------------------------------
+// 配置项真正生效：roundTimeoutMs / gateSettleMs / pollWatchingMs
+// ---------------------------------------------------------------------------
+
+const OTHER = 'b'.repeat(40)
+/** 不做任何状态推进的快照：只把 MR 副本写回，评审保持原样。 */
+const pinnedSnapshot = ({ mr: nextMr, setState }) => ({
+  state: setState({ mr: nextMr }),
+  newRound: false,
+  reviewArrived: false,
+  gatesChanged: false,
+  becameMergeable: false,
+})
+
+test('roundTimeoutMs：阈值到点只唤醒一次「评审超时」，之后不重复', async () => {
+  const h = harness({ notes: [], snapshot: pinnedSnapshot })
+
+  await h.watcher.tick('s')
+  assert.equal(h.notified.length, 0)
+  assert.equal(h.timers.at(-1).ms, cfg.pollAwaitingMs) // 评审未出：继续按等待间隔
+
+  h.advance(cfg.roundTimeoutMs - 1)
+  await h.watcher.tick('s')
+  assert.equal(h.notified.filter((text) => /评审超时/.test(text)).length, 0)
+
+  h.advance(1)
+  await h.watcher.tick('s')
+  const wakes = h.notified.filter((text) => /评审超时/.test(text))
+  assert.equal(wakes.length, 1)
+  assert.match(wakes[0], /已等待 15 分钟仍未出结论/)
+  assert.equal(h.timers.at(-1).ms, cfg.pollAwaitingMs) // 超时不是终止：仍然排下一次
+
+  h.advance(cfg.pollAwaitingMs)
+  await h.watcher.tick('s')
+  assert.equal(h.notified.filter((text) => /评审超时/.test(text)).length, 1)
+})
+
+test('roundTimeoutMs：观测到新 sha 后重新计时，不继承上一轮的等待时长', async () => {
+  let currentSha = SHA
+  const h = harness({
+    notes: [],
+    gitlabOver: { getMergeRequest: async () => mrOf({ sha: currentSha }) },
+    snapshot: ({ mr: nextMr, getState, getNow, setState }) => {
+      const before = getState().round
+      const newRound = before.sha !== nextMr.sha
+      return {
+        state: setState({
+          mr: nextMr,
+          // 新 sha 是本轮的「进展」：不更新它，30min idle 守卫会先于 timeout 触发。
+          lastProgressAt: newRound ? getNow() : getState().lastProgressAt,
+          round: newRound ? { sha: nextMr.sha, n: 2, observedAt: 1, review: null, sensitive: null, mandatory: null } : before,
+        }),
+        newRound,
+        reviewArrived: false,
+        gatesChanged: false,
+        becameMergeable: false,
+      }
+    },
+  })
+
+  await h.watcher.tick('s') // t=1000 起等 SHA
+  h.advance(cfg.roundTimeoutMs - 1000)
+  currentSha = OTHER
+  await h.watcher.tick('s') // 观测到新 sha：等待计时归零，不能立刻报超时
+  assert.equal(h.notified.filter((text) => /评审超时/.test(text)).length, 0)
+
+  h.advance(cfg.roundTimeoutMs)
+  await h.watcher.tick('s')
+  const wakes = h.notified.filter((text) => /评审超时/.test(text))
+  assert.equal(wakes.length, 1)
+  assert.match(wakes[0], new RegExp(`sha ${OTHER.slice(0, 8)}`))
+})
+
+test('gateSettleMs：评审已到、敏感/必过未出，窗口到点只唤醒一次「门禁未出」', async () => {
+  const h = harness({
+    mr: mrOf({ head_pipeline: { status: 'success', id: 9 } }),
+    stateOver: {
+      pipelineStatus: 'success',
+      round: { sha: SHA, n: 1, observedAt: 1, review: { verdict: 'changes' }, sensitive: null, mandatory: null },
+    },
+    snapshot: pinnedSnapshot,
+  })
+
+  await h.watcher.tick('s')
+  assert.equal(h.notified.length, 0)
+  assert.equal(h.timers.at(-1).ms, cfg.pollSettleMs) // settle 窗口内仍用 pollSettleMs
+
+  h.advance(cfg.gateSettleMs - 1)
+  await h.watcher.tick('s')
+  assert.equal(h.notified.filter((text) => /门禁未出/.test(text)).length, 0)
+
+  h.advance(1)
+  await h.watcher.tick('s')
+  const wakes = h.notified.filter((text) => /门禁未出/.test(text))
+  assert.equal(wakes.length, 1)
+  assert.match(wakes[0], /3 分钟仍无结论（敏感\/必过）/)
+
+  h.advance(cfg.gateSettleMs)
+  await h.watcher.tick('s')
+  assert.equal(h.notified.filter((text) => /门禁未出/.test(text)).length, 1)
+})
+
+test('pollWatchingMs：评审与门禁都已出、不可合 → 用等新 sha 的间隔', async () => {
+  const h = harness({
+    mr: mrOf({ head_pipeline: { status: 'success', id: 9 } }),
+    stateOver: {
+      pipelineStatus: 'success',
+      round: {
+        sha: SHA, n: 1, observedAt: 1,
+        review: { verdict: 'changes' },
+        sensitive: { verdict: 'pass' },
+        mandatory: { verdict: 'pass' },
+      },
+    },
+    snapshot: pinnedSnapshot,
+  })
+
+  await h.watcher.tick('s')
+  assert.equal(h.timers.length, 1)
+  assert.equal(h.timers[0].ms, cfg.pollWatchingMs) // 60s，而不是恒定的 pollSettleMs
+  assert.notEqual(cfg.pollWatchingMs, cfg.pollSettleMs)
+})
+
+test('轮询间隔：评审未出用 pollAwaitingMs，MR 没挂流水线用 pollNoPipelineMs', async () => {
+  const awaiting = harness({ notes: [], snapshot: pinnedSnapshot })
+  await awaiting.watcher.tick('s')
+  assert.equal(awaiting.timers[0].ms, cfg.pollAwaitingMs)
+
+  const noPipeline = harness({
+    mr: mrOf({ head_pipeline: null }),
+    stateOver: {
+      round: {
+        sha: SHA, n: 1, observedAt: 1,
+        review: { verdict: 'pass' },
+        sensitive: { verdict: 'pass' },
+        mandatory: { verdict: 'pass' },
+      },
+    },
+    snapshot: pinnedSnapshot,
+  })
+  await noPipeline.watcher.tick('s')
+  assert.equal(noPipeline.timers[0].ms, cfg.pollNoPipelineMs)
 })
