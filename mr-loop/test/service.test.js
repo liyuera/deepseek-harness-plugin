@@ -343,6 +343,158 @@ test('mr.sha 缺失或空串时不误复用已有轮次', async () => {
   }
 })
 
+test('同 sha 重绑收敛账本尾部连续重复轮次：保留最小 n 与首次观测基线', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mrloop-service-'))
+  const ledger = createLedger({ dir })
+  const firstObservedAt = NOW - 3000
+  await ledger.save({
+    binding: { projectPath: 'g/p', iid: 240 },
+    rounds: [1, 2, 3, 4].map((n, index) => ({ n, sha: SHA, observedAt: firstObservedAt + index * 1000 })),
+    decisions: {},
+  })
+  const service = createService({
+    config: resolveConfig({ baseUrl: 'https://git.x.com' }),
+    ledger,
+    gitlab: harness().gitlab,
+    repoState: harness().repoImpl,
+    now: () => NOW,
+  })
+  await service.bind({ sessionId: 's', url: 'https://git.x.com/g/p/-/merge_requests/240', repoRoot: '/r' })
+  const state = service.getState('s')
+  // 脏账本 [1(S),2(S),3(S),4(S)] 收敛成一条，轮次号取最早那条。
+  assert.equal(state.round.n, 1)
+  assert.equal(state.round.observedAt, firstObservedAt)
+  assert.deepEqual(state.rounds.map((item) => item.n), [1])
+  assert.equal(state.rounds[0].sha, SHA)
+  const saved = await service.ledger.load({ projectPath: 'g/p', iid: 240 })
+  assert.deepEqual(saved.rounds.map((item) => item.n), [1])
+  await rm(dir, { recursive: true, force: true })
+})
+
+test('同 sha 重绑只收敛尾部连续段，前面不同 sha 的轮次原样保留', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mrloop-service-'))
+  const SHA2 = 'b'.repeat(40)
+  const ledger = createLedger({ dir })
+  const firstObservedAt = NOW - 4000
+  await ledger.save({
+    binding: { projectPath: 'g/p', iid: 240 },
+    rounds: [
+      { n: 1, sha: SHA, observedAt: firstObservedAt },
+      { n: 2, sha: SHA2, observedAt: firstObservedAt + 1000 },
+      { n: 3, sha: SHA2, observedAt: firstObservedAt + 2000 },
+    ],
+    decisions: {},
+  })
+  const service = createService({
+    config: resolveConfig({ baseUrl: 'https://git.x.com' }),
+    ledger,
+    gitlab: { ...harness().gitlab, getMergeRequest: async () => mr({ sha: SHA2 }) },
+    repoState: harness().repoImpl,
+    now: () => NOW,
+  })
+  await service.bind({ sessionId: 's', url: 'https://git.x.com/g/p/-/merge_requests/240', repoRoot: '/r' })
+  const state = service.getState('s')
+  assert.equal(state.round.n, 2)
+  assert.equal(state.round.observedAt, firstObservedAt + 1000)
+  assert.deepEqual(state.rounds.map((item) => item.n), [1, 2])
+  assert.deepEqual(state.rounds.map((item) => item.sha), [SHA, SHA2])
+  await rm(dir, { recursive: true, force: true })
+})
+
+test('账本最后一条缺 n 时不复用，走新增路径', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mrloop-service-'))
+  const ledger = createLedger({ dir })
+  await ledger.save({
+    binding: { projectPath: 'g/p', iid: 240 },
+    rounds: [
+      { n: 5, sha: 'c'.repeat(40), observedAt: NOW - 5000 },
+      { sha: SHA, observedAt: NOW - 1000 },
+    ],
+    decisions: {},
+  })
+  const service = createService({
+    config: resolveConfig({ baseUrl: 'https://git.x.com' }),
+    ledger,
+    gitlab: harness().gitlab,
+    repoState: harness().repoImpl,
+    now: () => NOW,
+  })
+  await service.bind({ sessionId: 's', url: 'https://git.x.com/g/p/-/merge_requests/240', repoRoot: '/r' })
+  const state = service.getState('s')
+  // 坏 n 不能复用；新轮次从账本里最大的合法 n + 1 继续，而不是从 1 重新编号。
+  assert.equal(state.round.n, 6)
+  assert.equal(state.rounds.length, 3)
+  assert.equal(state.rounds[0].n, 5)
+  assert.equal(state.rounds[state.rounds.length - 1].n, 6)
+  const saved = await service.ledger.load({ projectPath: 'g/p', iid: 240 })
+  assert.equal(saved.rounds[0].n, 5)
+  assert.equal(saved.rounds[saved.rounds.length - 1].n, 6)
+  await rm(dir, { recursive: true, force: true })
+})
+
+test('同 sha 重绑只覆盖尾部最后一条，不收敛更早的不同 sha 轮次', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mrloop-service-'))
+  const SHA2 = 'b'.repeat(40)
+  const ledger = createLedger({ dir })
+  const firstObservedAt = NOW - 4000
+  await ledger.save({
+    binding: { projectPath: 'g/p', iid: 240 },
+    rounds: [
+      { n: 1, sha: SHA, observedAt: firstObservedAt },
+      { n: 2, sha: SHA2, observedAt: firstObservedAt + 1000 },
+    ],
+    decisions: {},
+  })
+  const service = createService({
+    config: resolveConfig({ baseUrl: 'https://git.x.com' }),
+    ledger,
+    gitlab: { ...harness().gitlab, getMergeRequest: async () => mr({ sha: SHA2 }) },
+    repoState: harness().repoImpl,
+    now: () => NOW,
+  })
+  await service.bind({ sessionId: 's', url: 'https://git.x.com/g/p/-/merge_requests/240', repoRoot: '/r' })
+  const state = service.getState('s')
+  assert.equal(state.round.n, 2)
+  assert.equal(state.round.observedAt, firstObservedAt + 1000)
+  assert.deepEqual(state.rounds.map((item) => item.n), [1, 2])
+  assert.deepEqual(state.rounds.map((item) => item.sha), [SHA, SHA2])
+  await rm(dir, { recursive: true, force: true })
+})
+
+test('同 sha 重绑继承 mergeableAt，新 sha 轮次不继承', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mrloop-service-'))
+  const SHA2 = 'b'.repeat(40)
+  const mergeableAt = '2026-11-13T10:00:00.000Z'
+  const ledger = createLedger({ dir })
+  await ledger.save({
+    binding: { projectPath: 'g/p', iid: 240 },
+    rounds: [{ n: 1, sha: SHA, observedAt: NOW - 1000 }],
+    decisions: {},
+    mergeableAt,
+  })
+  let current = mr()
+  const service = createService({
+    config: resolveConfig({ baseUrl: 'https://git.x.com' }),
+    ledger,
+    gitlab: { ...harness().gitlab, getMergeRequest: async () => current },
+    repoState: harness().repoImpl,
+    now: () => NOW,
+  })
+  const url = 'https://git.x.com/g/p/-/merge_requests/240'
+  await service.bind({ sessionId: 's', url, repoRoot: '/r' })
+  assert.equal(service.getState('s').mergeableAt, mergeableAt)
+  const saved = await service.ledger.load({ projectPath: 'g/p', iid: 240 })
+  assert.equal(saved.mergeableAt, mergeableAt)
+
+  // 新 sha = 新一轮：不继承上一轮的 mergeableAt。
+  current = mr({ sha: SHA2 })
+  await service.bind({ sessionId: 's', url, repoRoot: '/r' })
+  assert.equal(service.getState('s').mergeableAt, undefined)
+  const resaved = await service.ledger.load({ projectPath: 'g/p', iid: 240 })
+  assert.equal(resaved.mergeableAt, null)
+  await rm(dir, { recursive: true, force: true })
+})
+
 test('账本裁剪后轮次号仍单调：取已有最大 n + 1', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'mrloop-service-'))
   const ledger = createLedger({ dir })

@@ -119,16 +119,27 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
     // 新增时用「已有最大轮次 + 1」而不是数组长度：账本裁剪后长度会回退，轮次号不能重复。
     const previousRounds = Array.isArray(previous?.rounds) ? previous.rounds : []
     const lastRound = previousRounds[previousRounds.length - 1]
-    // sha 缺失（undefined / 空串）不能算「同 sha」，否则 undefined === undefined 会误复用。
-    const reuse = typeof mr.sha === 'string' && mr.sha !== '' && lastRound?.sha === mr.sha
+    // sha 缺失（undefined / 空串）不能算「同 sha」，否则 undefined === undefined 会误复用；
+    // n 损坏（缺失 / 非整数）同样不能复用，否则报告会出「第 0 轮」、后续新 sha 又从 1 编号。
+    const reuse = typeof mr.sha === 'string' && mr.sha !== '' && Number.isSafeInteger(lastRound?.n) && lastRound?.sha === mr.sha
     let round
+    let nextRounds
     if (reuse) {
-      // observedAt 是弱绑定的兜底基线：复用轮次时保留首次观测时间，重复绑定不能把基线后推。
-      const baselineObservedAt = Number.isFinite(lastRound?.observedAt) ? lastRound.observedAt : observedAt
-      round = { ...buildRound({ mr, notes, cfg: config, observedAt: baselineObservedAt }), n: lastRound.n }
+      // 旧账本可能在同一 sha 上堆了多条轮次：先把尾部连续同 sha 的段收敛成一条。
+      let segmentStart = previousRounds.length - 1
+      while (segmentStart > 0 && previousRounds[segmentStart - 1]?.sha === mr.sha) segmentStart -= 1
+      const segment = previousRounds.slice(segmentStart)
+      // 保留连续段里 n 最小的一条（最早那条）：它的 observedAt 才是该 sha 的首次观测基线。
+      const anchor = segment.reduce((min, item) => (
+        Number.isSafeInteger(item?.n) && (!Number.isSafeInteger(min?.n) || item.n < min.n) ? item : min
+      ), segment[0])
+      const baselineObservedAt = Number.isFinite(anchor?.observedAt) ? anchor.observedAt : observedAt
+      round = { ...buildRound({ mr, notes, cfg: config, observedAt: baselineObservedAt }), n: anchor.n }
+      nextRounds = [...previousRounds.slice(0, segmentStart), round]
     } else {
       const n = previousRounds.reduce((max, item) => (Number.isSafeInteger(item?.n) && item.n > max ? item.n : max), 0) + 1
       round = { ...buildRound({ mr, notes, cfg: config, observedAt }), n }
+      nextRounds = [...previousRounds, round]
     }
 
     const state = {
@@ -143,7 +154,10 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
       },
       mr,
       round,
-      rounds: (reuse ? [...previousRounds.slice(0, -1), round] : [...previousRounds, round]).slice(-config.ledgerKeepRounds),
+      rounds: nextRounds.slice(-config.ledgerKeepRounds),
+      // mergeableAt 是 §5.5 的记录：同 sha 重绑继承；新轮次不继承上一轮的收尾时间。
+      // 只继承字符串（null 表示尚未可合并），否则会挡住 applySnapshot 后续写入时间戳。
+      mergeableAt: reuse && typeof previous?.mergeableAt === 'string' ? previous.mergeableAt : undefined,
       decisions: previous?.decisions !== null && typeof previous?.decisions === 'object' ? previous.decisions : {},
       mergeability: null,
       paused: null,
