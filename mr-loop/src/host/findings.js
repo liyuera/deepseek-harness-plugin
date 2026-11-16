@@ -131,6 +131,11 @@ export function collectFindings(record) {
     }
   })
 
+  // fixed 的前提是「当前轮评审已经落地」：push 后新 sha 已建轮但评审没出（review: null）
+  // 或解析 unknown 时，FID 消失并不等于修好——不能把上一轮问题误记成 fixed（C1）。
+  const verdict = round?.review?.verdict
+  if (verdict !== 'pass' && verdict !== 'changes') return findings
+
   // 上一轮存在、本轮消失的 FID 记 fixed（已处置的不记：它没有「修好」的含义）。
   for (const item of findingsOf(previous)) {
     const fid = String(item?.fid ?? '')

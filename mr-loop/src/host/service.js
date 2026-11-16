@@ -623,6 +623,19 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
     return serialize(args?.sessionId, () => postWaiverInner(args ?? {}))
   }
 
+  /**
+   * I1：merged / closed 终态落账本。终态是永久的：必须 await persist，UI 与下次启动才能从
+   * 账本看到「已合并」；同时更新内存 state.mr 供 live 看板读取。findings 仍走旁路 record。
+   */
+  async function markTerminal({ sessionId, mr }) {
+    const state = requireState(sessionId)
+    state.mr = mr
+    state.terminal = typeof mr?.state === 'string' && mr.state !== '' ? mr.state : null
+    await persist(state)
+    record(state)
+    return state
+  }
+
   function getState(sessionId) {
     return bindings.get(sessionId) ?? null
   }
@@ -638,5 +651,5 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
     sessionLocks.clear()
   }
 
-  return { bind, status, review, applySnapshot, stop, resume, pause, getState, listStates, dispose, report, ledger, waiverDraft, postWaiver, release }
+  return { bind, status, review, applySnapshot, stop, resume, pause, getState, listStates, dispose, report, ledger, waiverDraft, postWaiver, release, markTerminal }
 }

@@ -43,7 +43,7 @@
 
 - 不改代码、不派修复子代理。修由主代理做（§7）。
 - 不生成 commit message、不建 MR、不合并、不 approve、不 close。插件不执行任何写操作的 git 命令；只允许 `git remote get-url origin` 与 `git rev-parse --abbrev-ref HEAD` 两条只读命令用于绑定校验（§5.1）。
-- 不做 client 半边：没有右栏 tab、没有状态行、没有设置页。
+- 不做完整的 client 半边：只做**最小只读看板**（会话头 chip + 右上角抽屉，`lib/client.js`，见 `2026-11-16-mr-loop-ui-design.md`）；不做右栏 tab、状态行、设置页、写操作按钮。
 - 不支持多个 GitLab 实例并存，只认一个 `baseUrl`。
 - 不做 Jira / Issues 集成，不做跨 MR 聚合看板。
 - 不自动 resolve 与门禁无关的讨论（例如人之间的讨论）。
@@ -65,7 +65,7 @@
 ## 4. 总体架构
 
 ```
-                    ┌──────────── Host 半边（无 client）────────────┐
+                    ┌──────────────── Host 半边 ──────────────────┐
   /mr <url> ───────▶│ command.js   绑定 + 首轮报告 + status/stop    │
   mr_* tools ──────▶│ tools.js     6 个工具（含 mr_waive 写路径）   │
                     ├──────────────────────────────────────────────┤
@@ -81,7 +81,9 @@
                               主代理（改代码 / 推 / 汇报）
 ```
 
-模块依赖单一方向：`command`/`tools` → `service`/`watcher`/`report` → `rounds`/`mergeable`/`parse-*`/`ledger` → `gitlab` → `fetch`。除 `index.js` 外没有模块 import harness 包。
+模块依赖单一方向：`command`/`tools` → `service`/`watcher`/`report` → `rounds`/`mergeable`/`parse-*`/`findings`/`ledger` → `gitlab` → `fetch`。除 `index.js` 外没有模块 import harness 包。
+
+client 半边（`lib/client.js`）只读 `GET /mr-loop/ui/state`：会话头 chip 显示 MR / 待处理数（只统计当前会话），右上角抽屉展示 MR 卡、门禁、问题与指令；**不写任何东西**，样式与 30s 轮询都走 `ctx.effect` 生命周期。
 
 ## 5. 运行时契约
 
@@ -295,6 +297,7 @@ idle ──bind──▶ watching(sha) ──head sha 变化──▶ awaiting(s
   - 单文件超过 `findingsMaxBytes`（默认 5 MiB）滚动成 `<name>.1.jsonl`（只保留一代）。
 - 每行一条（v1）：`{ v:1, at, workspace, projectPath, iid, sha, round, fid, file, line, level, type, gateCategory, problem, suggestion, reverifyCount, status, instruction: {kind, reason, noteId}|null }`；文本字段单行化并截断（problem / suggestion ≤ 500、file ≤ 300），控制字符压掉。
 - `status ∈ open | fixed | waived | skip | wontfix`：复用 `mergeable.js` 的处置口径（MR 评论里的有效 `#ai-*` 指令 + 账本 `decisions` + 与上一轮 FID 对比），`src/host/findings.js` 的 `collectFindings(record)` 同时供 UI 与落盘使用，避免两处漂移。
+  - `fixed` 只在**当前轮评审已落地**（`review` 存在且 `verdict` 为 `pass` / `changes`）时判定；push 后新 sha 评审未出或解析 `unknown` 时不判 fixed（否则 UI 会显示「全部已修 + 待处理 0」的假象）。
 - 只在状态变化时追加：同一 MR 内以 `(fid, status, instruction.kind, instruction.noteId)` 为键去重；进程启动后第一次写某文件前读回已有文件（含滚动的 `.1`）建立键集合，跨重启不重复；坏行 / 超大文件按「尽力而为」处理（坏行跳过）。
 - 触发点：`bind` 成功后、`applySnapshot` 更新后（新轮或同 sha 刷新）、`mr_waive` 回帖写 `decisions` 后；统一走一个 fire-and-forget 的 `record(state)`，写失败只 `log warn`，**绝不打断绑定 / 监视 / 回帖**。
 - 配置：`findingsDir`（默认 `~/.dsh/workspace`）、`findingsMaxBytes`（默认 `5242880`）。
@@ -467,6 +470,7 @@ mr-loop/
   package.json            bundle manifest（dsh.bundle.patch / exports / engines）
   cordis.patch.yml        insert 本插件
   index.js                apply：配置、注册命令/工具/skill、watcher 生命周期（≤200 行）
+  lib/client.js           客户端看板：会话头 chip + 右上角抽屉（只读 /mr-loop/ui/state）
   src/host/config.js      配置解析与校验（≤120）
   src/host/gitlab.js      REST 客户端：5 个方法（4 GET + 1 POST /notes）、错误分类、安全不变量（≤450）
   src/host/parse-review.js 移植 review-parser（≤360）
@@ -502,10 +506,11 @@ mr-loop/
 - `report`：强/弱绑定、unknown 门禁、降级判定各一份快照。
 - `config`：默认与非法值。
 - `tools`：参数校验与错误码。
+- `client`：bundle 契约（模块 id / 两个 slot 座位 / 样式与 30s 轮询走 `ctx.effect` 且可清理 / chip 只统计当前会话）；`ui`：只读聚合（问题状态、终态 merged、live 优先、webUrl 用配置 baseUrl）。
 
 E2E（`test/e2e.test.js`，loopback mock GitLab + 临时 git 仓库）：回放三段真实 note（需要修改 → 推 → 可直接合并），断言插件在第 1 轮唤醒、第 2 轮判定可合并；mock 记录所有写请求，断言没有 `merge`/`approve` 调用。
 
-Live 验收（用户执行）：真 MR 上跑一轮完整闭环，确认报告与 GitLab 网页逐条一致、豁免需用户发言才发送。
+Live 验收（用户执行）：真 MR 上跑一轮完整闭环，确认报告与 GitLab 网页逐条一致、豁免需用户确认「可以 / 自定义」后才发送。
 
 ## 11. 里程碑与验收
 
@@ -544,9 +549,9 @@ S0 不写产品代码；S1 起每期结束跑一次全量单测。
 | 1 | 数据面走 GitLab REST API，不走浏览器 | 网页路线无法证明归属与合并态，选择器脆；API 有 note id、sha、`detailed_merge_status` | 无需 token 的便利；每次都要配一次凭据 |
 | 2 | 复制 `gitlab.js` / `review-parser.js` 进新包 | 仓库约定「每个插件独立安装、互不依赖」；两文件本来零依赖且有单测 | 与 bug-workflow 共享一份代码 |
 | 3 | 修由主代理做，插件不派修复子代理 | 本次会话证明主代理会否定不最优的评审建议（页面级常量 vs 弹窗内部导入）；隔离子代理按建议改，缺少「这条建议本身不对」的动机 | 无人值守时不能自动完成修复 |
-| 4 | 豁免需「草稿 → 用户发言 → 发送」 | 豁免是对外的书面承诺，写多了会盖住真问题 | 全自动闭环的便利 |
+| 4 | 豁免需「草稿 → 用户确认『可以 / 自定义』→ `post:true` 发送」 | 豁免是对外的书面承诺，写多了会盖住真问题 | 全自动闭环的便利 |
 | 5 | 账本用 JSON 文件而非 storageDomain | 免 peer 依赖、可人肉查看；bug-workflow 的 v2 domain 迁移踩过版本兼容坑 | 多进程并发写需要文件锁（v1 只在单进程内串行化，见 §12） |
-| 6 | v1 无 client 半边 | 价值在正确性与唤醒，不在可视化；先跑顺再谈状态行/看板 | 一眼可见的常驻状态 |
+| 6 | v1 先无 client 半边；T4 后补最小只读看板（会话头 chip + 抽屉） | 先跑顺正确性与唤醒再做可视化；看板只读、不参与判定 | 完整右栏 tab / 设置页（仍不做） |
 | 7 | token 放 0600 文件（env 优先） | 无设置页时最省事的方案，且不进对话/日志 | 与 DSH credentials 服务统一管理（v2 迁移） |
 | 8 | 轮次不限，用「无进展」守卫代替轮次上限 | 需求是「跟到可合为止」；轮数多不等于有问题，同一问题反复不清才是 | 极端情况下 CI 被长时间占用（12h 预算 + 暂停兜底） |
 | 9 | 等待只用轮询，webhook 不列入任何一期 | 用户已明确只做轮询；GitLab 也没有 WebSocket / GraphQL 订阅，webhook 还要求服务端能访问本机且至少 Maintainer 权限 | 事件驱动的实时性：评审出结论到唤醒最慢约一个 tick（10s） |

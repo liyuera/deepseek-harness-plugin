@@ -7,6 +7,8 @@ test('默认值与冻结', () => {
   assert.equal(cfg.baseUrl, 'https://git.htwisdom.cn')
   assert.equal(cfg.maxRounds, 0)
   assert.equal(cfg.pollAwaitingMs, 10000)
+  // 用户决策：轮询保持 30s（可合后也不降频），默认值必须钉死。
+  assert.equal(cfg.pollWatchingMs, 30000)
   assert.equal(cfg.ledgerKeepRounds, 50)
   assert.ok(Object.isFrozen(cfg))
 })

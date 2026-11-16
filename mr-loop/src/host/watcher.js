@@ -258,6 +258,12 @@ export function createWatcher({ cfg, gitlab, service, notify, logger = undefined
     if (latest === null || latest === undefined || latest !== state) { clear(sessionId); return }
 
     if (mr.state === 'merged' || mr.state === 'closed') {
+      // I1：终态先落账本（UI 才能看到「已合并」）；落账本失败只 warn，唤醒与停表照旧。
+      try {
+        await service.markTerminal({ sessionId, mr })
+      } catch (error) {
+        logger?.warn?.(`[mr-loop] 终态落账本失败（${mr.state}）：${error?.message ?? error}`)
+      }
       // 终态是永久的：同一个 (state, sha) 只唤醒一次，避免用户下一句话又把 watcher 拉起来重复唤醒。
       // 终态后没有下一个 tick：立即送达。文案只说事实，合并收尾不写评论（决策 §2.4 / 用户决策 5）。
       const iid = state.binding.iid

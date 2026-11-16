@@ -150,6 +150,8 @@ test('service + watcher：评审先到 → 门禁翻面唤醒 → 新 sha 可合
   const saved = await service.ledger.load({ projectPath: 'g/p', iid: 240 })
   assert.equal(saved.rounds.length, 2)
   assert.deepEqual(saved.rounds.map((round) => round.n), [1, 2])
+  // I1：merged 终态必须落账本，UI 才能展示「已合并」。
+  assert.equal(saved.terminal, 'merged')
   await rm(dir, { recursive: true, force: true })
 })
 

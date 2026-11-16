@@ -134,6 +134,26 @@ test('collectFindings：账本 decisions 优先于指令；上一轮消失的 FI
   assert.equal(disposed[0].instruction.reason, '账本原因')
 })
 
+test('collectFindings：当前轮评审未出 / unknown 时不判 fixed；有新评审结论才判', () => {
+  const first = roundOf({ blocking: [finding({ fid: 'AAAA' })] })
+  const makeRound = (review) => ({
+    ...roundOf({ sha: SHA_B, n: 2, blocking: [], verdict: 'pass' }),
+    review,
+  })
+
+  // push 后新 sha 已建轮、评审还没出：不能把上一轮 FID 写成「已修」。
+  assert.deepEqual(collectFindings(stateOf({ rounds: [first, makeRound(null)] })), [])
+  // 评审 note 在但解析 unknown：同样证不了修复。
+  const unknownReview = { ...roundOf({ blocking: [], verdict: 'pass' }).review, verdict: 'unknown', blocking: [], nonBlocking: [] }
+  assert.deepEqual(collectFindings(stateOf({ rounds: [first, makeRound(unknownReview)] })), [])
+  // 完整的新一轮评审（pass，无该 FID）才允许判 fixed。
+  const settled = makeRound(roundOf({ blocking: [], verdict: 'pass' }).review)
+  const fixed = collectFindings(stateOf({ rounds: [first, settled] }))
+  assert.equal(fixed.length, 1)
+  assert.equal(fixed[0].fid, 'AAAA')
+  assert.equal(fixed[0].status, 'fixed')
+})
+
 // ---------------------------------------------------------------------------
 // 存储：路径 / 结构 / append-only / 去重
 // ---------------------------------------------------------------------------
@@ -380,6 +400,8 @@ const blockingReview = (fids) => {
   return `## AI Code Review (feat-x -> feature-y)\n\n结论: **需要修改**\n\n历史未收敛: \`0\` 条\n\n### 需要关注的问题\n${items}\n`
 }
 
+const passReview = (sha) => `## AI Code Review (feat-x -> feature-y)\n\n结论: **可直接合并**\n\n历史未收敛: \`0\` 条\n\n未发现必须修改的代码问题。\n\n<!-- AI_REVIEW_SHA ${sha} -->\n`
+
 const reviewNotes = (fids = ['aaaa000001']) => [
   { id: 11, system: false, created_at: '2026-11-16T10:02:00Z', body: blockingReview(fids) },
 ]
@@ -484,7 +506,7 @@ test('service：applySnapshot 同 sha 指令到达 → 追加 waived；同内容
   await rm(dir, { recursive: true, force: true })
 })
 
-test('service：新 sha 上 FID 消失 → applySnapshot 追加 fixed', async () => {
+test('service：新 sha + 完整新一轮评审（FID 消失）→ applySnapshot 追加 fixed', async () => {
   const dir = await tmp()
   const g = makeGitlab()
   const store = createFindingsStore({ dir: findingsDirOf(dir), now: () => NOW })
@@ -492,8 +514,8 @@ test('service：新 sha 上 FID 消失 → applySnapshot 追加 fixed', async ()
   await service.bind({ sessionId: 's1', url: BIND_URL, repoRoot: REPO_ROOT })
   await store.flush()
 
-  g.setMr({ sha: SHA_B, head_pipeline: { status: 'success', created_at: '2026-11-16T10:20:00Z' }, user_notes_count: 0 })
-  g.setNotes([])
+  g.setMr({ sha: SHA_B, head_pipeline: { status: 'success', created_at: '2026-11-16T10:20:00Z' }, user_notes_count: 1 })
+  g.setNotes([{ id: 21, system: false, created_at: '2026-11-16T10:22:00Z', body: passReview(SHA_B) }])
   service.applySnapshot({ sessionId: 's1', mr: g.getMr(), notes: g.getNotes() })
   await store.flush()
   const lines = await linesOf(expectedFile(findingsDirOf(dir), 'repo-a', 'group/project', 240))
@@ -501,6 +523,25 @@ test('service：新 sha 上 FID 消失 → applySnapshot 追加 fixed', async ()
   assert.equal(lines[1].status, 'fixed')
   assert.equal(lines[1].round, 2)
   assert.equal(lines[1].sha, SHA_B)
+  await service.stop({ sessionId: 's1' })
+  await rm(dir, { recursive: true, force: true })
+})
+
+test('service：新 sha 评审还没出 → 不把上一轮 FID 写成 fixed（C1）', async () => {
+  const dir = await tmp()
+  const g = makeGitlab()
+  const store = createFindingsStore({ dir: findingsDirOf(dir), now: () => NOW })
+  const service = serviceOf({ dir, gitlab: g.gitlab, findings: store })
+  await service.bind({ sessionId: 's1', url: BIND_URL, repoRoot: REPO_ROOT })
+  await store.flush()
+
+  g.setMr({ sha: SHA_B, head_pipeline: { status: 'running', created_at: '2026-11-16T10:20:00Z' }, user_notes_count: 0 })
+  g.setNotes([])
+  service.applySnapshot({ sessionId: 's1', mr: g.getMr(), notes: [] })
+  await store.flush()
+  const lines = await linesOf(expectedFile(findingsDirOf(dir), 'repo-a', 'group/project', 240))
+  assert.equal(lines.length, 1, '评审未出时不能追加任何行（尤其不能是 fixed）')
+  assert.equal(lines[0].status, 'open')
   await service.stop({ sessionId: 's1' })
   await rm(dir, { recursive: true, force: true })
 })

@@ -68,6 +68,7 @@ const multiTick = (patches) => {
  */
 function harness({ mr = mrOf(), notes = [], stateOver = {}, snapshot, report = () => 'REPORT', gitlabOver = {}, clock = 1000, notifyImpl, logger } = {}) {
   const notified = []
+  const terminalCalls = []
   const calls = { mr: 0, notes: 0 }
   const timers = []
   const cleared = []
@@ -101,6 +102,12 @@ function harness({ mr = mrOf(), notes = [], stateOver = {}, snapshot, report = (
       return { state: next, newRound: false, reviewArrived: fetched !== undefined && !hadReview, becameMergeable: false }
     },
     pause: ({ reason }) => setState({ paused: { reason, at: 'now' } }),
+    // 终态落账本的接缝：watcher 必须调用它（失败只 warn），不能只 wake。
+    markTerminal: async ({ mr: nextMr }) => {
+      terminalCalls.push(nextMr)
+      setState({ mr: nextMr, terminal: nextMr.state })
+      return state
+    },
   }
   const gitlab = {
     getMergeRequest: async () => { calls.mr += 1; return mr },
@@ -118,7 +125,7 @@ function harness({ mr = mrOf(), notes = [], stateOver = {}, snapshot, report = (
     setTimer: (fn, ms) => { const id = ++timerSeq; timers.push({ id, fn, ms }); return id },
     clearTimer: (id) => { cleared.push(id) },
   })
-  return { watcher, service, notified, calls, timers, cleared, setState, advance, getState: () => state, getNow: () => current }
+  return { watcher, service, notified, terminalCalls, calls, timers, cleared, setState, advance, getState: () => state, getNow: () => current }
 }
 
 test('每 tick 只发 1 个请求；有评审变化才拉 notes 并唤醒', async () => {
@@ -440,6 +447,10 @@ test('可合后 MR 变 merged → 唤醒「已合并」一次并停表', async (
   assert.equal(h.notified[1], `MR !240 已合并（sha ${SHA}），监视结束；不需要发评论。`)
   assert.equal(h.timers.length, timersBefore) // 终态不再排下一次
   assert.equal(h.watcher.isWatching('s'), false)
+  // I1：终态必须落账本，否则 UI 永远看不到「已合并」。
+  assert.equal(h.terminalCalls.length, 1)
+  assert.equal(h.terminalCalls[0].state, 'merged')
+  assert.equal(h.getState().terminal, 'merged')
 })
 
 test('closed → 唤醒「未合并关闭」一次并停表；同一 (state, sha) 不重复', async () => {
@@ -449,11 +460,26 @@ test('closed → 唤醒「未合并关闭」一次并停表；同一 (state, sha
   assert.equal(h.notified[0], 'MR 已关闭（未合并），监视结束。')
   assert.equal(h.timers.length, 0)
   assert.equal(h.watcher.isWatching('s'), false)
+  // I1：closed 同样要落账本 terminal。
+  assert.equal(h.terminalCalls.length, 1)
+  assert.equal(h.getState().terminal, 'closed')
 
   // 再 tick 一次：同一个 (state, sha) 不能重复唤醒。
   await h.watcher.tick('s')
   assert.equal(h.notified.length, 1)
   assert.equal(h.timers.length, 0)
+})
+
+test('终态落账本失败只 warn：merged 仍唤醒并停表（I1 失败隔离）', async () => {
+  const warnings = []
+  const h = harness({ mr: mrOf({ state: 'merged' }), logger: { warn: (line) => warnings.push(line) } })
+  h.service.markTerminal = async () => { throw new Error('disk full') }
+  await h.watcher.tick('s')
+  assert.equal(h.notified.length, 1)
+  assert.match(h.notified[0], /已合并/)
+  assert.equal(h.watcher.isWatching('s'), false)
+  assert.equal(warnings.length, 1)
+  assert.match(warnings[0], /终态/)
 })
 
 test('merged 之后会话再触发 tick → 去重、不复活监视', async () => {
@@ -764,7 +790,7 @@ test('pollWatchingMs：评审与门禁都已出、不可合 → 用等新 sha �
 
   await h.watcher.tick('s')
   assert.equal(h.timers.length, 1)
-  assert.equal(h.timers[0].ms, cfg.pollWatchingMs) // 60s，而不是恒定的 pollSettleMs
+  assert.equal(h.timers[0].ms, cfg.pollWatchingMs) // 30s（默认口径），而不是恒定的 pollSettleMs
   assert.notEqual(cfg.pollWatchingMs, cfg.pollSettleMs)
 })
 

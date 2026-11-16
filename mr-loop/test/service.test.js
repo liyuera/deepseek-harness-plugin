@@ -1389,3 +1389,29 @@ test('M-3 恢复判定留出请求超时余量：created_at 比草稿略早（�
     await cleanup(ctx)
   }
 })
+
+// ---------------------------------------------------------------------------
+// I1：merged / closed 终态落账本（UI 才能看到「已合并」）
+// ---------------------------------------------------------------------------
+test('markTerminal：terminal 落账本、state.mr 更新，findings 旁路照常 record', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mrloop-service-'))
+  const recorded = []
+  const h = harness()
+  const service = createService({
+    config: resolveConfig({ baseUrl: 'https://git.x.com' }),
+    ledger: createLedger({ dir }),
+    gitlab: h.gitlab,
+    repoState: h.repoImpl,
+    now: () => Date.parse('2026-11-13T10:10:00Z'),
+    findings: { record: (state) => { recorded.push(state) } },
+  })
+  await service.bind({ sessionId: 's', url: 'https://git.x.com/g/p/-/merge_requests/240', repoRoot: '/r' })
+  const merged = mr({ state: 'merged' })
+  const state = await service.markTerminal({ sessionId: 's', mr: merged })
+  assert.equal(state.mr.state, 'merged')
+  assert.equal(state.terminal, 'merged')
+  const saved = await service.ledger.load({ projectPath: 'g/p', iid: 240 })
+  assert.equal(saved.terminal, 'merged')
+  assert.equal(recorded.length, 2, 'bind 与 markTerminal 各 record 一次')
+  await rm(dir, { recursive: true, force: true })
+})

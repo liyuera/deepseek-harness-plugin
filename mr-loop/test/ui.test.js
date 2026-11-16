@@ -33,13 +33,13 @@ const roundOf = ({ decisionsFinding = { fid: 'aaaaaaaaaa', level: '中' }, direc
   },
 })
 
-const recordOf = ({ iid, round, decisions = {} }) => ({
+const recordOf = ({ iid, round, decisions = {}, terminal = null }) => ({
   version: 1,
   binding: { projectPath: 'group/project', iid, sourceBranch: 'feat-x', targetBranch: 'feature-y', boundAt: '2026-11-16T10:00:00Z' },
   rounds: [round],
   decisions,
   mergeableAt: null,
-  terminal: null,
+  terminal,
   paused: null,
   updatedAt: '2026-11-16T10:10:00Z',
 })
@@ -118,6 +118,16 @@ test('M3：账本里的 FID 大小写与评审不一致，面板仍是 waived �
   assert.equal(snapshot.mrs[0].pending, 0)
 })
 
+test('C1：新一轮评审还没出时，problems 不能把上一轮的 FID 显示成 fixed', async () => {
+  const first = roundOf()
+  const pendingRound = { ...roundOf({ sha: 'b'.repeat(40), n: 2 }), review: null }
+  const record = { ...recordOf({ iid: 244, round: first }) }
+  record.rounds = [first, pendingRound]
+  const snapshot = await snapshotOf([record])
+  assert.equal(snapshot.mrs[0].problems.length, 0, '评审未出 ≠ 已修')
+  assert.equal(snapshot.mrs[0].pending, 0)
+})
+
 test('活绑定的 MR 必须给出实时 state 与合并判定（回归：曾读取 live.mr 导致 merge 恒为 null）', async () => {
   const round = roundOf({ decisionsFinding: { fid: 'bbbbbbbbbb', level: '低' }, directives: [] })
   round.review.verdict = 'pass'
@@ -136,6 +146,7 @@ test('活绑定的 MR 必须给出实时 state 与合并判定（回归：曾读
       head_pipeline: { id: 7298, status: 'success' },
     },
     round,
+    rounds: [round],
     decisions: {},
   }
 
@@ -146,4 +157,73 @@ test('活绑定的 MR 必须给出实时 state 与合并判定（回归：曾读
   assert.equal(mr.session.id, 'session-live')
   assert.equal(mr.merge.mergeable, true)
   assert.equal(mr.merge.pipeline.status, 'success')
+})
+
+test('I1：账本 terminal=merged → UI state 为 merged，「已合并」计数正确', async () => {
+  const snapshot = await snapshotOf([recordOf({ iid: 245, round: roundOf(), terminal: 'merged' })])
+  assert.equal(snapshot.mrs[0].state, 'merged')
+  assert.equal(snapshot.mrs[0].live, false)
+  assert.equal(snapshot.counts.merged, 1)
+})
+
+// ---------------------------------------------------------------------------
+// M1：live 优先（内存状态比账本新）+ live.mr 与 round 必须同 sha
+// ---------------------------------------------------------------------------
+const liveMrOf = (sha) => ({
+  state: 'opened',
+  sha,
+  draft: false,
+  has_conflicts: false,
+  blocking_discussions_resolved: true,
+  merge_status: 'can_be_merged',
+  head_pipeline: { id: 7299, status: 'success' },
+})
+
+test('M1：live 存在时用内存状态（轮次更新），updatedAt 回落磁盘；sha 不一致则 merge=null', async () => {
+  const diskRound = roundOf() // 第 1 轮、还有一个 open 问题
+  const disk = recordOf({ iid: 246, round: diskRound })
+  // 内存状态已到第 2 轮：评审 pass、无问题（比 fire-and-forget 的账本新）。
+  const liveRound = {
+    ...roundOf(),
+    sha: 'b'.repeat(40),
+    n: 2,
+    review: { ...roundOf().review, verdict: 'pass', blocking: [], nonBlocking: [], historicalUnresolved: 0 },
+  }
+  const liveState = {
+    sessionId: 'session-live',
+    binding: { projectPath: 'group/project', iid: 246 },
+    mr: liveMrOf('b'.repeat(40)),
+    round: liveRound,
+    rounds: [liveRound],
+    decisions: {},
+  }
+  const snapshot = await snapshotWithLive([disk], [liveState])
+  const mr = snapshot.mrs[0]
+  assert.equal(mr.round, 2, 'live 的内存状态必须优先于磁盘')
+  assert.equal(mr.problems.length, 0)
+  assert.equal(mr.pending, 0)
+  assert.equal(mr.merge.mergeable, true)
+  assert.equal(mr.updatedAt, disk.updatedAt, 'live state 不维护 updatedAt，回落磁盘')
+
+  // 快照还没并到当前轮（live.mr.sha 与 round.sha 不一致）时不能拿它算合并判定。
+  const stale = await snapshotWithLive([disk], [{ ...liveState, mr: liveMrOf('c'.repeat(40)) }])
+  assert.equal(stale.mrs[0].merge, null)
+})
+
+// ---------------------------------------------------------------------------
+// M2：webUrl 用配置的 baseUrl（含子路径），不写死实例 host
+// ---------------------------------------------------------------------------
+test('M2：账本记录的 webUrl 用 config.baseUrl 拼（含子路径）', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mr-loop-ui-'))
+  try {
+    await writeFile(join(dir, 'mr-0.json'), JSON.stringify(recordOf({ iid: 240, round: roundOf() })), 'utf8')
+    const ui = createUiState({
+      config: { ledgerDir: dir, baseUrl: 'https://git.example.com/gitlab' },
+      service: { listStates: () => [] },
+    })
+    const snapshot = await ui.snapshot({ scope: 'all' })
+    assert.equal(snapshot.mrs[0].webUrl, 'https://git.example.com/gitlab/group/project/-/merge_requests/240')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
 })

@@ -1,6 +1,6 @@
 # mr-loop UI 设计稿 v2（2026-11-16）
 
-> 状态：**设计已定稿，未实现**（用户确认：会话头 chip 主入口 / v1 带「全部会话」/ 问题行展开看建议·代码·评论原文，默认收起）。
+> 状态：**已实现**（`lib/client.js` + `test/client.test.js`；用户确认：会话头 chip 主入口 / v1 带「全部会话」/ 问题行展开看建议·代码·评论原文，默认收起）。
 > 视觉稿：`docs/superpowers/mocks/mr-loop-ui.html`（直接浏览器打开；`document.body.classList.add('dark')` 切暗色）
 > 截图：`specs/assets/mr-loop-ui-light.jpg`、`specs/assets/mr-loop-ui-dark.jpg`
 

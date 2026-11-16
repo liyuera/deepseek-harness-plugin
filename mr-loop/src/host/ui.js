@@ -67,20 +67,41 @@ function uiProblemOf(finding) {
   return problem
 }
 
-function resultOf(record, live) {
+/** MR 地址：用配置的 baseUrl（含可能的子路径）拼，不写死实例 host（M2）。 */
+function webUrlOf(config, binding) {
+  let base
+  try {
+    base = new URL(String(config?.baseUrl ?? ''))
+  } catch {
+    return ''
+  }
+  const basePath = base.pathname.replace(/\/+$/, '')
+  const project = String(binding?.projectPath ?? '')
+  const iid = binding?.iid ?? 0
+  return `${base.origin}${basePath}/${project}/-/merge_requests/${iid}`
+}
+
+function resultOf(record, live, config) {
   const round = roundOf(record)
   const binding = record?.binding ?? {}
   const decisions = record?.decisions !== null && typeof record.decisions === 'object' ? record.decisions : {}
   const todo = reviewTodo(round, decisions)
   const mr = live?.state?.mr
-  const mergeability = mr === undefined ? null : evaluateMergeable({ mr, round, decisions })
+  // M1：live 的 MR 快照必须与当前轮同 sha 才参与合并判定——不一致说明快照还没并进这一轮，
+  // 拿它算会得到错配的「可合 / 差 N 项」。
+  const roundSha = typeof round?.sha === 'string' ? round.sha : ''
+  const mrSha = typeof mr?.sha === 'string' ? mr.sha : ''
+  const mergeability = mr === undefined || roundSha === '' || mrSha !== roundSha
+    ? null
+    : evaluateMergeable({ mr, round, decisions })
   return {
     projectPath: binding.projectPath ?? '',
     iid: binding.iid ?? 0,
-    webUrl: `https://${new URL(live?.config?.baseUrl ?? 'https://git.htwisdom.cn').host}/${binding.projectPath}/-/merge_requests/${binding.iid}`,
+    webUrl: webUrlOf(config, binding),
     sourceBranch: binding.sourceBranch ?? '',
     targetBranch: binding.targetBranch ?? '',
-    state: mr?.state ?? 'unknown',
+    // I1：终态以账本记录为准（merged/closed 是永久的）；live 还没落账本时回落实时 mr。
+    state: record?.terminal ?? mr?.state ?? 'unknown',
     sha: round?.sha ?? '',
     round: round?.n ?? 0,
     updatedAt: record?.updatedAt ?? binding.boundAt ?? null,
@@ -136,15 +157,21 @@ export function createUiState({ config, service, logger = undefined }) {
       }
 
       const records = await readLedgerFiles(dir)
-      const byKey = new Map()
+      const diskByKey = new Map()
       for (const record of records) {
         const binding = record?.binding
         if (binding === undefined) continue
-        byKey.set(`${binding.projectPath}#${binding.iid}`, record)
+        diskByKey.set(`${binding.projectPath}#${binding.iid}`, record)
       }
+      // live 优先（注释与实现一致）：内存状态比 fire-and-forget 的账本更新；live state 不维护
+      // updatedAt，回落磁盘记录，保证排序 / 展示时间仍有值。
+      const byKey = new Map()
       for (const [key, live] of liveByKey) {
-        // live 的账本可能还没落盘（刚绑定）：用内存状态补一条。
-        if (!byKey.has(key)) byKey.set(key, live.state)
+        const disk = diskByKey.get(key)
+        byKey.set(key, { ...live.state, updatedAt: live.state.updatedAt ?? disk?.updatedAt })
+      }
+      for (const [key, record] of diskByKey) {
+        if (!byKey.has(key)) byKey.set(key, record)
       }
 
       const mrs = []
@@ -153,7 +180,7 @@ export function createUiState({ config, service, logger = undefined }) {
         if (scope === 'session' && live !== undefined && sessionId !== undefined && live.sessionId !== sessionId) continue
         if (scope === 'session' && live === undefined) continue
         try {
-          mrs.push(resultOf(record, live))
+          mrs.push(resultOf(record, live, config))
         } catch (error) {
           logger?.warn?.(`[mr-loop] UI 聚合跳过 ${key}：${error.message}`)
         }
@@ -167,6 +194,7 @@ export function createUiState({ config, service, logger = undefined }) {
           total: mrs.length,
           pending: mrs.reduce((sum, mr) => sum + (mr.pending ?? 0), 0),
           mergeable: mrs.filter((mr) => mr.merge?.mergeable === true).length,
+          merged: mrs.filter((mr) => mr.state === 'merged').length,
         },
       }
     },

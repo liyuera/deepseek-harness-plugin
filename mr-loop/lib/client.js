@@ -81,14 +81,19 @@ window.__ModuleLoader__.load({
     ].join("\n");
 
     function injectStyle() {
-      if (typeof document === "undefined") return;
+      if (typeof document === "undefined") return function () {};
       var tagId = "@liyuera/dsh-mr-loop/panel.css";
-      if (document.querySelector('style[data-plugin-css="' + tagId + '"]') !== null) return;
+      // 已有同插件样式（另一个实例 / 未 dispose 的旧 effect）：不重复插，也不归本次清理。
+      if (document.querySelector('style[data-plugin-css="' + tagId + '"]') !== null) return function () {};
       var tag = document.createElement("style");
       tag.dataset.plugin = "@liyuera/dsh-mr-loop";
       tag.dataset.pluginCss = tagId;
       tag.textContent = CSS;
       document.head.appendChild(tag);
+      return function () {
+        if (tag.parentNode && typeof tag.parentNode.removeChild === "function") tag.parentNode.removeChild(tag);
+        else if (typeof tag.remove === "function") tag.remove();
+      };
     }
 
     // ---------------------------------------------------------------- store
@@ -210,15 +215,20 @@ window.__ModuleLoader__.load({
       }, [incomingSession]);
       var data = state.data;
       if (data === null || !Array.isArray(data.mrs) || data.mrs.length === 0) return null;
-      var pending = data.counts && typeof data.counts.pending === "number" ? data.counts.pending : 0;
-      var currentSessionId = state.sessionId;
-      var hasSessionMrs = currentSessionId === null
-        ? false
-        : data.mrs.some(function (mr) {
-            return mr.session !== undefined && mr.session !== null && String(mr.session.id) === currentSessionId;
-          });
-      var initialScope = hasSessionMrs ? "session" : "all";
-      var shown = data.mrs.slice(0, 2);
+      // 宿主给了本会话 id 就立刻按它过滤（不等 effect 回写 store，避免首帧闪一次「全会话」计数）。
+      var currentSessionId = incomingSession !== null ? incomingSession : state.sessionId;
+      var inSession = function (mr) {
+        return currentSessionId !== null && mr.session !== undefined && mr.session !== null && String(mr.session.id) === currentSessionId;
+      };
+      // M4：chip 只统计当前会话（会话未知才退回全部），避免别的会话的问题冒充「本会话待处理」。
+      var scoped = currentSessionId === null
+        ? data.mrs
+        : data.mrs.filter(inSession);
+      var pending = currentSessionId === null
+        ? (data.counts && typeof data.counts.pending === "number" ? data.counts.pending : 0)
+        : scoped.reduce(function (sum, mr) { return sum + (typeof mr.pending === "number" ? mr.pending : 0); }, 0);
+      var initialScope = currentSessionId !== null && scoped.length > 0 ? "session" : "all";
+      var shown = scoped.slice(0, 2);
       var tags = shown.map(function (mr) {
         var label = "!" + mr.iid;
         var tone = mr.merge && mr.merge.mergeable === true ? "ok" : (mr.pending > 0 ? "warn" : "");
@@ -232,8 +242,8 @@ window.__ModuleLoader__.load({
         h("span", { className: "mrl-dot " + tone }),
         h("span", null, label + " · 第 " + (mr.round || 0) + " 轮"));
       });
-      var more = data.mrs.length > shown.length
-        ? h("span", { className: "mrl-tag" }, "+" + (data.mrs.length - shown.length))
+      var more = scoped.length > shown.length
+        ? h("span", { className: "mrl-tag" }, "+" + (scoped.length - shown.length))
         : null;
       var pendingTag = pending > 0
         ? h("span", { className: "mrl-tag err" }, pending + " 待处理")
@@ -498,7 +508,9 @@ window.__ModuleLoader__.load({
     exports.inject = ["slots"];
 
     exports.apply = function (ctx) {
-      injectStyle();
+      // M4：样式与轮询都用 ctx.effect 注册并返回 cleanup，HMR 重载时先清旧副作用再装新的，
+      // 避免重复 <style> 与叠加 setInterval。
+      ctx.effect(function () { return injectStyle(); }, "mr-loop: client styles");
       ctx.slots.inject("conversation.session.header.actions", function () {
         return ctx.slots.register({
           name: "conversation.session.header.actions",
@@ -515,10 +527,12 @@ window.__ModuleLoader__.load({
           label: "MR 看板",
         }, Drawer);
       });
-      // 抽屉打开时立刻刷新一次；chip 常驻时 30s 轮询一次。
-      if (typeof window !== "undefined") {
-        window.setInterval(function () { if (subscribers > 0) load(); }, 30000);
-      }
+      // 抽屉打开时立刻刷新一次；chip 常驻时 30s 轮询一次（随插件卸载一起清理）。
+      ctx.effect(function () {
+        if (typeof window === "undefined") return function () {};
+        var timer = window.setInterval(function () { if (subscribers > 0) load(); }, 30000);
+        return function () { window.clearInterval(timer); };
+      }, "mr-loop: ui poll");
     };
 
     return module.exports;
