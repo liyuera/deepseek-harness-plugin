@@ -4,31 +4,59 @@
 <meta charset="utf-8">
 <title>mr-loop UI harness（真实 client bundle + 假数据）</title>
 <style>
+  /* 真实主题 token（从 DSH 应用包里的 alias→static 映射解析出来的，别再拍脑袋改）：
+     浅色：bg-layer-1/2 = #fff、bg-overlay = #e9ecf2、brand-primary = label-primary = #0f1115；
+     深色：bg-layer-1 = #232324、border 走白色低透明度。 */
   :root{
-    --dsw-alias-bg-base:#f4f5f7;
+    --dsw-alias-bg-base:#ffffff;
     --dsw-alias-bg-layer-1:#ffffff;
-    --dsw-alias-bg-layer-2:#f1f2f4;
-    --dsw-alias-bg-overlay:#ffffff;
-    --dsw-alias-border-l1:#e7e8eb;
-    --dsw-alias-border-l2:#d8dade;
-    --dsw-alias-brand-primary:#4d6bfe;
-    --dsw-alias-label-primary:#1b1c1e;
-    --dsw-alias-label-secondary:#6b7076;
-    --dsw-alias-state-error-primary:#dc2626;
-    --dsw-alias-state-idle-primary:#9aa0a6;
-    --dsw-alias-state-success-primary:#16a34a;
-    --dsw-alias-state-warn-primary:#d97706;
-    --dsw-specific-sidebar-fill:#f4f5f7;
+    --dsw-alias-bg-layer-2:#ffffff;
+    --dsw-alias-bg-overlay:#e9ecf2;
+    --dsw-alias-border-l1:rgba(0,0,0,.04);
+    --dsw-alias-border-l2:rgba(0,0,0,.1);
+    --dsw-alias-brand-primary:#0f1115;
+    --dsw-alias-label-primary:#0f1115;
+    --dsw-alias-label-secondary:#61666b;
+    --dsw-alias-label-tertiary:#81858c;
+    --dsw-alias-state-error-primary:#f25a5a;
+    --dsw-alias-state-idle-primary:#d4d4d4;
+    --dsw-alias-state-success-primary:#22c55e;
+    --dsw-alias-state-warn-primary:#f59e0b;
+    --dsw-alias-state-business-primary:#4176e6;
+    --dsw-specific-sidebar-fill:#f5f6f7;
     --dsw-alias-button-elevated-fill:#ffffff;
-    --dsw-alias-button-floating-hover:#f4f5f7;
+    --dsw-alias-button-floating-hover:#f1f3f5;
+  }
+  :root.dark{
+    --dsw-alias-bg-base:#151517;
+    --dsw-alias-bg-layer-1:#232324;
+    --dsw-alias-bg-layer-2:#2c2c2e;
+    --dsw-alias-bg-overlay:#2c2c2e;
+    --dsw-alias-border-l1:rgba(255,255,255,.06);
+    --dsw-alias-border-l2:rgba(255,255,255,.12);
+    --dsw-alias-brand-primary:#f9fafb;
+    --dsw-alias-label-primary:#f9fafb;
+    --dsw-alias-label-secondary:#cfd3d6;
+    --dsw-alias-label-tertiary:#adb2b8;
+    --dsw-alias-state-error-primary:#ec1313;
+    --dsw-alias-state-idle-primary:#545557;
+    --dsw-alias-state-success-primary:#22c55e;
+    --dsw-alias-state-warn-primary:#f59e0b;
+    --dsw-alias-state-business-primary:#7aaaff;
+    --dsw-specific-sidebar-fill:#1b1b1c;
+    --dsw-alias-button-elevated-fill:#2c2c2e;
+    --dsw-alias-button-floating-hover:#353638;
   }
   *{box-sizing:border-box}
-  body{margin:0;background:#e9eaee;font:13px/1.55 -apple-system,"PingFang SC","Helvetica Neue",Arial,sans-serif;color:#1b1c1e}
+  body{margin:0;background:var(--dsw-alias-bg-base);font:13px/1.55 -apple-system,"PingFang SC","Helvetica Neue",Arial,sans-serif;color:var(--dsw-alias-label-primary)}
   #stage{position:relative;width:900px;height:1080px;background:var(--dsw-alias-bg-base);overflow:hidden;margin:0 auto}
   /* 仅为了验收截图：把 fixed dialog 放进 stage，位置/尺寸/颜色不变 */
   .mrl-dialog{position:absolute !important;top:24px !important;right:24px !important}
   #chip-box{position:absolute;top:24px;left:24px;right:500px}
 </style>
+<script>
+  if (new URLSearchParams(location.search).get('theme') === 'dark') document.documentElement.classList.add('dark');
+</script>
 </head>
 <body>
 <div id="stage">
@@ -38,6 +66,16 @@
 
 <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script>
+  // 客户端把弹层 portal 到 document.body；验收台把目标改到 #stage，
+  // 这样截图只截 stage 也能把弹层框进去（位置/尺寸/颜色不变）。
+  (function () {
+    var createPortal = window.ReactDOM.createPortal;
+    window.ReactDOM.createPortal = function (node, container) {
+      return createPortal(node, container === document.body ? document.getElementById('stage') : container);
+    };
+  })();
+</script>
 <script>
   // 假数据：覆盖 未处理 / 已修 / 已豁免（带评论原文）/ 可合 / 已合并
   const STATE = {

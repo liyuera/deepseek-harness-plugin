@@ -142,3 +142,45 @@
 3. 数据延迟 ≤30s；打开抽屉强刷。
 4. 状态口径与 CLI 报告一致（共用 `reviewTodo`），UI 不自行推断。
 5. 不写 MR、不改会话事件流。
+
+## 十、主题 token 校正（2026-11-17，v0.2.2）
+
+**问题**：真机（DSH 0.2.2 桌面端，light 主题）上面板看起来「又旧又平」，和验收截图（`scripts/ui-harness.html` + Chromium 截图）差很多。
+
+**根因**：验收台的 `:root` token 是拍脑袋写的，和真实主题不一致。从应用包（`app.asar`）里解析出的真实映射：
+
+| token | 浅色（真机） | 深色（真机） |
+| --- | --- | --- |
+| `--dsw-alias-bg-base` | `#fff` | `#151517` |
+| `--dsw-alias-bg-layer-1` | `#fff` | `#232324` |
+| `--dsw-alias-bg-layer-2` | **`#fff`** | `#2c2c2e` |
+| `--dsw-alias-bg-overlay` | `#e9ecf2` | `#61666b` |
+| `--dsw-alias-border-l1` | `rgba(0,0,0,.04)` | `rgba(255,255,255,.06)` |
+| `--dsw-alias-border-l2` | `rgba(0,0,0,.1)` | `rgba(255,255,255,.12)` |
+| `--dsw-alias-brand-primary` | `#0f1115`（= label-primary，**不是蓝**） | `#f9fafb` |
+| `--dsw-alias-label-primary` | `#0f1115` | `#f9fafb` |
+| `--dsw-alias-label-secondary` | `#61666b` | `#cfd3d6` |
+| `--dsw-alias-label-tertiary` | `#81858c` | `#adb2b8` |
+| `--dsw-alias-state-success-primary` | `#22c55e` | `#22c55e` |
+| `--dsw-alias-state-warn-primary` | `#f59e0b` | `#f59e0b` |
+| `--dsw-alias-state-error-primary` | `#f25a5a` | `#ec1313` |
+| `--dsw-alias-state-idle-primary` | `#d4d4d4` | `#545557` |
+| `--dsw-alias-state-business-primary` | `#4176e6` | `#7aaaff` |
+
+四个直接后果：
+
+1. `bg-layer-2` 在浅色下就是**纯白**，所以「门禁胶囊 / 等级标签 / 详情块 / 页脚 / code 片段」的底色全白对白、看不见 → 面板变平。
+2. `bg-overlay` 是**灰蓝 `#e9ecf2`**，所以弹层是一块灰板（不是设计稿的白卡）。
+3. `brand-primary` 在浅色下是**近黑**，所以「第 N 轮」胶囊、FID 等级、`打开 MR` 链接全变黑 → 设计稿的蓝色强调消失。
+4. `border-l1` 只有 4% 黑，用它画卡片/按钮边框几乎等于没有。
+
+**改法（v0.2.2）**：
+
+- 面板表面改用 `bg-layer-1`（白/深灰），边框用 `border-l2`；
+- 在 `.mrl-chip,.mrl-panel` 上派生局部 token：`--mrl-fill` = `color-mix(in srgb, label-primary 5%, transparent)`、`--mrl-fill-2` = 8%、`--mrl-line`/`--mrl-line-soft` 映射 `border-l2/l1`、`--mrl-accent` = `state-business-primary`（fallback `label-primary`）；
+- 所有嵌套块（门禁胶囊、等级/状态胶囊、合并条、tab 轨道、详情块、页脚、code）统一用 `--mrl-fill`，语义色只用于「通过/待处理/阻止」；
+- 蓝色强调（第 N 轮、低等级、`打开 MR`）走 `--mrl-accent`（最接近设计稿的蓝，且随主题切换）；
+- 会话头 chip 改成「扁平标签 + 实心主按钮（brand）」，`order` 从 50 调到 **5**：头部位宽不够时 order 大的会被收进「⋯」溢出菜单，主入口必须在最前；
+- 验收台 `:root` 换成上表真实值并支持 `?theme=dark`，同时把 `createPortal` 目标改到 `#stage`（否则弹层 portal 到 body、截不到）。
+
+验收截图：`specs/assets/mr-loop-ui-implemented-light.jpg`、`mr-loop-ui-implemented-dark.jpg`（真实 bundle 渲染）。
