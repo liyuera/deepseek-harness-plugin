@@ -554,8 +554,8 @@ window.__ModuleLoader__.load({
         return ctx.slots.register({
           name: "conversation.session.header.actions",
           id: "mr-loop-chip",
-          // 头部位宽紧张时 order 大的会被收进「⋯」溢出菜单；主入口必须排在最前面。
-          order: 5,
+          // 用户要求：入口放在会话头最末尾（排在其它 chip 之后、工具按钮之前）。
+          order: 200,
           label: "MR",
         }, Chip);
       });

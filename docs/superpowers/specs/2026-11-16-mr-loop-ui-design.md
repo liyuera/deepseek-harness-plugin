@@ -180,7 +180,7 @@
 - 在 `.mrl-chip,.mrl-panel` 上派生局部 token：`--mrl-fill` = `color-mix(in srgb, label-primary 5%, transparent)`、`--mrl-fill-2` = 8%、`--mrl-line`/`--mrl-line-soft` 映射 `border-l2/l1`、`--mrl-accent` = `state-business-primary`（fallback `label-primary`）；
 - 所有嵌套块（门禁胶囊、等级/状态胶囊、合并条、tab 轨道、详情块、页脚、code）统一用 `--mrl-fill`，语义色只用于「通过/待处理/阻止」；
 - 蓝色强调（第 N 轮、低等级、`打开 MR`）走 `--mrl-accent`（最接近设计稿的蓝，且随主题切换）；
-- 会话头 chip 改成「扁平标签 + 实心主按钮（brand）」，`order` 从 50 调到 **5**：头部位宽不够时 order 大的会被收进「⋯」溢出菜单，主入口必须在最前；
+- 会话头 chip 改成「扁平标签 + 实心主按钮（brand）」；`order` 几经调整，v0.2.3 按用户要求固定为 **200**（排在其它 chip 之后、工具按钮之前，即会话头最末尾）；
 - 验收台 `:root` 换成上表真实值并支持 `?theme=dark`，同时把 `createPortal` 目标改到 `#stage`（否则弹层 portal 到 body、截不到）。
 
 验收截图：`specs/assets/mr-loop-ui-implemented-light.jpg`、`mr-loop-ui-implemented-dark.jpg`（真实 bundle 渲染）。
