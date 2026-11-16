@@ -3,7 +3,7 @@
  * 只陈述事实（含 unknown 与取证片段），不写「请修复」这类指令——修不修由主代理判断。
  * 「阻塞」与「可合并」共用 mergeable.js 的处置口径，避免两处说法不一致。
  */
-import { openFindings, reviewTodo } from './mergeable.js'
+import { openFindings, reviewFindings, reviewTodo, isNewFinding } from './mergeable.js'
 
 const OK = '✅'
 const BAD = '⛔'
@@ -51,6 +51,13 @@ function findingLabel(item) {
 }
 
 const BLOCKING_PREVIEW = 3
+const WAIVER_PREVIEW = 3
+
+/** 一条指令的展示：`FID · #ai-waive（评论 #75200） · reason 摘要`。 */
+function waiverLabel(item) {
+  const noteId = item?.noteId === null || item?.noteId === undefined ? '?' : noteText(item.noteId)
+  return `${noteText(item?.fid)} · #ai-${noteText(item?.kind)}（评论 #${noteId}） · ${noteText(item?.reason)}`
+}
 
 /**
  * @param {{ binding: object, mr: object, round: object|null, decisions: object, mergeability: object, paused: object|null, now: number }} input
@@ -65,10 +72,14 @@ export function renderReport({ binding, mr, round, decisions = {}, mergeability,
   const review = round?.review ?? null
   // 三个计数与合并判定、唤醒指令同源（reviewTodo）；阻塞行仍取完整条目展示门禁分类。
   const todo = reviewTodo(round, decisions)
-  const openItems = openFindings(review, decisions)
+  const openItems = openFindings(round, decisions)
+  // 「发现」给本轮评审的全部 finding（含已被指令豁免的），括号里补「已豁免 K」，
+  // 这样全部豁免时仍看得出「发现过 1 条」；合并判定与唤醒明细只算未处置（todo.total）。
+  const findings = reviewFindings(review)
+  const waivedSuffix = todo.waived.length > 0 ? `，已豁免 ${todo.waived.length}` : ''
   const reviewTail = review === null
     ? ''
-    : ` · 发现 ${todo.total}（本轮新增 ${todo.fresh}） · 历史未收敛 ${review.historicalUnresolved ?? DASH} · 本轮已验证修复 ${review.verifiedFixed ?? DASH}${review.jobDuration ? ` · Job ${noteText(review.jobDuration)}` : ''}`
+    : ` · 发现 ${findings.length}（本轮新增 ${findings.filter(isNewFinding).length}${waivedSuffix}） · 历史未收敛 ${review.historicalUnresolved ?? DASH} · 本轮已验证修复 ${review.verifiedFixed ?? DASH}${review.jobDuration ? ` · Job ${noteText(review.jobDuration)}` : ''}`
   lines.push(`${pad('评审')}${verdictLine(review)}${reviewTail}`)
 
   const sensitive = round?.sensitive ?? null
@@ -96,6 +107,12 @@ export function renderReport({ binding, mr, round, decisions = {}, mergeability,
     ? '无'
     : `${openItems.slice(0, BLOCKING_PREVIEW).map(findingLabel).join('；')}${openItems.length > BLOCKING_PREVIEW ? `；等 ${openItems.length} 条` : ''}`
   lines.push(`${pad('阻塞')}${blockingText}`)
+
+  // 豁免行只在有 MR 指令时出现：账本 decisions 的处置不重复展示（它没有评论可引用）。
+  if (todo.waived.length > 0) {
+    const waiverText = `${todo.waived.slice(0, WAIVER_PREVIEW).map(waiverLabel).join('；')}${todo.waived.length > WAIVER_PREVIEW ? `；等 ${todo.waived.length} 条` : ''}`
+    lines.push(`${pad('豁免')}${waiverText}`)
+  }
 
   const pendingWaives = Object.values(decisions).filter((decision) => decision?.kind === 'waive' && decision?.noteId === undefined)
   lines.push(`${pad('待点头')}${pendingWaives.length === 0 ? '（无）' : `${pendingWaives.length} 条豁免草稿`}`)

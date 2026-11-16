@@ -26,6 +26,42 @@ const snapshotWithReview = (review) => ({ mr: nextMr, setState }) => ({
   becameMergeable: false,
 })
 
+/** 控制快照：把给定 round 片段写回 state，并返回指定事件标志（T1 唤醒正文用）。 */
+const snapshotRound = (patch, flags = {}) => ({ mr: nextMr, setState }) => ({
+  state: setState({
+    mr: nextMr,
+    notesCount: nextMr.user_notes_count,
+    round: { sha: nextMr.sha, n: 1, observedAt: 1, review: null, sensitive: null, mandatory: null, ...patch },
+  }),
+  newRound: false,
+  reviewArrived: false,
+  gatesChanged: false,
+  becameMergeable: false,
+  ...flags,
+})
+
+/** 多次 tick 的评审快照：首轮按「评审到达」唤醒，此后同 sha 只靠内容变化触发。 */
+const sequenceSnapshot = (patches) => {
+  let call = 0
+  return (input) => {
+    const patch = patches[Math.min(call, patches.length - 1)]
+    const reviewArrived = call === 0
+    call += 1
+    return snapshotRound(patch, { reviewArrived })(input)
+  }
+}
+
+/** 多 tick 场景的 harness：每 tick 换一个 MR 副本（user_notes_count 递增 → 会拉 notes）。 */
+const multiTick = (patches) => {
+  const mrs = [mrOf({ user_notes_count: 2 }), mrOf({ user_notes_count: 3 }), mrOf({ user_notes_count: 4 })]
+  return harness({
+    mr: mrs[0],
+    notes: [{ id: 1, body: 'AI Code Review' }],
+    gitlabOver: { getMergeRequest: async () => mrs.shift() },
+    snapshot: sequenceSnapshot(patches),
+  })
+}
+
 /**
  * 假时钟 + 假定时器：`advance` 推进 now，`timers` 记录所有 setTimer 调用，
  * 这样「不再排下一次」是真的计数断言，30s 节流也能被测到。
@@ -163,22 +199,54 @@ test('gatesChanged：同 sha 评审在场、敏感门禁翻面 → 唤醒一次'
   assert.equal(h.notified.filter((text) => /REPORT/.test(text)).length, 1)
 })
 
-test('有未处置 finding → 唤醒消息以派发修复指令开头并含 FID', async () => {
+const FINDING_AA = {
+  fid: 'aa', level: '中', gateCategory: '逻辑错误', location: 'src/a.ts:10-20',
+  file: 'src/a.ts', problem: '可能空指针', suggestion: '先判空', reverifyCount: 2,
+}
+const FINDING_BB = {
+  fid: 'bb', level: '低', gateCategory: '非阻塞建议', location: 'src/b.ts:5',
+  file: 'src/b.ts', problem: '命名不一致', suggestion: '统一命名', reverifyCount: 1,
+}
+const FINDING_CC = {
+  fid: 'cc', level: '低', gateCategory: '非阻塞建议', location: 'src/c.ts:1',
+  file: 'src/c.ts', problem: '重复代码', suggestion: '抽公共函数', reverifyCount: 1,
+}
+const reviewOf = (blocking, over = {}) => ({ noteId: 100, verdict: 'changes', blocking, nonBlocking: [], historicalUnresolved: 0, ...over })
+const waiverOf = (fid, kind = 'waive', over = {}) => ({ fid, kind, reason: `${kind} 原因`, noteId: 74000, ...over })
+
+test('有未处置 finding → 指令段 + 报告 + 全量问题明细三段；已豁免 FID 不进明细', async () => {
   const h = harness({
     notes: [{ id: 1, body: 'AI Code Review' }],
     report: () => 'REPORT',
-    snapshot: snapshotWithReview(REVIEW_WITH_FINDING),
+    snapshot: snapshotRound(
+      {
+        review: reviewOf([FINDING_AA, FINDING_BB, FINDING_CC]),
+        // cc 已被指令豁免：它不出现在待处置数里，也不进明细；但「已收到 M 条」要算它。
+        directives: { directives: [waiverOf('cc')], invalid: [] },
+      },
+      { reviewArrived: true },
+    ),
   })
 
   await h.watcher.tick('s')
   assert.equal(h.notified.length, 1)
-  const text = h.notified[0]
-  assert.ok(
-    text.startsWith('有 1 处评审问题待处置（FID a1b2c3d4（低））：现在派发修复（按 FID 定位、TDD、跑测试、push），push 后用 mr_status 取新一轮；不打算改就在 GitLab 回帖豁免（写回未实现，需人工）。\n\n'),
-    text,
-  )
-  // 指令之后必须仍是原报告正文，不能被替换掉。
-  assert.ok(text.endsWith('REPORT'), text)
+  assert.equal(h.notified[0], [
+    '有 2 处评审问题待处置（FID aa（中）、FID bb（低））：全部问题见下方明细，修哪些由你决定；可以按问题分组并行派 subagent。',
+    '已收到 1 条 MR 指令（#ai-waive/#ai-skip/#ai-wontfix），对应 FID 已计入豁免。',
+    '不打算改的，按 #ai-waive <FID> reason=<原因> 回帖豁免（#ai-skip / #ai-wontfix 同理）；最后给出结论：修了哪些、用了什么指令、并引用对应 MR 评论。',
+    '',
+    'REPORT',
+    '',
+    '问题明细：',
+    '问题 1/2 · FID aa · 中 · 逻辑错误 · src/a.ts:10-20',
+    '  问题：可能空指针',
+    '  建议：先判空',
+    '  复验次数：2',
+    '问题 2/2 · FID bb · 低 · 非阻塞建议 · src/b.ts:5',
+    '  问题：命名不一致',
+    '  建议：统一命名',
+    '  复验次数：1',
+  ].join('\n'))
 })
 
 test('没有未处置 finding → 唤醒消息保持原样，不追加派发指令', async () => {
@@ -597,4 +665,107 @@ test('轮询间隔：评审未出用 pollAwaitingMs，MR 没挂流水线用 poll
   })
   await noPipeline.watcher.tick('s')
   assert.equal(noPipeline.timers[0].ms, cfg.pollNoPipelineMs)
+})
+
+// ---------------------------------------------------------------------------
+// T1：MR 指令 → 已豁免不吵；唤醒去重 key 含评审 note.id + findings 签名
+// ---------------------------------------------------------------------------
+
+test('全部豁免 → 唤醒正文只有报告，不追加指令段与明细段', async () => {
+  const h = harness({
+    notes: [{ id: 1, body: 'AI Code Review' }],
+    report: () => 'REPORT',
+    snapshot: snapshotRound(
+      {
+        review: reviewOf([FINDING_AA, FINDING_BB]),
+        directives: { directives: [waiverOf('aa', 'waive'), waiverOf('bb', 'wontfix')], invalid: [] },
+      },
+      { reviewArrived: true },
+    ),
+  })
+
+  await h.watcher.tick('s')
+  assert.equal(h.notified.length, 1)
+  assert.equal(h.notified[0], 'REPORT')
+})
+
+test('同一轮内容不变不重复唤醒；评审内容（findings 签名）变化才再唤醒', async () => {
+  const changedLevel = { ...FINDING_AA, level: '高' }
+  // 第一次：评审 note 100，aa 级别中；第二次：同 sha 同 note.id，findings 级别变高。
+  const h = multiTick([{ review: reviewOf([FINDING_AA]) }, { review: reviewOf([changedLevel]) }])
+  await h.watcher.tick('s')
+  assert.equal(h.notified.length, 1)
+
+  h.advance(31000)
+  await h.watcher.tick('s')
+  // 内容变了：唤醒 key（含 findings 签名）不同 → 再唤醒一次。
+  assert.equal(h.notified.length, 2)
+  assert.match(h.notified[1], /问题明细：/)
+})
+
+test('唤醒去重 key 含 findings 签名：同 note.id、同内容 + 门禁翻面不重复唤醒', async () => {
+  let call = 0
+  const mrs = [mrOf({ user_notes_count: 2 }), mrOf({ user_notes_count: 3 }), mrOf({ user_notes_count: 4 })]
+  const h = harness({
+    mr: mrs[0],
+    notes: [{ id: 1, body: 'AI Code Review' }],
+    gitlabOver: { getMergeRequest: async () => mrs.shift() },
+    snapshot: (input) => {
+      // 第一次评审到达；第二次同内容但门禁翻面；第三次同内容、无事件。
+      const flags = call === 0 ? { reviewArrived: true } : call === 1 ? { gatesChanged: true } : {}
+      call += 1
+      return snapshotRound({ review: reviewOf([FINDING_AA]) }, flags)(input)
+    },
+  })
+
+  await h.watcher.tick('s')
+  assert.equal(h.notified.length, 1)
+
+  h.advance(31000)
+  await h.watcher.tick('s')
+  assert.equal(h.notified.length, 1) // 同 key：门禁翻面也不重复推
+
+  h.advance(31000)
+  await h.watcher.tick('s')
+  assert.equal(h.notified.length, 1) // 无事件：更不该推
+})
+
+test('同 sha 上因评论触发的新评审（note.id 变）能再次唤醒', async () => {
+  const h = multiTick([
+    { review: reviewOf([FINDING_AA]) },
+    { review: reviewOf([FINDING_AA], { noteId: 101 }) },
+  ])
+  await h.watcher.tick('s')
+  assert.equal(h.notified.length, 1)
+  assert.equal(h.notified[0].startsWith('有 1 处评审问题待处置（FID aa（中））'), true)
+
+  h.advance(31000)
+  await h.watcher.tick('s')
+  assert.equal(h.notified.length, 2)
+  assert.match(h.notified[1], /问题 1\/1 · FID aa · 中 · 逻辑错误 · src\/a\.ts:10-20/)
+})
+
+test('明细段：问题/建议单行化并截断 ≤200 字，第三方文本不能改写段结构', async () => {
+  const h = harness({
+    notes: [{ id: 1, body: 'AI Code Review' }],
+    report: () => 'REPORT',
+    snapshot: snapshotRound(
+      {
+        review: reviewOf([{
+          ...FINDING_AA,
+          problem: `第一行\n第二行 ${'x'.repeat(400)}`,
+          suggestion: `建议\n改法 ${'y'.repeat(400)}`,
+        }]),
+      },
+      { reviewArrived: true },
+    ),
+  })
+
+  await h.watcher.tick('s')
+  const text = h.notified[0]
+  // 换行被压成空格：明细段行数固定，不会被 note 内容插入新行。
+  assert.match(text, /  问题：第一行 第二行 x+…\n  建议：建议 改法 y+…\n  复验次数：2$/)
+  const problemLine = text.split('\n').find((line) => line.startsWith('  问题：'))
+  assert.equal(problemLine.length, '  问题：'.length + 200)
+  assert.equal(problemLine.endsWith('…'), true)
 })

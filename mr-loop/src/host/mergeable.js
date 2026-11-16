@@ -29,9 +29,39 @@ export function reviewFindings(review) {
   ]
 }
 
-/** 未被 waive / skip / wontfix 终结的 finding；处置白名单与报告共用。 */
-export function openFindings(review, decisions = {}) {
-  return reviewFindings(review).filter((item) => isDisposed(decisions?.[item?.fid]) === false)
+/** 本轮 review 里该 FID 对应的 MR 指令；没有则 null。FID 大小写不敏感。 */
+export function directiveFor(round, fid) {
+  const list = Array.isArray(round?.directives?.directives) ? round.directives.directives : []
+  if (list.length === 0 || typeof fid !== 'string' || fid === '') return null
+  const key = fid.toLowerCase()
+  return list.find((item) => String(item?.fid ?? '').toLowerCase() === key) ?? null
+}
+
+/**
+ * 账本 decisions 的 FID 查找。账本由插件写入时大小写与评审一致，但人工回填 /
+ * 大小写不同的旧账本不该让豁免失效：按小写再兜一次。
+ */
+function decisionFor(decisions, fid) {
+  if (decisions === null || typeof decisions !== 'object' || typeof fid !== 'string' || fid === '') return undefined
+  if (decisions[fid] !== undefined) return decisions[fid]
+  const key = fid.toLowerCase()
+  for (const [id, decision] of Object.entries(decisions)) {
+    if (id.toLowerCase() === key) return decision
+  }
+  return undefined
+}
+
+/**
+ * 已处置 = 账本里有 waive / skip / wontfix，或 MR 评论里有该 FID 的有效指令。
+ * 两处并存时任一命中即算（决策文档 §2.1：有有效指令的 FID 视为已处置，不拦合并）。
+ */
+export function isDisposedFinding(round, decisions = {}, fid) {
+  return isDisposed(decisionFor(decisions, fid)) || directiveFor(round, fid) !== null
+}
+
+/** 未被账本处置、也没有 MR 指令豁免的 finding；处置口径与报告共用。 */
+export function openFindings(round, decisions = {}) {
+  return reviewFindings(round?.review).filter((item) => isDisposedFinding(round, decisions, item?.fid) === false)
 }
 
 /**
@@ -66,14 +96,28 @@ function fidLabel(item) {
 /**
  * 未处置 finding 的统一口径：报告（合并行的缺口）与唤醒（前置指令）共用，
  * 避免「报告说有 1 处、唤醒却说没有」。`fids` 只给前 3 个预览，总数看 `total`。
- * @returns {{ total: number, fresh: number, fids: string[] }}
+ * `waived` 只列本轮 review 里真实存在、且被 MR 指令豁免的 FID（账本处置不塞进来），
+ * 报告据此单独展示指令来源；`total` 仍同时扣掉账本处置与指令豁免，计数一致。
+ * @returns {{ total: number, fresh: number, fids: string[], waived: Array<{fid:string,kind:string,reason:string,noteId:number|null}> }}
  */
 export function reviewTodo(round, decisions = {}) {
-  const open = openFindings(round?.review, decisions)
+  const findings = reviewFindings(round?.review)
+  const open = findings.filter((item) => isDisposedFinding(round, decisions, item?.fid) === false)
+  const seen = new Set()
+  const waived = []
+  for (const item of findings) {
+    const found = directiveFor(round, item?.fid)
+    if (found === null) continue
+    const key = String(found.fid ?? '').toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    waived.push({ fid: found.fid, kind: found.kind, reason: found.reason, noteId: found.noteId ?? null })
+  }
   return {
     total: open.length,
     fresh: open.filter(isNewFinding).length,
     fids: open.slice(0, FID_PREVIEW).map(fidLabel),
+    waived,
   }
 }
 

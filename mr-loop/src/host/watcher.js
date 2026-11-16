@@ -6,34 +6,98 @@
  * 终止路径（守卫暂停 / token / merged / closed / 可合）没有下一个 tick，唤醒立即送达。
  */
 import { evaluateGuards } from './guards.js'
-import { reviewTodo } from './mergeable.js'
+import { openFindings, reviewTodo } from './mergeable.js'
+import { clipText } from './parse-directives.js'
 
 const WAKE_MIN_GAP_MS = 30000
+const DETAIL_LIMIT = 200
+const WAIVER_HINT = '不打算改的，按 #ai-waive <FID> reason=<原因> 回帖豁免（#ai-skip / #ai-wontfix 同理）；最后给出结论：修了哪些、用了什么指令、并引用对应 MR 评论。'
 const TERMINAL_PIPELINE = new Set(['success', 'failed', 'canceled'])
 const TOKEN_ERRORS = new Set(['unauthorized', 'forbidden', 'no-token'])
 
 const terminal = (status) => TERMINAL_PIPELINE.has(status)
 const sleepSeconds = (ms) => Math.max(1, Math.round(ms / 1000))
 
-/** 同一次评审（同一 sha、同一组门禁结论）只唤醒一次，避免 reviewArrived 反复触发。 */
-function wakeKey(round) {
-  const sha = String(round?.sha ?? '')
-  const review = round?.review?.verdict ?? 'none'
-  const sensitive = round?.sensitive?.verdict ?? 'none'
-  const mandatory = round?.mandatory?.verdict ?? 'none'
-  return `review:${sha}:${review}:${sensitive}:${mandatory}`
+/**
+ * findings 签名：FID + 级别 + 复验次数的稳定序列（排序后拼接，与解析顺序无关）。
+ * 同一评审 note 被编辑、或同 sha 又出一份评审时，签名用来判断「内容真的变了」。
+ */
+function findingsSignature(review) {
+  const items = [
+    ...(Array.isArray(review?.blocking) ? review.blocking : []),
+    ...(Array.isArray(review?.nonBlocking) ? review.nonBlocking : []),
+  ]
+  return items
+    .map((item) => `${String(item?.fid ?? '')}|${String(item?.level ?? '')}|${item?.reverifyCount ?? ''}`)
+    .sort()
+    .join(',')
+}
+
+/** 评审身份：note.id + findings 签名。同 sha 上「有没有新评审 / 内容变没变」只看这个。 */
+function reviewIdentity(review) {
+  if (review === null || review === undefined) return null
+  return `${review.noteId ?? '?'}|${findingsSignature(review)}`
 }
 
 /**
- * 唤醒正文 = 报告；有未处置 finding 时最前面加一段可执行指令。
+ * 同一次评审只唤醒一次：sha + 评审 note.id + findings 签名 + verdict + 三套门禁。
+ * 加入 note.id / findings 签名后，同一 sha 上因评论触发的新评审能唤醒（key 变了），
+ * 同一轮内容不变（含豁免理由变更）不会重复唤醒（key 不变）。
+ */
+function wakeKey(round) {
+  const sha = String(round?.sha ?? '')
+  const review = round?.review?.verdict ?? 'none'
+  const noteId = round?.review?.noteId ?? 'none'
+  const findings = findingsSignature(round?.review)
+  const sensitive = round?.sensitive?.verdict ?? 'none'
+  const mandatory = round?.mandatory?.verdict ?? 'none'
+  return `review:${sha}:${noteId}:${findings}:${review}:${sensitive}:${mandatory}`
+}
+
+/** note 派生文本进唤醒前先压单行、截断；缺失字段统一占位 `—`。 */
+function fieldText(value, max = DETAIL_LIMIT) {
+  const text = clipText(value, max)
+  return text === '' ? '—' : text
+}
+
+/** 一条未处置 finding 的明细：问题 i/N · FID · 级别 · 门禁分类 · file:line + 问题/建议/复验次数。 */
+function findingDetail(item, index, total) {
+  const location = fieldText(item?.location, 120)
+  const fileLine = location !== '—' ? location : fieldText(item?.file, 120)
+  const count = Number.isFinite(item?.reverifyCount) ? String(item.reverifyCount) : '—'
+  return [
+    `问题 ${index + 1}/${total} · FID ${fieldText(item?.fid, 64)} · ${fieldText(item?.level, 40)} · ${fieldText(item?.gateCategory ?? item?.type, 40)} · ${fileLine}`,
+    `  问题：${fieldText(item?.problem)}`,
+    `  建议：${fieldText(item?.suggestion)}`,
+    `  复验次数：${count}`,
+  ].join('\n')
+}
+
+/** 全量问题明细段：只列未处置 finding（已豁免的不进，避免让主代理重复决策）。 */
+function findingsDetail(open) {
+  return `问题明细：\n${open.map((item, index) => findingDetail(item, index, open.length)).join('\n')}`
+}
+
+/**
+ * 唤醒正文 = 动作指令段 → 报告 → 全量问题明细段。
  * 指令只属于唤醒这一层，报告本身仍是事实陈述（「合并」行说差几项）；
- * 没有待处置问题就原样返回，避免给既有唤醒加噪音。
+ * 没有未处置问题时原样返回报告，不加指令段也不加明细段，避免给既有唤醒加噪音。
  */
 function withReviewDirective(state, text) {
-  const todo = reviewTodo(state?.round, state?.decisions)
+  const round = state?.round
+  const todo = reviewTodo(round, state?.decisions)
   if (todo.total === 0) return text
+  const open = openFindings(round, state?.decisions)
   const preview = `${todo.fids.join('、')}${todo.total > todo.fids.length ? '、…' : ''}`
-  return `有 ${todo.total} 处评审问题待处置（${preview}）：现在派发修复（按 FID 定位、TDD、跑测试、push），push 后用 mr_status 取新一轮；不打算改就在 GitLab 回帖豁免（写回未实现，需人工）。\n\n${text}`
+  const directives = Array.isArray(round?.directives?.directives) ? round.directives.directives : []
+  const lines = [
+    `有 ${todo.total} 处评审问题待处置（${preview}）：全部问题见下方明细，修哪些由你决定；可以按问题分组并行派 subagent。`,
+  ]
+  if (directives.length > 0) {
+    lines.push(`已收到 ${directives.length} 条 MR 指令（#ai-waive/#ai-skip/#ai-wontfix），对应 FID 已计入豁免。`)
+  }
+  lines.push(WAIVER_HINT)
+  return `${lines.join('\n')}\n\n${text}\n\n${findingsDetail(open)}`
 }
 
 /**
@@ -215,6 +279,8 @@ export function createWatcher({ cfg, gitlab, service, notify, logger = undefined
       if (latestAfterNotes === null || latestAfterNotes === undefined || latestAfterNotes !== state) { clear(sessionId); return }
     }
 
+    // 快照前记下评审身份：同 sha 上「新评审 / 评审内容变化」靠它判定（服务层只报 verdict 变化）。
+    const reviewBefore = state.round?.review ?? null
     let result
     try {
       result = service.applySnapshot({ sessionId, mr, notes })
@@ -229,6 +295,11 @@ export function createWatcher({ cfg, gitlab, service, notify, logger = undefined
     const reviewVerdict = next.round?.review?.verdict
     const reviewPresent = next.round?.review !== null && next.round?.review !== undefined
     const reviewArrived = reviewVerdict !== undefined && reviewVerdict !== null && (result.newRound || result.reviewArrived)
+    // 同一 sha、同一评审 verdict 下，新 note.id 或 findings 签名变化也要唤醒（决策文档 §2.2）：
+    // 例如「评论触发的第二次评审」verdict 可能与上一份相同，但 note.id 是新的。
+    const identityBefore = reviewIdentity(reviewBefore)
+    const identityAfter = reviewIdentity(next.round?.review)
+    const reviewChanged = result.newRound !== true && identityBefore !== null && identityAfter !== null && identityBefore !== identityAfter
     // 可合并是终点：无论是否在本次 tick 里「变成」可合并，都必须停表；
     // 但只有状态真的发生变化时才唤醒，避免 bind 已经给过报告后又重复推一遍。
     if (next.mergeability?.mergeable === true) {
@@ -239,7 +310,7 @@ export function createWatcher({ cfg, gitlab, service, notify, logger = undefined
       clear(sessionId)
       return
     }
-    if (reviewArrived) wake(sessionId, withReviewDirective(next, service.report(next)), wakeKey(next.round))
+    if (reviewArrived || reviewChanged) wake(sessionId, withReviewDirective(next, service.report(next)), wakeKey(next.round))
     // 评审已经到、门禁后来才翻面（同 sha）时 reviewArrived 为假：单独补一条门禁唤醒。
     // 两个条件同时为真时只走上面那条，wake key 已含三套 verdict，不会双唤醒。
     // 新 sha 的首个快照还没有本轮评审：门禁只是先到，不能当成「门禁变化」唤醒，

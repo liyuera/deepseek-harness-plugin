@@ -8,6 +8,7 @@
  */
 import { parseReview, isReviewBody } from './parse-review.js'
 import { parseSensitiveGate, parseMandatoryGate } from './parse-gates.js'
+import { parseDirectives, authorOf, clipText } from './parse-directives.js'
 
 const SHA_MARKER_RE = /<!--\s*AI_REVIEW_SHA\s+([0-9a-f]{7,64})\s*-->/i
 
@@ -72,6 +73,35 @@ const isMandatoryNote = (body, cfg) => startsWithTitle(body, cfg.mandatoryTitle)
 /** 同 sha 多条命中取 note.id 最大的一条。 */
 const latestBy = (items) => items.reduce((best, item) => (best === null || item.note.id > best.note.id ? item : best), null)
 
+const COMMENT_LIMIT = 5
+const EXCERPT_LIMIT = 120
+
+/**
+ * 其它评论（非系统 / 非评审 / 非门禁 / 非指令）：最近 5 条，新的在前。
+ * 指令评论（含 reason 写错的无效指令）不进这里——它们已在 directives 里单独呈现，
+ * 混进「普通评论」只会让主代理重复读同一段文本。
+ */
+function otherComments({ notes, reviewOptions, cfg, directiveNoteIds }) {
+  const comments = []
+  for (const note of notes ?? []) {
+    if (!note || note.system === true) continue
+    const body = String(note.body ?? '')
+    if (isReviewBody(body, reviewOptions)) continue
+    if (isSensitiveNote(body, cfg) || isMandatoryNote(body, cfg)) continue
+    if (directiveNoteIds.has(note.id)) continue
+    comments.push({
+      noteId: note.id ?? null,
+      author: authorOf(note),
+      createdAt: typeof note.created_at === 'string' ? note.created_at : null,
+      excerpt: clipText(body, EXCERPT_LIMIT),
+    })
+  }
+  // 评论里没有可靠的时间字符串可用时按 note.id 排序：GitLab 的 id 单调递增，等价于「新的在前」。
+  const idOf = (item) => (typeof item.noteId === 'number' ? item.noteId : -Infinity)
+  comments.sort((left, right) => idOf(right) - idOf(left))
+  return comments.slice(0, COMMENT_LIMIT)
+}
+
 /**
  * 把一次 notes 快照归并成一整轮。
  * @param {{ mr: object, notes: object[], cfg: object, observedAt: number }} input
@@ -88,6 +118,11 @@ export function buildRound({ mr, notes, cfg, observedAt }) {
   // 评审标记来自配置 reviewMarker：与 reviewTitlePrefix / sensitiveTitle 一样是
   // 「评审机器人格式变了」时的可配置出口（设计 §12）。
   const reviewOptions = { marker: cfg?.reviewMarker }
+  const directives = parseDirectives(notes)
+  const directiveNoteIds = new Set([
+    ...directives.directives.map((item) => item.noteId),
+    ...directives.invalid.map((item) => item.noteId),
+  ])
 
   for (const note of notes ?? []) {
     if (!note || note.system === true) continue
@@ -146,6 +181,8 @@ export function buildRound({ mr, notes, cfg, observedAt }) {
     },
     sensitive: sensitive === null ? null : { noteId: sensitive.note.id, ...sensitive.parsed },
     mandatory: mandatory === null ? null : { noteId: mandatory.note.id, ...mandatory.parsed },
+    directives,
+    comments: otherComments({ notes, reviewOptions, cfg, directiveNoteIds }),
     dropped,
   }
 }

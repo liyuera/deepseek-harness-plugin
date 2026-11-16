@@ -115,6 +115,8 @@ watcher 每 tick 拉 `notes?per_page=50&sort=desc`（过滤 `system: true`），
 
 弱绑定在报告里显式标注「弱绑定（无 SHA 证明）」，并在可合并判定里按 `unknown` 处理——**弱绑定的 `pass` 不能单独授权合并**（§5.3 的 fail-closed 规则）。sha 标记是否真实存在由 S0 spike 核实；缺失时全轮次都会走弱绑定，功能仍可用，但报告会一直提示。
 
+> **T1（2026-11-16）补充：每轮快照还带两类只读数据。** `directives` = 评论里 `#ai-waive / #ai-skip / #ai-wontfix` 指令的解析结果（`{ directives, invalid }`，规则见 §5.5 与决策文档 §2.1；指令评论**不参与**评审 / 门禁判定，也不进 `comments`）；`comments` = 其余人类评论最近 5 条（`{ noteId, author, createdAt, excerpt }`，excerpt 单行化 ≤120 字）。两者只给主代理决策用，不改变 sha 绑定矩阵与 stale 判定。
+
 ### 5.3 门禁解析
 
 | 门禁 | 识别 | 解析出的字段 |
@@ -170,8 +172,11 @@ idle ──bind──▶ watching(sha) ──head sha 变化──▶ awaiting(s
 
 其余规则：
 
-- **唤醒去抖**：同一 `sha + verdict + 门禁状态` 只唤醒一次；两次唤醒最小间隔 30s。唤醒用 `agent.followup(message)`，`source.kind = 'plugin:mr-loop'`。
-- 有未处置 finding（`reviewTodo.total > 0`）时，唤醒消息**前置动作指令**，再附结构化摘要（§6.4）：`有 N 处评审问题待处置（FID …）：现在派发修复（按 FID 定位、TDD、跑测试、push），push 后用 mr_status 取新一轮；不打算改就在 GitLab 回帖豁免（写回未实现，需人工）`。没有待处置问题时不加前缀，避免噪音。
+- **唤醒去抖**：同一 `sha + 评审 note.id + findings 签名（FID + 级别 + 复验次数的稳定序列）+ 三套门禁 verdict` 只唤醒一次；两次唤醒最小间隔 30s。唤醒用 `agent.followup(message)`，`source.kind = 'plugin:mr-loop'`。同 sha 上「评论触发的新评审」（note.id 或 findings 签名变化）必须能再唤醒；同一轮内容不变（含豁免 reason 变更）不重复唤醒。
+- 有未处置 finding（`reviewTodo.total > 0`）时，唤醒正文固定三段：**动作指令段 → 报告 → 全量问题明细段**。
+  - 指令段：`有 N 处评审问题待处置（FID …）：全部问题见下方明细，修哪些由你决定；可以按问题分组并行派 subagent。`；已有有效指令时补一条 `已收到 M 条 MR 指令（#ai-waive/#ai-skip/#ai-wontfix），对应 FID 已计入豁免。`；最后 `不打算改的，按 #ai-waive <FID> reason=<原因> 回帖豁免（#ai-skip / #ai-wontfix 同理）；最后给出结论：修了哪些、用了什么指令、并引用对应 MR 评论。`
+  - 明细段：每条 `问题 i/N · FID · 级别 · 门禁分类 · file:line` 换行 `  问题：…` `  建议：…` `  复验次数：…`；只列未处置 finding（已豁免的不进），每个字段单行化并截断 ≤200 字。
+  - 没有待处置问题时不加指令段与明细段，唤醒正文只有报告，避免噪音。
 - 摘要本身仍只陈述事实、不含「请修复」这类指令；指令只属于唤醒这一层，修不修由主代理判断。
 - 连续请求失败退避 10→20→40→60s；401/403 立即暂停并唤醒一次说明 token 问题。
 - 会话销毁（`session/disposed`）与插件卸载（`ctx.effect`）必须 abort 定时器；不得对已关闭会话 `followup`。
@@ -302,15 +307,21 @@ Finding = { fid, file, level, gateCategory, location, problem, suggestion, rever
 ```
 MR !240 · wisdom-financial-service-platform/wisdom-financial-credit-platform-web
 feat-V1.7.0.20261119-ly → feature-V1.7.0.20261119 · 第 3 轮 · sha 0e2a9007（强绑定）
-评审   ✅ 可直接合并 · 发现 0（本轮新增 0） · 历史未收敛 0 · 本轮已验证修复 1 · Job 10s（20 秒前）
+评审   ⛔ 需要修改 · 发现 3（本轮新增 2，已豁免 1） · 历史未收敛 0 · 本轮已验证修复 1 · Job 10s（20 秒前）
 敏感   ✅ 门禁通过 · 共 15 条 / 历史豁免 15 / 当前有效 0
 必过   — 无本轮结论（建议性）
-阻塞   无
-待点头 #ai-waive ee81ac3eb3 reason=…（草稿，等你确认）
-合并   ✅ 可合（流水线 #7181 通过 · detailed_merge_status=mergeable）
+阻塞   ee81ac3eb3 · 中 · 逻辑错误；…（只列未处置）
+豁免   c3d4e5f6a7 · #ai-wontfix（评论 #75200） · 遗留文件本轮不动
+待点头  （无）
+合并   ⛔ 差 1 项：评审有 1 处需要关注的问题…（流水线 #7181 通过 · detailed_merge_status=mergeable）
 ```
 
 状态符号固定：`✅` 通过、`⛔` 阻塞、`⏳` 未出/待定、`⚠️` 弱绑定或降级判定、`—` 无结论 / 字段缺失占位。
+
+口径补充（T1）：
+
+- `评审` 行的「发现 N」= 本轮评审的**全部** finding（含已被 MR 指令豁免的），`本轮新增 M` 同理；有豁免时括号里补 `，已豁免 K`，所以全部豁免时仍能看出「发现 1（本轮新增 1，已豁免 1）」。`合并` / `阻塞` 行用未处置口径（扣掉账本处置与指令豁免），两者不矛盾：一个说「发现过多少」，一个说「还差多少」。
+- `豁免` 行只在有有效指令时出现：`FID · #ai-waive|skip|wontfix（评论 #noteId） · reason 摘要`，多条用 `；` 连接，超过 3 条折叠 `等 N 条`；账本 decisions 的处置不重复展示（它没有可引用的评论）。
 
 报告永远是纯事实：有未处置 finding 时，动作指令只加在唤醒消息的正文前（§5.4），不改变报告的形状与「差 N 项」的口径。
 
@@ -415,9 +426,11 @@ mr-loop/
   src/host/gitlab.js      REST 客户端：6 个方法、错误分类、安全不变量（≤450）
   src/host/parse-review.js 移植 review-parser（≤360）
   src/host/parse-gates.js  敏感门禁 / 必过项 note 解析（≤180）
-  src/host/rounds.js       sha 绑定矩阵、轮次归并、去重（≤200）
+  src/host/parse-directives.js MR 指令 #ai-* 解析（豁免判定、invalid、截断；≤200）
+  src/host/rounds.js       sha 绑定矩阵、轮次归并、去重（≤220）
+  src/host/mergeable.js    处置口径、reviewTodo、可合并判定（≤210）
   src/host/ledger.js       JSON 账本：原子写、裁剪、读取（≤180）
-  src/host/watcher.js      轮询状态机、退避、唤醒去抖、abort（≤320）
+  src/host/watcher.js      轮询状态机、退避、唤醒去抖、abort（≤420）
   src/host/waive.js        草稿校验、approvalToken、回帖、resolve（≤280）
   src/host/report.js       固定模板渲染（≤200）
   src/host/tools.js        7 个工具定义与参数校验（≤440）

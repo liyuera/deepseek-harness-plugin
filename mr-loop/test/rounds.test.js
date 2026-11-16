@@ -147,3 +147,78 @@ test('reviewMarker 贯通 buildRound：自定义标记的 note 才解析出结�
   const withDefault = buildRound({ mr, notes: [custom], cfg, observedAt })
   assert.equal(withDefault.review, null)
 })
+
+// ---------------------------------------------------------------------------
+// T1：指令评论 + 其它评论进 round（只读采集，不影响轮次归属）
+// ---------------------------------------------------------------------------
+
+const gateBody = 'Sensitive Content Gate\n\n结论: 门禁通过\n\n扫描结果：共 15 条命中；历史豁免 15 条；当前有效 0 条。'
+
+test('buildRound 输出 directives：有效指令 / invalid，且指令评论不被误判为评审或门禁', () => {
+  const mr = { sha: SHA, head_pipeline: { created_at: '2026-11-13T09:59:00Z' } }
+  const notes = [
+    note({ id: 11, created_at: '2026-11-13T10:02:00Z' }),
+    note({ id: 12, created_at: '2026-11-13T10:03:00Z', body: gateBody }),
+    // 指令评论正文里顺带提到门禁 / 结论字样：它仍是普通评论，不是门禁或评审。
+    note({
+      id: 20,
+      created_at: '2026-11-13T10:04:00Z',
+      body: '#ai-waive a1b2c3d4 reason=Sensitive Content Gate 已人工确认\n\n结论: 需要修改（这条不是评审）',
+    }),
+    note({ id: 21, created_at: '2026-11-13T10:05:00Z', body: '#ai-waive abc reason=字段写错' }),
+    note({ id: 22, created_at: '2026-11-13T10:06:00Z', body: '顺手补一个说明\n第二行' }),
+  ]
+  const round = buildRound({ mr, notes, cfg, observedAt: Date.parse('2026-11-13T10:10:00Z') })
+  assert.equal(round.review.noteId, 11)
+  assert.equal(round.sensitive.noteId, 12)
+  assert.equal(round.mandatory, null)
+  assert.deepEqual(round.dropped, [])
+  assert.deepEqual(round.directives, {
+    directives: [{
+      kind: 'waive',
+      fid: 'a1b2c3d4',
+      reason: 'Sensitive Content Gate 已人工确认',
+      noteId: 20,
+      author: null,
+      createdAt: '2026-11-13T10:04:00Z',
+      body: '#ai-waive a1b2c3d4 reason=Sensitive Content Gate 已人工确认 结论: 需要修改（这条不是评审）',
+    }],
+    invalid: [{ noteId: 21, line: 1, why: 'invalid-fid' }],
+  })
+  assert.deepEqual(round.comments, [
+    { noteId: 22, author: null, createdAt: '2026-11-13T10:06:00Z', excerpt: '顺手补一个说明 第二行' },
+  ])
+})
+
+test('comments：最近 5 条（noteId 降序）、排除系统/评审/门禁/指令、excerpt 单行化 ≤120', () => {
+  const mr = { sha: SHA, head_pipeline: { created_at: '2026-11-13T09:59:00Z' } }
+  const human = (id) => note({ id, created_at: '2026-11-13T10:00:00Z', body: `c${id}` })
+  const notes = [
+    human(1), human(2), human(3), human(4), human(5), human(6), human(7),
+    note({ id: 10, created_at: '2026-11-13T10:01:00Z' }), // 评审
+    note({ id: 11, created_at: '2026-11-13T10:01:00Z', body: gateBody }), // 门禁
+    note({ id: 12, created_at: '2026-11-13T10:01:00Z', body: '#ai-waive b2c3d4e5 reason=指令' }),
+    note({ id: 13, created_at: '2026-11-13T10:01:00Z', system: true, body: '#ai-skip b2c3d4e5 reason=系统' }),
+    note({ id: 14, created_at: '2026-11-13T10:01:00Z', body: '#ai-waive bad reason=无效指令也不当普通评论' }),
+  ]
+  const round = buildRound({ mr, notes, cfg, observedAt: Date.parse('2026-11-13T10:10:00Z') })
+  assert.deepEqual(round.comments.map((item) => item.noteId), [7, 6, 5, 4, 3])
+
+  const long = buildRound({
+    mr,
+    notes: [note({ id: 30, created_at: '2026-11-13T10:02:00Z', body: `${'x'.repeat(200)}\n第二行` })],
+    cfg,
+    observedAt: Date.parse('2026-11-13T10:10:00Z'),
+  })
+  assert.equal(long.comments.length, 1)
+  assert.equal(long.comments[0].excerpt.length, 120)
+  assert.equal(long.comments[0].excerpt.endsWith('…'), true)
+  assert.doesNotMatch(long.comments[0].excerpt, /\n/)
+})
+
+test('无指令 / 无其它评论时 directives 与 comments 仍是稳定空结构', () => {
+  const mr = { sha: SHA, head_pipeline: { created_at: '2026-11-13T09:59:00Z' } }
+  const round = buildRound({ mr, notes: [note({ id: 11, created_at: '2026-11-13T10:02:00Z' })], cfg, observedAt: Date.parse('2026-11-13T10:10:00Z') })
+  assert.deepEqual(round.directives, { directives: [], invalid: [] })
+  assert.deepEqual(round.comments, [])
+})

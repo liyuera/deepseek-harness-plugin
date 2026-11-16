@@ -110,7 +110,14 @@ export function createTools({ service, watcher = undefined }) {
       try {
         const sessionId = exec?.agent?.session?.id
         const { round, decisions } = service.review({ sessionId })
-        const data = { round, decisions }
+        // T1 读路径：指令与其它评论直接给模型看，主代理据此决定修哪些 / 豁免哪些；
+        // 旧账本里的轮次可能没有这两个字段，回落到 null / [] 而不是 undefined。
+        const data = {
+          round,
+          decisions,
+          directives: round?.directives ?? null,
+          comments: Array.isArray(round?.comments) ? round.comments : [],
+        }
         if (args?.history === true) {
           const state = service.getState(sessionId)
           data.history = (state?.rounds ?? []).map((item) => ({

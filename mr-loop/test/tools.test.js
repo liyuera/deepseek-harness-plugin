@@ -74,3 +74,37 @@ test('mr_status / mr_review 形状', async () => {
   assert.match(rendered, /"n": 2/)
   assert.match(rendered, /"decisions": \{\}/)
 })
+
+test('mr_review 返回 directives / comments 结构化数据，并渲染进模型可见文本', async () => {
+  const directives = {
+    directives: [{
+      kind: 'waive', fid: 'a1b2c3d4', reason: '风险已评估', noteId: 75200,
+      author: 'alice', createdAt: '2026-11-16T10:00:00Z', body: '#ai-waive a1b2c3d4 reason=风险已评估',
+    }],
+    invalid: [{ noteId: 9, line: 1, why: 'invalid-fid' }],
+  }
+  const comments = [{ noteId: 31, author: 'bob', createdAt: '2026-11-16T10:01:00Z', excerpt: '顺手改个命名' }]
+  const service = fakeService({
+    review: () => ({ round: { sha: 'abc', n: 2, directives, comments }, decisions: {} }),
+  })
+  const reviewDef = byName(createTools({ service }), 'mr_review')
+  const review = await reviewDef.execute({}, exec)
+  assert.equal(review.ok, true)
+  assert.deepEqual(review.data.directives, directives)
+  assert.deepEqual(review.data.comments, comments)
+  // 工具描述承诺的结构必须真的进到模型可见文本，不能只剩摘要。
+  const rendered = reviewDef.output.render({}, review).map((part) => part.text).join('')
+  assert.match(rendered, /"directives"/)
+  assert.match(rendered, /#ai-waive a1b2c3d4 reason=风险已评估/)
+  assert.match(rendered, /"invalid-fid"/)
+  assert.match(rendered, /"comments"/)
+  assert.match(rendered, /顺手改个命名/)
+})
+
+test('mr_review：旧 round 没有 directives / comments 时回落到 null / []，不抛', async () => {
+  const tools = createTools({ service: fakeService() })
+  const review = await byName(tools, 'mr_review').execute({}, exec)
+  assert.equal(review.ok, true)
+  assert.equal(review.data.directives, null)
+  assert.deepEqual(review.data.comments, [])
+})
