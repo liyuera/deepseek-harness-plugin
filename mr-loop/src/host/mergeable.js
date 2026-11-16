@@ -18,6 +18,71 @@ export function isDisposed(decision) {
   return typeof decision?.kind === 'string' && DISPOSED_KINDS.has(decision.kind)
 }
 
+/**
+ * 本轮评审的全部 finding。`parse-review` 按「门禁分类=非阻塞建议 / 级别=低」分出
+ * nonBlocking 只是展示口径：可合判定不再据此放行——任何一条未处置的问题都拦。
+ */
+export function reviewFindings(review) {
+  return [
+    ...(Array.isArray(review?.blocking) ? review.blocking : []),
+    ...(Array.isArray(review?.nonBlocking) ? review.nonBlocking : []),
+  ]
+}
+
+/** 未被 waive / skip / wontfix 终结的 finding；处置白名单与报告共用。 */
+export function openFindings(review, decisions = {}) {
+  return reviewFindings(review).filter((item) => isDisposed(decisions?.[item?.fid]) === false)
+}
+
+/**
+ * 本轮首次被评审看到的 finding：复验次数缺失或 <= 1。
+ * 字段缺失按「无法证明不是新问题」处理（fail-closed），不能因为解析不到就当旧问题。
+ */
+export function isNewFinding(item) {
+  const count = Number(item?.reverifyCount)
+  return !(Number.isFinite(count) && count > 1)
+}
+
+/** note 派生标量进 missing 前先压成单行并截断，避免改写报告行结构。 */
+const SCALAR_LIMIT = 60
+function scalar(value) {
+  if (value === null || value === undefined) return ''
+  const collapsed = String(value)
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ')
+    .replace(/ {2,}/g, ' ')
+    .trim()
+  return collapsed.length > SCALAR_LIMIT ? `${collapsed.slice(0, SCALAR_LIMIT)}…` : collapsed
+}
+
+const FID_PREVIEW = 3
+
+/**
+ * 把「需要关注的问题」与「本轮新增」合成一条 missing：
+ * `评审有 2 处需要关注的问题（其中 1 处本轮新增）：FID a1b2c3d4（低）、…`。
+ * 两者有重叠，但不拆成两条——用户要的是一个结论，不是重复计数。
+ */
+function findingGap(open, fresh) {
+  const freshSuffix = fresh > 0 ? `（其中 ${fresh} 处本轮新增）` : ''
+  const preview = open.slice(0, FID_PREVIEW).map((item) => {
+    const fid = scalar(item?.fid) || '?'
+    const level = scalar(item?.level)
+    return `FID ${fid}${level ? `（${level}）` : ''}`
+  })
+  const more = open.length > FID_PREVIEW ? `等 ${open.length} 处` : ''
+  return `评审有 ${open.length} 处需要关注的问题${freshSuffix}：${preview.join('、')}${more}`
+}
+
+/**
+ * 历史未收敛必须是 0 才能放行。字段缺失（null / undefined）表示 note 没写这个
+ * 字段，无法证明是 0 —— fail-closed 单独写成「未声明」，报告一眼能看出原因。
+ */
+function historyGap(review) {
+  const value = review?.historicalUnresolved
+  if (value === null || value === undefined) return '历史未收敛问题未声明'
+  if (value === 0) return null
+  return `历史未收敛问题 ${scalar(value)} 条`
+}
+
 export function evaluateMergeable({ mr, round, decisions = {} }) {
   const missing = []
   let degraded = false
@@ -34,19 +99,23 @@ export function evaluateMergeable({ mr, round, decisions = {} }) {
   const verdict = review?.verdict ?? 'unknown'
   if (review === null) {
     missing.push('AI 评审结论未知（未出或解析失败）')
-  } else if (round?.binding !== 'strong') {
-    missing.push('AI 评审为弱绑定（无 SHA 证明），需人工确认')
-  } else if (verdict !== 'pass') {
-    missing.push(verdict === 'changes' ? 'AI 评审结论为需要修改' : 'AI 评审结论未知（未出或解析失败）')
+  } else {
+    if (round?.binding !== 'strong') {
+      missing.push('AI 评审为弱绑定（无 SHA 证明），需人工确认')
+    } else if (verdict !== 'pass') {
+      missing.push(verdict === 'changes' ? 'AI 评审结论为需要修改' : 'AI 评审结论未知（未出或解析失败）')
+    }
+    // 用户口径：结论 + 需要关注的问题 + 历史未收敛 + 本轮新增，四个维度都为 0/通过才提示合并。
+    const open = openFindings(review, decisions)
+    if (open.length > 0) missing.push(findingGap(open, open.filter(isNewFinding).length))
+    const history = historyGap(review)
+    if (history !== null) missing.push(history)
   }
 
-  const blocking = Array.isArray(round?.review?.blocking) ? round.review.blocking : []
-  // 只有这三种处置才算「对外终结」；fix/pending/空壳对象都不能顶掉阻塞项（fail-closed）。
-  const unresolved = blocking.filter((item) => isDisposed(decisions?.[item?.fid]) === false)
-  if (unresolved.length > 0) missing.push(`有 ${unresolved.length} 条阻塞问题未处置`)
-
-  const sensitive = round?.sensitive?.verdict ?? 'unknown'
-  if (sensitive !== 'pass') missing.push(sensitive === 'block' ? '敏感内容门禁未通过' : '敏感内容门禁本轮无结论')
+  // 用户口径：敏感门禁只有「阻止合并」才拦；pass / unknown / 无本轮结论都不拦，
+  // 但报告行会如实标注后两者的状态（14.9 上该 bot 并非每次重发）。
+  const sensitive = round?.sensitive?.verdict ?? null
+  if (sensitive === 'block') missing.push('敏感内容门禁阻止合并')
 
   if (round?.mandatory?.verdict === 'block') missing.push('必过项完整性检查未通过')
 

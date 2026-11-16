@@ -3,12 +3,13 @@
  * 只陈述事实（含 unknown 与取证片段），不写「请修复」这类指令——修不修由主代理判断。
  * 「阻塞」与「可合并」共用 mergeable.js 的处置口径，避免两处说法不一致。
  */
-import { isDisposed } from './mergeable.js'
+import { openFindings, isNewFinding } from './mergeable.js'
 
 const OK = '✅'
 const BAD = '⛔'
 const PENDING = '⏳'
 const WARN = '⚠️'
+const DASH = '—'
 
 const pad = (label) => `${label.padEnd(5, ' ')}`
 const ago = (now, iso) => {
@@ -41,6 +42,16 @@ const verdictLine = (review) => {
   return `${PENDING} 解析失败（unknown）`
 }
 
+/** 一条未处置 finding 的展示：FID · 级别 · 门禁分类（缺字段就省略该段）。 */
+function findingLabel(item) {
+  const parts = [item?.fid, item?.level, item?.gateCategory]
+    .filter((value) => value !== null && value !== undefined && String(value).trim() !== '')
+    .map((value) => noteText(value))
+  return parts.length === 0 ? '?' : parts.join(' · ')
+}
+
+const BLOCKING_PREVIEW = 3
+
 /**
  * @param {{ binding: object, mr: object, round: object|null, decisions: object, mergeability: object, paused: object|null, now: number }} input
  * @returns {string}
@@ -52,34 +63,39 @@ export function renderReport({ binding, mr, round, decisions = {}, mergeability,
   lines.push(`${binding.sourceBranch} → ${binding.targetBranch} · 第 ${round?.n ?? 0} 轮 · sha ${String(mr.sha ?? '').slice(0, 8)}（${bindingLabel}）`)
 
   const review = round?.review ?? null
+  // 三个计数与合并判定同源：需要关注 = 未处置 finding（含非阻塞/低），本轮新增 = 复验次数缺失或 <= 1。
+  const openItems = openFindings(review, decisions)
+  const freshCount = openItems.filter(isNewFinding).length
   const reviewTail = review === null
     ? ''
-    : ` · 历史未收敛 ${review.historicalUnresolved ?? '?'} · 本轮已验证修复 ${review.verifiedFixed ?? '?'}${review.jobDuration ? ` · Job ${noteText(review.jobDuration)}` : ''}`
+    : ` · 发现 ${openItems.length}（本轮新增 ${freshCount}） · 历史未收敛 ${review.historicalUnresolved ?? DASH} · 本轮已验证修复 ${review.verifiedFixed ?? DASH}${review.jobDuration ? ` · Job ${noteText(review.jobDuration)}` : ''}`
   lines.push(`${pad('评审')}${verdictLine(review)}${reviewTail}`)
 
   const sensitive = round?.sensitive ?? null
   const sensitiveLine = sensitive === null
-    ? `${PENDING} 未出`
+    ? `${DASH} 无本轮结论（不拦合并）`
     : sensitive.verdict === 'pass'
       ? `${OK} 门禁通过 · 共 ${sensitive.total ?? '?'} / 历史豁免 ${sensitive.waived ?? '?'} / 当前有效 ${sensitive.effective ?? '?'}`
       : sensitive.verdict === 'block'
         ? `${BAD} 阻止合并 · 有效 ${sensitive.effective ?? '?'} 条 / 阻断项 ${sensitive.blocking ?? '?'}`
-        : `${PENDING} 解析失败（unknown）`
+        : `${PENDING} 未解析（不拦合并）`
   lines.push(`${pad('敏感')}${sensitiveLine}`)
 
   const mandatory = round?.mandatory ?? null
   const mandatoryLine = mandatory === null
-    ? `${PENDING} 无本轮结论`
+    ? `${DASH} 无本轮结论（建议性）`
     : mandatory.verdict === 'pass'
       ? `${OK} 通过`
       : mandatory.verdict === 'block'
         ? `${BAD} 阻止合并（敏感 ${noteText(mandatory.items?.sensitive)} / 评审 ${noteText(mandatory.items?.review)} / 证据 ${noteText(mandatory.items?.evidence)}）`
-        : `${PENDING} 解析失败（unknown）`
+        : `${DASH} 未解析（建议性）`
   lines.push(`${pad('必过')}${mandatoryLine}`)
 
-  const blocking = Array.isArray(review?.blocking) ? review.blocking : []
-  const openItems = blocking.filter((item) => isDisposed(decisions[item.fid]) === false)
-  lines.push(`${pad('阻塞')}${openItems.length === 0 ? '无' : openItems.map((item) => `#${noteText(item?.fid)} · ${noteText(item?.level)}`).join('；')}`)
+  // 阻塞行列出所有未处置 finding（不再只列 blocking 那部分），太长时收口。
+  const blockingText = openItems.length === 0
+    ? '无'
+    : `${openItems.slice(0, BLOCKING_PREVIEW).map(findingLabel).join('；')}${openItems.length > BLOCKING_PREVIEW ? `；等 ${openItems.length} 条` : ''}`
+  lines.push(`${pad('阻塞')}${blockingText}`)
 
   const pendingWaives = Object.values(decisions).filter((decision) => decision?.kind === 'waive' && decision?.noteId === undefined)
   lines.push(`${pad('待点头')}${pendingWaives.length === 0 ? '（无）' : `${pendingWaives.length} 条豁免草稿`}`)

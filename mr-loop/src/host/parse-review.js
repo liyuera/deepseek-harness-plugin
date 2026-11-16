@@ -18,6 +18,8 @@
  *   4. Items are read from `需要关注的问题` and `历史未收敛问题`: `文件`, `FID`,
  *      `复验次数`, `级别`, `门禁分类`, `位置`, `问题`, `建议` (other fields are ignored).
  *   5. `门禁分类 = 非阻塞建议` or `级别 = 低` -> nonBlocking, everything else -> blocking.
+ *      This grouping is presentation-only: mergeability treats every undisposed
+ *      finding in either group as blocking (see `mergeable.js`).
  *   6. Never guess: a `需要修改` verdict with no parsable item, a malformed item, a
  *      recognized issue section with text but no parsable item (format drift), or a
  *      pass note with no item and no explicit zero-issue statement yields `unknown`.
