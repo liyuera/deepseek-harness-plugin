@@ -73,7 +73,7 @@
                     │ rounds.js    sha 绑定矩阵 + 轮次归并          │◀─JSON──
                     │ parse-review / parse-gates  评审与门禁解析     │
                     │ ledger.js    JSON 账本（原子写、上限裁剪）     │
-                    │ waive.js     草稿 → 用户发言 → 回帖 → resolve │──POST/PUT─▶ GitLab
+                    │ service.js   绑定编排 + 草稿 / 确认 / 回帖     │──POST────▶ GitLab
                     │ report.js    固定模板渲染                      │
                     └───────────────┬──────────────────────────────┘
                                     │ agent.followup(plugin 消息)
@@ -81,7 +81,7 @@
                               主代理（改代码 / 推 / 汇报）
 ```
 
-模块依赖单一方向：`command`/`tools` → `watcher`/`waive`/`report` → `rounds`/`parse-*`/`ledger` → `gitlab` → `fetch`。除 `index.js` 外没有模块 import harness 包。
+模块依赖单一方向：`command`/`tools` → `service`/`watcher`/`report` → `rounds`/`mergeable`/`parse-*`/`ledger` → `gitlab` → `fetch`。除 `index.js` 外没有模块 import harness 包。
 
 ## 5. 运行时契约
 
@@ -182,7 +182,7 @@ idle ──bind──▶ watching(sha) ──head sha 变化──▶ awaiting(s
 
 - **唤醒去抖**：同一 `sha + 评审 note.id + findings 签名（FID + 级别 + 复验次数的稳定序列）+ 三套门禁 verdict` 只唤醒一次；两次唤醒最小间隔 30s。唤醒用 `agent.followup(message)`，`source.kind = 'plugin:mr-loop'`。同 sha 上「评论触发的新评审」（note.id 或 findings 签名变化）必须能再唤醒；同一轮内容不变（含豁免 reason 变更）不重复唤醒。
 - 有未处置 finding（`reviewTodo.total > 0`）时，唤醒正文固定三段：**动作指令段 → 报告 → 全量问题明细段**。
-  - 指令段：`有 N 处评审问题待处置（FID …）：全部问题见下方明细，修哪些由你决定；可以按问题分组并行派 subagent。`；已有有效指令时补一条 `已收到 M 条 MR 指令（#ai-waive/#ai-skip/#ai-wontfix），对应 FID 已计入豁免。`（**M 只算真正命中本轮的豁免数 `reviewTodo.waived.length`**，不是评论里的指令总数）；有格式不对的指令时再补 `另有 K 条 #ai-* 指令格式不对，未生效。`；最后 `不打算改的，按 #ai-waive <FID> reason=<原因> 回帖豁免（#ai-skip / #ai-wontfix 同理）；最后给出结论：修了哪些、用了什么指令、并引用对应 MR 评论。`
+  - 指令段：`有 N 处评审问题待处置（FID …）：全部问题见下方明细，修哪些由你决定；可以按问题分组并行派 subagent。`；已有有效指令时补一条 `已收到 M 条 MR 指令（#ai-waive/#ai-skip/#ai-wontfix），对应 FID 已计入豁免。`（**M 只算真正命中本轮的豁免数 `reviewTodo.waived.length`**，不是评论里的指令总数）；有格式不对的指令时再补 `另有 K 条 #ai-* 指令格式不对，未生效。`；最后 `不打算改的用 mr_waive 出草稿，经用户「可以 / 自定义」确认后 post:true 回帖（#ai-skip / #ai-wontfix 同理）；最后给出结论：修了哪些、用了什么指令、并引用对应 MR 评论。`
   - 明细段：每条 `问题 i/N · FID · 级别 · 门禁分类 · file:line` 换行 `  问题：…` `  建议：…` `  复验次数：…`；只列未处置 finding（已豁免的不进），每个字段单行化并截断 ≤200 字。
   - 没有待处置问题时不加指令段与明细段，唤醒正文只有报告，避免噪音。
 - 摘要本身仍只陈述事实、不含「请修复」这类指令；指令只属于唤醒这一层，修不修由主代理判断。
@@ -201,11 +201,15 @@ idle ──bind──▶ watching(sha) ──head sha 变化──▶ awaiting(s
 #sensitive-waive reason=<原因>    敏感内容门禁整轮豁免（本阶段不实现）
 ```
 
-流程（用户 2026-11-16 拍板，替换旧的 approvalToken / `mr_waive_send` 两步方案）：
+流程（用户 2026-11-16 拍板）：
 
-1. 主代理决定某条 finding 不修 → `mr_waive({ fid, kind, reason })`（`post` 默认 false，`kind` 默认 `waive`）→ 插件只生成**草稿** `{ body, fid, kind, reason }`，**不写账本、不改 decisions、不发 MR 评论**。
-2. 主代理把草稿给用户看，用 **「可以 / 自定义」** 确认；用户确认后才 `mr_waive({ fid, kind, reason, post: true })` → `POST /projects/:id/merge_requests/:iid/notes` 发一条 `#ai-waive|skip|wontfix <FID> reason=<原因>`。
-3. 发成功后插件把 `decisions[fid] = { kind, reason, noteId, at, source: 'comment' }` 写进状态并落账本；**只有回帖成功才写**，失败与草稿都不写。
+1. 主代理决定某条 finding 不修 → `mr_waive({ fid, kind, reason })`（`post` 默认 false，`kind` 默认 `waive`）→ 插件只生成**草稿** `{ body, fid, kind, reason, mrLabel }`，**不写账本、不改 decisions、不发 MR 评论**；同时把确认目标（`projectPath / iid / sha / fid / kind / reason / at`）记进**会话内存**。
+2. 主代理把草稿（首行带 `MR !240 · group/project`）给用户看，用 **「可以 / 自定义」** 确认；用户确认后才 `mr_waive({ fid, kind, reason, post: true })` → `POST /projects/:id/merge_requests/:iid/notes` 发一条 `#ai-waive|skip|wontfix <FID> reason=<原因>`。
+   - **草稿绑定目标（C1）**：post 前必须与最近一次草稿逐字段匹配（会话 / MR / sha / FID / kind / reason）；没出草稿 → `draft-required`，确认后换绑或 sha 变了 → `stale-round`，**绝不把评论发到另一条 MR**。
+   - **跨会话防重（I2）**：同一 MR 已被其它 live 会话绑定 → 写操作拒绝 `bound-elsewhere`（只读查询不受影响），避免两边 decisions / 账本互相覆盖。
+3. 发成功后插件把 `decisions[fid] = { kind, reason, noteId, at, source: 'comment' }` 写进状态并落账本；**只有回帖成功才写**，失败与草稿都不写；成功后清掉会话草稿。
+   - **结果未知可恢复（I1）**：`timeout` / `network` / 5xx / `bad-response` 时评论可能已创建；改用 `GET notes` 按「body 全等 + `created_at >= 草稿 at`」找回，找到则补写 decisions 并返回 `{ posted: true, noteId, url, recovered: true }`，找不到才抛错——不盲目重发。
+   - **落盘失败降级（M2）**：回帖已成功但账本 persist 失败时返回 `{ posted: true, persisted: false, noteId, url, warning }`，不报 `storage-failed` 让模型误以为没发出去。
 4. 幂等：当前轮已有同 FID 同 kind 的 MR 指令，或本会话已回帖过同 kind → 返回 `{ posted: false, noteId, existing: true }`，不再发；同 FID 已有其它 kind 的处置 → `already-disposed`（不重复回帖）。
 5. **先评论、后提交代码**：评论本身会触发一次新评审；主代理发完评论再 commit + push，然后 `mr_status` 看新一轮。
 6. 不实现 resolve discussion：FID 在评审 note 正文里，无法精确映射到 discussion。
@@ -215,11 +219,15 @@ idle ──bind──▶ watching(sha) ──head sha 变化──▶ awaiting(s
 | 校验 | 失败码 |
 |---|---|
 | `kind ∈ {waive, skip, wontfix}`（缺省 `waive`） | `invalid-kind` |
-| FID 属于**当前轮**评审的 finding（大小写不敏感，回帖用评审原文大小写） | `unknown-fid` |
+| FID 符合解析器格式 `[A-Za-z0-9_-]{4,64}`（回帖要能被读回）且属于**当前轮**评审的 finding（大小写不敏感，回帖用评审原文大小写） | `unknown-fid` |
 | FID 尚未处置（账本 decisions 与 MR 指令都没有），幂等命中除外 | `already-disposed` |
-| `reason` 单行化（控制符/零宽字符剔除）后含可见字符，≤200 字 | `invalid-reason` |
+| `reason` 单行化（控制符/零宽字符剔除）后含可见字符，≤200 字；且用真实解析器 round-trip 必须恰好读回 1 条同 fid / kind / reason（挡住 `<!-- -->`、隐藏统计块标记导致失真） | `invalid-reason` |
+| 未先出草稿 / 草稿已被消费 | `draft-required` |
+| 草稿之后换绑、sha 变化或 kind / reason 被改 | `stale-round` |
+| 其它 live 会话已绑定同一 MR | `bound-elsewhere` |
 | 同一会话的写操作串行（复用绑定锁）；并发两次 post 只发一条，第二次命中 `existing` | — |
-| 403 写权限 / 404 / 网络 / 超时 / token | `permission-denied` / `not-found` / `network` / `timeout` / `no-token` |
+| 403 写权限 / 404 / 429 / 409 / 网络 / 超时 / token | `permission-denied` / `not-found` / `rate-limited` / `conflict` / `network` / `timeout` / `no-token` |
+| 响应结构异常 / 未知内部错误（非 GitlabError 用静态文案，不回显上游原文） | `bad-response` / `internal` |
 
 **草稿不算处置（M4）**：只有 MR 里真实出现的 `#ai-*` 指令，或回帖成功写进 `decisions` 的处置，才参与合并判定；`waiverDraft` 不碰 `decisions`、不写账本、不改 `round` 状态。看板/报告沿用「账本 + round.directives」读路径，无需为草稿改口径。
 
@@ -310,7 +318,7 @@ Finding = { fid, file, level, gateCategory, location, problem, suggestion, rever
 
 统一返回 `{ ok: boolean, code?: string, message: string, data?: object }`；`message` 为静态中文，不含 token、URL、上游原文。
 
-错误码（稳定，调用方按 `code` 分支）：`no-token`、`unauthorized`、`forbidden`、`permission-denied`、`not-found`、`rate-limited`、`network`、`timeout`、`bad-response`、`invalid-url`、`mr-not-open`、`repo-mismatch`、`not-bound`、`storage-failed`、`invalid-kind`、`unknown-fid`、`already-disposed`、`invalid-reason`。`branch-mismatch` 只出现在 `warnings[].code`，不中断绑定。`permission-denied` 只出现在写路径：403 在读路径是 `forbidden`（可能只是仓库不可见），在发评论时是 token 缺 `api` 写权限。
+错误码（稳定，调用方按 `code` 分支）：`no-token`、`unauthorized`、`forbidden`、`permission-denied`、`not-found`、`rate-limited`、`network`、`timeout`、`bad-response`、`invalid-url`、`mr-not-open`、`repo-mismatch`、`not-bound`、`storage-failed`、`invalid-kind`、`unknown-fid`、`already-disposed`、`invalid-reason`、`draft-required`、`stale-round`、`bound-elsewhere`、`conflict`、`internal`。`branch-mismatch` 只出现在 `warnings[].code`，不中断绑定。`permission-denied` 只出现在写路径：403 在读路径是 `forbidden`（可能只是仓库不可见），在发评论时是 token 缺 `api` 写权限。
 
 ### 6.4 报告模板（固定，每轮同一形状）
 
@@ -323,7 +331,6 @@ feat-V1.7.0.20261119-ly → feature-V1.7.0.20261119 · 第 3 轮 · sha 0e2a9007
 阻塞   无
 豁免   ee81ac3eb3 · #ai-waive（评论 #75200） · 风险已评估；c3d4e5f6a7 · #ai-wontfix（评论 #75201） · 遗留文件本轮不动
 指令   ⚠️ 无效指令 1 条（格式不对，未生效）
-待点头  （无）
 合并   ✅ 可合 · 流水线 #7181 success
 ```
 
@@ -335,6 +342,7 @@ feat-V1.7.0.20261119-ly → feature-V1.7.0.20261119 · 第 3 轮 · sha 0e2a9007
 - **I3（verdict=changes + 问题全豁免）**：当 `verdict === 'changes'` 但 `reviewTodo.total === 0` 且 `historicalUnresolved === 0` 时，verdict 不再计入 `missing`；报告评审行仍如实写 `⛔ 需要修改`，并在后面补 ` · 问题已全部豁免`，合并行照常按剩余缺口判定（可能是 ✅ 可合）。
 - `豁免` 行只在有有效指令时出现：`FID · #ai-waive|skip|wontfix（评论 #noteId） · reason 摘要`，多条用 `；` 连接，超过 3 条折叠 `等 N 条`；账本 decisions 的处置不重复展示（它没有可引用的评论）。
 - `指令` 行只在有无效指令时出现：`⚠️ 无效指令 N 条（格式不对，未生效）`，只给条数，不展开原始行。
+- 报告没有「待点头」行：草稿不落账本、不写 decisions，所以不存在可展示的草稿状态；「草稿不算处置」的唯一口径见 §5.5。
 - 缺口文案里的「本轮新增」只强调**未处置**的子集（`其中 N 处本轮新增未处置`），与评审行的全部 finding 口径用标签区分。
 
 报告永远是纯事实：有未处置 finding 时，动作指令只加在唤醒消息的正文前（§5.4），不改变报告的形状与「差 N 项」的口径。
@@ -435,17 +443,17 @@ mr-loop/
   cordis.patch.yml        insert 本插件
   index.js                apply：配置、注册命令/工具/skill、watcher 生命周期（≤200 行）
   src/host/config.js      配置解析与校验（≤120）
-  src/host/gitlab.js      REST 客户端：6 个方法、错误分类、安全不变量（≤450）
+  src/host/gitlab.js      REST 客户端：5 个方法（4 GET + 1 POST /notes）、错误分类、安全不变量（≤450）
   src/host/parse-review.js 移植 review-parser（≤360）
   src/host/parse-gates.js  敏感门禁 / 必过项 note 解析（≤180）
   src/host/parse-directives.js MR 指令 #ai-* 解析（豁免判定、可信来源、有界输出；≤300）
   src/host/rounds.js       sha 绑定矩阵、轮次归并、去重（≤220）
+  src/host/service.js     绑定编排 + 草稿 / 确认 / 回帖（幂等、恢复、写锁；≤620）
   src/host/mergeable.js    处置口径、reviewTodo、可合并判定（≤210）
   src/host/ledger.js       JSON 账本：原子写、裁剪、读取（≤180）
   src/host/watcher.js      轮询状态机、退避、唤醒去抖、abort（≤420）
-  src/host/waive.js        草稿校验、approvalToken、回帖、resolve（≤280）
   src/host/report.js       固定模板渲染（≤200）
-  src/host/tools.js        7 个工具定义与参数校验（≤440）
+  src/host/tools.js        6 个工具定义与参数校验（≤440）
   src/host/command.js      /mr handler（≤180）
   src/host/skill.js        mr-loop 技能正文（教主代理何时用、怎么用）
   src/host/token.js        token 读取（env → 0600 文件）与来源说明（≤80）
@@ -462,7 +470,7 @@ mr-loop/
 - `parse-gates`：敏感门禁通过/阻止两种正文；必过项三子项；缺字段降级。
 - `rounds`：sha 绑定矩阵全枚举（强 / 弱 / 丢弃（stale）/ 多命中），至少 12 个用例，含「push 后立刻读到上一轮 note」这一现场 failure 模式。
 - `watcher`：假定时器 + 假 fetch，覆盖 head 变化、评审先到、门禁后到、流水线失败、兜底超时、401、连续失败退避、唤醒去抖、会话销毁、四类守卫暂停（stall / reverify / wallClock / idle）与 `/mr resume`；另断言稳态 tick 只发 1 个请求、`user_notes_count` 不变时不拉 notes。
-- `waive`：token 过期 / 无用户发言 / 内容变更 / sha 变化 / FID 不属于本轮 / kind 不匹配 / reason 非法 / 重复发送。
+- `waive`（service + tools + 真实接缝）：草稿不落账本；非法 kind / FID / reason；`post` 必须先出草稿（`draft-required`）；草稿后换绑或 sha 变化（`stale-round`）；跨会话重复写（`bound-elsewhere`）；重复 post 幂等；结果未知（timeout / network / bad-response）按 body 找回已创建评论（`recovered`）；persist 失败降级（`persisted:false`）；并发 post 只发一条。
 - `ledger`：原子写（写一半崩溃不留坏文件）、裁剪、并发写串行化。
 - `report`：强/弱绑定、unknown 门禁、降级判定各一份快照。
 - `config`：默认与非法值。
@@ -476,10 +484,10 @@ Live 验收（用户执行）：真 MR 上跑一轮完整闭环，确认报告�
 
 | 期 | 内容 | 验收标准 |
 |---|---|---|
-| **S0** | spike：真 MR 上核实 ① notes 是否带 `AI_REVIEW_SHA` ② `detailed_merge_status` 在门禁红/绿两态的取值 ③ discussions 的 `resolvable/resolved` 结构 ④ POST note 与 resolve 权限 ⑤ 门禁 bot 能否解析「一条 note 内多行 `#ai-waive`」 ⑥ `user_notes_count` 是否随 bot 评论变化、`head_pipeline` 是否存在（决定「1 个请求 tick」是否成立） | 一份 JSON 证据贴给用户；结论回填本文档 §5.2 / §5.6；⑤ 若 bot 只认单行，则改为逐条一条 note |
+| **S0** | spike：真 MR 上核实 ① notes 是否带 `AI_REVIEW_SHA` ② `detailed_merge_status` 在门禁红/绿两态的取值 ③ discussions 的 `resolvable/resolved` 结构 ④ POST note 权限（确认没有 approve / merge / resolve 代码路径） ⑤ 门禁 bot 能否解析「一条 note 内多行 `#ai-waive`」 ⑥ `user_notes_count` 是否随 bot 评论变化、`head_pipeline` 是否存在（决定「1 个请求 tick」是否成立） | 一份 JSON 证据贴给用户；结论回填本文档 §5.2 / §5.6；⑤ 若 bot 只认单行，则改为逐条一条 note |
 | **S1** | 只读：`mr_bind` / `mr_status` / `mr_review` + 报告 | 与 GitLab 网页对同一 MR 的结论、FID、门禁逐条一致；stale 矩阵单测全绿 |
 | **S2** | watcher + followup | 真 MR 上完成一次「需要修改 → 修 → 推 → 可合并」，全程无 `sleep` |
-| **S3** | 豁免：草稿 / 确认 / 回帖 / resolve + 账本 | 没有用户发言时发送被拒（单测 + 手动验证各一）；重复发送幂等；在一个测试 MR 上完成一次真实回帖 + resolve |
+| **S3** | 豁免：草稿 / 确认 / 回帖 / 幂等 + 账本 | 草稿不算处置；未出草稿或用户未确认时 post 被拒（`draft-required`）；重复 post 幂等；结果未知时按 body 找回而不是重发；在一个测试 MR 上完成一次真实回帖（不 resolve discussion） |
 | **S4** | 护栏与收尾：进度守卫、暂停/恢复、失败矩阵、README、skill | 断 token、评审超时、解析 unknown、无进展暂停四条路径都能说清「卡在哪、你该做什么」；`/mr stop` 与 `/mr resume` 真实可用 |
 
 S0 不写产品代码；S1 起每期结束跑一次全量单测。
@@ -492,7 +500,7 @@ S0 不写产品代码；S1 起每期结束跑一次全量单测。
 | 实例是 GitLab 14.9，没有 `detailed_merge_status` | 可合并判定长期走降级路径 | 已实测：改用 `merge_status` + `blocking_discussions_resolved` + `head_pipeline.status` 组合，并在报告固定标注「⚠️ 降级判定」 |
 | 必过项检查只在早期出现一次 | 状态过期 | 报告标注 observedAt，不作为实时状态；最终以 `detailed_merge_status` 为准 |
 | 评审 bot 换代（模型/模板变化） | 解析 unknown | fail-closed + 唤醒带原文；标题与标记可配置 |
-| token 权限过大 | 误操作面 | 客户端只有 6 个固定方法和 2 个写端点，无 merge/approve 代码路径 |
+| token 权限过大 | 误操作面 | 客户端只有 5 个固定方法和 1 个写端点（POST /notes），无 merge/approve/resolve 代码路径 |
 | watcher 空转 | 无谓请求 | 稳态每 tick 1 个请求；空闲 30min 暂停 + `/mr stop` |
 | 轮次不限、反复推送 | 反复占用 CI 与远端审查 bot | 用「无改善」守卫暂停（§5.7）+ 12h 预算 + 人工终结；不设轮次硬上限 |
 | 同一 MR 两会话同时绑 | 重复回帖 | 进程内绑定 registry + 账本；写操作要求绑定会话，非绑定会话拒绝 |

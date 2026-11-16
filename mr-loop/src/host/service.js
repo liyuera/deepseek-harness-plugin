@@ -6,7 +6,8 @@ import { parseMrUrl } from './url.js'
 import { readRepoState } from './repo.js'
 import { buildRound } from './rounds.js'
 import { evaluateMergeable, isDisposed, isDisposedFinding, directiveFor, decisionFor, reviewFindings } from './mergeable.js'
-import { clipText, REASON_LIMIT } from './parse-directives.js'
+import { clipText, FID_RE, parseDirectives, REASON_LIMIT } from './parse-directives.js'
+import { GitlabError } from './gitlab.js'
 import { renderReport } from './report.js'
 
 export class ServiceError extends Error {
@@ -21,6 +22,23 @@ const sameProject = (a, b) => String(a ?? '').toLowerCase() === String(b ?? '').
 
 /** 写路径只接受这三种处置；与服务端解析 / 账本口径一致。 */
 const WAIVER_KINDS = new Set(['waive', 'skip', 'wontfix'])
+
+/** 这些失败「结果未知」：评论可能已经创建，只能按 body 从 notes 里找回，不能直接重发（I1）。 */
+const AMBIGUOUS_WRITE_CODES = new Set(['timeout', 'network', 'bad-response'])
+
+/** 写路径错误的静态中文文案：非 GitlabError（上游原文不可信）一律用它，不回显 error.message（M6）。 */
+const STATIC_WRITE_MESSAGES = Object.freeze({
+  'no-token': '未配置 GitLab token',
+  unauthorized: 'GitLab 鉴权失败，请检查 token',
+  'permission-denied': 'GitLab 拒绝发评论：token 缺少 api 写权限',
+  'not-found': 'GitLab 项目或 MR 不存在',
+  'rate-limited': 'GitLab 请求过于频繁，请稍后重试',
+  conflict: 'GitLab 请求冲突，资源状态已变化',
+  network: '无法连接 GitLab 或服务暂时不可用',
+  timeout: 'GitLab 请求超时',
+  'bad-response': 'GitLab 响应结构异常',
+  internal: '发评论失败',
+})
 
 /**
  * 发评论的 GitLab 错误码 → 工具面错误码。读路径的 403 是 `forbidden`（可能只是仓库不可见），
@@ -284,6 +302,17 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
     }
   }
 
+  /**
+   * 回收会话锁：只有在「等完当前链后 map 里仍是同一条链」时才删——避免把别人刚排上的
+   * 新写操作从串行队列里摘掉（M7）。
+   */
+  async function releaseSessionLock(sessionId) {
+    const pending = sessionLocks.get(sessionId)
+    if (pending === undefined) return
+    await pending.catch(() => {})
+    if (sessionLocks.get(sessionId) === pending) sessionLocks.delete(sessionId)
+  }
+
   async function stop({ sessionId, forget = false }) {
     const state = bindings.get(sessionId)
     if (forget) {
@@ -296,10 +325,14 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
         }
       }
       bindings.delete(sessionId)
+      drafts.delete(sessionId)
+      await releaseSessionLock(sessionId)
       return { stopped: state !== undefined, forgotten: true }
     }
     bindings.delete(sessionId)
     if (state !== undefined) await persist(state).catch(() => {})
+    drafts.delete(sessionId)
+    await releaseSessionLock(sessionId)
     return { stopped: state !== undefined, forgotten: false }
   }
 
@@ -326,36 +359,59 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
   }
 
   // ---------------------------------------------------------------------------
-  // T2 写路径：豁免草稿（不写任何东西）与回帖（唯一写 GitLab 的路径）
+  // T2 写路径：豁免草稿（不落账本 / 不发评论，只记会话内确认目标）与回帖（唯一写 GitLab 的路径）
   // ---------------------------------------------------------------------------
+
+  /** 会话内的「最近一次草稿」：只进内存、不入账本；post 必须与它逐字段一致才允许发（C1）。 */
+  const drafts = new Map()
 
   /** 单行化 + 截断到解析器上限，保证回帖能被自己的读路径原样读回（不会被二次裁剪出差异）。 */
   const waiverReason = (value) => clipText(value, REASON_LIMIT)
 
-  /**
-   * 校验并规范化三条入参；kind 缺省 waive，FID 大小写不敏感匹配，
-   * 但回帖 / 账本里用评审原文的大小写（读路径按大小写不敏感匹配，人看着也一致）。
-   * 这里不判「是否已处置」：postWaiver 要先做幂等判定，再决定是 existing 还是 already-disposed。
-   */
-  function waiverArgs(state, { fid, kind, reason }) {
+  const mrLabelOf = (state) => `MR !${state.binding.iid} · ${state.binding.projectPath}`
+
+  const sameBindingTarget = (left, right) => typeof left?.binding?.projectPath === 'string'
+    && sameProject(left.binding.projectPath, right?.binding?.projectPath)
+    && left.binding.iid === right?.binding?.iid
+
+  /** 只做 kind / reason / FID 格式校验，不查当前轮：草稿与回帖共用。 */
+  function waiverInput({ fid, kind, reason }) {
     const normalizedKind = kind === undefined ? 'waive' : kind
     if (typeof normalizedKind !== 'string' || WAIVER_KINDS.has(normalizedKind) === false) {
       throw new ServiceError('invalid-kind', 'kind 只能是 waive / skip / wontfix')
     }
     const normalizedReason = waiverReason(reason)
     if (normalizedReason === '') throw new ServiceError('invalid-reason', 'reason 必须是非空的单行文本')
-    const wanted = typeof fid === 'string' ? fid.trim().toLowerCase() : ''
-    const finding = wanted === ''
-      ? null
-      : reviewFindings(state.round?.review).find((item) => String(item?.fid ?? '').trim().toLowerCase() === wanted) ?? null
-    const canonicalFid = String(finding?.fid ?? '').trim()
-    if (finding === null || canonicalFid === '') {
-      throw new ServiceError('unknown-fid', 'FID 不属于当前轮评审的未处置问题')
+    const wanted = typeof fid === 'string' ? fid.trim() : ''
+    // 回帖 body 要能被自己的解析器读回，FID 必须先符合解析器的字符 / 长度约束。
+    if (wanted === '' || FID_RE.test(wanted) === false) {
+      throw new ServiceError('unknown-fid', 'FID 不属于当前轮评审的未处置问题（格式或轮次不对）')
     }
-    return { kind: normalizedKind, reason: normalizedReason, fid: canonicalFid }
+    return { kind: normalizedKind, reason: normalizedReason, fid: wanted }
   }
 
-  const waiverBody = ({ kind, fid, reason }) => `#ai-${kind} ${fid} reason=${reason}`
+  /** 在当前轮 finding 里按大小写不敏感找 FID，返回评审原文大小写的 FID。 */
+  function waiverFindingFid(state, fid) {
+    const key = fid.toLowerCase()
+    const finding = reviewFindings(state.round?.review).find((item) => String(item?.fid ?? '').trim().toLowerCase() === key) ?? null
+    const canonicalFid = String(finding?.fid ?? '').trim()
+    if (finding === null || canonicalFid === '') throw new ServiceError('unknown-fid', 'FID 不属于当前轮评审的未处置问题')
+    return canonicalFid
+  }
+
+  /**
+   * M1 round-trip：生成 body 后用真实解析器读一遍，必须恰好 1 条且 fid / kind / reason 全等。
+   * 挡住 reason 里塞 HTML 注释 / 隐藏统计块标记，导致「发出去的指令读回来失真」。
+   */
+  function waiverBodyOf({ kind, fid, reason }) {
+    const body = `#ai-${kind} ${fid} reason=${reason}`
+    const parsed = parseDirectives([{ id: 0, system: false, body }])
+    const back = parsed.directives[0]
+    if (parsed.directives.length !== 1 || back.fid !== fid || back.kind !== kind || back.reason !== reason) {
+      throw new ServiceError('invalid-reason', 'reason 含会被指令解析器丢弃 / 改写的内容（如 <!-- -->、隐藏块标记），请换一种写法')
+    }
+    return body
+  }
 
   /**
    * 幂等命中：当前轮 MR 指令里已有同 FID 同 kind，或本会话已回帖过同 kind 的 decisions。
@@ -374,27 +430,36 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
   }
 
   /**
-   * 只生成草稿：不写账本、不改 decisions、不碰 GitLab。
-   * 「草稿」不是处置——只有 MR 里真实出现的指令或已回帖的 decisions 才算（M4）。
+   * 只生成草稿：不写账本、不改 decisions、不碰 GitLab；但把「确认目标」记进会话内存，
+   * postWaiver 必须逐字段匹配它才发（防确认后换绑 / 换 sha 把评论发到错误 MR，C1）。
    */
   function waiverDraft({ sessionId, fid, kind, reason }) {
     const state = requireState(sessionId)
-    const input = waiverArgs(state, { fid, kind, reason })
-    if (isDisposedFinding(state.round, state.decisions, input.fid)) {
+    const input = waiverInput({ fid, kind, reason })
+    const canonicalFid = waiverFindingFid(state, input.fid)
+    if (isDisposedFinding(state.round, state.decisions, canonicalFid)) {
       throw new ServiceError('already-disposed', '该 FID 已有处置（MR 指令或已回帖的 decisions），不再生成草稿')
     }
-    return { body: waiverBody(input), fid: input.fid, kind: input.kind, reason: input.reason }
+    const body = waiverBodyOf({ ...input, fid: canonicalFid })
+    drafts.set(sessionId, {
+      projectPath: state.binding.projectPath,
+      iid: state.binding.iid,
+      sha: String(state.round?.sha ?? state.mr?.sha ?? ''),
+      fid: canonicalFid,
+      kind: input.kind,
+      reason: input.reason,
+      at: new Date(now()).toISOString(),
+    })
+    return { body, fid: canonicalFid, kind: input.kind, reason: input.reason, mrLabel: mrLabelOf(state) }
   }
 
-  /** GitLab 失败 → 稳定的 ServiceError；错误消息不含 token / URL / 上游原文。 */
+  /** GitLab 失败 → 稳定的 ServiceError；非 GitlabError（原文不可信）用静态文案，不回显上游原文（M6）。 */
   function writeFailure(error) {
     const rawCode = typeof error?.code === 'string' ? error.code : ''
     const code = WRITE_ERROR_CODES[rawCode] ?? 'internal'
-    const message = code === 'permission-denied'
-      ? 'GitLab 拒绝发评论：token 缺少 api 写权限'
-      : typeof error?.message === 'string' && error.message !== ''
-        ? error.message
-        : '发评论失败'
+    const message = error instanceof GitlabError
+      ? error.message
+      : STATIC_WRITE_MESSAGES[code] ?? STATIC_WRITE_MESSAGES.internal
     return new ServiceError(code, message)
   }
 
@@ -408,23 +473,33 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
     return `${base}#note_${noteId}`
   }
 
-  async function postWaiverInner({ sessionId, fid, kind, reason }) {
-    const state = requireState(sessionId)
-    const input = waiverArgs(state, { fid, kind, reason })
-    // 幂等先于「已处置」：重复 post（含并发第二次）不该报错，也不该再发一条。
-    const existing = existingWaiver(state, input)
-    if (existing !== null) return { posted: false, noteId: existing.noteId, existing: true }
-    if (isDisposedFinding(state.round, state.decisions, input.fid)) {
-      throw new ServiceError('already-disposed', '该 FID 已用其它方式处置，不再重复回帖')
-    }
-    const body = waiverBody(input)
-    let note
+  /**
+   * I1：timeout / network / bad-response 时评论可能已创建。按「body 全等 + created_at >= 草稿时间」
+   * 在 notes 里找回；找不到返回 null，由调用方抛原始失败。listNotes 自己失败也按找不到处理。
+   */
+  async function recoverPostedNote(state, body, notBefore) {
+    let notes
     try {
-      note = await gitlab.postNote({ project: state.binding.projectPath, iid: state.binding.iid, body })
-    } catch (error) {
-      // 失败时内存 / 账本都保持原样：没发出去的评论不能算处置。
-      throw writeFailure(error)
+      notes = await gitlab.listNotes({ project: state.binding.projectPath, iid: state.binding.iid })
+    } catch {
+      return null
     }
+    const since = Date.parse(notBefore)
+    if (!Number.isFinite(since)) return null
+    const found = (Array.isArray(notes) ? notes : []).find((note) => {
+      if (note === null || typeof note !== 'object' || note.system === true) return false
+      if (note.body !== body) return false
+      const createdAt = Date.parse(note.created_at ?? '')
+      return Number.isFinite(createdAt) && createdAt >= since
+    })
+    return found ?? null
+  }
+
+  /**
+   * 回帖成功后统一落 decisions 并清掉草稿。M2：persist 失败不报 storage-failed（评论确实发出去了），
+   * 降级成 `persisted:false + warning`，同时内存里保留 decision，重试会命中幂等而不是重复发。
+   */
+  async function recordPostedWaiver(sessionId, state, input, note, { body, recovered = false }) {
     state.decisions[input.fid] = {
       kind: input.kind,
       reason: input.reason,
@@ -432,8 +507,65 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
       at: new Date(now()).toISOString(),
       source: 'comment',
     }
-    await persist(state)
-    return { posted: true, noteId: note.id, url: noteUrl(state, note.id), body }
+    drafts.delete(sessionId)
+    const result = { posted: true, noteId: note.id, url: noteUrl(state, note.id), body }
+    if (recovered) result.recovered = true
+    try {
+      await persist(state)
+    } catch (error) {
+      result.persisted = false
+      result.warning = typeof error?.message === 'string' && error.message !== '' ? error.message : '账本写入失败'
+    }
+    return result
+  }
+
+  async function postWaiverInner({ sessionId, fid, kind, reason }) {
+    const state = requireState(sessionId)
+    const input = waiverInput({ fid, kind, reason })
+    // 幂等先于其它校验：重复 post（含并发第二次）不该报错，也不该再发。
+    const existing = existingWaiver(state, input)
+    if (existing !== null) return { posted: false, noteId: existing.noteId, existing: true }
+    const canonicalFid = waiverFindingFid(state, input.fid)
+    const canonical = { ...input, fid: canonicalFid }
+    if (isDisposedFinding(state.round, state.decisions, canonicalFid)) {
+      throw new ServiceError('already-disposed', '该 FID 已用其它方式处置，不再重复回帖')
+    }
+    // I2：同一 MR 已被其它 live 会话绑定 → 拒绝写，避免两边 decisions / 账本互相覆盖。
+    const other = listStates().find((item) => item.sessionId !== sessionId && sameBindingTarget(item, state))
+    if (other !== undefined) {
+      throw new ServiceError('bound-elsewhere', `同一 MR 已被其它会话绑定（${other.sessionId ?? '未知'}），先 mr_stop 再回帖`)
+    }
+    // C1：必须与最近一次草稿逐字段一致，否则说明确认之后目标 / 轮次 / 内容变了。
+    const draft = drafts.get(sessionId)
+    if (draft === undefined) {
+      throw new ServiceError('draft-required', '先调用 mr_waive 出草稿并由用户确认，再 post:true 回帖')
+    }
+    const currentSha = String(state.round?.sha ?? state.mr?.sha ?? '')
+    const targetChanged = draft.projectPath !== state.binding.projectPath
+      || draft.iid !== state.binding.iid
+      || String(draft.sha) !== currentSha
+      || draft.fid.toLowerCase() !== canonicalFid.toLowerCase()
+      || draft.kind !== canonical.kind
+      || draft.reason !== canonical.reason
+    if (targetChanged) {
+      throw new ServiceError('stale-round', '草稿的目标 MR / 轮次 / 内容已变化，请重新出草稿并确认')
+    }
+    const body = waiverBodyOf(canonical)
+    let note
+    try {
+      note = await gitlab.postNote({ project: state.binding.projectPath, iid: state.binding.iid, body })
+    } catch (error) {
+      const failure = writeFailure(error)
+      if (AMBIGUOUS_WRITE_CODES.has(failure.code)) {
+        const recovered = await recoverPostedNote(state, body, draft.at)
+        if (recovered !== null) {
+          return recordPostedWaiver(sessionId, state, canonical, recovered, { body, recovered: true })
+        }
+      }
+      // 失败时内存 / 账本都保持原样：没发出去的评论不能算处置；草稿保留以便重试。
+      throw failure
+    }
+    return recordPostedWaiver(sessionId, state, canonical, note, { body })
   }
 
   /** 回帖必须经用户确认由主代理显式调用（post:true），不会自动发。 */
@@ -452,6 +584,8 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
 
   function dispose() {
     bindings.clear()
+    drafts.clear()
+    sessionLocks.clear()
   }
 
   return { bind, status, review, applySnapshot, stop, resume, pause, getState, listStates, dispose, report, ledger, waiverDraft, postWaiver }

@@ -240,7 +240,7 @@ test('有未处置 finding → 指令段 + 报告 + 全量问题明细三段；�
   assert.equal(h.notified[0], [
     '有 2 处评审问题待处置（FID aa（中）、FID bb（低））：全部问题见下方明细，修哪些由你决定；可以按问题分组并行派 subagent。',
     '已收到 1 条 MR 指令（#ai-waive/#ai-skip/#ai-wontfix），对应 FID 已计入豁免。',
-    '不打算改的，按 #ai-waive <FID> reason=<原因> 回帖豁免（#ai-skip / #ai-wontfix 同理）；最后给出结论：修了哪些、用了什么指令、并引用对应 MR 评论。',
+    '不打算改的用 mr_waive 出草稿，经用户「可以 / 自定义」确认后 post:true 回帖（#ai-skip / #ai-wontfix 同理）；最后给出结论：修了哪些、用了什么指令、并引用对应 MR 评论。',
     '',
     'REPORT',
     '',

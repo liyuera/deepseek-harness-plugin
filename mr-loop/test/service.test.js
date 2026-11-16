@@ -7,6 +7,7 @@ import { resolveConfig } from '../src/host/config.js'
 import { createLedger } from '../src/host/ledger.js'
 import { createService, ServiceError } from '../src/host/service.js'
 import { evaluateMergeable } from '../src/host/mergeable.js'
+import { parseDirectives } from '../src/host/parse-directives.js'
 import { createWatcher } from '../src/host/watcher.js'
 
 const SHA = 'a'.repeat(40)
@@ -851,18 +852,28 @@ test('resume 落盘失败 → storage-failed，但内存状态不留在 paused',
 
 // ---------------------------------------------------------------------------
 // T2 写路径：waiverDraft（草稿）/ postWaiver（回帖）
+// 评审第 2 轮加固：草稿绑定目标（C1）、结果未知补写（I1）、跨会话防重（I2）、
+// round-trip 校验（M1）、persist 失败降级（M2）、草稿消费（M7）。
 // ---------------------------------------------------------------------------
 const URL240 = 'https://git.x.com/g/p/-/merge_requests/240'
+const URL241 = 'https://git.x.com/g/p/-/merge_requests/241'
+const SHA2 = 'b'.repeat(40)
 
 /** 强绑定 + changes + 1 条 finding：草稿/回帖测试的基线。 */
 const strongBlockingNotes = (fids = ['a1b2c3d4'], sha = SHA) => ([
   { id: 11, system: false, created_at: '2026-11-13T10:02:00Z', body: `${blockingReview(fids)}\n\n<!-- AI_REVIEW_SHA ${sha} -->\n` },
 ])
 const directiveNote = (id, body) => ({ id, system: false, created_at: '2026-11-13T10:05:00Z', body })
+const waiverBodyOf = (reason, kind = 'waive', fid = 'a1b2c3d4') => `#ai-${kind} ${fid} reason=${reason}`
 
-async function boundService({ notesImpl, postNoteImpl, now } = {}) {
+async function boundService({ notesImpl, postNoteImpl, listNotesImpl, now } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'mrloop-service-'))
-  const h = harness({ notesImpl: notesImpl ?? (async () => strongBlockingNotes()), postNoteImpl })
+  const baseNotes = notesImpl ?? (async () => strongBlockingNotes())
+  const h = harness({
+    mrImpl: async ({ iid }) => mr({ iid }),
+    notesImpl: listNotesImpl ?? baseNotes,
+    postNoteImpl,
+  })
   const service = createService({
     config: resolveConfig({ baseUrl: 'https://git.x.com' }),
     ledger: createLedger({ dir }),
@@ -879,7 +890,9 @@ async function cleanup({ dir, service }) {
   await rm(dir, { recursive: true, force: true })
 }
 
-test('T2 waiverDraft：合法草稿单行化、FID 用评审原文大小写，且不写账本 / 不算处置', async () => {
+const MR_LABEL = 'MR !240 · g/p'
+
+test('T2 waiverDraft：合法草稿单行化、FID 用评审原文大小写、带 MR 标识，且不写账本 / 不算处置', async () => {
   const ctx = await boundService()
   const draft = ctx.service.waiverDraft({ sessionId: 's', fid: 'A1B2C3D4', kind: 'skip', reason: '  不适用\n当前场景  ' })
   assert.deepEqual(draft, {
@@ -887,6 +900,7 @@ test('T2 waiverDraft：合法草稿单行化、FID 用评审原文大小写，�
     fid: 'a1b2c3d4',
     kind: 'skip',
     reason: '不适用 当前场景',
+    mrLabel: MR_LABEL,
   })
   // kind 缺省 = waive。
   const defaultKind = ctx.service.waiverDraft({ sessionId: 's', fid: 'a1b2c3d4', reason: '默认 kind' })
@@ -936,7 +950,81 @@ test('T2 waiverDraft 错误码：invalid-kind / unknown-fid / already-disposed /
   await cleanup(ctx)
 })
 
-test('T2 postWaiver：成功回帖 → decisions 落账本、evaluateMergeable 变为可合、url 带 #note', async () => {
+test('M1 草稿 round-trip：body 能被真实解析器原样读回；FID 必须合法；会失真的 reason 拒绝', async () => {
+  const ctx = await boundService()
+  // round-trip：草稿 body 解析回来恰好 1 条且 fid / kind / reason 全等。
+  for (const [kind, reason] of [['waive', '风险已评估'], ['skip', '不适用于当前场景'], ['wontfix', '业务决定不修']]) {
+    const draft = ctx.service.waiverDraft({ sessionId: 's', fid: 'a1b2c3d4', kind, reason })
+    const parsed = parseDirectives([{ id: 1, system: false, body: draft.body }])
+    assert.equal(parsed.directives.length, 1, `${kind}: ${draft.body}`)
+    assert.deepEqual(
+      { fid: parsed.directives[0].fid, kind: parsed.directives[0].kind, reason: parsed.directives[0].reason },
+      { fid: 'a1b2c3d4', kind, reason },
+    )
+  }
+  // FID 不符合解析器格式 → 回帖会读不回来，直接拒绝。
+  await assert.rejects(
+    async () => ctx.service.waiverDraft({ sessionId: 's', fid: 'aa', reason: 'x' }),
+    (e) => e instanceof ServiceError && e.code === 'unknown-fid',
+  )
+  // HTML 注释 / 隐藏统计块标记会改变读回内容 → invalid-reason。
+  for (const reason of ['原因 <!-- 隐藏 --> 后续', '原因 备注：以下隐藏数据仅用于统计 后续']) {
+    await assert.rejects(
+      async () => ctx.service.waiverDraft({ sessionId: 's', fid: 'a1b2c3d4', reason }),
+      (e) => e instanceof ServiceError && e.code === 'invalid-reason',
+      reason,
+    )
+  }
+  await cleanup(ctx)
+})
+
+test('C1 未出草稿直接 post → draft-required，且一次请求都不发', async () => {
+  const posts = []
+  const ctx = await boundService({
+    postNoteImpl: async (arg) => { posts.push(arg); return { id: 1, body: arg.body, created_at: null, author: null } },
+  })
+  await assert.rejects(
+    ctx.service.postWaiver({ sessionId: 's', fid: 'a1b2c3d4', reason: '风险已评估' }),
+    (e) => e instanceof ServiceError && e.code === 'draft-required',
+  )
+  assert.equal(posts.length, 0)
+  await cleanup(ctx)
+})
+
+test('C1 草稿后换绑到别的 MR → stale-round，postNote 0 次（草稿不会发到错误 MR）', async () => {
+  const posts = []
+  const ctx = await boundService({
+    postNoteImpl: async (arg) => { posts.push(arg); return { id: 1, body: arg.body, created_at: null, author: null } },
+  })
+  const draft = ctx.service.waiverDraft({ sessionId: 's', fid: 'a1b2c3d4', reason: '风险已评估' })
+  assert.equal(draft.mrLabel, MR_LABEL)
+  // 会话改绑 !241：草稿目标 !240 已经不匹配。
+  await ctx.service.bind({ sessionId: 's', url: URL241, repoRoot: '/r' })
+  await assert.rejects(
+    ctx.service.postWaiver({ sessionId: 's', fid: 'a1b2c3d4', reason: '风险已评估' }),
+    (e) => e instanceof ServiceError && e.code === 'stale-round',
+  )
+  assert.equal(posts.length, 0)
+  await cleanup(ctx)
+})
+
+test('C1 草稿与 post 之间 sha 变化 → stale-round，postNote 0 次', async () => {
+  const posts = []
+  const ctx = await boundService({
+    postNoteImpl: async (arg) => { posts.push(arg); return { id: 1, body: arg.body, created_at: null, author: null } },
+  })
+  ctx.service.waiverDraft({ sessionId: 's', fid: 'a1b2c3d4', reason: '风险已评估' })
+  ctx.service.applySnapshot({ sessionId: 's', mr: mr({ sha: SHA2 }), notes: strongBlockingNotes(['a1b2c3d4'], SHA2) })
+  assert.equal(ctx.service.getState('s').round.sha, SHA2)
+  await assert.rejects(
+    ctx.service.postWaiver({ sessionId: 's', fid: 'a1b2c3d4', reason: '风险已评估' }),
+    (e) => e instanceof ServiceError && e.code === 'stale-round',
+  )
+  assert.equal(posts.length, 0)
+  await cleanup(ctx)
+})
+
+test('T2 postWaiver：草稿确认后回帖成功 → decisions 落账本、evaluateMergeable 变为可合、url 带 #note', async () => {
   const posts = []
   const ctx = await boundService({
     postNoteImpl: async (arg) => {
@@ -947,12 +1035,13 @@ test('T2 postWaiver：成功回帖 → decisions 落账本、evaluateMergeable �
   const beforeState = ctx.service.getState('s')
   assert.equal(evaluateMergeable({ mr: beforeState.mr, round: beforeState.round, decisions: beforeState.decisions }).mergeable, false)
 
+  const draft = ctx.service.waiverDraft({ sessionId: 's', fid: 'A1B2C3D4', reason: '风险已评估' })
   const result = await ctx.service.postWaiver({ sessionId: 's', fid: 'A1B2C3D4', kind: 'waive', reason: '风险已评估' })
   assert.deepEqual(result, {
     posted: true,
     noteId: 9001,
     url: 'https://git.x.com/g/p/-/merge_requests/240#note_9001',
-    body: '#ai-waive a1b2c3d4 reason=风险已评估',
+    body: draft.body,
   })
   assert.deepEqual(posts, [{ project: 'g/p', iid: 240, body: '#ai-waive a1b2c3d4 reason=风险已评估' }])
 
@@ -986,32 +1075,149 @@ test('T2 postWaiver 幂等：已有同 FID 同 kind 指令 → 返回 existing �
   await cleanup(ctx)
 })
 
-test('T2 postWaiver 失败：GitLab 错误映射成 ServiceError，且不写 decisions / 账本', async () => {
+test('T2 postWaiver 失败：GitLab 错误映射成 ServiceError、不写 decisions / 账本；非 GitlabError 用静态文案', async () => {
   const cases = [
     ['forbidden', 'permission-denied'],
     ['not-found', 'not-found'],
-    ['network', 'network'],
-    ['timeout', 'timeout'],
+    ['rate-limited', 'rate-limited'],
+    ['conflict', 'conflict'],
     ['no-token', 'no-token'],
+    ['network', 'network'],
   ]
   for (const [gitlabCode, serviceCode] of cases) {
     const ctx = await boundService({
       postNoteImpl: async () => {
-        const error = new Error(`gitlab ${gitlabCode}`)
+        const error = new Error(`上游原文 secret-${gitlabCode}`)
         error.code = gitlabCode
         throw error
       },
     })
+    ctx.service.waiverDraft({ sessionId: 's', fid: 'a1b2c3d4', reason: '风险已评估' })
     await assert.rejects(
       ctx.service.postWaiver({ sessionId: 's', fid: 'a1b2c3d4', reason: '风险已评估' }),
-      (e) => e instanceof ServiceError && e.code === serviceCode && e.message !== '',
-      `gitlab ${gitlabCode} 应映射成 ${serviceCode}`,
+      (e) => e instanceof ServiceError && e.code === serviceCode && e.message !== '' && !e.message.includes('上游原文'),
+      `gitlab ${gitlabCode} 应映射成 ${serviceCode} 且不回显上游原文`,
     )
     assert.deepEqual(ctx.service.getState('s').decisions, {}, `${gitlabCode} 失败后不得写 decisions`)
     const saved = await ctx.service.ledger.load({ projectPath: 'g/p', iid: 240 })
     assert.deepEqual(saved.decisions, {}, `${gitlabCode} 失败后不得落账本`)
     await cleanup(ctx)
   }
+})
+
+test('I1 结果未知（timeout）但评论已创建 → 按 body + created_at 找回并补写 decisions（recovered）', async () => {
+  const expectedBody = waiverBodyOf('风险已评估')
+  let notes = strongBlockingNotes()
+  let posted = 0
+  const ctx = await boundService({
+    listNotesImpl: async () => notes,
+    postNoteImpl: async () => {
+      posted += 1
+      // 服务端其实已创建成功，只是响应超时：下一次 listNotes 能看到它。
+      notes = [...notes, { id: 950, system: false, created_at: '2026-11-13T10:10:30Z', body: expectedBody }]
+      const error = new Error('GitLab 请求超时')
+      error.code = 'timeout'
+      throw error
+    },
+  })
+  ctx.service.waiverDraft({ sessionId: 's', fid: 'a1b2c3d4', reason: '风险已评估' })
+  const result = await ctx.service.postWaiver({ sessionId: 's', fid: 'a1b2c3d4', reason: '风险已评估' })
+  assert.deepEqual(result, {
+    posted: true,
+    noteId: 950,
+    url: 'https://git.x.com/g/p/-/merge_requests/240#note_950',
+    body: expectedBody,
+    recovered: true,
+  })
+  assert.equal(posted, 1)
+  assert.equal(ctx.service.getState('s').decisions.a1b2c3d4.noteId, 950)
+  await cleanup(ctx)
+})
+
+test('I1 结果未知且 notes 里找不到对应评论 → 仍抛 timeout，decisions 不写、草稿保留可重试', async () => {
+  const ctx = await boundService({
+    postNoteImpl: async () => {
+      const error = new Error('GitLab 请求超时')
+      error.code = 'timeout'
+      throw error
+    },
+  })
+  ctx.service.waiverDraft({ sessionId: 's', fid: 'a1b2c3d4', reason: '风险已评估' })
+  await assert.rejects(
+    ctx.service.postWaiver({ sessionId: 's', fid: 'a1b2c3d4', reason: '风险已评估' }),
+    (e) => e instanceof ServiceError && e.code === 'timeout',
+  )
+  assert.deepEqual(ctx.service.getState('s').decisions, {})
+  // 草稿没被消费：同一份草稿仍可重试 post（非结果未知错误不会清草稿）。
+  await assert.rejects(
+    ctx.service.postWaiver({ sessionId: 's', fid: 'a1b2c3d4', reason: '风险已评估' }),
+    (e) => e instanceof ServiceError && e.code === 'timeout',
+  )
+  await cleanup(ctx)
+})
+
+test('I2 跨会话防重：同一 MR 有其它 live 绑定时拒绝 bound-elsewhere，另一会话停止后可写', async () => {
+  const posts = []
+  const ctx = await boundService({
+    postNoteImpl: async (arg) => {
+      posts.push(arg)
+      return { id: 9100, body: arg.body, created_at: '2026-11-13T10:10:00Z', author: null }
+    },
+  })
+  await ctx.service.bind({ sessionId: 's2', url: URL240, repoRoot: '/r' })
+  ctx.service.waiverDraft({ sessionId: 's', fid: 'a1b2c3d4', reason: '风险已评估' })
+  ctx.service.waiverDraft({ sessionId: 's2', fid: 'a1b2c3d4', reason: '风险已评估' })
+
+  await assert.rejects(
+    ctx.service.postWaiver({ sessionId: 's', fid: 'a1b2c3d4', reason: '风险已评估' }),
+    (e) => e instanceof ServiceError && e.code === 'bound-elsewhere',
+  )
+  // 「第二次 post」同样被拒：不能有两个会话往同一 MR 各写一条。
+  await assert.rejects(
+    ctx.service.postWaiver({ sessionId: 's2', fid: 'a1b2c3d4', reason: '风险已评估' }),
+    (e) => e instanceof ServiceError && e.code === 'bound-elsewhere',
+  )
+  assert.equal(posts.length, 0)
+
+  // 停掉另一个会话后，原会话可以正常回帖。
+  await ctx.service.stop({ sessionId: 's2' })
+  const result = await ctx.service.postWaiver({ sessionId: 's', fid: 'a1b2c3d4', reason: '风险已评估' })
+  assert.equal(result.posted, true)
+  assert.equal(posts.length, 1)
+  await cleanup(ctx)
+})
+
+test('M2 回帖成功但 persist 失败 → posted:true + persisted:false + warning，不报 storage-failed', async () => {
+  const ctx = await boundService({
+    postNoteImpl: async (arg) => ({ id: 9200, body: arg.body, created_at: '2026-11-13T10:10:00Z', author: null }),
+  })
+  ctx.service.waiverDraft({ sessionId: 's', fid: 'a1b2c3d4', reason: '风险已评估' })
+  ctx.service.ledger.save = async () => { throw new Error('EACCES') }
+  const result = await ctx.service.postWaiver({ sessionId: 's', fid: 'a1b2c3d4', reason: '风险已评估' })
+  assert.equal(result.posted, true)
+  assert.equal(result.persisted, false)
+  assert.equal(result.noteId, 9200)
+  assert.equal(result.url, 'https://git.x.com/g/p/-/merge_requests/240#note_9200')
+  assert.match(result.warning, /账本/)
+  // 评论确实发出去了，内存里必须记住，否则重试会重复发。
+  assert.equal(ctx.service.getState('s').decisions.a1b2c3d4.noteId, 9200)
+  await cleanup(ctx)
+})
+
+test('M7 stop 回收草稿：停止后重新绑定同一 MR，旧草稿不能再直接 post', async () => {
+  const posts = []
+  const ctx = await boundService({
+    postNoteImpl: async (arg) => { posts.push(arg); return { id: 1, body: arg.body, created_at: null, author: null } },
+  })
+  ctx.service.waiverDraft({ sessionId: 's', fid: 'a1b2c3d4', reason: '风险已评估' })
+  await ctx.service.stop({ sessionId: 's' })
+  await ctx.service.bind({ sessionId: 's', url: URL240, repoRoot: '/r' })
+  await assert.rejects(
+    ctx.service.postWaiver({ sessionId: 's', fid: 'a1b2c3d4', reason: '风险已评估' }),
+    (e) => e instanceof ServiceError && e.code === 'draft-required',
+  )
+  assert.equal(posts.length, 0)
+  await cleanup(ctx)
 })
 
 test('T2 postWaiver 并发：同一会话串行，只发一条评论，第二次命中 existing', async () => {
@@ -1023,6 +1229,7 @@ test('T2 postWaiver 并发：同一会话串行，只发一条评论，第二次
       return { id: 9002, body: arg.body, created_at: '2026-11-13T10:10:00Z', author: null }
     },
   })
+  ctx.service.waiverDraft({ sessionId: 's', fid: 'a1b2c3d4', reason: '风险已评估' })
   const [first, second] = await Promise.all([
     ctx.service.postWaiver({ sessionId: 's', fid: 'a1b2c3d4', reason: '风险已评估' }),
     ctx.service.postWaiver({ sessionId: 's', fid: 'a1b2c3d4', reason: '风险已评估' }),

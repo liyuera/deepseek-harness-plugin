@@ -25,12 +25,12 @@ const reviewBody = ({ sha, verdict }) => {
     ? [
         '### 需要关注的问题',
         '1. **文件**: `src/a.js`',
-        '   - FID: `aa`',
+        '   - FID: `aaaa0001`',
         '   - 复验次数: `0`',
         '   - 级别: 中',
         '   - 门禁分类: 逻辑错误',
         '   - 位置: `src/a.js:1`',
-        '   - 问题: 问题 aa',
+        '   - 问题: 问题 aaaa0001',
         '   - 建议: 修复',
       ].join('\n')
     : '未发现必须修改的代码问题。'
@@ -170,22 +170,23 @@ test('T2 service + tools：mr_waive 草稿 → post → 幂等，评论只发一
   const exec = { agent: { session: { id: 's', header: { cwd: '/r' } } } }
 
   // 1. 草稿：只返回 body，不写 decisions、不发评论。
-  const draft = await waive.execute({ fid: 'AA', reason: '评审误报' }, exec)
+  const draft = await waive.execute({ fid: 'AAAA0001', reason: '评审误报' }, exec)
   assert.equal(draft.ok, true)
-  assert.deepEqual(draft.data, { body: '#ai-waive aa reason=评审误报', fid: 'aa', kind: 'waive', reason: '评审误报', posted: false })
+  assert.deepEqual(draft.data, { body: '#ai-waive aaaa0001 reason=评审误报', fid: 'aaaa0001', kind: 'waive', reason: '评审误报', mrLabel: 'MR !240 · g/p', posted: false })
+  assert.match(waive.output.render({}, draft).map((part) => part.text).join(''), /MR !240 · g\/p 豁免草稿/)
   assert.match(waive.output.render({}, draft).map((part) => part.text).join(''), /可以 \/ 自定义/)
-  assert.equal(service.getState('s').decisions.aa, undefined)
+  assert.equal(service.getState('s').decisions.aaaa0001, undefined)
   assert.equal(posted.length, 0)
 
   // 2. 用户确认后 post:true：发一条评论并落 decisions。
-  const post = await waive.execute({ fid: 'aa', reason: '评审误报', post: true }, exec)
+  const post = await waive.execute({ fid: 'aaaa0001', reason: '评审误报', post: true }, exec)
   assert.equal(post.ok, true)
   assert.deepEqual(post.data, { posted: true, noteId: 9001, url: 'https://git.x.com/g/p/-/merge_requests/240#note_9001' })
-  assert.deepEqual(posted, ['#ai-waive aa reason=评审误报'])
-  assert.equal(service.getState('s').decisions.aa.noteId, 9001)
+  assert.deepEqual(posted, ['#ai-waive aaaa0001 reason=评审误报'])
+  assert.equal(service.getState('s').decisions.aaaa0001.noteId, 9001)
 
   // 3. 再 post 一次：幂等命中，不再发第二条。
-  const again = await waive.execute({ fid: 'aa', reason: '评审误报', post: true }, exec)
+  const again = await waive.execute({ fid: 'aaaa0001', reason: '评审误报', post: true }, exec)
   assert.equal(again.ok, true)
   assert.deepEqual(again.data, { posted: false, noteId: 9001, existing: true })
   assert.equal(posted.length, 1)
@@ -193,7 +194,7 @@ test('T2 service + tools：mr_waive 草稿 → post → 幂等，评论只发一
 
   await service.stop({ sessionId: 's' })
   const saved = await service.ledger.load({ projectPath: 'g/p', iid: 240 })
-  assert.equal(saved.decisions.aa.noteId, 9001)
-  assert.equal(saved.decisions.aa.source, 'comment')
+  assert.equal(saved.decisions.aaaa0001.noteId, 9001)
+  assert.equal(saved.decisions.aaaa0001.source, 'comment')
   await rm(dir, { recursive: true, force: true })
 })

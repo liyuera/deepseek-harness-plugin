@@ -11,7 +11,7 @@ function fakeService(over = {}) {
     review: ({ sessionId }) => ({ round: { sha: 'abc', n: 2 }, decisions: {} }),
     stop: async () => ({ stopped: true, forgotten: false }),
     resume: () => ({ sha: 'abc' }),
-    waiverDraft: ({ fid, kind, reason }) => ({ body: `#ai-${kind ?? 'waive'} ${fid} reason=${reason}`, fid, kind: kind ?? 'waive', reason }),
+    waiverDraft: ({ fid, kind, reason }) => ({ body: `#ai-${kind ?? 'waive'} ${fid} reason=${reason}`, fid, kind: kind ?? 'waive', reason, mrLabel: 'MR !240 · g/p' }),
     postWaiver: async ({ fid, kind, reason }) => ({ posted: true, noteId: 901, url: 'https://git.x.com/g/p/-/merge_requests/240#note_901', body: `#ai-${kind ?? 'waive'} ${fid} reason=${reason}` }),
     ...over,
   }
@@ -131,7 +131,7 @@ test('mr_waive 默认只出草稿：不透传 post，返回 body 并要求用「
   const service = fakeService({
     waiverDraft: (args) => {
       draftArgs = args
-      return { body: `#ai-${args.kind} ${args.fid} reason=${args.reason}`, fid: args.fid, kind: args.kind, reason: args.reason }
+      return { body: `#ai-${args.kind} ${args.fid} reason=${args.reason}`, fid: args.fid, kind: args.kind, reason: args.reason, mrLabel: 'MR !240 · g/p' }
     },
     postWaiver: async () => { throw new Error('草稿阶段绝不能回帖') },
   })
@@ -144,11 +144,13 @@ test('mr_waive 默认只出草稿：不透传 post，返回 body 并要求用「
     fid: 'a1b2c3d4',
     kind: 'waive',
     reason: '风险已评估',
+    mrLabel: 'MR !240 · g/p',
     posted: false,
   })
   // 模型实际看到的是 render 的文本：草稿与「可以 / 自定义」的下一步都必须出现在里面。
   const rendered = def.output.render({}, result).map((part) => part.text).join('')
   assert.match(rendered, /#ai-waive a1b2c3d4 reason=风险已评估/)
+  assert.match(rendered, /MR !240 · g\/p/)
   assert.match(rendered, /可以 \/ 自定义/)
   assert.match(rendered, /post: true/)
   assert.match(def.description, /草稿/)
@@ -226,4 +228,38 @@ test('mr_waive 错误映射：草稿与回帖都走 ServiceError → ok:false + 
   assert.equal(post.ok, false)
   assert.equal(post.code, 'permission-denied')
   assert.match(post.message, /权限/)
+})
+
+test('M8 幂等命中但 noteId 缺失：消息改为「已有该 FID 的处置」，不再报评论号', async () => {
+  const service = fakeService({
+    postWaiver: async () => ({ posted: false, noteId: null, existing: true }),
+  })
+  const def = byName(createTools({ service }), 'mr_waive')
+  const result = await def.execute({ fid: 'a1b2c3d4', reason: '风险已评估', post: true }, exec)
+  assert.equal(result.ok, true)
+  assert.deepEqual(result.data, { posted: false, noteId: null, existing: true })
+  assert.match(result.message, /已有该 FID 的处置/)
+  assert.doesNotMatch(result.message, /评论 #/)
+})
+
+test('M2 回帖成功但账本落盘失败：透传 persisted:false / warning，消息里提示警告', async () => {
+  const service = fakeService({
+    postWaiver: async () => ({
+      posted: true,
+      persisted: false,
+      warning: '账本写入失败，检查 ~/.dsh/mr-loop 的磁盘权限',
+      noteId: 901,
+      url: 'https://git.x.com/g/p/-/merge_requests/240#note_901',
+      body: '#ai-waive a1b2c3d4 reason=风险已评估',
+    }),
+  })
+  const def = byName(createTools({ service }), 'mr_waive')
+  const result = await def.execute({ fid: 'a1b2c3d4', reason: '风险已评估', post: true }, exec)
+  assert.equal(result.ok, true)
+  assert.equal(result.data.posted, true)
+  assert.equal(result.data.persisted, false)
+  assert.match(result.data.warning, /账本/)
+  assert.match(result.message, /账本写入失败/)
+  // 评论确实发出去了，不能提示失败让人重发。
+  assert.match(result.message, /已发豁免评论/)
 })

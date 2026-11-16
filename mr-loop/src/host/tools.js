@@ -142,7 +142,7 @@ export function createTools({ service, watcher = undefined }) {
   const WAIVER_KINDS = ['waive', 'skip', 'wontfix']
   const waive = {
     name: 'mr_waive',
-    description: '对当前轮的一条评审问题生成豁免草稿，或经用户确认后发 MR 评论（#ai-waive/#ai-skip/#ai-wontfix <FID> reason=<原因>）。必须先用 post:false 出草稿给用户看，用「可以 / 自定义」询问；用户确认后才 post:true 真正回帖。先发评论、后提交代码（评论会触发一次新评审）。',
+    description: '对当前轮的一条评审问题生成豁免草稿，或经用户确认后发 MR 评论（#ai-waive/#ai-skip/#ai-wontfix <FID> reason=<原因>）。必须先用 post:false 出草稿给用户看，用「可以 / 自定义」询问；用户确认后才 post:true 真正回帖（post 会校验目标 MR / sha 与最近一次草稿一致，换绑或换 sha 后需重新出草稿）。先发评论、后提交代码（评论会触发一次新评审）。',
     parameters: objectSchema({
       fid: { type: 'string', description: '评审里的 FID（大小写不敏感；回帖用评审原文大小写）' },
       kind: { type: 'string', enum: WAIVER_KINDS, description: '默认 waive；skip=不适用当前场景，wontfix=业务决定不修' },
@@ -167,8 +167,10 @@ export function createTools({ service, watcher = undefined }) {
         // 默认只出草稿：绝不因为「模型觉得可以」就自动发评论。
         if (args?.post !== true) {
           const draft = service.waiverDraft({ sessionId, fid, kind, reason: args.reason })
+          // C1：把确认目标（MR 标识）放在草稿首行，用户一眼看出确认的是哪条 MR。
+          const label = typeof draft.mrLabel === 'string' && draft.mrLabel !== '' ? `${draft.mrLabel} ` : ''
           const message = [
-            '豁免草稿（尚未发送）：',
+            `${label}豁免草稿（尚未发送）：`,
             draft.body,
             '',
             '下一步：把草稿给用户看，用「可以 / 自定义」问用户是否按此发送（说「可以」就原样、说「自定义」就按用户给的原因改写）；用户确认后再调用 mr_waive({ fid, kind, reason, post: true })。未确认前不要发。',
@@ -177,19 +179,29 @@ export function createTools({ service, watcher = undefined }) {
         }
         const result = await service.postWaiver({ sessionId, fid, kind, reason: args.reason })
         if (result.posted === true) {
-          const message = [
+          const lines = [
             `已发豁免评论 #${result.noteId}：${result.body}`,
             result.url,
             '评论已先发；需要提交代码时现在再 commit + push（先评论后提交，评论会触发一次新评审）。',
-          ].join('\n')
-          return ok(message, { posted: true, noteId: result.noteId, url: result.url })
+          ]
+          const data = { posted: true, noteId: result.noteId, url: result.url }
+          // M2：评论已发出但账本没落盘——如实提示，不要让模型以为发送失败而重发。
+          if (result.persisted === false) {
+            lines.push(`⚠️ ${result.warning ?? '账本写入失败'}（评论已发出，不要重发）`)
+            data.persisted = false
+            data.warning = result.warning
+          }
+          return ok(lines.join('\n'), data)
         }
-        // 幂等命中：不重复发，也不报错。
-        return ok(`已有同 kind 指令（评论 #${result.noteId ?? '?'}），未重复发送。`, {
-          posted: false,
-          noteId: result.noteId ?? null,
-          existing: true,
-        })
+        // 幂等命中：不重复发，也不报错。M8：没有 noteId 可引用时换一句不带评论号的提示。
+        if (typeof result.noteId === 'number') {
+          return ok(`已有同 kind 指令（评论 #${result.noteId}），未重复发送。`, {
+            posted: false,
+            noteId: result.noteId,
+            existing: true,
+          })
+        }
+        return ok('已有该 FID 的处置，未重复发送。', { posted: false, noteId: null, existing: true })
       } catch (error) {
         return fail(errorOf(error), String(error?.message ?? error))
       }

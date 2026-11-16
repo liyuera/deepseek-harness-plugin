@@ -11,7 +11,7 @@ import { clipText } from './parse-directives.js'
 
 const WAKE_MIN_GAP_MS = 30000
 const DETAIL_LIMIT = 200
-const WAIVER_HINT = '不打算改的，按 #ai-waive <FID> reason=<原因> 回帖豁免（#ai-skip / #ai-wontfix 同理）；最后给出结论：修了哪些、用了什么指令、并引用对应 MR 评论。'
+const WAIVER_HINT = '不打算改的用 mr_waive 出草稿，经用户「可以 / 自定义」确认后 post:true 回帖（#ai-skip / #ai-wontfix 同理）；最后给出结论：修了哪些、用了什么指令、并引用对应 MR 评论。'
 const TERMINAL_PIPELINE = new Set(['success', 'failed', 'canceled'])
 const TOKEN_ERRORS = new Set(['unauthorized', 'forbidden', 'no-token'])
 
