@@ -17,7 +17,7 @@
 | 层级 | 位置 | 插槽 | 说明 |
 | --- | --- | --- | --- |
 | 主入口 | 会话头 chip | `conversation.session.header.actions` | 常驻；显示 `!241 · 第 1 轮 / 1 待处理 / !238 · 可合 / [看板]` |
-| 看板 | 右侧抽屉浮层 | `shell.overlay` | 宽 438px；`本会话 / 全部会话 / 已合并` 三段；点 chip 打开 |
+| 看板 | **右上角 dialog（无遮罩）** | `shell.overlay` 挂载 + `react-dom` portal 到 `document.body` | 宽 560px、距顶/右各 28px；`本会话 / 全部 / 已合并` 三段；点 chip 打开；只能点右上角 ✕ 关闭（Esc 同效） |
 | 每轮报告 | 工具结果内联卡 | `tool.call.toolview`（keyed `mr_bind`/`mr_status`/`mr_review`） | 报告就地变卡，不跳转 |
 | 后续 | 右侧页签 / 左侧全局面板 | `sidebar.right.pane.tab` / `sidebar.panellist` | v2 再评估，不阻塞 v1 |
 
@@ -55,7 +55,7 @@
 
 | 元素 | 规格 |
 | --- | --- |
-| 抽屉 | `bg-overlay`，宽 438px，右侧滑入 220ms `cubic-bezier(.2,.8,.2,1)`，遮罩 `rgba(0,0,0,.18)`，Esc 关闭 + 焦点陷阱 |
+| Dialog | `bg-overlay`，宽 560px，距顶/右 28px，圆角 12，阴影 `0 18px 48px rgba(0,0,0,.18)`；**无遮罩、不点外部关闭**；✕ 关闭 + Esc |
 | MR 卡 | `bg-layer-1` + 1px `border-l1`，圆角 12，卡间距 10，卡内边距 12 |
 | 嵌套块（门禁 chip、详情块） | `bg-layer-2`，圆角 8–9 |
 | 文字 | 主 `label-primary`，次 `label-secondary`；FID/路径/代码用等宽 10.5–11px |
@@ -71,7 +71,7 @@
 ## 五、交互细节
 
 - **chip**：最多显示 2 个 MR + `+N`；`待处理` 徽标用 warn 色并显示数量；点击任意处打开抽屉；键盘可聚焦（Enter 打开）。
-- **抽屉**：默认打开「本会话」；切到「全部会话」才请求跨会话数据（懒加载）。
+- **Dialog**：默认「全部」；「本会话」在无活绑定时为空，自动回退到「全部」并给跳转按钮。
 - **问题行**：默认收起；点「展开 ▾」就地展开，同一 MR 内可多行同时展开；「收起 ▴」折叠。
 - **复制指令**：把该 MR 的待处理 FID 生成为 `#ai-waive <FID> reason=` 草稿并复制（主 agent 用 `mr_waive` 走确认流程）。
 - **打开 MR**：新浏览器标签打开 GitLab。
@@ -137,6 +137,7 @@
 ## 九、风险与约束
 
 1. 会话头空间窄：chip 只放数量与状态，溢出 `+N`。
+2. Dialog 挂到 `document.body`，避免 `shell.overlay` 的点击穿透层拦截交互。
 2. 跨会话列表可能很长：默认收起已合并，滚动加载。
 3. 数据延迟 ≤30s；打开抽屉强刷。
 4. 状态口径与 CLI 报告一致（共用 `reviewTodo`），UI 不自行推断。

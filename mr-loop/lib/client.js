@@ -6,6 +6,8 @@ window.__ModuleLoader__.load({
     Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 
     var React = require("react");
+    var ReactDOM = null;
+    try { ReactDOM = require("react-dom"); } catch (error) { ReactDOM = null; }
     var h = React.createElement;
 
     // ---------------------------------------------------------------- styles
@@ -18,8 +20,8 @@ window.__ModuleLoader__.load({
       ".mrl-dot.ok{background:var(--dsw-alias-state-success-primary)}",
       ".mrl-dot.warn{background:var(--dsw-alias-state-warn-primary)}",
       ".mrl-dot.err{background:var(--dsw-alias-state-error-primary)}",
-      ".mrl-mask{position:fixed;inset:0;background:rgba(0,0,0,.12);z-index:80;display:flex;align-items:flex-start;justify-content:flex-start;padding:28px;pointer-events:auto}",
-      ".mrl-panel{width:560px;max-width:calc(100vw - 56px);max-height:calc(100vh - 56px);display:flex;flex-direction:column;background:var(--dsw-alias-bg-overlay);border:1px solid var(--dsw-alias-border-l1);border-radius:12px;box-shadow:0 18px 48px rgba(0,0,0,.18);overflow:hidden}",
+      ".mrl-dialog{position:fixed;top:28px;right:28px;z-index:1000;display:flex;align-items:flex-start;justify-content:flex-end;pointer-events:auto}",
+      ".mrl-panel{width:560px;max-width:calc(100vw - 56px);max-height:calc(100vh - 56px);display:flex;flex-direction:column;background:var(--dsw-alias-bg-overlay);border:1px solid var(--dsw-alias-border-l1);border-radius:12px;box-shadow:0 18px 48px rgba(0,0,0,.18);overflow:hidden;pointer-events:auto}",
       ".mrl-hd{padding:13px 14px 0;border-bottom:1px solid var(--dsw-alias-border-l1);flex:none}",
       ".mrl-hd-row{display:flex;align-items:center;gap:8px}",
       ".mrl-title{font-size:14px;font-weight:650;margin:0;color:var(--dsw-alias-label-primary)}",
@@ -452,10 +454,7 @@ window.__ModuleLoader__.load({
         body = visible.map(function (mr) { return h(MrCard, { key: mr.projectPath + "#" + mr.iid, mr: mr }); });
       }
 
-      return h("div", {
-        className: "mrl-mask",
-      },
-      h("div", {
+      var panel = h("div", {
         className: "mrl-panel",
       },
       h("div", { className: "mrl-hd" },
@@ -493,7 +492,12 @@ window.__ModuleLoader__.load({
               h("span", { className: "mrl-sp" }),
               h("button", { className: "mrl-btn", type: "button", onClick: function () { load(); } }, "重试"))
           : null,
-        body)));
+        body));
+      var dialog = h("div", { className: "mrl-dialog" }, panel);
+      if (ReactDOM !== null && typeof ReactDOM.createPortal === "function") {
+        return ReactDOM.createPortal(dialog, document.body);
+      }
+      return dialog;
     }
 
     // ---------------------------------------------------------------- plugin
