@@ -93,11 +93,13 @@
 2. `GET /projects/:encoded/merge_requests/:iid` 取 `state` / `source_branch` / `target_branch` / `sha` / `web_url`。`state !== 'opened'` → `mr-not-open`。
 3. **repo 校验**：会话 cwd 必须是 git 仓库，`git remote get-url origin` 的 host + path 必须与 MR 项目路径一致 → 否则 `repo-mismatch`，提示换目录。`mr_bind({ repo })` 可显式指定仓库根（`/mr` 命令不支持该参数，需要时回退到工具调用）。
 4. 当前分支与 `source_branch` 不一致 → 绑定成功但报告里带 `branch-mismatch` 警告（worktree 场景合法）。
-5. 绑定写入账本，启动 watcher，返回首轮报告（当前 head sha 上的评审与门禁现状）。
+5. 绑定写入账本，启动 watcher，返回首轮报告（当前 head sha 上的评审与门禁现状）。重复绑定同一 MR 时若 head sha 未变，**不新增轮次**：复用账本最后一轮的轮次号并覆盖其快照（保留该轮 `observedAt` 基线）；只有 head sha 变化才开新一轮（§5.2）。
 
 一个会话只允许一个绑定；再次 `/mr` 会先停旧 watcher 再绑新的，并在返回里说明。同一 MR 已被另一个 live 会话绑定 → 允许只读查询，但**写操作（豁免）拒绝** `bound-elsewhere`，避免两个会话同时往同一 MR 回帖。
 
 ### 5.2 轮次与 SHA 绑定（本插件的核心）
+
+**轮次以 head sha 为界**：同一 sha 上重复绑定 / 重复观测都复用当前轮次，不新增；只有 head sha 变化才开启新一轮（`n + 1`）。
 
 每轮记录 `{ n, sha, observedAt, baselineAt, notes: { review?, sensitive?, mandatory? } }`。`baselineAt` 是本轮的时间基线：优先取该 sha 的 `head_pipeline.created_at`（流水线只为当前 sha 跑，等价于 push 时间），取不到时退回 `observedAt`（本轮 sha 首次观测时间）。这样「绑定前评审就已存在」的 MR 也能被正确归属，而不是一律判 stale。
 
