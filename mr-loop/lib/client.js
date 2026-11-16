@@ -96,7 +96,7 @@ window.__ModuleLoader__.load({
       loading: false,
       error: null,
       open: false,
-      scope: "session",
+      scope: "all",
       sessionId: null,
       expanded: {},
     };
@@ -379,6 +379,19 @@ window.__ModuleLoader__.load({
     // ---------------------------------------------------------------- drawer
     function Drawer() {
       var state = useStore();
+      var allMrs = state.data && Array.isArray(state.data.mrs) ? state.data.mrs : [];
+      var sessionIdForDrawer = store.sessionId;
+      var sessionCount = sessionIdForDrawer === null
+        ? 0
+        : allMrs.filter(function (mr) {
+            return mr.session !== undefined && mr.session !== null && String(mr.session.id) === sessionIdForDrawer;
+          }).length;
+      // 打开抽屉时若「本会话」为空，自动落到「全部」，避免一进来就是空页。
+      React.useEffect(function () {
+        if (state.open === true && state.scope === "session" && sessionCount === 0 && allMrs.length > 0) {
+          setStore({ scope: "all" });
+        }
+      }, [state.open, state.scope, sessionCount, allMrs.length]);
       if (state.open !== true) return null;
       var data = state.data;
       var mrs = data && Array.isArray(data.mrs) ? data.mrs : [];
@@ -411,7 +424,15 @@ window.__ModuleLoader__.load({
         body = h("div", { className: "mrl-empty" },
           state.scope === "session"
             ? "本会话还没有跟踪中的 MR（历史账本在「全部」里）"
-            : "这个分类里还没有 MR");
+            : "这个分类里还没有 MR",
+          state.scope === "session" && mrs.length > 0
+            ? h("div", { style: { marginTop: 10 } },
+                h("button", {
+                  className: "mrl-btn",
+                  type: "button",
+                  onClick: function () { setStore({ scope: "all" }); },
+                }, "查看全部 " + mrs.length + " 个 MR"))
+            : null);
       } else {
         body = visible.map(function (mr) { return h(MrCard, { key: mr.projectPath + "#" + mr.iid, mr: mr }); });
       }
