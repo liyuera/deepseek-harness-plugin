@@ -4,11 +4,40 @@
   "description": "MR review loop for dsh: bind an existing GitLab MR, watch its review and gates, bind verdicts to head sha, and wake the main agent with a structured report instead of sleeping.",
   "type": "module",
   "main": "index.js",
-  "exports": { ".": "./index.js", "./package.json": "./package.json" },
-  "files": ["index.js", "cordis.patch.yml", "src", "scripts", "README.md"],
-  "scripts": { "test": "node --test test/*.test.js" },
-  "engines": { "dsh": ">=0.2.2-rc.1" },
-  "keywords": ["dsh", "dsh-plugin", "gitlab", "merge-request", "code-review"],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "lib/client.js",
+    "cordis.patch.yml",
+    "src",
+    "scripts",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "dsh": ">=0.2.2-rc.1"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "gitlab",
+    "merge-request",
+    "code-review"
+  ],
   "license": "UNLICENSED",
-  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [],
+      "platform": "web"
+    }
+  }
 }

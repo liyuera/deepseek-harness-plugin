@@ -5,13 +5,16 @@ import { apply } from '../index.js'
 
 function fakeCtx({ failFirstTool = false } = {}) {
   const skills = []
-  const registered = { tools: [], commands: [], effects: [], listeners: [], injects: [] }
+  const registered = { tools: [], commands: [], effects: [], listeners: [], injects: [], webServerRoutes: [] }
   const warnings = []
   let toolCalls = 0
   const scoped = {
     get: (serviceName) => (serviceName === 'skills'
       ? { register: (skill) => { skills.push(skill); return () => {} } }
       : undefined),
+    webServer: {
+      register: (route) => { registered.webServerRoutes.push(route); return () => {} },
+    },
     effect: (factory, label) => {
       const dispose = factory()
       registered.effects.push({ label, dispose })
@@ -45,8 +48,11 @@ test('apply() 注册 5 个工具、/mr 命令，并通过 skills 服务注册技
   assert.deepEqual(h.tools.map((tool) => tool.name), ['mr_bind', 'mr_status', 'mr_review', 'mr_stop', 'mr_resume'])
   assert.equal(h.commands.length, 1)
   assert.equal(h.commands[0].name, 'mr')
-  // 技能必须走 ctx.inject(['skills']) 拿 scoped ctx，而不是直接用根 ctx。
-  assert.deepEqual(h.injects, [['skills']])
+  // 只读 UI 路由（webServer）先注册，技能随后；两者都走 scoped ctx。
+  assert.deepEqual(h.injects, [['webServer'], ['skills']])
+  assert.equal(h.webServerRoutes.length, 1)
+  assert.equal(h.webServerRoutes[0].path, '/mr-loop/ui/state')
+  assert.equal(h.webServerRoutes[0].kind, 'exact')
   assert.equal(h.skills.length, 1)
   assert.equal(h.skills[0].name, 'mr-loop')
 })
@@ -57,6 +63,24 @@ test('enabled=false 仍注册工具、命令与技能（只是没有 watcher）'
   assert.equal(h.tools.length, 5)
   assert.equal(h.commands.length, 1)
   assert.equal(h.skills.length, 1)
+})
+
+test('没有 webServer 服务时只跳过 UI 路由，工具/命令/技能照常注册', () => {
+  const h = fakeCtx()
+  const originalInject = h.ctx.inject
+  h.ctx.inject = (names, callback) => {
+    if (names[0] !== 'webServer') return originalInject(names, callback)
+    h.injects.push(names)
+    // 模拟宿主没有 webServer：scoped ctx 缺少该服务，注册应当抛错并被兜住；
+    // 其它 inject 走原始实现，证明失败只影响 UI 路由这一件事。
+    callback({ get: () => undefined, effect: (factory) => { factory() } })
+  }
+  apply(h.ctx, {})
+
+  assert.equal(h.tools.length, 5)
+  assert.equal(h.commands.length, 1)
+  assert.equal(h.skills.length, 1)
+  assert.equal(h.warnings.filter((line) => /UI 路由注册失败/.test(line)).length, 1)
 })
 
 test('单个工具注册抛错不影响其余工具、命令与技能接线', () => {

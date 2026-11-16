@@ -8,6 +8,7 @@ import { createWatcher } from './src/host/watcher.js'
 import { createTools } from './src/host/tools.js'
 import { createCommand } from './src/host/command.js'
 import { registerMrLoopSkill } from './src/host/skill.js'
+import { createUiState, registerUiRoute } from './src/host/ui.js'
 
 export const name = 'mr-loop'
 export const inject = ['tools', 'commands']
@@ -113,6 +114,14 @@ export function apply(ctx, rawConfig = {}) {
   // 插件卸载时停掉所有会话的定时器（不依赖 effect disposer 的相对顺序：
   // 即使 service 先被清空，tick 也会因 getState() 为 null 而自行收工）。
   ctx.effect(() => () => watcher.stopAll(), 'mr-loop: stop watchers')
+
+  // UI 只读聚合：/mr-loop/ui/state。webServer 可选，没有就静默跳过（不影响工具与监视）。
+  try {
+    const ui = createUiState({ config, service, logger: ctx.logger })
+    registerUiRoute({ ctx, ui, logger: ctx.logger })
+  } catch (error) {
+    ctx.logger?.warn?.(`[mr-loop] UI 路由注册失败：${error.message}`)
+  }
 
   registerMrLoopSkill(ctx)
   ctx.logger?.info?.(`[mr-loop] loaded baseUrl=${config.baseUrl}`)

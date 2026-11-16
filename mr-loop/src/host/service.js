@@ -303,9 +303,14 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
     return bindings.get(sessionId) ?? null
   }
 
+  /** UI 只读聚合用：当前进程里所有仍在跟踪的绑定（返回值只读，不要改它）。 */
+  function listStates() {
+    return [...bindings.values()]
+  }
+
   function dispose() {
     bindings.clear()
   }
 
-  return { bind, status, review, applySnapshot, stop, resume, pause, getState, dispose, report, ledger }
+  return { bind, status, review, applySnapshot, stop, resume, pause, getState, listStates, dispose, report, ledger }
 }
