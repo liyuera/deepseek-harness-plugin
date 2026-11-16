@@ -61,6 +61,8 @@
 <body>
 <div id="stage">
   <div id="chip-box"></div>
+  <!-- cramped 演示：把 chip 塞进 200px 的裁剪行里，应该自动收成图标（真实测量路径） -->
+  <div id="chip-cramped-row" style="position:absolute;top:72px;left:24px;width:200px;display:flex;align-items:center;gap:6px;overflow:hidden;border:1px dashed #cfd3d6;padding:4px 6px;box-sizing:border-box"></div>
   <div id="root"></div>
 </div>
 
@@ -177,15 +179,24 @@
 
   const React = window.React
   const ReactDOM = window.ReactDOM
-  ReactDOM.createRoot(document.getElementById('chip-box')).render(React.createElement(chip, { sessionId: 'session-1' }))
-  ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(drawer))
-
-  // 等 fetch 落定后点开看板
-  setTimeout(function () {
-    const buttons = Array.from(document.querySelectorAll('button'))
-    const open = buttons.find(b => b.textContent.trim() === '看板')
-    if (open) open.click()
-  }, 300)
+  // ?chip=compact 演示「窄屏收成一个 MR 图标」：整个页面当成窄屏，只挂 chip。
+  const chipDemo = new URLSearchParams(location.search).get('chip')
+  if (chipDemo === 'cramped') {
+    // 真实测量路径：容器只有 200px，chip 会自己量出「放不下」→ 收成图标。
+    ReactDOM.createRoot(document.getElementById('chip-cramped-row')).render(React.createElement(chip, { sessionId: 'session-1' }))
+  } else if (chipDemo === 'compact') {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, get: function () { return 900 } })
+    ReactDOM.createRoot(document.getElementById('chip-box')).render(React.createElement(chip, { sessionId: 'session-1' }))
+  } else {
+    ReactDOM.createRoot(document.getElementById('chip-box')).render(React.createElement(chip, { sessionId: 'session-1' }))
+    ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(drawer))
+    // 等 fetch 落定后点开看板
+    setTimeout(function () {
+      const buttons = Array.from(document.querySelectorAll('button'))
+      const open = buttons.find(b => b.textContent.trim() === '看板')
+      if (open) open.click()
+    }, 300)
+  }
 </script>
 </body>
 </html>

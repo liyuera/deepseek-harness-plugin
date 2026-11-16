@@ -14,8 +14,14 @@ window.__ModuleLoader__.load({
     var CSS = [
       // 表面层次用主题 token 现算：DSH 真机上 bg-layer-1/2 都是纯白（浅色），
       // 直接拿 layer-2 当「嵌套底色」会白对白看不见，所以用前景色低透明度混出灰底。
-      ".mrl-chip,.mrl-panel{--mrl-surface:var(--dsw-alias-bg-layer-1);--mrl-fill:color-mix(in srgb,var(--dsw-alias-label-primary) 5%,transparent);--mrl-fill-2:color-mix(in srgb,var(--dsw-alias-label-primary) 8%,transparent);--mrl-line:var(--dsw-alias-border-l2);--mrl-line-soft:var(--dsw-alias-border-l1);--mrl-on-accent:var(--dsw-alias-bg-base);--mrl-accent:var(--dsw-alias-state-business-primary,var(--dsw-alias-label-primary))}",
-      ".mrl-chip{display:inline-flex;align-items:center;gap:6px;margin:0 2px;font-size:11.5px;line-height:1}",
+      ".mrl-chip,.mrl-chip-btn,.mrl-panel{--mrl-surface:var(--dsw-alias-bg-layer-1);--mrl-fill:color-mix(in srgb,var(--dsw-alias-label-primary) 5%,transparent);--mrl-fill-2:color-mix(in srgb,var(--dsw-alias-label-primary) 8%,transparent);--mrl-line:var(--dsw-alias-border-l2);--mrl-line-soft:var(--dsw-alias-border-l1);--mrl-on-accent:var(--dsw-alias-bg-base);--mrl-accent:var(--dsw-alias-state-business-primary,var(--dsw-alias-label-primary))}",
+      ".mrl-chip{position:relative;display:inline-flex;align-items:center;gap:6px;margin:0 2px;font-size:11.5px;line-height:1}",
+      // 窄屏/被裁剪时的紧凑形态：只有一个 MR 图标按钮 + 状态点。
+      ".mrl-chip-btn{position:relative;display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;padding:0;border:1px solid var(--mrl-line);background:transparent;border-radius:7px;color:var(--dsw-alias-label-secondary);cursor:pointer}",
+      ".mrl-chip-btn:hover{background:var(--mrl-fill);color:var(--dsw-alias-label-primary)}",
+      ".mrl-chip-btn:focus-visible{outline:2px solid var(--mrl-accent);outline-offset:-2px}",
+      ".mrl-chip-badge{position:absolute;top:-3px;right:-3px;width:8px;height:8px;border-radius:50%;border:2px solid var(--dsw-alias-bg-base);background:var(--dsw-alias-state-warn-primary)}",
+      ".mrl-chip-badge[data-tone=ok]{background:var(--dsw-alias-state-success-primary)}",
       ".mrl-chip-tag{display:inline-flex;align-items:center;gap:5px;height:24px;padding:0 5px;border-radius:7px;border:1px solid transparent;background:transparent;color:var(--dsw-alias-label-primary);font-size:11.5px;line-height:1;white-space:nowrap;cursor:pointer}",
       ".mrl-chip-tag:hover{background:var(--mrl-fill)}",
       ".mrl-chip-tag.warn{border-color:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 40%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 12%,transparent)}",
@@ -227,9 +233,184 @@ window.__ModuleLoader__.load({
       } catch (error) { /* ignore */ }
     }
 
-    // ---------------------------------------------------------------- chip
+    // ---------------------------------------------------------------- 响应式 chip
+    /** 量不到会话头容器时退回窗口宽度断点（宽 < 该值就收成图标）。 */
+    var COMPACT_MAX_WIDTH = 1000;
+
+    function viewportCompact(win) {
+      var width = win !== null && win !== undefined && typeof win.innerWidth === "number" ? win.innerWidth : 0;
+      return width > 0 && width < COMPACT_MAX_WIDTH;
+    }
+
+    function computedStyleOf(element) {
+      var win = typeof window === "undefined" ? null : window;
+      if (win === null || typeof win.getComputedStyle !== "function" || element === null || element === undefined) return null;
+      try { return win.getComputedStyle(element); } catch (error) { return null; }
+    }
+
+    /**
+     * 量宽度用的容器：优先「会裁剪子元素的祖先」（会话头动作区就是 overflow 裁剪 + 渐隐），
+     * 退一步找最近的 flex 行（即便没设 overflow，也能从行宽判断够不够）。
+     * 都找不到返回 null，交给窗口宽度兜底。
+     */
+    function findChipContainer(node) {
+      if (node === null || node === undefined || node.parentElement === undefined || node.parentElement === null) return null;
+      var flexFallback = null;
+      var current = node.parentElement;
+      while (current !== null && current !== undefined) {
+        var style = computedStyleOf(current);
+        if (style !== null && style.overflowX !== "visible") return current;
+        if (flexFallback === null && style !== null && (style.display === "flex" || style.display === "inline-flex")) {
+          flexFallback = current;
+        }
+        if (current === document.body || current === document.documentElement) break;
+        current = current.parentElement;
+      }
+      return flexFallback;
+    }
+
+    /** 容器里已排版的子元素总宽（不含 gap 之外的额外空间）。 */
+    function childrenWidthOf(box) {
+      if (box === null || box === undefined || box.children === null || box.children === undefined) return 0;
+      var total = 0;
+      for (var index = 0; index < box.children.length; index += 1) {
+        var child = box.children[index];
+        if (child === null || child === undefined || typeof child.getBoundingClientRect !== "function") continue;
+        var rect = child.getBoundingClientRect();
+        if (rect !== null && rect !== undefined && typeof rect.width === "number") total += rect.width;
+      }
+      return total;
+    }
+
+    /**
+     * 这一排「内容实际需要多宽」：溢出时用 scrollWidth（含 gap 与内边距，最准）；
+     * 没溢出时只累加子元素宽度 + 左右内边距，绝不能把容器宽度本身当成内容宽度。
+     */
+    function contentWidthOf(box) {
+      var style = computedStyleOf(box);
+      var paddingX = 0;
+      if (style !== null) {
+        paddingX = (parseFloat(style.paddingLeft) || 0) + (parseFloat(style.paddingRight) || 0);
+      }
+      var content = childrenWidthOf(box) + paddingX;
+      if (typeof box.scrollWidth === "number" && typeof box.clientWidth === "number"
+        && box.scrollWidth > box.clientWidth && box.scrollWidth > content) {
+        content = box.scrollWidth;
+      }
+      return content;
+    }
+
+    /**
+     * 纯函数：按会话头可用宽度决定 chip 形态（不碰 DOM，便于单测）。
+     * needed = 「把 chip 换成完整形态后这一排需要的总宽度」，两种形态算出来相同，
+     * 所以判定不会在 compact / full 之间来回抖。
+     */
+    function chipShrinkMode(metrics) {
+      var m = metrics || {};
+      var containerWidth = Number(m.containerWidth);
+      var contentWidth = Number(m.contentWidth);
+      var chipWidth = Number(m.chipWidth);
+      var fullWidth = Number(m.fullWidth);
+      var slack = Number(m.slack);
+      if (!Number.isFinite(containerWidth) || containerWidth <= 0) return "full";
+      if (!Number.isFinite(slack) || slack < 0) slack = 8;
+      if (!Number.isFinite(contentWidth) || contentWidth <= 0) contentWidth = containerWidth;
+      if (!Number.isFinite(chipWidth) || chipWidth < 0) chipWidth = 0;
+      if (!Number.isFinite(fullWidth) || fullWidth <= 0) fullWidth = chipWidth;
+      var needed = contentWidth - chipWidth + fullWidth;
+      return needed + slack <= containerWidth ? "full" : "compact";
+    }
+
+    /**
+     * chip 形态：优先按会话头真实可用宽度判断（末尾被裁剪就收成图标，保证一直在）；
+     * 量不到容器时退回窗口宽度断点。返回 { compact, ref }。
+     */
+    function useChipCompact() {
+      var state = React.useState(false);
+      var compact = state[0] === true;
+      var setCompact = state[1];
+      var nodeRef = React.useRef(null);
+      var fullRef = React.useRef(0);
+      var modeRef = React.useRef("full");
+      var observerRef = React.useRef(null);
+      var observedRef = React.useRef(null);
+
+      var measure = function () {
+        var win = typeof window === "undefined" ? null : window;
+        var current = nodeRef.current;
+        var box = current === null ? null : findChipContainer(current);
+        var mode = null;
+        if (current !== null && box !== null && typeof box.clientWidth === "number" && box.clientWidth > 0
+          && typeof current.getBoundingClientRect === "function" && typeof box.getBoundingClientRect === "function") {
+          var width = (current.getBoundingClientRect() || {}).width || 0;
+          if (modeRef.current === "full" && width > 0) fullRef.current = width;
+          mode = chipShrinkMode({
+            containerWidth: box.clientWidth,
+            contentWidth: contentWidthOf(box),
+            chipWidth: width,
+            fullWidth: fullRef.current || width,
+          });
+        } else {
+          mode = viewportCompact(win) ? "compact" : "full";
+        }
+        if (mode !== modeRef.current) {
+          modeRef.current = mode;
+          setCompact(mode === "compact");
+        }
+      };
+
+      // 每次渲染后都测一次：chip 在数据到达前返回 null（没有 DOM），effect 只跑一次会漏挂观察器。
+      React.useEffect(function () {
+        var win = typeof window === "undefined" ? null : window;
+        var current = nodeRef.current;
+        var box = current === null ? null : findChipContainer(current);
+        if (box !== observedRef.current) {
+          if (observerRef.current !== null && typeof observerRef.current.disconnect === "function") observerRef.current.disconnect();
+          observerRef.current = null;
+          observedRef.current = box;
+          if (box !== null && win !== null && typeof win.ResizeObserver === "function") {
+            try {
+              var observer = new win.ResizeObserver(function () { measure(); });
+              observer.observe(box);
+              observerRef.current = observer;
+            } catch (error) { observerRef.current = null; }
+          }
+        }
+        measure();
+      });
+
+      React.useEffect(function () {
+        var win = typeof window === "undefined" ? null : window;
+        var onResize = function () { measure(); };
+        if (win !== null && typeof win.addEventListener === "function") win.addEventListener("resize", onResize);
+        // 首次测量时行宽可能还没排完版（量到 0 会误判成 full），补两次重测。
+        var retries = [];
+        if (win !== null && typeof win.setTimeout === "function") {
+          retries.push(win.setTimeout(function () { measure(); }, 0));
+          retries.push(win.setTimeout(function () { measure(); }, 150));
+        }
+        return function () {
+          if (win !== null && typeof win.removeEventListener === "function") win.removeEventListener("resize", onResize);
+          if (win !== null && typeof win.clearTimeout === "function") {
+            retries.forEach(function (id) { win.clearTimeout(id); });
+          }
+          if (observerRef.current !== null && typeof observerRef.current.disconnect === "function") observerRef.current.disconnect();
+          observerRef.current = null;
+          observedRef.current = null;
+        };
+      }, []);
+
+      // 首帧（还没挂载节点）没有测量机会：直接按窗口宽度兜底，窄屏不先闪一版完整 chip。
+      var pending = nodeRef.current === null && viewportCompact(typeof window === "undefined" ? null : window);
+      return {
+        compact: compact || pending,
+        ref: function (node) { nodeRef.current = node; },
+      };
+    }
+
     function Chip(props) {
       var state = useStore();
+      var layout = useChipCompact();
       var incomingSession = props && props.sessionId !== undefined && props.sessionId !== null
         ? String(props.sessionId)
         : null;
@@ -253,6 +434,46 @@ window.__ModuleLoader__.load({
         ? (data.counts && typeof data.counts.pending === "number" ? data.counts.pending : 0)
         : scoped.reduce(function (sum, mr) { return sum + (typeof mr.pending === "number" ? mr.pending : 0); }, 0);
       var initialScope = currentSessionId !== null && scoped.length > 0 ? "session" : "all";
+      var openPanel = function () { setStore({ open: true, expanded: {}, scope: initialScope }); };
+
+      // 紧凑形态：会话头宽度不够时只留一个 MR 图标按钮（点击照旧打开看板）。
+      if (layout.compact) {
+        var hasMergeable = scoped.some(function (mr) {
+          return mr.merge !== null && mr.merge !== undefined && mr.merge.mergeable === true;
+        });
+        var badgeTone = pending > 0 ? "warn" : (hasMergeable ? "ok" : "");
+        var tips = ["MR 看板"];
+        scoped.slice(0, 2).forEach(function (mr) { tips.push("!" + mr.iid + " 第 " + (mr.round || 0) + " 轮"); });
+        if (scoped.length > 2) tips.push("+" + (scoped.length - 2));
+        if (pending > 0) tips.push(pending + " 待处理");
+        var tipsText = tips.join(" · ");
+        return h("button", {
+          className: "mrl-chip-btn",
+          type: "button",
+          ref: layout.ref,
+          title: tipsText,
+          "aria-label": tipsText,
+          onClick: openPanel,
+        },
+        h("svg", {
+          viewBox: "0 0 16 16",
+          width: 14,
+          height: 14,
+          fill: "none",
+          stroke: "currentColor",
+          strokeWidth: 1.5,
+          strokeLinecap: "round",
+          strokeLinejoin: "round",
+          "aria-hidden": "true",
+        },
+        h("circle", { cx: 4.5, cy: 3.5, r: 1.6 }),
+        h("circle", { cx: 4.5, cy: 12.5, r: 1.6 }),
+        h("circle", { cx: 11.5, cy: 8, r: 1.6 }),
+        h("path", { d: "M4.5 5.1v5.8" }),
+        h("path", { d: "M4.5 7h3.4a2.7 2.7 0 0 1 2.7 1" })),
+        badgeTone === "" ? null : h("span", { className: "mrl-chip-badge", "data-tone": badgeTone }));
+      }
+
       var shown = scoped.slice(0, 2);
       var tags = shown.map(function (mr, index) {
         var label = "!" + mr.iid;
@@ -262,7 +483,7 @@ window.__ModuleLoader__.load({
           className: "mrl-chip-tag " + tone,
           type: "button",
           title: mr.sourceBranch + " → " + mr.targetBranch,
-          onClick: function () { setStore({ open: true, expanded: {}, scope: initialScope }); },
+          onClick: openPanel,
         },
         h("span", { className: "mrl-dot " + tone }),
         h("span", null, label + " · 第 " + (mr.round || 0) + " 轮"));
@@ -273,11 +494,11 @@ window.__ModuleLoader__.load({
       var pendingTag = pending > 0
         ? h("span", { className: "mrl-tag err" }, pending + " 待处理")
         : null;
-      return h("span", { className: "mrl-chip" }, tags, more, pendingTag,
+      return h("span", { className: "mrl-chip", ref: layout.ref }, tags, more, pendingTag,
         h("button", {
           className: "mrl-chip-tag brand",
           type: "button",
-          onClick: function () { setStore({ open: true, expanded: {}, scope: initialScope }); },
+          onClick: openPanel,
         }, "看板"));
     }
 
@@ -573,6 +794,13 @@ window.__ModuleLoader__.load({
         var timer = window.setInterval(function () { if (subscribers > 0) load(); }, 30000);
         return function () { window.clearInterval(timer); };
       }, "mr-loop: ui poll");
+    };
+
+    // 仅供单测：宿主只读 apply / inject，未知导出会被忽略。
+    exports.__internals = {
+      chipShrinkMode: chipShrinkMode,
+      viewportCompact: viewportCompact,
+      COMPACT_MAX_WIDTH: COMPACT_MAX_WIDTH,
     };
 
     return module.exports;

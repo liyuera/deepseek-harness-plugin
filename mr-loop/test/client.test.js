@@ -98,6 +98,9 @@ function loadBundle({ fetchData = { mrs: [], counts: {} } } = {}) {
         return intervals.set.length
       },
       clearInterval: (id) => { intervals.cleared.push(id) },
+      // Drawer 打开时挂 Esc 监听，chip 侧挂 resize 监听：桩里给个空实现（浏览器行为）。
+      addEventListener: () => {},
+      removeEventListener: () => {},
     },
     document: styles.documentStub,
     fetch: async () => ({ ok: true, json: async () => fetchData }),
@@ -221,4 +224,69 @@ test('chip：sessionId 已知时只统计当前会话的 MR 与待处理', async
   assert.doesNotMatch(texts, /!243/)
   assert.match(texts, /2 待处理/)
   assert.doesNotMatch(texts, /7 待处理/)
+})
+
+const drawerOf = (loaded) => loaded.registrations.find((entry) => entry.definition.id === 'mr-loop-drawer').component
+
+/** 窄屏：把窗口宽度塞到断点以下，chip 应退化成只有一个 MR 图标。 */
+test('chip：窄屏退化成一个 MR 图标按钮，点击仍能打开看板', async () => {
+  const loaded = loadBundle({ fetchData: chipData })
+  loaded.sandbox.window.innerWidth = 900
+  loaded.sandbox.__moduleExports.apply(loaded.ctx)
+  renderChip(loaded, 's1')
+  await settle()
+
+  const chip = renderChip(loaded, 's1')
+  const texts = textsOf(chip).join(' | ')
+  assert.equal(texts, '', '紧凑形态不渲染任何文字，只有图标')
+  assert.equal(chip.props.className, 'mrl-chip-btn')
+  assert.match(chip.props.title, /!241 第 1 轮/)
+  assert.match(chip.props.title, /2 待处理/)
+  assert.equal(chip.props['aria-label'], chip.props.title)
+
+  // 图标里应有一枚告警状态点（本会话 2 条待处理）。
+  const kinds = []
+  const walk = (node) => {
+    if (node === null || node === undefined || node === false) return
+    if (Array.isArray(node)) { node.forEach(walk); return }
+    if (typeof node !== 'object') return
+    if (typeof node.type === 'function') return
+    if (typeof node.type === 'string') kinds.push(node.type)
+    if (Array.isArray(node.children)) node.children.forEach(walk)
+  }
+  walk(chip)
+  assert.deepEqual(kinds.filter((kind) => kind === 'svg'), ['svg'])
+  const badge = chip.children.find((node) => node !== null && typeof node === 'object' && node.props.className === 'mrl-chip-badge')
+  assert.ok(badge, '有待处理时应渲染状态点')
+  assert.equal(badge.props['data-tone'], 'warn')
+
+  // 点击图标 → store.open=true → 抽屉渲染出面板。
+  assert.equal(typeof chip.props.onClick, 'function')
+  chip.props.onClick()
+  const drawer = drawerOf(loaded)()
+  assert.equal(drawer.props.className, 'mrl-dialog')
+})
+
+test('chipShrinkMode：放得下就用完整形态，放不下才收成图标，且判定与当前形态无关（不抖）', () => {
+  const { sandbox } = loadBundle()
+  const { chipShrinkMode } = sandbox.__moduleExports.__internals
+
+  // 一排只占 300px、容器 400px → 完整形态还留 100px 余量。
+  assert.equal(chipShrinkMode({ containerWidth: 400, contentWidth: 300, chipWidth: 120, fullWidth: 120 }), 'full')
+  // 内容 396 + 8px 余量刚好顶到 404 > 400 → 收成图标。
+  assert.equal(chipShrinkMode({ containerWidth: 400, contentWidth: 396, chipWidth: 120, fullWidth: 120 }), 'compact')
+  // 边缘：正好卡在 container - 8 上仍算放得下。
+  assert.equal(chipShrinkMode({ containerWidth: 400, contentWidth: 392, chipWidth: 120, fullWidth: 120 }), 'full')
+
+  // 不变式：同一排内容，用紧凑态量（chipWidth=26）或完整态量（120），结论必须一致。
+  const compactMode = chipShrinkMode({ containerWidth: 400, contentWidth: 302, chipWidth: 26, fullWidth: 120 })
+  const fullMode = chipShrinkMode({ containerWidth: 400, contentWidth: 396, chipWidth: 120, fullWidth: 120 })
+  assert.equal(compactMode, fullMode)
+  assert.equal(compactMode, 'compact')
+
+  // 量不到容器（0/NaN）→ 交给调用方按窗口兜底，别误判。
+  assert.equal(chipShrinkMode({ containerWidth: 0, contentWidth: 10, chipWidth: 10, fullWidth: 10 }), 'full')
+  assert.equal(chipShrinkMode({}), 'full')
+  // 缺 contentWidth 时按容器宽度算 = 已经占满 → 收成图标。
+  assert.equal(chipShrinkMode({ containerWidth: 360, chipWidth: 120, fullWidth: 120 }), 'compact')
 })

@@ -184,3 +184,45 @@
 - 验收台 `:root` 换成上表真实值并支持 `?theme=dark`，同时把 `createPortal` 目标改到 `#stage`（否则弹层 portal 到 body、截不到）。
 
 验收截图：`specs/assets/mr-loop-ui-implemented-light.jpg`、`mr-loop-ui-implemented-dark.jpg`（真实 bundle 渲染）。
+
+## 十一、响应式 chip：窄屏收成一个 MR 图标（2026-11-17，v0.2.4）
+
+需求：入口放在会话头最末尾（`order: 200`），但这一排 chip 是「放不下就从末尾裁剪、收进 ⋯」的行为，
+放在最后的入口反而最先被裁掉。所以 chip 自己量宽度，放不下就收成 26×26 的图标按钮，保证**一直在**。
+
+### 判定
+
+```
+container = 从 chip 往上找：第一个 overflow-x ≠ visible 的祖先（会话头动作区就是裁剪 + 渐隐），
+            找不到再退一步用最近的 flex 行；都没有 → 用窗口宽度兜底
+content   = 溢出时取 container.scrollWidth（含 gap/内边距，最准）
+            没溢出时只累加子元素宽度 + 左右内边距（绝不能把容器宽度当内容宽度）
+needed    = content - 当前chip宽 + 完整chip宽      // 换成完整形态后这一排需要的总宽度
+mode      = needed + 8px 余量 ≤ container.clientWidth ? full : compact
+```
+
+关键点：`needed` 在两种形态下算出来相同（紧凑态量 `content` 少了一个 chip 宽度，但公式把它加回来了），
+所以「宽了就展开、窄了就收起」不会来回抖。8px 余量是刻意留的保守量。
+
+兜底：量不到容器（或首帧还没挂载 DOM）时按 `window.innerWidth < 1000` 判紧凑。
+
+### 触发时机
+
+- 每次渲染后测一次（chip 在数据到达前返回 `null`，只跑一次的 effect 会漏挂观察器）；
+- 容器尺寸变化（`ResizeObserver`）+ 窗口 `resize`；
+- 挂载后补两次重测（下一拍 + 150ms），避免首帧没排完版量到 0 误判。
+
+### 形态
+
+| 形态 | 内容 | 尺寸 |
+| --- | --- | --- |
+| 完整 | `!241 · 第 N 轮` ＋ `+N` ＋ `N 待处理` ＋ `看板` | 约 210–260px |
+| 紧凑 | 一个 MR 合并图标按钮（三个圆点 + 连线），待处理/可合时右上角一枚状态点 | 26×26 |
+
+紧凑态：`title`/`aria-label` 带 `MR 看板 · !241 第 1 轮 · 2 待处理`，点击照旧打开看板。
+
+### 验收与测试
+
+- 单测：`chipShrinkMode` 的边界（放得下 / 差 8px 内 / 缺字段）+ 形态不变式 + 兜底；窄屏渲染出一个图标按钮且点击能开抽屉（`test/client.test.js`，共 311 项）
+- 视觉台：`scripts/ui-harness.html?chip=cramped` 把 chip 塞进 200px 裁剪行（真实测量路径），`?chip=compact` 模拟窄窗口
+- 截图：`specs/assets/mr-loop-ui-chip-compact.jpg`
