@@ -6,12 +6,12 @@
   "main": "index.js",
   "exports": {
     ".": "./index.js",
-    "./client": "./lib/client.js",
+    "./client": "./lib/ui-client.js",
     "./package.json": "./package.json"
   },
   "files": [
     "index.js",
-    "lib/client.js",
+    "lib/ui-client.js",
     "cordis.patch.yml",
     "src",
     "scripts",

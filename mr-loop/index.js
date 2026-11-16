@@ -156,8 +156,10 @@ export function apply(ctx, rawConfig = {}) {
     ctx.inject(['webServer'], (scoped) => scoped.effect(() => scoped.webServer.register({
       kind: 'exact',
       path: '/mr-loop/ui/diag',
-      handler: async (_request, res) => {
+      handler: async (request, res) => {
         const out = { at: new Date().toISOString() }
+        const url = new URL(request.url ?? '/mr-loop/ui/diag', 'http://localhost')
+        out.query = url.search
         try {
           const clientModules = ctx.get?.('clientModules')
           out.hasService = clientModules !== undefined
@@ -172,6 +174,11 @@ export function apply(ctx, rawConfig = {}) {
               const { readFile } = await import('node:fs/promises')
               const text = await readFile(path, 'utf8')
               out.bundle = { length: text.length, hasMergeIcon: text.includes('mergeIcon'), hasOldMergeText: text.includes('— 历史账本（未在跟踪）') }
+            }
+            if (url.searchParams.get('rebuild') === '1' && typeof clientModules.rebuilt === 'function') {
+              const before = out.entries && out.entries[0] ? out.entries[0].rev : null
+              const next = clientModules.rebuilt('@liyuera/dsh-mr-loop')
+              out.rebuilt = { before, next }
             }
             // 浏览器真正拿到的内容：走 fetchBundle（与 /plugins 路由同一实现）
             try {
