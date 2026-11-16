@@ -15,7 +15,7 @@ const DEFAULTS = Object.freeze({
   baseUrl: 'https://git.htwisdom.cn',
   tokenFile: '~/.dsh/mr-loop/gitlab-token',
   ledgerDir: '~/.dsh/mr-loop/ledger',
-  pollWatchingMs: 60000,
+  pollWatchingMs: 30000,
   pollAwaitingMs: 10000,
   pollSettleMs: 15000,
   pollNoPipelineMs: 20000,

@@ -367,7 +367,7 @@ feat-V1.7.0.20261119-ly → feature-V1.7.0.20261119 · 第 3 轮 · sha 0e2a9007
 |---|---|---|
 | `baseUrl` | `https://git.htwisdom.cn` | 只允许 http/https，不含凭据/query |
 | `tokenFile` | `~/.dsh/mr-loop/gitlab-token` | 0600 文件；环境变量 `MR_LOOP_GITLAB_TOKEN` 优先 |
-| `pollWatchingMs` | `60000` | 等新 sha 的间隔（最小 5000） |
+| `pollWatchingMs` | `30000` | 等新 sha / 等合并的轮询间隔（最小 5000；可合后保持 30s） |
 | `pollAwaitingMs` | `10000` | 等评审的间隔 |
 | `pollSettleMs` | `15000` | 门禁 settle / 回帖复判 |
 | `pollNoPipelineMs` | `20000` | MR 没挂 CI 时的兜底间隔 |
