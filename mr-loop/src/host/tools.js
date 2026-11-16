@@ -185,6 +185,11 @@ export function createTools({ service, watcher = undefined }) {
             '评论已先发；需要提交代码时现在再 commit + push（先评论后提交，评论会触发一次新评审）。',
           ]
           const data = { posted: true, noteId: result.noteId, url: result.url }
+          // M-2：结果未知时评论可能已发出，服务已按 notes 找回——提示「不要重发」。
+          if (result.recovered === true) {
+            lines.push('上一次尝试可能已发出，已按 notes 找回，不要重发。')
+            data.recovered = true
+          }
           // M2：评论已发出但账本没落盘——如实提示，不要让模型以为发送失败而重发。
           if (result.persisted === false) {
             lines.push(`⚠️ ${result.warning ?? '账本写入失败'}（评论已发出，不要重发）`)

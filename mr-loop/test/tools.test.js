@@ -263,3 +263,22 @@ test('M2 回帖成功但账本落盘失败：透传 persisted:false / warning，
   // 评论确实发出去了，不能提示失败让人重发。
   assert.match(result.message, /已发豁免评论/)
 })
+
+test('M-2 恢复命中：data 透传 recovered:true，消息提示「上一次可能已发出，已按 notes 找回，不要重发」', async () => {
+  const service = fakeService({
+    postWaiver: async () => ({
+      posted: true,
+      recovered: true,
+      noteId: 902,
+      url: 'https://git.x.com/g/p/-/merge_requests/240#note_902',
+      body: '#ai-waive a1b2c3d4 reason=风险已评估',
+    }),
+  })
+  const def = byName(createTools({ service }), 'mr_waive')
+  const result = await def.execute({ fid: 'a1b2c3d4', reason: '风险已评估', post: true }, exec)
+  assert.equal(result.ok, true)
+  assert.equal(result.data.posted, true)
+  assert.equal(result.data.recovered, true)
+  assert.match(result.message, /已按 notes 找回/)
+  assert.match(result.message, /不要重发/)
+})

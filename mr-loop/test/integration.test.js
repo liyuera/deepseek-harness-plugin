@@ -12,6 +12,7 @@ import { createLedger } from '../src/host/ledger.js'
 import { createService } from '../src/host/service.js'
 import { createWatcher } from '../src/host/watcher.js'
 import { createTools } from '../src/host/tools.js'
+import { releaseSession } from '../index.js'
 
 const SHA_A = 'a'.repeat(40)
 const SHA_B = 'b'.repeat(40)
@@ -196,5 +197,47 @@ test('T2 service + tools：mr_waive 草稿 → post → 幂等，评论只发一
   const saved = await service.ledger.load({ projectPath: 'g/p', iid: 240 })
   assert.equal(saved.decisions.aaaa0001.noteId, 9001)
   assert.equal(saved.decisions.aaaa0001.source, 'comment')
+  await rm(dir, { recursive: true, force: true })
+})
+
+// ---------------------------------------------------------------------------
+// I-1（第 3 轮复审）：session/disposed → releaseSession，旧会话不再永久占住写路径。
+// ---------------------------------------------------------------------------
+test('I-1 releaseSession 真实接缝：旧会话被释放后，另一会话同一 MR 的 post 不再 bound-elsewhere', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mrloop-integration-'))
+  const cfg = resolveConfig({ baseUrl: 'https://git.x.com' })
+  const posted = []
+  const gitlab = {
+    getMergeRequest: async () => mrOf({ sha: SHA_A, notesCount: 1, baseline: BASELINE_A }),
+    listNotes: async () => [{ id: 11, system: false, created_at: '2026-11-13T10:02:00Z', body: reviewBody({ sha: SHA_A, verdict: 'changes' }) }],
+    postNote: async ({ body }) => {
+      posted.push(body)
+      return { id: 9500, body, created_at: '2026-11-13T10:40:00Z', author: null }
+    },
+  }
+  const service = createService({
+    config: cfg,
+    ledger: createLedger({ dir }),
+    gitlab,
+    repoState: async () => ({ root: '/r', host: 'git.x.com', projectPath: 'g/p', branch: 'feat-x' }),
+    now: () => NOW,
+  })
+  const url = 'https://git.x.com/g/p/-/merge_requests/240'
+  await service.bind({ sessionId: 'old', url, repoRoot: '/r' })
+  await service.bind({ sessionId: 'new', url, repoRoot: '/r' })
+  service.waiverDraft({ sessionId: 'old', fid: 'aaaa0001', reason: '旧会话的草稿' })
+  service.waiverDraft({ sessionId: 'new', fid: 'aaaa0001', reason: '新会话的草稿' })
+  await assert.rejects(
+    service.postWaiver({ sessionId: 'new', fid: 'aaaa0001', reason: '新会话的草稿' }),
+    (e) => e.code === 'bound-elsewhere',
+  )
+
+  // 等价于 index.js 收到 session/disposed(old)：停 watcher + 释放绑定。
+  releaseSession({ watcher: { stop: () => {} }, service }, 'old')
+  assert.deepEqual(service.listStates().map((state) => state.sessionId), ['new'])
+  const result = await service.postWaiver({ sessionId: 'new', fid: 'aaaa0001', reason: '新会话的草稿' })
+  assert.equal(result.posted, true)
+  assert.deepEqual(posted, ['#ai-waive aaaa0001 reason=新会话的草稿'])
+  await service.stop({ sessionId: 'new' })
   await rm(dir, { recursive: true, force: true })
 })

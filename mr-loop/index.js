@@ -14,6 +14,25 @@ export const name = 'mr-loop'
 export const inject = ['tools', 'commands']
 
 /**
+ * 会话销毁：先停该会话的 watcher，再释放 service 里的绑定（不写账本、不删账本）。
+ * 必须释放绑定：否则已关闭的会话会永远留在 listStates()，挡住其它会话对同一 MR 的写
+ * （bound-elsewhere 文案还让用户去已消失的会话 mr_stop，做不到，I-1）。
+ * 两个操作各自兜错：会话销毁路径不能把插件带崩。
+ */
+export function releaseSession({ watcher, service }, sessionId) {
+  try {
+    watcher?.stop?.(sessionId)
+  } catch {
+    /* 定时器已经没了也不影响释放绑定 */
+  }
+  try {
+    service?.release?.({ sessionId })
+  } catch {
+    /* 释放失败不能把插件带崩；下次重载会清空内存绑定 */
+  }
+}
+
+/**
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @param {Record<string, unknown>} [rawConfig]
  */
@@ -85,7 +104,7 @@ export function apply(ctx, rawConfig = {}) {
     // enabled=false：只留工具与命令（设计 §6.5），所有 watcher 入口都是空操作。
     : { tick: async () => {}, start() {}, stop() {}, stopAll() {}, isWatching: () => false }
   watcherRef = watcher
-  ctx.on('session/disposed', (session) => watcher.stop(session.id))
+  ctx.on('session/disposed', (session) => releaseSession({ watcher, service }, session.id))
 
   // 用户发言续跑：会话里只要有人说话，就重新开始盯（暂停中的会话除外，等 /mr resume）。
   ctx.on('session/event', (session, event) => {

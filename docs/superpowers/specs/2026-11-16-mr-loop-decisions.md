@@ -1,6 +1,6 @@
 # mr-loop 下一阶段决策记录（2026-11-16）
 
-> 状态：**已记录，未开工**。等用户明确「开始」后再按任务顺序实施。
+> 状态：**T1 / T2 已实现（读路径 + 写路径）**；T3 / T4 / T5 与 UI 待开工。实现已回写主 spec。
 > 本文件与 `2026-11-13-mr-loop-design.md` 冲突时，以本文件的决策为准（实现完成后回写进主 spec）。
 
 ## 一、用户已拍板的 6 条决策
@@ -35,9 +35,9 @@
 ### 2.3 写回
 - 工具 `mr_waive`：先出草稿（`#ai-waive <FID> reason=<原因>`），主 agent 用 **「可以 / 自定义」** 提问确认，确认后才 `POST /notes`。
 - **草稿不落账本**：`waiverDraft` 只返回 body，不写 decisions、不改状态；只有 `post:true` 成功回帖后才写入 `decisions`（失败也不写）。所以「草稿」永远不会被当成已处置。
-- **草稿绑定目标**：草稿把 `projectPath/iid/sha/fid/kind/reason/at` 记进会话内存（不入账本）；post 必须逐字段匹配，未出草稿 → `draft-required`，换绑 / 换 sha / 改内容 → `stale-round`，绝不把评论发到另一条 MR。草稿 data 与 message 都带 `MR !<iid> · <project>`。
-- **结果未知不重发**：`timeout` / `network` / 5xx / `bad-response` 时评论可能已创建；按 body 全等 + `created_at >= 草稿 at` 从 notes 找回，找到返回 `{ posted:true, noteId, url, recovered:true }` 并补写 decisions。
-- **跨会话防重**：同一 MR 有其它 live 绑定时拒绝写（`bound-elsewhere`），只读查询不受影响。
+- **草稿绑定目标**：草稿把 `projectPath/iid/sha/fid/kind/reason/at` 记进会话内存（不入账本，按 `sessionId + FID` 分槽）；post 必须逐字段匹配，未出草稿 → `draft-required`，换绑 / 换 sha → `stale-round`，同一 FID 用新 kind/reason 重新确认后旧草稿作废 → `draft-superseded`，绝不把评论发到另一条 MR。草稿 data 与 message 都带 `MR !<iid> · <project>`。
+- **结果未知不重发**：`timeout` / `network` / 5xx / `bad-response` 时评论可能已创建；按 body 全等 + `created_at >= 草稿 at - requestTimeoutMs`（留时钟偏移余量）从 notes 找回，找到返回 `{ posted:true, noteId, url, recovered:true }` 并补写 decisions。
+- **跨会话防重**：同一 MR 有其它 live 绑定时拒绝写（`bound-elsewhere`），只读查询不受影响；会话销毁（`session/disposed`）时 `index.js` 调 `service.release` 释放绑定 / 草稿 / 会话锁（不 persist、不 forget），已关闭会话不会永久占住写路径。
 - **reason round-trip**：生成 body 后用真实 `parseDirectives` 读回，必须恰好 1 条且 fid/kind/reason 全等，否则 `invalid-reason`（挡住 HTML 注释 / 隐藏块标记导致失真）。
 - **落盘失败降级**：回帖成功但账本 persist 失败 → 返回 `{ posted:true, persisted:false, noteId, url, warning }`，不报 storage-failed。
 - 回帖成功返回 `{ posted, noteId, url }`（恢复时多 `recovered:true`）；同一 FID 同 kind 已有指令 / 已回帖过 → 幂等返回 `{ posted:false, noteId, existing:true }`，不重复发。
@@ -56,7 +56,7 @@
   `sha / round / noteId / fid / file / lineRange / level / type / gateCategory / problem / suggestion / reverifyCount / firstSeenAt / lastSeenAt / disposition(open|fixed|waived|skip|wontfix) / dispositionSource(noteId 或 ledger)`
 - 只在状态变化时追加新行，不重写历史；供后续挖掘，不做任何分析、不参与判定。
 
-## 三、任务拆分（待开工）
+## 三、任务拆分（T1/T2 已完成，T3-T5 待开工）
 
 | 任务 | 内容 | 依赖 | 验收 |
 | --- | --- | --- | --- |

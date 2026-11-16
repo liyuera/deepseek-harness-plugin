@@ -35,7 +35,7 @@
 1. 一条 `/mr <url>` 绑定后，插件自己盯住这个 MR 的评审与门禁，主代理不再靠 `sleep` 或反复刷页面。
 2. 每轮判定有**可证的归属**：一条评审属于哪个 sha、哪一轮，要么有证据，要么标 `stale`/`unknown`，绝不猜。
 3. 三套门禁统一成一个状态面，`unknown` 不当 `pass`（fail-closed）。
-4. 豁免回帖是唯一对外写动作，必须**先草稿、再经用户一轮发言、才允许发送**。
+4. 豁免回帖是唯一对外写动作，必须**先草稿、再经用户「可以 / 自定义」确认、才允许发送**（未确认绝不发）。
 5. 账本落盘，重开会话能查：每个 MR 的轮次、FID 处置、门禁历史。
 6. **轮次不设上限**：跟到「可合并且没有待修问题」为止；没有进展时自动暂停并交回人，`/mr stop` 是随时可用的人工出口。
 
@@ -187,7 +187,7 @@ idle ──bind──▶ watching(sha) ──head sha 变化──▶ awaiting(s
   - 没有待处置问题时不加指令段与明细段，唤醒正文只有报告，避免噪音。
 - 摘要本身仍只陈述事实、不含「请修复」这类指令；指令只属于唤醒这一层，修不修由主代理判断。
 - 连续请求失败退避 10→20→40→60s；401/403 立即暂停并唤醒一次说明 token 问题。
-- 会话销毁（`session/disposed`）与插件卸载（`ctx.effect`）必须 abort 定时器；不得对已关闭会话 `followup`。
+- 会话销毁（`session/disposed`）与插件卸载（`ctx.effect`）必须 abort 定时器；不得对已关闭会话 `followup`。会话销毁还要**释放该会话的内存绑定 / 草稿 / 会话锁**（`service.release`，不 persist、不 forget）：否则已关闭会话会永久留在 `listStates()`，挡住其它会话对同一 MR 的写（`bound-elsewhere`）。
 - watcher 不产生任何 LLM 调用；稳态每 tick 1 个只读请求，仅在信号变化时追加。
 
 ### 5.5 豁免（写路径，T2）
@@ -204,11 +204,13 @@ idle ──bind──▶ watching(sha) ──head sha 变化──▶ awaiting(s
 流程（用户 2026-11-16 拍板）：
 
 1. 主代理决定某条 finding 不修 → `mr_waive({ fid, kind, reason })`（`post` 默认 false，`kind` 默认 `waive`）→ 插件只生成**草稿** `{ body, fid, kind, reason, mrLabel }`，**不写账本、不改 decisions、不发 MR 评论**；同时把确认目标（`projectPath / iid / sha / fid / kind / reason / at`）记进**会话内存**。
+   - 会话销毁时由 `index.js` 调 `service.release({ sessionId })` 释放绑定 / 草稿 / 会话锁（不落账本、不删账本）。
 2. 主代理把草稿（首行带 `MR !240 · group/project`）给用户看，用 **「可以 / 自定义」** 确认；用户确认后才 `mr_waive({ fid, kind, reason, post: true })` → `POST /projects/:id/merge_requests/:iid/notes` 发一条 `#ai-waive|skip|wontfix <FID> reason=<原因>`。
    - **草稿绑定目标（C1）**：post 前必须与最近一次草稿逐字段匹配（会话 / MR / sha / FID / kind / reason）；没出草稿 → `draft-required`，确认后换绑或 sha 变了 → `stale-round`，**绝不把评论发到另一条 MR**。
+   - **多槽与取代（M-1）**：草稿按 `sessionId + FID` 分槽保存；同一 FID 重新出草稿会覆盖该 FID 的旧草稿，用旧 kind / reason post → `draft-superseded`（与 `stale-round` 区分）；post 只消费自己那条草稿，不碰其它 FID 的草稿。
    - **跨会话防重（I2）**：同一 MR 已被其它 live 会话绑定 → 写操作拒绝 `bound-elsewhere`（只读查询不受影响），避免两边 decisions / 账本互相覆盖。
 3. 发成功后插件把 `decisions[fid] = { kind, reason, noteId, at, source: 'comment' }` 写进状态并落账本；**只有回帖成功才写**，失败与草稿都不写；成功后清掉会话草稿。
-   - **结果未知可恢复（I1）**：`timeout` / `network` / 5xx / `bad-response` 时评论可能已创建；改用 `GET notes` 按「body 全等 + `created_at >= 草稿 at`」找回，找到则补写 decisions 并返回 `{ posted: true, noteId, url, recovered: true }`，找不到才抛错——不盲目重发。
+   - **结果未知可恢复（I1）**：`timeout` / `network` / 5xx / `bad-response` 时评论可能已创建；改用 `GET notes` 按「body 全等 + `created_at >= 草稿 at - requestTimeoutMs`（留时钟偏移余量）」找回，找到则补写 decisions 并返回 `{ posted: true, noteId, url, recovered: true }`，找不到才抛错——不盲目重发。
    - **落盘失败降级（M2）**：回帖已成功但账本 persist 失败时返回 `{ posted: true, persisted: false, noteId, url, warning }`，不报 `storage-failed` 让模型误以为没发出去。
 4. 幂等：当前轮已有同 FID 同 kind 的 MR 指令，或本会话已回帖过同 kind → 返回 `{ posted: false, noteId, existing: true }`，不再发；同 FID 已有其它 kind 的处置 → `already-disposed`（不重复回帖）。
 5. **先评论、后提交代码**：评论本身会触发一次新评审；主代理发完评论再 commit + push，然后 `mr_status` 看新一轮。
@@ -223,10 +225,11 @@ idle ──bind──▶ watching(sha) ──head sha 变化──▶ awaiting(s
 | FID 尚未处置（账本 decisions 与 MR 指令都没有），幂等命中除外 | `already-disposed` |
 | `reason` 单行化（控制符/零宽字符剔除）后含可见字符，≤200 字；且用真实解析器 round-trip 必须恰好读回 1 条同 fid / kind / reason（挡住 `<!-- -->`、隐藏统计块标记导致失真） | `invalid-reason` |
 | 未先出草稿 / 草稿已被消费 | `draft-required` |
-| 草稿之后换绑、sha 变化或 kind / reason 被改 | `stale-round` |
+| 草稿之后换绑或 sha 变化 | `stale-round` |
+| 同一 FID 已用新 kind / reason 重新确认过，旧草稿作废 | `draft-superseded` |
 | 其它 live 会话已绑定同一 MR | `bound-elsewhere` |
 | 同一会话的写操作串行（复用绑定锁）；并发两次 post 只发一条，第二次命中 `existing` | — |
-| 403 写权限 / 404 / 429 / 409 / 网络 / 超时 / token | `permission-denied` / `not-found` / `rate-limited` / `conflict` / `network` / `timeout` / `no-token` |
+| 401 / 403 写权限 / 404 / 429 / 409 / 网络 / 超时 / token | `unauthorized` / `permission-denied` / `not-found` / `rate-limited` / `conflict` / `network` / `timeout` / `no-token` |
 | 响应结构异常 / 未知内部错误（非 GitlabError 用静态文案，不回显上游原文） | `bad-response` / `internal` |
 
 **草稿不算处置（M4）**：只有 MR 里真实出现的 `#ai-*` 指令，或回帖成功写进 `decisions` 的处置，才参与合并判定；`waiverDraft` 不碰 `decisions`、不写账本、不改 `round` 状态。看板/报告沿用「账本 + round.directives」读路径，无需为草稿改口径。
@@ -318,7 +321,7 @@ Finding = { fid, file, level, gateCategory, location, problem, suggestion, rever
 
 统一返回 `{ ok: boolean, code?: string, message: string, data?: object }`；`message` 为静态中文，不含 token、URL、上游原文。
 
-错误码（稳定，调用方按 `code` 分支）：`no-token`、`unauthorized`、`forbidden`、`permission-denied`、`not-found`、`rate-limited`、`network`、`timeout`、`bad-response`、`invalid-url`、`mr-not-open`、`repo-mismatch`、`not-bound`、`storage-failed`、`invalid-kind`、`unknown-fid`、`already-disposed`、`invalid-reason`、`draft-required`、`stale-round`、`bound-elsewhere`、`conflict`、`internal`。`branch-mismatch` 只出现在 `warnings[].code`，不中断绑定。`permission-denied` 只出现在写路径：403 在读路径是 `forbidden`（可能只是仓库不可见），在发评论时是 token 缺 `api` 写权限。
+错误码（稳定，调用方按 `code` 分支）：`no-token`、`unauthorized`、`forbidden`、`permission-denied`、`not-found`、`rate-limited`、`network`、`timeout`、`bad-response`、`invalid-url`、`mr-not-open`、`repo-mismatch`、`not-bound`、`storage-failed`、`invalid-kind`、`unknown-fid`、`already-disposed`、`invalid-reason`、`draft-required`、`stale-round`、`draft-superseded`、`bound-elsewhere`、`conflict`、`internal`。`branch-mismatch` 只出现在 `warnings[].code`，不中断绑定。`permission-denied` 只出现在写路径：403 在读路径是 `forbidden`（可能只是仓库不可见），在发评论时是 token 缺 `api` 写权限。
 
 ### 6.4 报告模板（固定，每轮同一形状）
 
@@ -397,7 +400,7 @@ feat-V1.7.0.20261119-ly → feature-V1.7.0.20261119 · 第 3 轮 · sha 0e2a9007
 | `mr_bind` | `url`（必填）、`repo`（可选，覆盖 cwd） | `{ binding, round, report, warnings }` |
 | `mr_status` | 无 | `{ binding, headSha, round, gates, decisions, mergeable, nextWakeAt, paused: null \| { reason: 'stalled'\|'budget'\|'idle'\|'token', at } }` |
 | `mr_review` | `history?: boolean`（默认 false） | `{ round, review, sensitive, mandatory }`；`history: true` 时附账本内最近 `ledgerKeepRounds` 轮的摘要 |
-| `mr_waive` | `fid`（必填）、`kind?: 'waive'\|'skip'\|'wontfix'`（默认 `waive`）、`reason`（必填）、`post?: boolean`（默认 false） | 草稿：`{ body, fid, kind, reason, posted: false }`，message 带「可以 / 自定义」确认要求；回帖：`{ posted, noteId, url }`，幂等命中 `{ posted: false, noteId, existing: true }` |
+| `mr_waive` | `fid`（必填）、`kind?: 'waive'\|'skip'\|'wontfix'`（默认 `waive`）、`reason`（必填）、`post?: boolean`（默认 false） | 草稿：`{ body, fid, kind, reason, mrLabel, posted: false }`，message 带 MR 标识与「可以 / 自定义」确认要求；回帖：`{ posted, noteId, url }`，恢复未知结果时带 `recovered: true`，落盘失败时带 `persisted: false, warning`，幂等命中 `{ posted: false, noteId, existing: true }` |
 | `mr_stop` | `forget?: boolean`（默认 false） | `{ stopped: boolean, forgotten: boolean }` |
 | `mr_resume` | 无 | `{ resumed: boolean, state }` |
 
@@ -470,7 +473,7 @@ mr-loop/
 - `parse-gates`：敏感门禁通过/阻止两种正文；必过项三子项；缺字段降级。
 - `rounds`：sha 绑定矩阵全枚举（强 / 弱 / 丢弃（stale）/ 多命中），至少 12 个用例，含「push 后立刻读到上一轮 note」这一现场 failure 模式。
 - `watcher`：假定时器 + 假 fetch，覆盖 head 变化、评审先到、门禁后到、流水线失败、兜底超时、401、连续失败退避、唤醒去抖、会话销毁、四类守卫暂停（stall / reverify / wallClock / idle）与 `/mr resume`；另断言稳态 tick 只发 1 个请求、`user_notes_count` 不变时不拉 notes。
-- `waive`（service + tools + 真实接缝）：草稿不落账本；非法 kind / FID / reason；`post` 必须先出草稿（`draft-required`）；草稿后换绑或 sha 变化（`stale-round`）；跨会话重复写（`bound-elsewhere`）；重复 post 幂等；结果未知（timeout / network / bad-response）按 body 找回已创建评论（`recovered`）；persist 失败降级（`persisted:false`）；并发 post 只发一条。
+- `waive`（service + tools + 真实接缝）：草稿不落账本；非法 kind / FID / reason；`post` 必须先出草稿（`draft-required`）；草稿后换绑或 sha 变化（`stale-round`）；同 FID 新草稿取代旧草稿（`draft-superseded`）；多 FID 草稿互不覆盖；跨会话重复写（`bound-elsewhere`）与会话销毁 `service.release` 释放后恢复可写；重复 post 幂等；结果未知（timeout / network / bad-response）按 body + 超时余量找回已创建评论（`recovered`）；persist 失败降级（`persisted:false`）；并发 post 只发一条。
 - `ledger`：原子写（写一半崩溃不留坏文件）、裁剪、并发写串行化。
 - `report`：强/弱绑定、unknown 门禁、降级判定各一份快照。
 - `config`：默认与非法值。

@@ -41,8 +41,10 @@ export const SKILL_CONTENT = `# MR 评审闭环（mr-loop）
    - 「自定义」→ 按用户给的原因重新出草稿并再确认；
    - 用户没确认前**不要发**。
 3. \`mr_waive({ fid, kind, reason, post: true })\` → 返回 \`posted / noteId / url\`；幂等命中返回 \`posted:false\` 并提示「已有同 kind 指令」，这时不必再发。
+   - \`post\` 必须对应**最近一次草稿**：换绑 MR 或换 sha 后草稿作废，要重新出草稿并重新向用户确认，不要凭旧确认去发。
+   - 结果未知（timeout / network / bad-response）时插件会按 notes 找回：返回 \`recovered:true\` 说明评论可能已发出、**不要再发**；\`persisted:false\` 说明评论已发出但账本没落盘，也不要重发（重试会命中幂等）。
 4. **先评论、后提交代码**：评论会触发一次新评审；发完评论再 commit + push，然后 \`mr_status\` 看新一轮。
-5. 错误提示：\`permission-denied\` = token 缺 \`api\` 写权限；\`unknown-fid\` = FID 不属于当前轮；\`already-disposed\` = 该 FID 已有处置（换 kind 也不行）；\`invalid-reason\` = 原因空 / 只有零宽字符。
+5. 错误处置：\`draft-required\` → 先 \`mr_waive\` 出草稿、让用户确认后再 post，不要跳过确认；\`stale-round\` / \`draft-superseded\` → 目标 MR / sha 或确认内容已变，重新出草稿并重新确认；\`bound-elsewhere\` → 同一 MR 被其它会话绑着，先在那边 \`mr_stop\`，若是已关闭会话则重启应用 / 重载插件；\`permission-denied\` = token 缺 \`api\` 写权限；\`unknown-fid\` = FID 不属于当前轮；\`already-disposed\` = 该 FID 已有处置（换 kind 也不行）；\`invalid-reason\` = 原因空 / 只有零宽字符 / 含会失真的标记。
 
 ## 规矩
 

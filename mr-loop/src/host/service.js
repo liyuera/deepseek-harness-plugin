@@ -313,6 +313,19 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
     if (sessionLocks.get(sessionId) === pending) sessionLocks.delete(sessionId)
   }
 
+  /**
+   * 会话销毁（index.js 的 session/disposed）用：只释放内存里的绑定 / 草稿 / 会话锁，
+   * **不 persist、不 forget**——账本保留，稍后重开会话仍可 /mr resume；也不让已关闭会话
+   * 永久占住同一 MR 的写路径（I-1）。
+   */
+  function release({ sessionId }) {
+    const existed = bindings.has(sessionId)
+    bindings.delete(sessionId)
+    drafts.delete(sessionId)
+    sessionLocks.delete(sessionId)
+    return { released: existed }
+  }
+
   async function stop({ sessionId, forget = false }) {
     const state = bindings.get(sessionId)
     if (forget) {
@@ -362,7 +375,11 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
   // T2 写路径：豁免草稿（不落账本 / 不发评论，只记会话内确认目标）与回帖（唯一写 GitLab 的路径）
   // ---------------------------------------------------------------------------
 
-  /** 会话内的「最近一次草稿」：只进内存、不入账本；post 必须与它逐字段一致才允许发（C1）。 */
+  /**
+   * 会话内的豁免草稿：`Map<sessionId, Map<fidLower, draft>>`，只进内存、不入账本。
+   * 用 per-FID 多槽而不是单槽：并发处置多条 finding 时，后出的草稿不会吃掉前一条（M-1）；
+   * post 只消费自己那一条草稿，且必须与它逐字段一致（C1）。
+   */
   const drafts = new Map()
 
   /** 单行化 + 截断到解析器上限，保证回帖能被自己的读路径原样读回（不会被二次裁剪出差异）。 */
@@ -441,7 +458,13 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
       throw new ServiceError('already-disposed', '该 FID 已有处置（MR 指令或已回帖的 decisions），不再生成草稿')
     }
     const body = waiverBodyOf({ ...input, fid: canonicalFid })
-    drafts.set(sessionId, {
+    let sessionDrafts = drafts.get(sessionId)
+    if (sessionDrafts === undefined) {
+      sessionDrafts = new Map()
+      drafts.set(sessionId, sessionDrafts)
+    }
+    // 同一 FID 重新出草稿 = 覆盖该 FID 的旧草稿（用户「自定义」后重确认）；其它 FID 的草稿保留。
+    sessionDrafts.set(canonicalFid.toLowerCase(), {
       projectPath: state.binding.projectPath,
       iid: state.binding.iid,
       sha: String(state.round?.sha ?? state.mr?.sha ?? ''),
@@ -484,7 +507,9 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
     } catch {
       return null
     }
-    const since = Date.parse(notBefore)
+    // M-3：notes.created_at 可能因服务端 / 本机时钟偏移略早于草稿时间，扣掉一个请求超时余量，
+    // 否则「评论其实已创建」会被漏认领，下一次重试就会重复发。
+    const since = Date.parse(notBefore) - config.requestTimeoutMs
     if (!Number.isFinite(since)) return null
     const found = (Array.isArray(notes) ? notes : []).find((note) => {
       if (note === null || typeof note !== 'object' || note.system === true) return false
@@ -507,7 +532,11 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
       at: new Date(now()).toISOString(),
       source: 'comment',
     }
-    drafts.delete(sessionId)
+    const sessionDrafts = drafts.get(sessionId)
+    if (sessionDrafts !== undefined) {
+      sessionDrafts.delete(input.fid.toLowerCase())
+      if (sessionDrafts.size === 0) drafts.delete(sessionId)
+    }
     const result = { posted: true, noteId: note.id, url: noteUrl(state, note.id), body }
     if (recovered) result.recovered = true
     try {
@@ -533,10 +562,11 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
     // I2：同一 MR 已被其它 live 会话绑定 → 拒绝写，避免两边 decisions / 账本互相覆盖。
     const other = listStates().find((item) => item.sessionId !== sessionId && sameBindingTarget(item, state))
     if (other !== undefined) {
-      throw new ServiceError('bound-elsewhere', `同一 MR 已被其它会话绑定（${other.sessionId ?? '未知'}），先 mr_stop 再回帖`)
+      throw new ServiceError('bound-elsewhere', `同一 MR 已被其它会话绑定（${other.sessionId ?? '未知'}），先在那条会话 mr_stop 再回帖；若是已关闭会话，重启应用 / 重载插件即可清除`)
     }
-    // C1：必须与最近一次草稿逐字段一致，否则说明确认之后目标 / 轮次 / 内容变了。
-    const draft = drafts.get(sessionId)
+    // C1：必须与上次确认的草稿逐字段一致。M-1：按 FID 取草稿，多槽互不覆盖。
+    const sessionDrafts = drafts.get(sessionId)
+    const draft = sessionDrafts?.get(canonicalFid.toLowerCase())
     if (draft === undefined) {
       throw new ServiceError('draft-required', '先调用 mr_waive 出草稿并由用户确认，再 post:true 回帖')
     }
@@ -544,11 +574,12 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
     const targetChanged = draft.projectPath !== state.binding.projectPath
       || draft.iid !== state.binding.iid
       || String(draft.sha) !== currentSha
-      || draft.fid.toLowerCase() !== canonicalFid.toLowerCase()
-      || draft.kind !== canonical.kind
-      || draft.reason !== canonical.reason
     if (targetChanged) {
-      throw new ServiceError('stale-round', '草稿的目标 MR / 轮次 / 内容已变化，请重新出草稿并确认')
+      throw new ServiceError('stale-round', '草稿的目标 MR / 轮次已变化，请重新出草稿并确认')
+    }
+    if (draft.kind !== canonical.kind || draft.reason !== canonical.reason) {
+      // 同一 FID 已用新参数重新确认过：旧参数不能再发，但这不是换绑 / 换轮。
+      throw new ServiceError('draft-superseded', '该 FID 的草稿已被更新的确认内容取代，请按最新草稿 post')
     }
     const body = waiverBodyOf(canonical)
     let note
@@ -588,5 +619,5 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
     sessionLocks.clear()
   }
 
-  return { bind, status, review, applySnapshot, stop, resume, pause, getState, listStates, dispose, report, ledger, waiverDraft, postWaiver }
+  return { bind, status, review, applySnapshot, stop, resume, pause, getState, listStates, dispose, report, ledger, waiverDraft, postWaiver, release }
 }

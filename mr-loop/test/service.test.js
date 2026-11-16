@@ -1170,7 +1170,7 @@ test('I2 跨会话防重：同一 MR 有其它 live 绑定时拒绝 bound-elsewh
 
   await assert.rejects(
     ctx.service.postWaiver({ sessionId: 's', fid: 'a1b2c3d4', reason: '风险已评估' }),
-    (e) => e instanceof ServiceError && e.code === 'bound-elsewhere',
+    (e) => e instanceof ServiceError && e.code === 'bound-elsewhere' && /已关闭会话/.test(e.message),
   )
   // 「第二次 post」同样被拒：不能有两个会话往同一 MR 各写一条。
   await assert.rejects(
@@ -1240,4 +1240,152 @@ test('T2 postWaiver 并发：同一会话串行，只发一条评论，第二次
   assert.equal(posts.length, 1, '并发两次 post 只能发一条评论')
   assert.equal(ctx.service.getState('s').decisions.a1b2c3d4.noteId, 9002)
   await cleanup(ctx)
+})
+
+// ---------------------------------------------------------------------------
+// 第 3 轮复审：I-1 会话销毁释放 / M-1 草稿多槽 / M-3 恢复余量
+// ---------------------------------------------------------------------------
+
+test('I-1 release：会话销毁释放绑定 / 草稿 / 会话锁（不落账本），不再挡住另一会话回帖', async () => {
+  const posts = []
+  const ctx = await boundService({
+    postNoteImpl: async (arg) => {
+      posts.push(arg)
+      return { id: 9300, body: arg.body, created_at: '2026-11-13T10:10:00Z', author: null }
+    },
+  })
+  await ctx.service.bind({ sessionId: 's2', url: URL240, repoRoot: '/r' })
+  ctx.service.waiverDraft({ sessionId: 's', fid: 'a1b2c3d4', reason: '风险已评估' })
+  ctx.service.waiverDraft({ sessionId: 's2', fid: 'a1b2c3d4', reason: '风险已评估' })
+
+  // 旧会话还活着 → 另一会话的写被 bound-elsewhere 挡住。
+  await assert.rejects(
+    ctx.service.postWaiver({ sessionId: 's2', fid: 'a1b2c3d4', reason: '风险已评估' }),
+    (e) => e instanceof ServiceError && e.code === 'bound-elsewhere',
+  )
+  assert.equal(posts.length, 0)
+
+  // 模拟 index.js 的 session/disposed：释放旧会话（不 persist、不 forget）。
+  const originalSave = ctx.service.ledger.save
+  let savesAfterRelease = 0
+  ctx.service.ledger.save = async (...args) => { savesAfterRelease += 1; return originalSave(...args) }
+  const released = ctx.service.release({ sessionId: 's' })
+  assert.equal(released.released, true)
+  assert.equal(savesAfterRelease, 0, 'release 不应写账本')
+  assert.deepEqual(ctx.service.listStates().map((state) => state.sessionId), ['s2'])
+  assert.equal(ctx.service.getState('s'), null)
+  // 释放 s1 后，s2 的草稿仍然有效，且不再被 bound-elsewhere 拦。
+  const result = await ctx.service.postWaiver({ sessionId: 's2', fid: 'a1b2c3d4', reason: '风险已评估' })
+  assert.equal(result.posted, true)
+  assert.equal(posts.length, 1)
+  await ctx.service.stop({ sessionId: 's2' })
+  await rm(ctx.dir, { recursive: true, force: true })
+})
+
+test('I-1 release：未知会话返回 released:false，重复释放幂等', async () => {
+  const ctx = await boundService()
+  assert.deepEqual(ctx.service.release({ sessionId: 'nobody' }), { released: false })
+  assert.deepEqual(ctx.service.release({ sessionId: 's' }), { released: true })
+  assert.deepEqual(ctx.service.release({ sessionId: 's' }), { released: false })
+  await rm(ctx.dir, { recursive: true, force: true })
+})
+
+test('M-1 草稿多槽：F1 在途时出的 F2 草稿不被吃掉，F1/F2 都能 post', async () => {
+  const posts = []
+  let markStarted
+  const started = new Promise((resolve) => { markStarted = resolve })
+  let releaseFirst
+  const gate = new Promise((resolve) => { releaseFirst = resolve })
+  const ctx = await boundService({
+    notesImpl: async () => strongBlockingNotes(['a1b2c3d4', 'b2c3d4e5']),
+    postNoteImpl: async (arg) => {
+      posts.push(arg)
+      if (posts.length === 1) {
+        markStarted()
+        await gate
+      }
+      return { id: 9300 + posts.length, body: arg.body, created_at: '2026-11-13T10:10:00Z', author: null }
+    },
+  })
+  ctx.service.waiverDraft({ sessionId: 's', fid: 'a1b2c3d4', reason: 'F1 原因' })
+  const first = ctx.service.postWaiver({ sessionId: 's', fid: 'a1b2c3d4', reason: 'F1 原因' })
+  await started
+  // F1 的请求还在途：此时为 F2 出草稿，不能覆盖 / 消费掉 F1 的草稿槽。
+  ctx.service.waiverDraft({ sessionId: 's', fid: 'b2c3d4e5', reason: 'F2 原因' })
+  releaseFirst()
+  assert.equal((await first).posted, true)
+
+  const second = await ctx.service.postWaiver({ sessionId: 's', fid: 'b2c3d4e5', reason: 'F2 原因' })
+  assert.equal(second.posted, true)
+  assert.deepEqual(posts.map((item) => item.body), [
+    '#ai-waive a1b2c3d4 reason=F1 原因',
+    '#ai-waive b2c3d4e5 reason=F2 原因',
+  ])
+  await cleanup(ctx)
+})
+
+test('M-1 同一 FID 重新出草稿 → 旧参数的 post 报 draft-superseded；新参数可发（与 stale-round 区分）', async () => {
+  const posts = []
+  const ctx = await boundService({
+    postNoteImpl: async (arg) => {
+      posts.push(arg)
+      return { id: 9310, body: arg.body, created_at: '2026-11-13T10:10:00Z', author: null }
+    },
+  })
+  ctx.service.waiverDraft({ sessionId: 's', fid: 'a1b2c3d4', reason: '旧原因' })
+  // 用户说「自定义」：同一 FID 重新出草稿（新 reason 取代旧草稿）。
+  ctx.service.waiverDraft({ sessionId: 's', fid: 'a1b2c3d4', reason: '新原因' })
+  await assert.rejects(
+    ctx.service.postWaiver({ sessionId: 's', fid: 'a1b2c3d4', reason: '旧原因' }),
+    (e) => e instanceof ServiceError && e.code === 'draft-superseded',
+  )
+  assert.equal(posts.length, 0)
+  const result = await ctx.service.postWaiver({ sessionId: 's', fid: 'a1b2c3d4', reason: '新原因' })
+  assert.equal(result.posted, true)
+  assert.deepEqual(posts.map((item) => item.body), ['#ai-waive a1b2c3d4 reason=新原因'])
+  await cleanup(ctx)
+})
+
+test('M-3 恢复判定留出请求超时余量：created_at 比草稿略早（时钟偏移）也能找回；created_at 缺失不认领', async () => {
+  const expectedBody = waiverBodyOf('风险已评估')
+
+  // 时钟偏移：notes.created_at 比草稿 at 早 10s，但在请求超时（15s）余量内 → 必须认领。
+  {
+    let notes = strongBlockingNotes()
+    const ctx = await boundService({
+      listNotesImpl: async () => notes,
+      postNoteImpl: async () => {
+        notes = [...notes, { id: 9400, system: false, created_at: '2026-11-13T10:09:50Z', body: expectedBody }]
+        const error = new Error('GitLab 请求超时')
+        error.code = 'timeout'
+        throw error
+      },
+    })
+    ctx.service.waiverDraft({ sessionId: 's', fid: 'a1b2c3d4', reason: '风险已评估' })
+    const result = await ctx.service.postWaiver({ sessionId: 's', fid: 'a1b2c3d4', reason: '风险已评估' })
+    assert.equal(result.recovered, true)
+    assert.equal(result.noteId, 9400)
+    await cleanup(ctx)
+  }
+
+  // created_at 缺失：无法证明是这次发的 → 不认领，仍抛 timeout。
+  {
+    let notes = strongBlockingNotes()
+    const ctx = await boundService({
+      listNotesImpl: async () => notes,
+      postNoteImpl: async () => {
+        notes = [...notes, { id: 9401, system: false, body: expectedBody }]
+        const error = new Error('GitLab 请求超时')
+        error.code = 'timeout'
+        throw error
+      },
+    })
+    ctx.service.waiverDraft({ sessionId: 's', fid: 'a1b2c3d4', reason: '风险已评估' })
+    await assert.rejects(
+      ctx.service.postWaiver({ sessionId: 's', fid: 'a1b2c3d4', reason: '风险已评估' }),
+      (e) => e instanceof ServiceError && e.code === 'timeout',
+    )
+    assert.deepEqual(ctx.service.getState('s').decisions, {})
+    await cleanup(ctx)
+  }
 })
