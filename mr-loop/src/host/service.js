@@ -115,10 +115,21 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
     const notes = await gitlab.listNotes({ project: parsed.project, iid: parsed.iid })
     const observedAt = now()
     const previous = await ledger.load({ projectPath: parsed.project, iid: parsed.iid })
-    // 用「已有最大轮次 + 1」而不是数组长度：账本裁剪后长度会回退，轮次号不能重复。
+    // 轮次 = 一个 head sha 上的「评审 → 处置」周期：同 sha 的重绑复用最后一轮，sha 变化才新增。
+    // 新增时用「已有最大轮次 + 1」而不是数组长度：账本裁剪后长度会回退，轮次号不能重复。
     const previousRounds = Array.isArray(previous?.rounds) ? previous.rounds : []
-    const n = previousRounds.reduce((max, item) => (Number.isSafeInteger(item?.n) && item.n > max ? item.n : max), 0) + 1
-    const round = { ...buildRound({ mr, notes, cfg: config, observedAt }), n }
+    const lastRound = previousRounds[previousRounds.length - 1]
+    // sha 缺失（undefined / 空串）不能算「同 sha」，否则 undefined === undefined 会误复用。
+    const reuse = typeof mr.sha === 'string' && mr.sha !== '' && lastRound?.sha === mr.sha
+    let round
+    if (reuse) {
+      // observedAt 是弱绑定的兜底基线：复用轮次时保留首次观测时间，重复绑定不能把基线后推。
+      const baselineObservedAt = Number.isFinite(lastRound?.observedAt) ? lastRound.observedAt : observedAt
+      round = { ...buildRound({ mr, notes, cfg: config, observedAt: baselineObservedAt }), n: lastRound.n }
+    } else {
+      const n = previousRounds.reduce((max, item) => (Number.isSafeInteger(item?.n) && item.n > max ? item.n : max), 0) + 1
+      round = { ...buildRound({ mr, notes, cfg: config, observedAt }), n }
+    }
 
     const state = {
       sessionId,
@@ -132,7 +143,7 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
       },
       mr,
       round,
-      rounds: [...previousRounds, round].slice(-config.ledgerKeepRounds),
+      rounds: (reuse ? [...previousRounds.slice(0, -1), round] : [...previousRounds, round]).slice(-config.ledgerKeepRounds),
       decisions: previous?.decisions !== null && typeof previous?.decisions === 'object' ? previous.decisions : {},
       mergeability: null,
       paused: null,

@@ -244,15 +244,103 @@ test('新 sha 门禁先到、评审未出：gatesChanged 为真也不唤醒', as
   await rm(dir, { recursive: true, force: true })
 })
 
-test('未绑定 → not-bound；重复绑定同 MR 会新增一轮', async () => {
+test('未绑定 → not-bound；同 sha 重复绑定复用轮次，不新增', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'mrloop-service-'))
   const service = createService({ config: resolveConfig({ baseUrl: 'https://git.x.com' }), ledger: createLedger({ dir }), gitlab: harness().gitlab, repoState: harness().repoImpl, now: () => Date.parse('2026-11-13T10:10:00Z') })
   await assert.rejects(service.status({ sessionId: 'nobody' }), (e) => e.code === 'not-bound')
   const url = 'https://git.x.com/g/p/-/merge_requests/240'
   await service.bind({ sessionId: 's', url, repoRoot: '/r' })
+  // 空账本的首次绑定就是第 1 轮。
+  assert.equal(service.getState('s').round.n, 1)
+  assert.equal(service.getState('s').rounds.length, 1)
+
+  // head sha 没变：第二次绑定应覆盖账本最后一条，轮次号与条数都不变。
   await service.bind({ sessionId: 's', url, repoRoot: '/r' })
-  assert.equal(service.getState('s').round.n, 2)
+  const state = service.getState('s')
+  assert.equal(state.round.n, 1)
+  assert.equal(state.round.sha, SHA)
+  assert.deepEqual(state.rounds.map((item) => item.n), [1])
+  const saved = await service.ledger.load({ projectPath: 'g/p', iid: 240 })
+  assert.deepEqual(saved.rounds.map((item) => item.n), [1])
+  assert.equal(saved.rounds[0].sha, SHA)
   await rm(dir, { recursive: true, force: true })
+})
+
+test('MR 换 sha 后再 bind：轮次 +1、账本追加', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mrloop-service-'))
+  const SHA2 = 'b'.repeat(40)
+  let current = mr()
+  const service = createService({
+    config: resolveConfig({ baseUrl: 'https://git.x.com' }),
+    ledger: createLedger({ dir }),
+    gitlab: { ...harness().gitlab, getMergeRequest: async () => current, listNotes: async () => notes(current.sha) },
+    repoState: harness().repoImpl,
+    now: () => Date.parse('2026-11-13T10:10:00Z'),
+  })
+  const url = 'https://git.x.com/g/p/-/merge_requests/240'
+  await service.bind({ sessionId: 's', url, repoRoot: '/r' })
+  assert.equal(service.getState('s').round.n, 1)
+
+  current = mr({ sha: SHA2 })
+  await service.bind({ sessionId: 's', url, repoRoot: '/r' })
+  const state = service.getState('s')
+  assert.equal(state.round.n, 2)
+  assert.equal(state.round.sha, SHA2)
+  assert.deepEqual(state.rounds.map((item) => item.n), [1, 2])
+  const saved = await service.ledger.load({ projectPath: 'g/p', iid: 240 })
+  assert.deepEqual(saved.rounds.map((item) => item.n), [1, 2])
+  assert.equal(saved.rounds[1].sha, SHA2)
+  await rm(dir, { recursive: true, force: true })
+})
+
+test('同 sha 重复绑定保留上一轮 observedAt 基线，不往后推', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mrloop-service-'))
+  let current = NOW
+  const service = createService({
+    config: resolveConfig({ baseUrl: 'https://git.x.com' }),
+    ledger: createLedger({ dir }),
+    gitlab: harness().gitlab,
+    repoState: harness().repoImpl,
+    now: () => current,
+  })
+  const url = 'https://git.x.com/g/p/-/merge_requests/240'
+  await service.bind({ sessionId: 's', url, repoRoot: '/r' })
+  const firstObservedAt = service.getState('s').round.observedAt
+  assert.equal(firstObservedAt, NOW)
+
+  current += 3_600_000
+  await service.bind({ sessionId: 's', url, repoRoot: '/r' })
+  const state = service.getState('s')
+  assert.equal(state.round.n, 1)
+  // observedAt 是弱绑定的兜底基线：重复绑定不能把基线后移、削弱弱绑定证据。
+  assert.equal(state.round.observedAt, firstObservedAt)
+  const saved = await service.ledger.load({ projectPath: 'g/p', iid: 240 })
+  assert.equal(saved.rounds[saved.rounds.length - 1].observedAt, firstObservedAt)
+  await rm(dir, { recursive: true, force: true })
+})
+
+test('mr.sha 缺失或空串时不误复用已有轮次', async () => {
+  for (const sha of [undefined, '']) {
+    const dir = await mkdtemp(join(tmpdir(), 'mrloop-service-'))
+    const ledger = createLedger({ dir })
+    await ledger.save({
+      binding: { projectPath: 'g/p', iid: 240 },
+      rounds: [{ n: 7, sha, observedAt: NOW }],
+      decisions: {},
+    })
+    const service = createService({
+      config: resolveConfig({ baseUrl: 'https://git.x.com' }),
+      ledger,
+      gitlab: { ...harness().gitlab, getMergeRequest: async () => mr({ sha }) },
+      repoState: harness().repoImpl,
+      now: () => NOW,
+    })
+    await service.bind({ sessionId: 's', url: 'https://git.x.com/g/p/-/merge_requests/240', repoRoot: '/r' })
+    const state = service.getState('s')
+    assert.equal(state.round.n, 8, `sha=${String(sha)} 时不应复用轮次号`)
+    assert.deepEqual(state.rounds.map((item) => item.n), [7, 8])
+    await rm(dir, { recursive: true, force: true })
+  }
 })
 
 test('账本裁剪后轮次号仍单调：取已有最大 n + 1', async () => {
@@ -296,10 +384,14 @@ test('账本写入失败 → storage-failed，且不留半绑定', async () => {
 
 test('并发绑定同一会话：串行执行、轮次连续、只留一个 state', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'mrloop-service-'))
+  // 两次并发绑定之间 MR 已换 sha：串行执行才可能看到 [1, 2] 而不是互相覆盖。
+  const SHA2 = 'b'.repeat(40)
+  let calls = 0
+  const mrImpl = async () => { calls += 1; return mr({ sha: calls === 1 ? SHA : SHA2 }) }
   const service = createService({
     config: resolveConfig({ baseUrl: 'https://git.x.com' }),
     ledger: createLedger({ dir }),
-    gitlab: harness().gitlab,
+    gitlab: harness({ mrImpl }).gitlab,
     repoState: harness().repoImpl,
     now: () => Date.parse('2026-11-13T10:10:00Z'),
   })
