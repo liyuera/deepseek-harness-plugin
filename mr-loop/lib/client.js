@@ -18,8 +18,8 @@ window.__ModuleLoader__.load({
       ".mrl-dot.ok{background:var(--dsw-alias-state-success-primary)}",
       ".mrl-dot.warn{background:var(--dsw-alias-state-warn-primary)}",
       ".mrl-dot.err{background:var(--dsw-alias-state-error-primary)}",
-      ".mrl-mask{position:fixed;inset:0;background:rgba(0,0,0,.18);z-index:80;display:flex;justify-content:flex-end;pointer-events:auto}",
-      ".mrl-panel{width:438px;max-width:100vw;height:100%;display:flex;flex-direction:column;background:var(--dsw-alias-bg-overlay);border-left:1px solid var(--dsw-alias-border-l1);box-shadow:-16px 0 36px rgba(0,0,0,.10)}",
+      ".mrl-mask{position:fixed;inset:0;background:rgba(0,0,0,.12);z-index:80;display:flex;align-items:flex-start;justify-content:flex-start;padding:28px;pointer-events:auto}",
+      ".mrl-panel{width:560px;max-width:calc(100vw - 56px);max-height:calc(100vh - 56px);display:flex;flex-direction:column;background:var(--dsw-alias-bg-overlay);border:1px solid var(--dsw-alias-border-l1);border-radius:12px;box-shadow:0 18px 48px rgba(0,0,0,.18);overflow:hidden}",
       ".mrl-hd{padding:13px 14px 0;border-bottom:1px solid var(--dsw-alias-border-l1);flex:none}",
       ".mrl-hd-row{display:flex;align-items:center;gap:8px}",
       ".mrl-title{font-size:14px;font-weight:650;margin:0;color:var(--dsw-alias-label-primary)}",
@@ -218,7 +218,7 @@ window.__ModuleLoader__.load({
           className: "mrl-chip-tag",
           type: "button",
           title: mr.sourceBranch + " → " + mr.targetBranch,
-          onClick: function () { setStore({ open: true }); },
+          onClick: function () { setStore({ open: true, expanded: {} }); },
         },
         h("span", { className: "mrl-dot " + tone }),
         h("span", null, label + " · 第 " + (mr.round || 0) + " 轮"));
@@ -233,7 +233,7 @@ window.__ModuleLoader__.load({
         h("button", {
           className: "mrl-chip-tag",
           type: "button",
-          onClick: function () { setStore({ open: true }); },
+          onClick: function () { setStore({ open: true, expanded: {} }); },
         }, "看板"));
     }
 
@@ -337,7 +337,8 @@ window.__ModuleLoader__.load({
             h("div", { className: "mrl-mr-id" },
               "!" + mr.iid,
               mr.live === true ? h("span", { className: "mrl-tag" }, "跟踪中") : null,
-              h("span", { className: "mrl-tag", style: { color: "var(--dsw-alias-label-secondary)" } }, MR_STATE_LABEL[mr.state] || mr.state)),
+              h("span", { className: "mrl-tag", style: { color: "var(--dsw-alias-label-secondary)" } },
+              MR_STATE_LABEL[mr.state] || (mr.live === true ? "跟踪中" : "历史账本"))),
             h("div", { className: "mrl-mr-sub", title: mr.sourceBranch + " → " + mr.targetBranch },
               (mr.sourceBranch || "?") + " → " + (mr.targetBranch || "?"))),
           h("div", { className: "mrl-tags" }, tags)),
@@ -398,6 +399,14 @@ window.__ModuleLoader__.load({
           setStore({ scope: "all" });
         }
       }, [state.open, state.scope, sessionCount, allMrs.length]);
+      React.useEffect(function () {
+        if (state.open !== true) return undefined;
+        var onKey = function (event) {
+          if (event.key === "Escape") setStore({ open: false });
+        };
+        window.addEventListener("keydown", onKey);
+        return function () { window.removeEventListener("keydown", onKey); };
+      }, [state.open]);
       if (state.open !== true) return null;
       var data = state.data;
       var mrs = data && Array.isArray(data.mrs) ? data.mrs : [];
@@ -445,11 +454,9 @@ window.__ModuleLoader__.load({
 
       return h("div", {
         className: "mrl-mask",
-        onClick: function () { setStore({ open: false }); },
       },
       h("div", {
         className: "mrl-panel",
-        onClick: function (event) { event.stopPropagation(); },
       },
       h("div", { className: "mrl-hd" },
         h("div", { className: "mrl-hd-row" },
