@@ -115,31 +115,42 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
     const notes = await gitlab.listNotes({ project: parsed.project, iid: parsed.iid })
     const observedAt = now()
     const previous = await ledger.load({ projectPath: parsed.project, iid: parsed.iid })
-    // 轮次 = 一个 head sha 上的「评审 → 处置」周期：同 sha 的重绑复用最后一轮，sha 变化才新增。
+    // 轮次 = 一个 head sha 上的「评审 → 处置」周期：同 sha 的重绑复用轮次，sha 变化才新增。
     // 新增时用「已有最大轮次 + 1」而不是数组长度：账本裁剪后长度会回退，轮次号不能重复。
     const previousRounds = Array.isArray(previous?.rounds) ? previous.rounds : []
-    const lastRound = previousRounds[previousRounds.length - 1]
-    // sha 缺失（undefined / 空串）不能算「同 sha」，否则 undefined === undefined 会误复用；
-    // n 损坏（缺失 / 非整数）同样不能复用，否则报告会出「第 0 轮」、后续新 sha 又从 1 编号。
-    const reuse = typeof mr.sha === 'string' && mr.sha !== '' && Number.isSafeInteger(lastRound?.n) && lastRound?.sha === mr.sha
+    const shaKnown = typeof mr.sha === 'string' && mr.sha !== ''
+    // 先收敛账本尾部连续同 sha 的段，再判定复用 / 新增：旧版本可能堆了
+    // [1(S),2(S),3(S),4(S)]，无论 head 是否已前进，都不能把虚高的 n 带进后续轮次。
+    let rounds = previousRounds
+    let baselineObservedAt = observedAt
+    const tailSha = previousRounds[previousRounds.length - 1]?.sha
+    if (shaKnown && typeof tailSha === 'string' && tailSha !== '') {
+      let segmentStart = previousRounds.length - 1
+      while (segmentStart > 0 && previousRounds[segmentStart - 1]?.sha === tailSha) segmentStart -= 1
+      const segment = previousRounds.slice(segmentStart)
+      // 锚条缺 observedAt 时，基线取段内最早的有效时间；全无才退回本次观测时间。
+      const observedTimes = segment.map((item) => item?.observedAt).filter((value) => Number.isFinite(value))
+      if (observedTimes.length > 0) baselineObservedAt = Math.min(...observedTimes)
+      // 段长 > 1 才收敛；只保留 n 最小的合法条目，坏 n / 非正整数不参与编号。
+      const valid = segment.filter((item) => Number.isSafeInteger(item?.n) && item.n > 0)
+      if (segment.length > 1 && valid.length > 0) {
+        const anchor = valid.reduce((min, item) => (item.n < min.n ? item : min))
+        rounds = [...previousRounds.slice(0, segmentStart), anchor]
+      }
+    }
+    const lastRound = rounds[rounds.length - 1]
+    // sha 缺失（undefined / 空串）不能算「同 sha」；n 必须是正整数，否则 0 / 负数
+    // 会复用出「第 0 轮」或倒序轮次。
+    const reuse = shaKnown && Number.isSafeInteger(lastRound?.n) && lastRound.n > 0 && lastRound.sha === mr.sha
     let round
     let nextRounds
     if (reuse) {
-      // 旧账本可能在同一 sha 上堆了多条轮次：先把尾部连续同 sha 的段收敛成一条。
-      let segmentStart = previousRounds.length - 1
-      while (segmentStart > 0 && previousRounds[segmentStart - 1]?.sha === mr.sha) segmentStart -= 1
-      const segment = previousRounds.slice(segmentStart)
-      // 保留连续段里 n 最小的一条（最早那条）：它的 observedAt 才是该 sha 的首次观测基线。
-      const anchor = segment.reduce((min, item) => (
-        Number.isSafeInteger(item?.n) && (!Number.isSafeInteger(min?.n) || item.n < min.n) ? item : min
-      ), segment[0])
-      const baselineObservedAt = Number.isFinite(anchor?.observedAt) ? anchor.observedAt : observedAt
-      round = { ...buildRound({ mr, notes, cfg: config, observedAt: baselineObservedAt }), n: anchor.n }
-      nextRounds = [...previousRounds.slice(0, segmentStart), round]
+      round = { ...buildRound({ mr, notes, cfg: config, observedAt: baselineObservedAt }), n: lastRound.n }
+      nextRounds = [...rounds.slice(0, -1), round]
     } else {
-      const n = previousRounds.reduce((max, item) => (Number.isSafeInteger(item?.n) && item.n > max ? item.n : max), 0) + 1
+      const n = rounds.reduce((max, item) => (Number.isSafeInteger(item?.n) && item.n > max ? item.n : max), 0) + 1
       round = { ...buildRound({ mr, notes, cfg: config, observedAt }), n }
-      nextRounds = [...previousRounds, round]
+      nextRounds = [...rounds, round]
     }
 
     const state = {
