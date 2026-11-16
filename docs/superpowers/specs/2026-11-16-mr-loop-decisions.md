@@ -34,6 +34,8 @@
 
 ### 2.3 写回
 - 工具 `mr_waive`：先出草稿（`#ai-waive <FID> reason=<原因>`），主 agent 用 **「可以 / 自定义」** 提问确认，确认后才 `POST /notes`。
+- **草稿不落账本**：`waiverDraft` 只返回 body，不写 decisions、不改状态；只有 `post:true` 成功回帖后才写入 `decisions`（失败也不写）。所以「草稿」永远不会被当成已处置。
+- 回帖成功返回 `{ posted, noteId, url }`；同一 FID 同 kind 已有指令 / 已回帖过 → 幂等返回 `{ posted:false, noteId, existing:true }`，不重复发。
 - 发完评论后主 agent 再决定是否 commit/push 代码（顺序约束见决策 1）。
 - 不实现 resolve discussion（FID 在评审 note 正文里，无法精确映射 discussion）。
 

@@ -8,7 +8,7 @@
  */
 import { parseReview, isReviewBody } from './parse-review.js'
 import { parseSensitiveGate, parseMandatoryGate } from './parse-gates.js'
-import { parseDirectives, authorOf, clipText, hasDirectiveLine } from './parse-directives.js'
+import { parseDirectives, authorOf, clipText, hasDirectiveLine, visibleBody } from './parse-directives.js'
 
 const SHA_MARKER_RE = /<!--\s*AI_REVIEW_SHA\s+([0-9a-f]{7,64})\s*-->/i
 
@@ -110,7 +110,8 @@ function otherComments({ notes, reviewOptions, cfg }) {
       noteId: note.id ?? null,
       author: authorOf(note),
       createdAt: typeof note.created_at === 'string' ? note.created_at : null,
-      excerpt: clipText(body, EXCERPT_LIMIT),
+      // excerpt 只取可见正文：HTML 注释 / 隐藏统计块里的内容不该展示成普通评论（M1）。
+      excerpt: clipText(visibleBody(body), EXCERPT_LIMIT),
     })
   }
   // 评论里没有可靠的时间字符串可用时按 note.id 排序：GitLab 的 id 单调递增，等价于「新的在前」。

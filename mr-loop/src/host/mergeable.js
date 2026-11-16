@@ -13,7 +13,12 @@ export const DISPOSED_KINDS = new Set(['waive', 'skip', 'wontfix'])
 const PIPELINE_FAILED_STATUSES = new Set(['failed', 'canceled'])
 const pipelineGap = (status) => `${PIPELINE_FAILED_STATUSES.has(status) ? '流水线未通过' : '流水线未完成'}（${status}）`
 
-/** 报告与判定共用同一口径，避免「报告说无阻塞、判定说不能合」。 */
+/**
+ * 报告与判定共用同一口径，避免「报告说无阻塞、判定说不能合」。
+ * 只认 waive / skip / wontfix 三种对外终结。**草稿不是处置（M4）**：mr_waive 的草稿
+ * 不写 decisions、也不写 MR，所以这里永远看不到草稿；只有 MR 里真实出现的指令或
+ * 回帖成功写进 decisions 的处置才算。
+ */
 export function isDisposed(decision) {
   return typeof decision?.kind === 'string' && DISPOSED_KINDS.has(decision.kind)
 }
@@ -40,8 +45,9 @@ export function directiveFor(round, fid) {
 /**
  * 账本 decisions 的 FID 查找。账本由插件写入时大小写与评审一致，但人工回填 /
  * 大小写不同的旧账本不该让豁免失效：按小写再兜一次。
+ * 导出给 UI / 服务写路径复用，避免各处再写一套大小写兜底（M3）。
  */
-function decisionFor(decisions, fid) {
+export function decisionFor(decisions, fid) {
   if (decisions === null || typeof decisions !== 'object' || typeof fid !== 'string' || fid === '') return undefined
   if (decisions[fid] !== undefined) return decisions[fid]
   const key = fid.toLowerCase()
@@ -54,6 +60,7 @@ function decisionFor(decisions, fid) {
 /**
  * 已处置 = 账本里有 waive / skip / wontfix，或 MR 评论里有该 FID 的有效指令。
  * 两处并存时任一命中即算（决策文档 §2.1：有有效指令的 FID 视为已处置，不拦合并）。
+ * M4：草稿不算处置——草稿不落 decisions、不发 MR，只有真正出现的来源才在这里生效。
  */
 export function isDisposedFinding(round, decisions = {}, fid) {
   return isDisposed(decisionFor(decisions, fid)) || directiveFor(round, fid) !== null

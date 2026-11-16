@@ -48,8 +48,8 @@ const HEADING_RE = /^ {0,3}#{1,6}[ \t]/
 const DIRECTIVE_HEAD_RE = /^ {0,3}#ai-([a-z][a-z0-9_-]*)(?:[ \t]+(.*))?$/
 // FID 之后必须是 `reason=`（允许 = 两侧空格）；前面不允许再夹别的词。
 const REASON_RE = /^[ \t]*reason[ \t]*=[ \t]*(.*)$/
-// 任何一行以指令前缀开头（不校验格式）的评论都算「指令评论」，不再当普通评论展示。
-const DIRECTIVE_LINE_RE = /^ {0,3}#ai-/m
+// 指令行前缀（不校验格式）：只用来判断「这条评论里有没有指令行」，判定时逐行匹配。
+const DIRECTIVE_LINE_RE = /^ {0,3}#ai-/
 const HTML_COMMENT_RE = /<!--[\s\S]*?-->/g
 const HIDDEN_MARKER_RE = /备注\s*[:：]\s*以下隐藏数据仅用于统计/
 const ZERO_WIDTH_RE = /[\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u206f\ufeff]/g
@@ -82,16 +82,25 @@ export function authorOf(note) {
   return null
 }
 
-/** 这条评论里有没有指令行（不校验格式）：rounds 用它把指令评论挡在「普通评论」之外。 */
+/**
+ * 这条评论里有没有「真正会被扫描到的」指令行（不校验格式）：rounds 用它把指令评论挡在
+ * 「普通评论」之外。与 parseDirectives 共用围栏 / 引用 / HTML 注释 / 隐藏块口径：
+ * 围栏或引用里展示指令示例的正常评论不算指令评论，否则会被从 comments 静默剔除（M1）。
+ */
 export function hasDirectiveLine(body) {
-  return typeof body === 'string' && DIRECTIVE_LINE_RE.test(body)
+  if (typeof body !== 'string') return false
+  const { lines } = scanView(body)
+  for (const { line } of scannableLines(lines)) {
+    if (DIRECTIVE_LINE_RE.test(line)) return true
+  }
+  return false
 }
 
 /**
  * 可见正文：剔除隐藏统计块（其内容不是给人看的）与 HTML 注释。
  * HTML 注释替换成等量换行，保证后续行号仍是原评论里的行号。
  */
-function visibleBody(body) {
+export function visibleBody(body) {
   let text = String(body ?? '')
   const markerIndex = text.search(HIDDEN_MARKER_RE)
   if (markerIndex >= 0) {
@@ -101,6 +110,35 @@ function visibleBody(body) {
     text = text.slice(0, /^[ \t]*>[ \t]*$/.test(prefix) ? lineStart : markerIndex)
   }
   return text.replace(HTML_COMMENT_RE, (match) => '\n'.repeat((match.match(/\n/g) ?? []).length))
+}
+
+/** 可见正文 + 扫描上限：parseDirectives 与 hasDirectiveLine 共用同一输入口径。 */
+function scanView(body) {
+  const visible = visibleBody(body)
+  return { visible, ...scanLimits(visible) }
+}
+
+/**
+ * 真正会被当成指令扫描的行：围栏代码块内的行、引用行都不参与。
+ * 返回原始行号（index + 1），保证 invalid.samples 的 line 仍是评论原文里的行号。
+ */
+function* scannableLines(lines) {
+  let fence = null
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]
+    if (fence !== null) {
+      const close = FENCE_CLOSE_RE.exec(line)
+      if (close !== null && close[1][0] === fence[0] && close[1].length >= fence.length) fence = null
+      continue
+    }
+    if (BLOCKQUOTE_RE.test(line)) continue
+    const open = FENCE_OPEN_RE.exec(line)
+    if (open !== null) {
+      fence = open[1]
+      continue
+    }
+    yield { line, lineNo: index + 1 }
+  }
 }
 
 /** 只扫前 MAX_NOTE_LINES 行 / MAX_NOTE_BYTES 字节；返回扫描行与未扫行数。 */
@@ -141,28 +179,12 @@ function scanNote(note, allowedKinds) {
   const noteId = note?.id ?? null
   const author = authorOf(note)
   const createdAt = typeof note?.created_at === 'string' ? note.created_at : null
-  const visible = visibleBody(note?.body)
-  const { lines, skipped } = scanLimits(visible)
+  const { lines, skipped, visible } = scanView(note?.body)
   const directives = []
   const invalid = []
-  let fence = null
 
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index]
-    const lineNo = index + 1
-
-    if (fence !== null) {
-      const close = FENCE_CLOSE_RE.exec(line)
-      if (close !== null && close[1][0] === fence[0] && close[1].length >= fence.length) fence = null
-      continue
-    }
-    // 引用行整行剔除：引用别人的豁免不能当成自己的指令。
-    if (BLOCKQUOTE_RE.test(line)) continue
-    const open = FENCE_OPEN_RE.exec(line)
-    if (open !== null) {
-      fence = open[1]
-      continue
-    }
+  // 与 hasDirectiveLine 共用围栏 / 引用剔除，避免两套排除规则漂移（M1）。
+  for (const { line, lineNo } of scannableLines(lines)) {
     // 标题行整行剔除：`## 说明 #ai-waive ...` 不是指令（`#ai-waive` 本身不是标题）。
     if (HEADING_RE.test(line)) continue
     const head = DIRECTIVE_HEAD_RE.exec(line)

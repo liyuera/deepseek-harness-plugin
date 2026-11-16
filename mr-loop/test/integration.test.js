@@ -11,6 +11,7 @@ import { resolveConfig } from '../src/host/config.js'
 import { createLedger } from '../src/host/ledger.js'
 import { createService } from '../src/host/service.js'
 import { createWatcher } from '../src/host/watcher.js'
+import { createTools } from '../src/host/tools.js'
 
 const SHA_A = 'a'.repeat(40)
 const SHA_B = 'b'.repeat(40)
@@ -137,5 +138,62 @@ test('service + watcher：评审先到 → 门禁翻面唤醒 → 新 sha 可合
   const saved = await service.ledger.load({ projectPath: 'g/p', iid: 240 })
   assert.equal(saved.rounds.length, 2)
   assert.deepEqual(saved.rounds.map((round) => round.n), [1, 2])
+  await rm(dir, { recursive: true, force: true })
+})
+
+// ---------------------------------------------------------------------------
+// T2 写路径真实接缝：service + tools 不替身任何一方，只替换 GitLab / 账本目录 / 时钟。
+// 防「工具调用的 service 方法名 / 返回结构与真实 service 不一致」这类假 service 看不出的错。
+// ---------------------------------------------------------------------------
+test('T2 service + tools：mr_waive 草稿 → post → 幂等，评论只发一条、decisions 落账本', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mrloop-integration-'))
+  const cfg = resolveConfig({ baseUrl: 'https://git.x.com' })
+  const posted = []
+  const review = { id: 11, system: false, created_at: '2026-11-13T10:02:00Z', body: reviewBody({ sha: SHA_A, verdict: 'changes' }) }
+  const gitlab = {
+    getMergeRequest: async () => mrOf({ sha: SHA_A, notesCount: 1, baseline: BASELINE_A }),
+    listNotes: async () => [review],
+    postNote: async ({ body }) => {
+      posted.push(body)
+      return { id: 9001, body, created_at: '2026-11-13T10:40:00Z', author: { id: 7, username: 'me', name: 'Me' } }
+    },
+  }
+  const service = createService({
+    config: cfg,
+    ledger: createLedger({ dir }),
+    gitlab,
+    repoState: async () => ({ root: '/r', host: 'git.x.com', projectPath: 'g/p', branch: 'feat-x' }),
+    now: () => NOW,
+  })
+  await service.bind({ sessionId: 's', url: 'https://git.x.com/g/p/-/merge_requests/240', repoRoot: '/r' })
+  const waive = createTools({ service }).find((tool) => tool.name === 'mr_waive')
+  const exec = { agent: { session: { id: 's', header: { cwd: '/r' } } } }
+
+  // 1. 草稿：只返回 body，不写 decisions、不发评论。
+  const draft = await waive.execute({ fid: 'AA', reason: '评审误报' }, exec)
+  assert.equal(draft.ok, true)
+  assert.deepEqual(draft.data, { body: '#ai-waive aa reason=评审误报', fid: 'aa', kind: 'waive', reason: '评审误报', posted: false })
+  assert.match(waive.output.render({}, draft).map((part) => part.text).join(''), /可以 \/ 自定义/)
+  assert.equal(service.getState('s').decisions.aa, undefined)
+  assert.equal(posted.length, 0)
+
+  // 2. 用户确认后 post:true：发一条评论并落 decisions。
+  const post = await waive.execute({ fid: 'aa', reason: '评审误报', post: true }, exec)
+  assert.equal(post.ok, true)
+  assert.deepEqual(post.data, { posted: true, noteId: 9001, url: 'https://git.x.com/g/p/-/merge_requests/240#note_9001' })
+  assert.deepEqual(posted, ['#ai-waive aa reason=评审误报'])
+  assert.equal(service.getState('s').decisions.aa.noteId, 9001)
+
+  // 3. 再 post 一次：幂等命中，不再发第二条。
+  const again = await waive.execute({ fid: 'aa', reason: '评审误报', post: true }, exec)
+  assert.equal(again.ok, true)
+  assert.deepEqual(again.data, { posted: false, noteId: 9001, existing: true })
+  assert.equal(posted.length, 1)
+  assert.match(again.message, /已有同 kind 指令/)
+
+  await service.stop({ sessionId: 's' })
+  const saved = await service.ledger.load({ projectPath: 'g/p', iid: 240 })
+  assert.equal(saved.decisions.aa.noteId, 9001)
+  assert.equal(saved.decisions.aa.source, 'comment')
   await rm(dir, { recursive: true, force: true })
 })

@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { parseDirectives } from '../src/host/parse-directives.js'
+import { parseDirectives, hasDirectiveLine } from '../src/host/parse-directives.js'
 
 const CREATED = '2026-11-16T10:00:00Z'
 /** GitLab note 的最小形状：id / system / body / author.username / created_at。 */
@@ -367,4 +367,28 @@ test('C1：5 千条合法指令被 cap 到 50 条 / 20 条评论，解析结果 
   assert.equal(result.directiveNotes.length, 20)
   assert.equal(result.truncated.directives, 4950)
   assert.ok(JSON.stringify(result).length < 100 * 1024)
+})
+
+// ---------------------------------------------------------------------------
+// M1：hasDirectiveLine 与 parseDirectives 共用「真正会被扫描的行」口径，
+// 围栏 / 引用 / HTML 注释 / 隐藏统计块里展示的指令示例不算指令评论。
+// ---------------------------------------------------------------------------
+test('M1 hasDirectiveLine：围栏 / 引用 / HTML 注释 / 隐藏统计块里的指令示例不算指令评论', () => {
+  const examples = [
+    '```md\n#ai-waive a1b2c3d4 reason=代码块示例\n```',
+    '~~~\n#ai-skip b2c3d4e5 reason=波浪围栏示例\n~~~',
+    '> #ai-waive a1b2c3d4 reason=引用别人的豁免',
+    '  > #ai-waive a1b2c3d4 reason=引用行前有空格',
+    '<!--\n#ai-waive a1b2c3d4 reason=HTML 注释里\n-->',
+    '正常说明\n\n> 备注：以下隐藏数据仅用于统计\n#ai-waive a1b2c3d4 reason=隐藏块里',
+    '示例：\n```\n#ai-wontfix c3d4e5f6 reason=缩进无关\n```\n正常收尾',
+  ]
+  for (const body of examples) assert.equal(hasDirectiveLine(body), false, body)
+
+  // 围栏外真实出现的指令行（哪怕格式不合法）仍是指令评论：无效指令不能混进普通评论。
+  assert.equal(hasDirectiveLine('#ai-waive a1b2c3d4 reason=x'), true)
+  assert.equal(hasDirectiveLine('正常说明\n#ai-waive bad reason='), true)
+  assert.equal(hasDirectiveLine('正文里提一嘴 #ai-waive a1b2c3d4 reason=x'), false)
+  assert.equal(hasDirectiveLine(undefined), false)
+  assert.equal(hasDirectiveLine(null), false)
 })

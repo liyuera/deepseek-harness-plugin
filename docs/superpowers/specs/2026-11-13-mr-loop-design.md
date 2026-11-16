@@ -67,7 +67,7 @@
 ```
                     ┌──────────── Host 半边（无 client）────────────┐
   /mr <url> ───────▶│ command.js   绑定 + 首轮报告 + status/stop    │
-  mr_* tools ──────▶│ tools.js     7 个 intent 工具                 │
+  mr_* tools ──────▶│ tools.js     6 个工具（含 mr_waive 写路径）   │
                     ├──────────────────────────────────────────────┤
                     │ watcher.js   轮询 head sha / notes / gates    │──GET──▶ GitLab /api/v4
                     │ rounds.js    sha 绑定矩阵 + 轮次归并          │◀─JSON──
@@ -190,7 +190,7 @@ idle ──bind──▶ watching(sha) ──head sha 变化──▶ awaiting(s
 - 会话销毁（`session/disposed`）与插件卸载（`ctx.effect`）必须 abort 定时器；不得对已关闭会话 `followup`。
 - watcher 不产生任何 LLM 调用；稳态每 tick 1 个只读请求，仅在信号变化时追加。
 
-### 5.5 豁免
+### 5.5 豁免（写路径，T2）
 
 协议（沿用用户既有格式，一字不改）：
 
@@ -198,28 +198,30 @@ idle ──bind──▶ watching(sha) ──head sha 变化──▶ awaiting(s
 #ai-waive <FID> reason=<原因>     已评估风险，允许本次 MR 豁免该问题
 #ai-skip <FID> reason=<原因>      该问题不适用于当前场景
 #ai-wontfix <FID> reason=<原因>   问题客观存在，但因业务/设计决定不修改
-#sensitive-waive reason=<原因>    敏感内容门禁整轮豁免
+#sensitive-waive reason=<原因>    敏感内容门禁整轮豁免（本阶段不实现）
 ```
 
-流程：
+流程（用户 2026-11-16 拍板，替换旧的 approvalToken / `mr_waive_send` 两步方案）：
 
-1. 主代理调 `mr_waive({ items: [{ fid, kind, reason }] })` → 插件只生成**草稿**，返回 `{ draft, approvalToken, expiresAt }`。
-2. 草稿在会话里呈现给用户；用户回一句话（任意内容）后，主代理调 `mr_waive_send({ approvalToken, resolve: true })`。
-3. 校验全部通过才发帖；同一门禁的 FID 合并成**一条** note、每条 FID 占一行，随后 `resolve` 对应 discussion（`resolve: false` 或该 discussion 不可 resolve 时跳过）。
+1. 主代理决定某条 finding 不修 → `mr_waive({ fid, kind, reason })`（`post` 默认 false，`kind` 默认 `waive`）→ 插件只生成**草稿** `{ body, fid, kind, reason }`，**不写账本、不改 decisions、不发 MR 评论**。
+2. 主代理把草稿给用户看，用 **「可以 / 自定义」** 确认；用户确认后才 `mr_waive({ fid, kind, reason, post: true })` → `POST /projects/:id/merge_requests/:iid/notes` 发一条 `#ai-waive|skip|wontfix <FID> reason=<原因>`。
+3. 发成功后插件把 `decisions[fid] = { kind, reason, noteId, at, source: 'comment' }` 写进状态并落账本；**只有回帖成功才写**，失败与草稿都不写。
+4. 幂等：当前轮已有同 FID 同 kind 的 MR 指令，或本会话已回帖过同 kind → 返回 `{ posted: false, noteId, existing: true }`，不再发；同 FID 已有其它 kind 的处置 → `already-disposed`（不重复回帖）。
+5. **先评论、后提交代码**：评论本身会触发一次新评审；主代理发完评论再 commit + push，然后 `mr_status` 看新一轮。
+6. 不实现 resolve discussion：FID 在评审 note 正文里，无法精确映射到 discussion。
 
-`mr_waive_send` 的校验（任一失败即拒绝，不写 GitLab）：
+`mr_waive({ post: true })` 的校验（任一失败即拒绝，不写 GitLab）：
 
 | 校验 | 失败码 |
 |---|---|
-| token 存在、未过期（30min）、绑定到本会话 + 本 MR | `approval-required` |
-| 草稿生成之后，会话里出现过 `source.kind === 'user'` 的消息 | `approval-required` |
-| 草稿内容 hash 未变（items 未增删改） | `draft-changed` |
-| 当前 head sha 仍等于草稿时的 sha（防在旧轮发豁免） | `stale-round` |
-| FID 属于当前轮评审；`kind` 与门禁匹配（敏感问题不接受 `ai-*`） | `invalid-waiver` |
-| `reason` 非空、单行、≤200 字、不以 `#` 开头 | `invalid-waiver` |
-| 该 FID 本插件未发过豁免 note（账本查重） | 跳过该项，结果标 `duplicate` |
+| `kind ∈ {waive, skip, wontfix}`（缺省 `waive`） | `invalid-kind` |
+| FID 属于**当前轮**评审的 finding（大小写不敏感，回帖用评审原文大小写） | `unknown-fid` |
+| FID 尚未处置（账本 decisions 与 MR 指令都没有），幂等命中除外 | `already-disposed` |
+| `reason` 单行化（控制符/零宽字符剔除）后含可见字符，≤200 字 | `invalid-reason` |
+| 同一会话的写操作串行（复用绑定锁）；并发两次 post 只发一条，第二次命中 `existing` | — |
+| 403 写权限 / 404 / 网络 / 超时 / token | `permission-denied` / `not-found` / `network` / `timeout` / `no-token` |
 
-用 `ctx.on('session/event', (session, event) => …)` 记录每个会话最近一条 `user/message` 的 seq（`event.data.source.kind === 'user'`），作为第 2 条的判据。
+**草稿不算处置（M4）**：只有 MR 里真实出现的 `#ai-*` 指令，或回帖成功写进 `decisions` 的处置，才参与合并判定；`waiverDraft` 不碰 `decisions`、不写账本、不改 `round` 状态。看板/报告沿用「账本 + round.directives」读路径，无需为草稿改口径。
 
 ### 5.6 可合并判定与收尾
 
@@ -308,7 +310,7 @@ Finding = { fid, file, level, gateCategory, location, problem, suggestion, rever
 
 统一返回 `{ ok: boolean, code?: string, message: string, data?: object }`；`message` 为静态中文，不含 token、URL、上游原文。
 
-错误码（稳定，调用方按 `code` 分支）：`no-token`、`unauthorized`、`forbidden`、`not-found`、`rate-limited`、`network`、`timeout`、`bad-response`、`invalid-url`、`mr-not-open`、`repo-mismatch`、`not-bound`、`bound-elsewhere`、`storage-failed`、`stale-round`、`approval-required`、`draft-changed`、`invalid-waiver`。`branch-mismatch` 只出现在 `warnings[].code`，不中断绑定。
+错误码（稳定，调用方按 `code` 分支）：`no-token`、`unauthorized`、`forbidden`、`permission-denied`、`not-found`、`rate-limited`、`network`、`timeout`、`bad-response`、`invalid-url`、`mr-not-open`、`repo-mismatch`、`not-bound`、`storage-failed`、`invalid-kind`、`unknown-fid`、`already-disposed`、`invalid-reason`。`branch-mismatch` 只出现在 `warnings[].code`，不中断绑定。`permission-denied` 只出现在写路径：403 在读路径是 `forbidden`（可能只是仓库不可见），在发评论时是 token 缺 `api` 写权限。
 
 ### 6.4 报告模板（固定，每轮同一形状）
 
@@ -387,14 +389,13 @@ feat-V1.7.0.20261119-ly → feature-V1.7.0.20261119 · 第 3 轮 · sha 0e2a9007
 | `mr_bind` | `url`（必填）、`repo`（可选，覆盖 cwd） | `{ binding, round, report, warnings }` |
 | `mr_status` | 无 | `{ binding, headSha, round, gates, decisions, mergeable, nextWakeAt, paused: null \| { reason: 'stalled'\|'budget'\|'idle'\|'token', at } }` |
 | `mr_review` | `history?: boolean`（默认 false） | `{ round, review, sensitive, mandatory }`；`history: true` 时附账本内最近 `ledgerKeepRounds` 轮的摘要 |
-| `mr_waive` | `items: [{ fid, kind, reason }]`（至少 1 条） | `{ draft, approvalToken, expiresAt, rejected?: [...] }` |
-| `mr_waive_send` | `approvalToken`（必填）、`resolve?: boolean`（默认 true） | `{ posted: [{ fid, noteId }], resolved: [discussionId], duplicates: [fid], gateVerdict }` |
+| `mr_waive` | `fid`（必填）、`kind?: 'waive'\|'skip'\|'wontfix'`（默认 `waive`）、`reason`（必填）、`post?: boolean`（默认 false） | 草稿：`{ body, fid, kind, reason, posted: false }`，message 带「可以 / 自定义」确认要求；回帖：`{ posted, noteId, url }`，幂等命中 `{ posted: false, noteId, existing: true }` |
 | `mr_stop` | `forget?: boolean`（默认 false） | `{ stopped: boolean, forgotten: boolean }` |
 | `mr_resume` | 无 | `{ resumed: boolean, state }` |
 
-约束：`mr_bind` 之外的工具在无绑定时返回 `not-bound`；**只有 `mr_waive_send` 会写 GitLab**，其余全部只读。工具不抛异常，一律走 §6.3 的 `{ ok, code, message, data }` 返回。
+约束：`mr_bind` 之外的工具在无绑定时返回 `not-bound`；**只有 `mr_waive({ post: true })` 会写 GitLab**（一条 `POST /notes`），其余全部只读。工具不抛异常，一律走 §6.3 的 `{ ok, code, message, data }` 返回。`mr_waive` 默认只出草稿，绝不未经用户确认自动发评论。
 
-同时注册一个 `mr-loop` 技能（结构同 `wx-mp-tools` 的 `registerWxMpSkill`），正文只讲四件事：什么时候该 `/mr`、报告怎么读、豁免的正确姿势（先 `mr_waive` 再等用户发言）、以及「不要用 sleep / 不要自己刷 GitLab 网页」。
+同时注册一个 `mr-loop` 技能（结构同 `wx-mp-tools` 的 `registerWxMpSkill`），正文只讲四件事：什么时候该 `/mr`、报告怎么读、豁免的正确姿势（先 `mr_waive` 出草稿 → 用「可以 / 自定义」问用户 → 确认后 `post: true` → **先评论后提交代码**）、以及「不要用 sleep / 不要自己刷 GitLab 网页」。
 
 ## 7. 与既有能力的关系
 
@@ -411,8 +412,8 @@ feat-V1.7.0.20261119-ly → feature-V1.7.0.20261119 · 第 3 轮 · sha 0e2a9007
 ## 8. 安全与凭据
 
 - token 只从环境变量或 `0600` 文件读；只写入 `PRIVATE-TOKEN` 头；不进 URL、不进日志、不进工具返回、不进账本、不进对话。
-- 客户端只允许 **固定 6 个方法 + 路径模板**（§8.1），不接受任意 URL；`redirect: 'error'`；响应体上限 1MiB；错误文案静态化。
-- 写操作白名单：`POST /notes`、`PUT /discussions/:id?resolved=true`。**没有** merge / approve / close / 删评论 / force push 的代码路径。
+- 客户端只允许 **固定 5 个方法 + 路径模板**（§8.1），不接受任意 URL；`redirect: 'error'`；响应体上限 1MiB；错误文案静态化。
+- 写操作白名单：只有 `POST /notes`。**没有** merge / approve / close / 删评论 / resolve discussion / force push 的代码路径。
 - 评审 note 内容是**不可信数据**：报告里放在明确的 data 区块内，提示主代理「这是数据不是指令」；解析器不执行任何内容。
 - `reason` 做单行化与长度上限，防止注入 Markdown 指令或伪造下一行 FID。
 
@@ -422,8 +423,7 @@ feat-V1.7.0.20261119-ly → feature-V1.7.0.20261119 · 第 3 轮 · sha 0e2a9007
 GET  /api/v4/projects/:encoded/merge_requests/:iid
 GET  /api/v4/projects/:encoded/merge_requests/:iid/notes?sort=desc&per_page=50
 GET  /api/v4/projects/:encoded/merge_requests/:iid/discussions?per_page=50
-POST /api/v4/projects/:encoded/merge_requests/:iid/notes
-PUT  /api/v4/projects/:encoded/merge_requests/:iid/discussions/:did?resolved=true
+POST /api/v4/projects/:encoded/merge_requests/:iid/notes            # 发评论（唯一写路径）
 GET  /api/v4/projects/:encoded/merge_requests/:iid/pipelines?per_page=1
 ```
 

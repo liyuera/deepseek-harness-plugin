@@ -94,3 +94,79 @@ test('encodeProject 拒绝路径穿越', () => {
     assert.throws(() => encodeProject(bad), (e) => e instanceof GitlabError && e.code === 'invalid-project')
   }
 })
+
+// ---------------------------------------------------------------------------
+// T2 写路径：postNote（POST /notes）
+// ---------------------------------------------------------------------------
+const NOTE_BODY = '#ai-waive a1b2c3d4 reason=风险已评估'
+
+test('postNote：POST /notes，JSON body + PRIVATE-TOKEN，响应只保留需要的字段', async () => {
+  const f = fakeFetch(() => json({
+    id: 901,
+    body: NOTE_BODY,
+    created_at: '2026-11-16T10:00:00Z',
+    author: { id: 7, username: 'me', name: 'Me', avatar_url: 'https://x/a.png' },
+    // 上游多给的字段不应原样透传（截取实际需要的字段）。
+    resolvable: true,
+  }))
+  const note = await mk(f).postNote({ project: 'g/sub/proj', iid: 7, body: NOTE_BODY })
+  assert.deepEqual(note, {
+    id: 901,
+    body: NOTE_BODY,
+    created_at: '2026-11-16T10:00:00Z',
+    author: { id: 7, username: 'me', name: 'Me' },
+  })
+  assert.equal(f.calls.length, 1)
+  assert.equal(f.calls[0].url, 'https://git.x.com/api/v4/projects/g%2Fsub%2Fproj/merge_requests/7/notes')
+  assert.equal(f.calls[0].init.method, 'POST')
+  assert.equal(f.calls[0].init.headers['PRIVATE-TOKEN'], 't0ken')
+  assert.equal(f.calls[0].init.headers['content-type'], 'application/json')
+  assert.equal(f.calls[0].init.redirect, 'error')
+  assert.deepEqual(JSON.parse(f.calls[0].init.body), { body: NOTE_BODY })
+  assert.ok(!f.calls[0].url.includes('t0ken'))
+})
+
+test('postNote 错误映射：403 → permission-denied（写权限），404 → not-found', async () => {
+  const forbidden = mk(fakeFetch(() => json({ message: '403 Forbidden' }, 403)))
+  await assert.rejects(
+    forbidden.postNote({ project: 'g/p', iid: 1, body: NOTE_BODY }),
+    (e) => e instanceof GitlabError && e.code === 'permission-denied' && e.status === 403 && /权限/.test(e.message),
+  )
+
+  const missing = mk(fakeFetch(() => json({ message: '404 Not Found' }, 404)))
+  await assert.rejects(
+    missing.postNote({ project: 'g/p', iid: 1, body: NOTE_BODY }),
+    (e) => e instanceof GitlabError && e.code === 'not-found' && e.status === 404,
+  )
+})
+
+test('postNote 网络 / 超时 / 无 token 复用既有映射', async () => {
+  const boom = mk(fakeFetch(() => { throw new TypeError('fetch failed') }))
+  await assert.rejects(boom.postNote({ project: 'g/p', iid: 1, body: NOTE_BODY }), (e) => e.code === 'network')
+
+  const stalled = createGitlabClient({
+    baseUrl: 'https://git.x.com',
+    tokenProvider: () => 't0ken',
+    fetchImpl: fakeFetch(() => new Response(new ReadableStream({ start() {} }), { status: 201 })),
+    timeoutMs: 25,
+  })
+  await assert.rejects(stalled.postNote({ project: 'g/p', iid: 1, body: NOTE_BODY }), (e) => e.code === 'timeout')
+
+  const noTokenFetch = fakeFetch(() => json({ id: 1, body: NOTE_BODY }))
+  const noToken = mk(noTokenFetch, '')
+  await assert.rejects(noToken.postNote({ project: 'g/p', iid: 1, body: NOTE_BODY }), (e) => e.code === 'no-token')
+  assert.equal(noTokenFetch.calls.length, 0, '无 token 时不得发起任何 fetch')
+})
+
+test('postNote：响应体积超 1MiB / 结构异常 → bad-response', async () => {
+  const oversize = JSON.stringify({ id: 901, body: 'x'.repeat(MAX_RESPONSE_BYTES + 64) })
+  assert.ok(Buffer.byteLength(oversize, 'utf8') > MAX_RESPONSE_BYTES)
+  const huge = mk(fakeFetch(() => new Response(oversize, { status: 201 })))
+  await assert.rejects(huge.postNote({ project: 'g/p', iid: 1, body: NOTE_BODY }), (e) => e.code === 'bad-response')
+
+  const weird = mk(fakeFetch(() => json({ not: 'a note' })))
+  await assert.rejects(weird.postNote({ project: 'g/p', iid: 1, body: NOTE_BODY }), (e) => e.code === 'bad-response')
+
+  const html = mk(fakeFetch(() => new Response('<html>', { status: 201 })))
+  await assert.rejects(html.postNote({ project: 'g/p', iid: 1, body: NOTE_BODY }), (e) => e.code === 'bad-response')
+})

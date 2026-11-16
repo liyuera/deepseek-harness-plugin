@@ -274,7 +274,7 @@ test('I2：敏感 / 必过门禁 note 正文里的 #ai-* 指令不生效', () =>
   assert.deepEqual(round.directives.directives, [])
 })
 
-test('I2：HTML 注释里的指令不生效，也不当普通评论展示', () => {
+test('M1：HTML 注释里的指令不生效，评论按普通评论展示（只给可见正文）', () => {
   const mr = { sha: SHA, head_pipeline: { created_at: '2026-11-13T09:59:00Z' } }
   const hidden = ['<!--', '#ai-waive a1b2c3d4 reason=HTML 注释里', '-->', '正常说明'].join('\n')
   const round = buildRound({
@@ -285,8 +285,13 @@ test('I2：HTML 注释里的指令不生效，也不当普通评论展示', () =
   })
   assert.deepEqual(round.directives.directives, [])
   assert.deepEqual(round.directives.invalid, { count: 0, samples: [] })
-  // 含 #ai- 行的评论按「指令评论」处理，不混进普通评论；内容也不会落进账本。
-  assert.deepEqual(round.comments, [])
+  // M1：HTML 注释里展示的指令不是指令，评论本身仍是普通评论；excerpt 只取可见正文。
+  assert.deepEqual(round.comments, [{
+    noteId: 30,
+    author: null,
+    createdAt: '2026-11-13T10:02:00Z',
+    excerpt: '正常说明',
+  }])
 })
 
 // ---------------------------------------------------------------------------
@@ -331,4 +336,38 @@ test('C1：5 千条合法指令 → directives ≤50、directiveNotes ≤20，�
   assert.equal(round.directiveNotes.length, 20)
   assert.equal(round.directives.truncated.directives, 4950)
   assert.ok(JSON.stringify(round).length < 100 * 1024)
+})
+
+// ---------------------------------------------------------------------------
+// M1：围栏 / 引用里展示指令示例的正常评论不能被从 comments 里剔掉（且不留痕）
+// ---------------------------------------------------------------------------
+test('M1：围栏 / 引用 / 标题里展示指令示例的评论仍出现在 comments', () => {
+  const mr = { sha: SHA, head_pipeline: { created_at: '2026-11-13T09:59:00Z' } }
+  const notes = [
+    note({
+      id: 30,
+      created_at: '2026-11-13T10:02:00Z',
+      body: ['示例：', '```md', '#ai-waive a1b2c3d4 reason=代码块里的示例', '```', '正常说明'].join('\n'),
+    }),
+    note({
+      id: 31,
+      created_at: '2026-11-13T10:02:00Z',
+      body: ['> #ai-waive b2c3d4e5 reason=引用别人的豁免', '我的回复'].join('\n'),
+    }),
+    note({
+      id: 32,
+      created_at: '2026-11-13T10:02:00Z',
+      body: ['## 标题 #ai-skip c3d4e5f6 reason=标题里', '正文'].join('\n'),
+    }),
+  ]
+  const round = buildRound({ mr, notes, cfg, observedAt: Date.parse('2026-11-13T10:10:00Z') })
+  // 示例不是指令：既不生效，也不产生 invalid。
+  assert.deepEqual(round.directives.directives, [])
+  assert.deepEqual(round.directives.invalid, { count: 0, samples: [] })
+  // 但它们是有内容的正常评论，必须能被主代理看到（noteId 降序）。
+  assert.deepEqual(round.comments.map((item) => item.noteId), [32, 31, 30])
+  const excerptOf = new Map(round.comments.map((item) => [item.noteId, item.excerpt]))
+  assert.match(excerptOf.get(30), /#ai-waive a1b2c3d4 reason=代码块里的示例/)
+  assert.match(excerptOf.get(31), /引用别人的豁免/)
+  assert.match(excerptOf.get(32), /标题/)
 })

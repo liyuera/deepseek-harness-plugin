@@ -11,6 +11,8 @@ function fakeService(over = {}) {
     review: ({ sessionId }) => ({ round: { sha: 'abc', n: 2 }, decisions: {} }),
     stop: async () => ({ stopped: true, forgotten: false }),
     resume: () => ({ sha: 'abc' }),
+    waiverDraft: ({ fid, kind, reason }) => ({ body: `#ai-${kind ?? 'waive'} ${fid} reason=${reason}`, fid, kind: kind ?? 'waive', reason }),
+    postWaiver: async ({ fid, kind, reason }) => ({ posted: true, noteId: 901, url: 'https://git.x.com/g/p/-/merge_requests/240#note_901', body: `#ai-${kind ?? 'waive'} ${fid} reason=${reason}` }),
     ...over,
   }
 }
@@ -118,4 +120,110 @@ test('mr_review：旧 round 没有 directives / comments 时回落到 null / []�
   assert.equal(review.data.directives, null)
   assert.deepEqual(review.data.directiveNotes, [])
   assert.deepEqual(review.data.comments, [])
+})
+
+// ---------------------------------------------------------------------------
+// T2 写路径工具：mr_waive（草稿 → 用户确认「可以 / 自定义」→ post:true 回帖）
+// ---------------------------------------------------------------------------
+
+test('mr_waive 默认只出草稿：不透传 post，返回 body 并要求用「可以 / 自定义」问用户', async () => {
+  let draftArgs
+  const service = fakeService({
+    waiverDraft: (args) => {
+      draftArgs = args
+      return { body: `#ai-${args.kind} ${args.fid} reason=${args.reason}`, fid: args.fid, kind: args.kind, reason: args.reason }
+    },
+    postWaiver: async () => { throw new Error('草稿阶段绝不能回帖') },
+  })
+  const def = byName(createTools({ service }), 'mr_waive')
+  const result = await def.execute({ fid: 'a1b2c3d4', reason: '风险已评估' }, exec)
+  assert.equal(result.ok, true)
+  assert.deepEqual(draftArgs, { sessionId: 's1', fid: 'a1b2c3d4', kind: 'waive', reason: '风险已评估' })
+  assert.deepEqual(result.data, {
+    body: '#ai-waive a1b2c3d4 reason=风险已评估',
+    fid: 'a1b2c3d4',
+    kind: 'waive',
+    reason: '风险已评估',
+    posted: false,
+  })
+  // 模型实际看到的是 render 的文本：草稿与「可以 / 自定义」的下一步都必须出现在里面。
+  const rendered = def.output.render({}, result).map((part) => part.text).join('')
+  assert.match(rendered, /#ai-waive a1b2c3d4 reason=风险已评估/)
+  assert.match(rendered, /可以 \/ 自定义/)
+  assert.match(rendered, /post: true/)
+  assert.match(def.description, /草稿/)
+  assert.match(def.description, /可以 \/ 自定义/)
+})
+
+test('mr_waive post:true 才回帖：kind 透传，返回 posted/noteId/url 并提示先评论后提交', async () => {
+  let postArgs
+  const service = fakeService({
+    postWaiver: async (args) => {
+      postArgs = args
+      return { posted: true, noteId: 901, url: 'https://git.x.com/g/p/-/merge_requests/240#note_901', body: '#ai-wontfix a1b2c3d4 reason=遗留问题' }
+    },
+  })
+  const def = byName(createTools({ service }), 'mr_waive')
+  const result = await def.execute({ fid: 'a1b2c3d4', kind: 'wontfix', reason: '遗留问题', post: true }, exec)
+  assert.equal(result.ok, true)
+  assert.deepEqual(postArgs, { sessionId: 's1', fid: 'a1b2c3d4', kind: 'wontfix', reason: '遗留问题' })
+  assert.deepEqual(result.data, { posted: true, noteId: 901, url: 'https://git.x.com/g/p/-/merge_requests/240#note_901' })
+  assert.match(result.message, /901/)
+  assert.match(result.message, /https:\/\/git\.x\.com/)
+  // 决策 1：先评论、后提交代码。
+  assert.match(result.message, /先评论/)
+  assert.match(result.message, /commit/)
+})
+
+test('mr_waive post:true 幂等命中：posted:false + 提示已有同 kind 指令', async () => {
+  const service = fakeService({
+    postWaiver: async () => ({ posted: false, noteId: 900, existing: true }),
+  })
+  const def = byName(createTools({ service }), 'mr_waive')
+  const result = await def.execute({ fid: 'a1b2c3d4', reason: '风险已评估', post: true }, exec)
+  assert.equal(result.ok, true)
+  assert.deepEqual(result.data, { posted: false, noteId: 900, existing: true })
+  assert.match(result.message, /已有同 kind 指令/)
+  assert.match(result.message, /900/)
+})
+
+test('mr_waive 参数校验：fid / reason 必填，kind 枚举，post 必须是布尔，未知参数拒绝', async () => {
+  const def = byName(createTools({ service: fakeService() }), 'mr_waive')
+  assert.equal(def.parameters.required.includes('fid'), true)
+  assert.equal(def.parameters.required.includes('reason'), true)
+  assert.deepEqual(def.parameters.properties.kind.enum, ['waive', 'skip', 'wontfix'])
+  assert.equal(def.parameters.additionalProperties, false)
+  const badCases = [
+    { reason: 'x' }, // 缺 fid
+    { fid: '', reason: 'x' }, // fid 空
+    { fid: 'a1b2c3d4' }, // 缺 reason
+    { fid: 'a1b2c3d4', reason: 'x', kind: 'fix' },
+    { fid: 'a1b2c3d4', reason: 'x', post: 'yes' },
+    { fid: 'a1b2c3d4', reason: 'x', bogus: true },
+  ]
+  for (const args of badCases) {
+    const result = await def.execute(args, exec)
+    assert.equal(result.ok, false, JSON.stringify(args))
+    assert.equal(result.code, 'invalid-arguments', JSON.stringify(args))
+  }
+})
+
+test('mr_waive 错误映射：草稿与回帖都走 ServiceError → ok:false + code', async () => {
+  const draftFail = byName(createTools({
+    service: fakeService({
+      waiverDraft: () => { const error = new Error('该 FID 已有处置'); error.code = 'already-disposed'; throw error },
+    }),
+  }), 'mr_waive')
+  const draft = await draftFail.execute({ fid: 'a1b2c3d4', reason: 'x' }, exec)
+  assert.deepEqual({ ok: draft.ok, code: draft.code, message: draft.message }, { ok: false, code: 'already-disposed', message: '该 FID 已有处置' })
+
+  const postFail = byName(createTools({
+    service: fakeService({
+      postWaiver: async () => { const error = new Error('GitLab 拒绝发评论：token 缺少 api 写权限'); error.code = 'permission-denied'; throw error },
+    }),
+  }), 'mr_waive')
+  const post = await postFail.execute({ fid: 'a1b2c3d4', reason: 'x', post: true }, exec)
+  assert.equal(post.ok, false)
+  assert.equal(post.code, 'permission-denied')
+  assert.match(post.message, /权限/)
 })

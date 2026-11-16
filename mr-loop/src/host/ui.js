@@ -10,7 +10,7 @@
 import { readdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { expandHome } from './ledger.js'
-import { evaluateMergeable, reviewTodo, isDisposed, isDisposedFinding, directiveFor } from './mergeable.js'
+import { evaluateMergeable, reviewTodo, isDisposed, isDisposedFinding, directiveFor, decisionFor } from './mergeable.js'
 
 const MAX_TEXT = 400
 const MAX_COMMENTS = 5
@@ -86,7 +86,8 @@ function problemsOf(record) {
 
   const problems = current.map((item) => {
     const fid = sanitizeId(item?.fid) ?? '?'
-    const decision = decisions[fid] ?? decisions[String(item?.fid ?? '')]
+    // M3：与 mergeable.js 共用 decisionFor 的大小写兜底，不再用精确 key 查 decisions。
+    const decision = decisionFor(decisions, item?.fid)
     const fromLedger = kindOfDecision(decision)
     // 账本处置优先；没有时看 MR 评论里的指令（旧的线上账本 round 里没有 directives 也不抛）。
     const directive = directiveFor(round, item?.fid)

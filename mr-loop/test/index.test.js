@@ -41,11 +41,11 @@ function fakeCtx({ failFirstTool = false } = {}) {
   return { ctx, skills, warnings, ...registered }
 }
 
-test('apply() 注册 5 个工具、/mr 命令，并通过 skills 服务注册技能', () => {
+test('apply() 注册 6 个工具、/mr 命令，并通过 skills 服务注册技能', () => {
   const h = fakeCtx()
   apply(h.ctx, {})
 
-  assert.deepEqual(h.tools.map((tool) => tool.name), ['mr_bind', 'mr_status', 'mr_review', 'mr_stop', 'mr_resume'])
+  assert.deepEqual(h.tools.map((tool) => tool.name), ['mr_bind', 'mr_status', 'mr_review', 'mr_waive', 'mr_stop', 'mr_resume'])
   assert.equal(h.commands.length, 1)
   assert.equal(h.commands[0].name, 'mr')
   // 只读 UI 路由（webServer）先注册，技能随后；两者都走 scoped ctx。
@@ -60,7 +60,7 @@ test('apply() 注册 5 个工具、/mr 命令，并通过 skills 服务注册技
 test('enabled=false 仍注册工具、命令与技能（只是没有 watcher）', () => {
   const h = fakeCtx()
   apply(h.ctx, { enabled: false })
-  assert.equal(h.tools.length, 5)
+  assert.equal(h.tools.length, 6)
   assert.equal(h.commands.length, 1)
   assert.equal(h.skills.length, 1)
 })
@@ -77,7 +77,7 @@ test('没有 webServer 服务时只跳过 UI 路由，工具/命令/技能照常
   }
   apply(h.ctx, {})
 
-  assert.equal(h.tools.length, 5)
+  assert.equal(h.tools.length, 6)
   assert.equal(h.commands.length, 1)
   assert.equal(h.skills.length, 1)
   assert.equal(h.warnings.filter((line) => /UI 路由注册失败/.test(line)).length, 1)
@@ -87,8 +87,8 @@ test('单个工具注册抛错不影响其余工具、命令与技能接线', ()
   const h = fakeCtx({ failFirstTool: true })
   apply(h.ctx, {})
 
-  // 5 次注册尝试，第一次失败；其余 4 个照常注册。
-  assert.equal(h.tools.length, 4)
+  // 6 次注册尝试，第一次失败；其余 5 个照常注册。
+  assert.equal(h.tools.length, 5)
   assert.equal(h.commands.length, 1)
   assert.equal(h.skills.length, 1)
   assert.equal(h.warnings.filter((line) => /工具 mr_bind 注册失败/.test(line)).length, 1)

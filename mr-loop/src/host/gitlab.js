@@ -1,9 +1,10 @@
 /**
- * GitLab REST 只读客户端。只允许 4 个 GET，没有任何写路径：
- *   GET /projects/:p/merge_requests/:iid
- *   GET /projects/:p/merge_requests/:iid/notes?sort=desc&order_by=created_at&per_page=50
- *   GET /projects/:p/merge_requests/:iid/discussions?per_page=50
- *   GET /projects/:p/merge_requests/:iid/pipelines?per_page=1
+ * GitLab REST 客户端。只允许 5 条固定路径（写路径只有发评论这一条）：
+ *   GET  /projects/:p/merge_requests/:iid
+ *   GET  /projects/:p/merge_requests/:iid/notes?sort=desc&order_by=created_at&per_page=50
+ *   GET  /projects/:p/merge_requests/:iid/discussions?per_page=50
+ *   GET  /projects/:p/merge_requests/:iid/pipelines?per_page=1
+ *   POST /projects/:p/merge_requests/:iid/notes      —— 只发评论（不 merge / approve / resolve）
  *
  * 安全不变量：token 只进 PRIVATE-TOKEN 头；redirect:'error' 防转发到别的主机；
  * 响应体上限 1MiB（流式累计，超限立即中断，不会先整体缓冲）；超时覆盖整个请求
@@ -21,6 +22,8 @@ const MESSAGE = Object.freeze({
   'no-token': '未配置 GitLab token',
   unauthorized: 'GitLab 鉴权失败，请检查 token',
   forbidden: 'GitLab 拒绝访问，token 权限不足',
+  // 写路径（发评论）的 403 语义比读路径更具体：缺的是 token 的 api 写权限，单独一个码。
+  'permission-denied': 'GitLab 拒绝写评论，token 缺少 api 写权限',
   'not-found': 'GitLab 项目或 MR 不存在',
   conflict: 'GitLab 请求冲突，资源状态已变化',
   'rate-limited': 'GitLab 请求过于频繁，请稍后重试',
@@ -112,6 +115,16 @@ async function readBody(response, signal) {
   }
 }
 
+/** 发评论的响应只保留实际需要的作者字段：body 里不需要头像等大字段。 */
+function noteAuthor(author) {
+  if (author === null || typeof author !== 'object') return null
+  const result = {}
+  if (Number.isSafeInteger(author.id)) result.id = author.id
+  if (typeof author.username === 'string') result.username = author.username
+  if (typeof author.name === 'string') result.name = author.name
+  return result
+}
+
 /**
  * @param {{ baseUrl: string, tokenProvider: () => (string|Promise<string>), fetchImpl?: typeof fetch, timeoutMs?: number }} options
  */
@@ -120,7 +133,7 @@ export function createGitlabClient({ baseUrl, tokenProvider, fetchImpl = globalT
   if (typeof fetchImpl !== 'function') throw new TypeError('fetchImpl must be a function')
   const base = baseUrl.replace(/\/+$/, '')
 
-  async function request({ path, query, signal }) {
+  async function request({ path, query, signal, method = 'GET', jsonBody = undefined }) {
     let token = ''
     try {
       token = String((await tokenProvider()) ?? '').trim()
@@ -131,6 +144,14 @@ export function createGitlabClient({ baseUrl, tokenProvider, fetchImpl = globalT
 
     const url = new URL(`${base}${API_PREFIX}${path}`)
     if (query) for (const [key, value] of Object.entries(query)) url.searchParams.set(key, String(value))
+
+    const headers = { [AUTH_HEADER]: token, accept: 'application/json' }
+    const init = { method, headers, redirect: 'error' }
+    // 只有写路径带 body；JSON 序列化保证内容不会因对象注入改写请求。
+    if (jsonBody !== undefined) {
+      headers['content-type'] = 'application/json'
+      init.body = JSON.stringify(jsonBody)
+    }
 
     const controller = new AbortController()
     const forward = () => controller.abort(signal?.reason)
@@ -144,12 +165,7 @@ export function createGitlabClient({ baseUrl, tokenProvider, fetchImpl = globalT
     try {
       let response
       try {
-        response = await fetchImpl(url, {
-          method: 'GET',
-          headers: { [AUTH_HEADER]: token, accept: 'application/json' },
-          redirect: 'error',
-          signal: controller.signal,
-        })
+        response = await fetchImpl(url, { ...init, signal: controller.signal })
       } catch (error) {
         if (controller.signal.aborted || error?.name === 'AbortError') throw new GitlabError('timeout')
         throw new GitlabError('network')
@@ -206,6 +222,30 @@ export function createGitlabClient({ baseUrl, tokenProvider, fetchImpl = globalT
       const data = await request({ path: `${mrPath(project, iid)}/pipelines`, query: { per_page: 1 }, signal })
       if (!Array.isArray(data)) throw new GitlabError('bad-response')
       return data.filter((item) => item !== null && typeof item === 'object')
+    },
+    /**
+     * 发一条 MR 评论（唯一写路径）。403 在这里映射成更具体的 `permission-denied`：
+     * 读路径 403 可能只是仓库不可见，写路径 403 基本等价于 token 少了 api 写权限。
+     */
+    async postNote({ project, iid, body, signal }) {
+      let data
+      try {
+        data = await request({ path: `${mrPath(project, iid)}/notes`, method: 'POST', jsonBody: { body }, signal })
+      } catch (error) {
+        if (error instanceof GitlabError && error.code === 'forbidden') {
+          throw new GitlabError('permission-denied', error.status)
+        }
+        throw error
+      }
+      if (data === null || typeof data !== 'object' || Number.isSafeInteger(data.id) === false || typeof data.body !== 'string') {
+        throw new GitlabError('bad-response')
+      }
+      return {
+        id: data.id,
+        body: data.body,
+        created_at: typeof data.created_at === 'string' ? data.created_at : null,
+        author: noteAuthor(data.author),
+      }
     },
   }
 }

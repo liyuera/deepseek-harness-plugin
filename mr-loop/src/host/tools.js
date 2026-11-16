@@ -138,6 +138,64 @@ export function createTools({ service, watcher = undefined }) {
     },
   }
 
+  /** 与 service / 解析器一致的三种处置；枚举校验在工具层先挡一次，服务层再兜底。 */
+  const WAIVER_KINDS = ['waive', 'skip', 'wontfix']
+  const waive = {
+    name: 'mr_waive',
+    description: '对当前轮的一条评审问题生成豁免草稿，或经用户确认后发 MR 评论（#ai-waive/#ai-skip/#ai-wontfix <FID> reason=<原因>）。必须先用 post:false 出草稿给用户看，用「可以 / 自定义」询问；用户确认后才 post:true 真正回帖。先发评论、后提交代码（评论会触发一次新评审）。',
+    parameters: objectSchema({
+      fid: { type: 'string', description: '评审里的 FID（大小写不敏感；回帖用评审原文大小写）' },
+      kind: { type: 'string', enum: WAIVER_KINDS, description: '默认 waive；skip=不适用当前场景，wontfix=业务决定不修' },
+      reason: { type: 'string', description: '豁免原因（单行，非空）' },
+      post: { type: 'boolean', description: '默认 false=只出草稿；用户确认后再传 true 发评论' },
+    }, ['fid', 'reason']),
+    output: { schema: {}, render: (_args, value) => text(value) },
+    async execute(args, exec) {
+      const unknown = unknownArgument(waive.parameters, args)
+      if (unknown !== null) return fail('invalid-arguments', `未知参数：${unknown}`)
+      const fid = typeof args?.fid === 'string' ? args.fid.trim() : ''
+      if (fid === '') return fail('invalid-arguments', 'fid 必填')
+      // reason 的空白 / 零宽字符由服务层判 invalid-reason；这里只挡缺失与非字符串。
+      if (typeof args?.reason !== 'string') return fail('invalid-arguments', 'reason 必填')
+      const kind = args?.kind === undefined ? 'waive' : args.kind
+      if (typeof kind !== 'string' || WAIVER_KINDS.includes(kind) === false) {
+        return fail('invalid-arguments', 'kind 只能是 waive / skip / wontfix')
+      }
+      if (args?.post !== undefined && typeof args.post !== 'boolean') return fail('invalid-arguments', 'post 必须是布尔值')
+      const sessionId = exec?.agent?.session?.id
+      try {
+        // 默认只出草稿：绝不因为「模型觉得可以」就自动发评论。
+        if (args?.post !== true) {
+          const draft = service.waiverDraft({ sessionId, fid, kind, reason: args.reason })
+          const message = [
+            '豁免草稿（尚未发送）：',
+            draft.body,
+            '',
+            '下一步：把草稿给用户看，用「可以 / 自定义」问用户是否按此发送（说「可以」就原样、说「自定义」就按用户给的原因改写）；用户确认后再调用 mr_waive({ fid, kind, reason, post: true })。未确认前不要发。',
+          ].join('\n')
+          return ok(message, { ...draft, posted: false })
+        }
+        const result = await service.postWaiver({ sessionId, fid, kind, reason: args.reason })
+        if (result.posted === true) {
+          const message = [
+            `已发豁免评论 #${result.noteId}：${result.body}`,
+            result.url,
+            '评论已先发；需要提交代码时现在再 commit + push（先评论后提交，评论会触发一次新评审）。',
+          ].join('\n')
+          return ok(message, { posted: true, noteId: result.noteId, url: result.url })
+        }
+        // 幂等命中：不重复发，也不报错。
+        return ok(`已有同 kind 指令（评论 #${result.noteId ?? '?'}），未重复发送。`, {
+          posted: false,
+          noteId: result.noteId ?? null,
+          existing: true,
+        })
+      } catch (error) {
+        return fail(errorOf(error), String(error?.message ?? error))
+      }
+    },
+  }
+
   const stop = {
     name: 'mr_stop',
     description: '停止跟踪当前 MR（保留账本）；forget=true 同时解绑并删除账本。',
@@ -177,5 +235,5 @@ export function createTools({ service, watcher = undefined }) {
     },
   }
 
-  return [bind, status, review, stop, resume]
+  return [bind, status, review, waive, stop, resume]
 }

@@ -87,3 +87,19 @@ test('#9：没有豁免（指令/账本都没有）的 FID 仍是 open 且无 in
   assert.equal(problem.instruction, undefined)
   assert.equal(snapshot.mrs[0].pending, 1)
 })
+
+// ---------------------------------------------------------------------------
+// M3：账本 decisions 的 FID 大小写与评审不一致时，UI 也要算已处置（与 mergeable 同口径）
+// ---------------------------------------------------------------------------
+test('M3：账本里的 FID 大小写与评审不一致，面板仍是 waived 且带 instruction', async () => {
+  const round = roundOf({ decisionsFinding: { fid: 'bbbbbbbbbb', level: '低' }, directives: [] })
+  const snapshot = await snapshotOf([
+    recordOf({ iid: 243, round, decisions: { BBBBBBBBBB: { kind: 'wontfix', reason: '大小写不同', noteId: 77 } } }),
+  ])
+  const [problem] = snapshot.mrs[0].problems
+  assert.equal(problem.fid, 'bbbbbbbbbb')
+  assert.equal(problem.status, 'waived')
+  assert.deepEqual(problem.instruction, { kind: 'wontfix', reason: '大小写不同', noteId: 77 })
+  // 面板的待处理计数与合并判定同口径：大小写不同也必须扣掉。
+  assert.equal(snapshot.mrs[0].pending, 0)
+})
