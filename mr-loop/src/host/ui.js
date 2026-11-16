@@ -72,7 +72,7 @@ function resultOf(record, live) {
   const binding = record?.binding ?? {}
   const decisions = record?.decisions !== null && typeof record.decisions === 'object' ? record.decisions : {}
   const todo = reviewTodo(round, decisions)
-  const mr = live?.mr
+  const mr = live?.state?.mr
   const mergeability = mr === undefined ? null : evaluateMergeable({ mr, round, decisions })
   return {
     projectPath: binding.projectPath ?? '',

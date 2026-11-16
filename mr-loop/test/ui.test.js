@@ -44,6 +44,20 @@ const recordOf = ({ iid, round, decisions = {} }) => ({
   updatedAt: '2026-11-16T10:10:00Z',
 })
 
+/** 带 live 绑定的快照：service.listStates 返回内存状态，用来钉住「活绑定必须算合并判定」 */
+async function snapshotWithLive(records, liveStates) {
+  const dir = await mkdtemp(join(tmpdir(), 'mr-loop-ui-'))
+  try {
+    for (const [index, record] of records.entries()) {
+      await writeFile(join(dir, `mr-${index}.json`), JSON.stringify(record), 'utf8')
+    }
+    const ui = createUiState({ config: config(dir), service: { listStates: () => liveStates } })
+    return await ui.snapshot({ scope: 'all' })
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+}
+
 async function snapshotOf(records) {
   const dir = await mkdtemp(join(tmpdir(), 'mr-loop-ui-'))
   try {
@@ -102,4 +116,34 @@ test('M3：账本里的 FID 大小写与评审不一致，面板仍是 waived �
   assert.deepEqual(problem.instruction, { kind: 'wontfix', reason: '大小写不同', noteId: 77 })
   // 面板的待处理计数与合并判定同口径：大小写不同也必须扣掉。
   assert.equal(snapshot.mrs[0].pending, 0)
+})
+
+test('活绑定的 MR 必须给出实时 state 与合并判定（回归：曾读取 live.mr 导致 merge 恒为 null）', async () => {
+  const round = roundOf({ decisionsFinding: { fid: 'bbbbbbbbbb', level: '低' }, directives: [] })
+  round.review.verdict = 'pass'
+  round.review.blocking = []
+  const record = recordOf({ iid: 241, round })
+  const liveState = {
+    sessionId: 'session-live',
+    binding: { projectPath: 'group/project', iid: 241 },
+    mr: {
+      state: 'opened',
+      sha: SHA,
+      draft: false,
+      has_conflicts: false,
+      blocking_discussions_resolved: true,
+      merge_status: 'can_be_merged',
+      head_pipeline: { id: 7298, status: 'success' },
+    },
+    round,
+    decisions: {},
+  }
+
+  const snapshot = await snapshotWithLive([record], [liveState])
+  const mr = snapshot.mrs[0]
+  assert.equal(mr.live, true)
+  assert.equal(mr.state, 'opened')
+  assert.equal(mr.session.id, 'session-live')
+  assert.equal(mr.merge.mergeable, true)
+  assert.equal(mr.merge.pipeline.status, 'success')
 })
