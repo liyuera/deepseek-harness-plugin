@@ -1,6 +1,6 @@
 {
   "name": "@liyuera/dsh-mr-loop",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "MR review loop for dsh: bind an existing GitLab MR, watch its review and gates, bind verdicts to head sha, and wake the main agent with a structured report instead of sleeping.",
   "type": "module",
   "main": "index.js",
