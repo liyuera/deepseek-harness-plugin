@@ -99,7 +99,7 @@
 
 ### 5.2 轮次与 SHA 绑定（本插件的核心）
 
-**轮次以 head sha 为界**：同一 sha 上重复绑定 / 重复观测都复用当前轮次，不新增；只有 head sha 变化才开启新一轮（`n + 1`）。
+**轮次以 head sha 为界**：同一 sha 上重复绑定 / 重复观测都复用当前轮次，不新增；只有 head sha 变化才开启新一轮（`n + 1`）。账本尾部若已有同一 sha 的连续重复轮次（旧版本遗留），重绑时收敛为其中 `n` 最小（最早）的一条；`n` 损坏的尾条不复用。
 
 每轮记录 `{ n, sha, observedAt, baselineAt, notes: { review?, sensitive?, mandatory? } }`。`baselineAt` 是本轮的时间基线：优先取该 sha 的 `head_pipeline.created_at`（流水线只为当前 sha 跑，等价于 push 时间），取不到时退回 `observedAt`（本轮 sha 首次观测时间）。这样「绑定前评审就已存在」的 MR 也能被正确归属，而不是一律判 stale。
 
@@ -222,6 +222,8 @@ idle ──bind──▶ watching(sha) ──head sha 变化──▶ awaiting(s
 ### 5.7 无限轮次、进度守卫与手动终结
 
 **轮次不设上限**（`maxRounds: 0`，0 = 不限）：只要还在改善，就一直跟到「可合并、且没有待修问题」为止。防死循环不靠轮数，靠「有没有进展」——真正该停的是「没在改善」，不是「轮数多」。
+
+同 sha 重绑复用轮次号与 `observedAt` 基线，但守卫计时（`stallStreak` / `reverifyStreak` / `lastProgressAt`）从重绑时刻重新开始——这些计数本来就不落账本。
 
 | 守卫 | 默认 | 判据 | 触发后 |
 |---|---|---|---|
