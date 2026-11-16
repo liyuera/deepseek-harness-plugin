@@ -3,7 +3,7 @@
  * 只陈述事实（含 unknown 与取证片段），不写「请修复」这类指令——修不修由主代理判断。
  * 「阻塞」与「可合并」共用 mergeable.js 的处置口径，避免两处说法不一致。
  */
-import { openFindings, reviewFindings, reviewTodo, isNewFinding } from './mergeable.js'
+import { openFindings, reviewFindings, reviewTodo } from './mergeable.js'
 
 const OK = '✅'
 const BAD = '⛔'
@@ -53,6 +53,13 @@ function findingLabel(item) {
 const BLOCKING_PREVIEW = 3
 const WAIVER_PREVIEW = 3
 
+/** 无效指令条数：新结构是 `{count, samples}`，旧账本里可能还是数组。 */
+function invalidCountOf(round) {
+  const invalid = round?.directives?.invalid
+  if (Array.isArray(invalid)) return invalid.length
+  return typeof invalid?.count === 'number' ? invalid.count : 0
+}
+
 /** 一条指令的展示：`FID · #ai-waive（评论 #75200） · reason 摘要`。 */
 function waiverLabel(item) {
   const noteId = item?.noteId === null || item?.noteId === undefined ? '?' : noteText(item.noteId)
@@ -77,9 +84,14 @@ export function renderReport({ binding, mr, round, decisions = {}, mergeability,
   // 这样全部豁免时仍看得出「发现过 1 条」；合并判定与唤醒明细只算未处置（todo.total）。
   const findings = reviewFindings(review)
   const waivedSuffix = todo.waived.length > 0 ? `，已豁免 ${todo.waived.length}` : ''
+  // I3：changes 但所有问题都已处置且历史未收敛为 0 时，verdict 不再拦合并——报告仍如实写
+  // ⛔ 需要修改，同时明确「问题已全部豁免」，避免和合并行的 ✅ 可合 看起来互相矛盾。
+  const excused = review !== null && review.verdict === 'changes' && todo.total === 0 && review.historicalUnresolved === 0
+  const excusedSuffix = excused ? ' · 问题已全部豁免' : ''
+  // #5：「本轮新增」统一为全部 finding 口径（含已豁免），与 reviewTodo.fresh / 合并缺口同源。
   const reviewTail = review === null
     ? ''
-    : ` · 发现 ${findings.length}（本轮新增 ${findings.filter(isNewFinding).length}${waivedSuffix}） · 历史未收敛 ${review.historicalUnresolved ?? DASH} · 本轮已验证修复 ${review.verifiedFixed ?? DASH}${review.jobDuration ? ` · Job ${noteText(review.jobDuration)}` : ''}`
+    : ` · 发现 ${findings.length}（本轮新增 ${todo.fresh}${waivedSuffix}）${excusedSuffix} · 历史未收敛 ${review.historicalUnresolved ?? DASH} · 本轮已验证修复 ${review.verifiedFixed ?? DASH}${review.jobDuration ? ` · Job ${noteText(review.jobDuration)}` : ''}`
   lines.push(`${pad('评审')}${verdictLine(review)}${reviewTail}`)
 
   const sensitive = round?.sensitive ?? null
@@ -113,6 +125,10 @@ export function renderReport({ binding, mr, round, decisions = {}, mergeability,
     const waiverText = `${todo.waived.slice(0, WAIVER_PREVIEW).map(waiverLabel).join('；')}${todo.waived.length > WAIVER_PREVIEW ? `；等 ${todo.waived.length} 条` : ''}`
     lines.push(`${pad('豁免')}${waiverText}`)
   }
+
+  // #6：格式不对的 #ai-* 指令不生效，但要让主代理知道「有别写了」——只给条数。
+  const invalidCount = invalidCountOf(round)
+  if (invalidCount > 0) lines.push(`${pad('指令')}${WARN} 无效指令 ${invalidCount} 条（格式不对，未生效）`)
 
   const pendingWaives = Object.values(decisions).filter((decision) => decision?.kind === 'waive' && decision?.noteId === undefined)
   lines.push(`${pad('待点头')}${pendingWaives.length === 0 ? '（无）' : `${pendingWaives.length} 条豁免草稿`}`)

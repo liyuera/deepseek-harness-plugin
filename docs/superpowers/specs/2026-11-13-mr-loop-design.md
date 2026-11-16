@@ -115,7 +115,15 @@ watcher 每 tick 拉 `notes?per_page=50&sort=desc`（过滤 `system: true`），
 
 弱绑定在报告里显式标注「弱绑定（无 SHA 证明）」，并在可合并判定里按 `unknown` 处理——**弱绑定的 `pass` 不能单独授权合并**（§5.3 的 fail-closed 规则）。sha 标记是否真实存在由 S0 spike 核实；缺失时全轮次都会走弱绑定，功能仍可用，但报告会一直提示。
 
-> **T1（2026-11-16）补充：每轮快照还带两类只读数据。** `directives` = 评论里 `#ai-waive / #ai-skip / #ai-wontfix` 指令的解析结果（`{ directives, invalid }`，规则见 §5.5 与决策文档 §2.1；指令评论**不参与**评审 / 门禁判定，也不进 `comments`）；`comments` = 其余人类评论最近 5 条（`{ noteId, author, createdAt, excerpt }`，excerpt 单行化 ≤120 字）。两者只给主代理决策用，不改变 sha 绑定矩阵与 stale 判定。
+> **T1（2026-11-16）补充：每轮快照还带两类只读数据。** `directives` = 评论里 `#ai-waive / #ai-skip / #ai-wontfix` 指令的解析结果，`comments` = 其余人类评论最近 5 条（`{ noteId, author, createdAt, excerpt }`，excerpt 单行化 ≤120 字）。两者只给主代理决策用，不改变 sha 绑定矩阵与 stale 判定。
+>
+> **有界结构（C1，防账本 / 工具返回膨胀）**：`round.directives = { directives, invalid, truncated }`，评论原文单独放 `round.directiveNotes`
+> - `directives`：≤50 条（按 `note.id` 降序留最新），每条只留 `{ kind, fid, reason, noteId, author, createdAt }`，**不复制评论正文**；
+> - `directiveNotes`：`round.directiveNotes`，≤20 条 `{ noteId, body（单行化 ≤500） }`，按 noteId 去重、最新优先，替代原来「每条指令复制整条 body」；
+> - `invalid`：`{ count, samples（前 5 条） }`，不逐条落盘；
+> - `truncated`：`{ directives, directiveNotes, notes, lines }`，记录被 cap 掉 / 未扫描的量；单条评论只扫前 5000 行 / 200KB。
+>
+> **来源可信（I2）**：只有「非系统 + 不是评审 note + 不是敏感/必过门禁 note」的评论才交给指令扫描；扫描前剔除 HTML 注释（`<!-- ... -->`，含 `AI_REVIEW_*` 标记）与 `备注：以下隐藏数据仅用于统计` 之后的隐藏块。评审 / 门禁正文或注释里写 `#ai-*` 不生效，避免机器人或引用文本自己放行自己。
 
 ### 5.3 门禁解析
 
@@ -174,7 +182,7 @@ idle ──bind──▶ watching(sha) ──head sha 变化──▶ awaiting(s
 
 - **唤醒去抖**：同一 `sha + 评审 note.id + findings 签名（FID + 级别 + 复验次数的稳定序列）+ 三套门禁 verdict` 只唤醒一次；两次唤醒最小间隔 30s。唤醒用 `agent.followup(message)`，`source.kind = 'plugin:mr-loop'`。同 sha 上「评论触发的新评审」（note.id 或 findings 签名变化）必须能再唤醒；同一轮内容不变（含豁免 reason 变更）不重复唤醒。
 - 有未处置 finding（`reviewTodo.total > 0`）时，唤醒正文固定三段：**动作指令段 → 报告 → 全量问题明细段**。
-  - 指令段：`有 N 处评审问题待处置（FID …）：全部问题见下方明细，修哪些由你决定；可以按问题分组并行派 subagent。`；已有有效指令时补一条 `已收到 M 条 MR 指令（#ai-waive/#ai-skip/#ai-wontfix），对应 FID 已计入豁免。`；最后 `不打算改的，按 #ai-waive <FID> reason=<原因> 回帖豁免（#ai-skip / #ai-wontfix 同理）；最后给出结论：修了哪些、用了什么指令、并引用对应 MR 评论。`
+  - 指令段：`有 N 处评审问题待处置（FID …）：全部问题见下方明细，修哪些由你决定；可以按问题分组并行派 subagent。`；已有有效指令时补一条 `已收到 M 条 MR 指令（#ai-waive/#ai-skip/#ai-wontfix），对应 FID 已计入豁免。`（**M 只算真正命中本轮的豁免数 `reviewTodo.waived.length`**，不是评论里的指令总数）；有格式不对的指令时再补 `另有 K 条 #ai-* 指令格式不对，未生效。`；最后 `不打算改的，按 #ai-waive <FID> reason=<原因> 回帖豁免（#ai-skip / #ai-wontfix 同理）；最后给出结论：修了哪些、用了什么指令、并引用对应 MR 评论。`
   - 明细段：每条 `问题 i/N · FID · 级别 · 门禁分类 · file:line` 换行 `  问题：…` `  建议：…` `  复验次数：…`；只列未处置 finding（已豁免的不进），每个字段单行化并截断 ≤200 字。
   - 没有待处置问题时不加指令段与明细段，唤醒正文只有报告，避免噪音。
 - 摘要本身仍只陈述事实、不含「请修复」这类指令；指令只属于唤醒这一层，修不修由主代理判断。
@@ -307,21 +315,25 @@ Finding = { fid, file, level, gateCategory, location, problem, suggestion, rever
 ```
 MR !240 · wisdom-financial-service-platform/wisdom-financial-credit-platform-web
 feat-V1.7.0.20261119-ly → feature-V1.7.0.20261119 · 第 3 轮 · sha 0e2a9007（强绑定）
-评审   ⛔ 需要修改 · 发现 3（本轮新增 2，已豁免 1） · 历史未收敛 0 · 本轮已验证修复 1 · Job 10s（20 秒前）
+评审   ⛔ 需要修改 · 发现 2（本轮新增 2，已豁免 2） · 问题已全部豁免 · 历史未收敛 0 · 本轮已验证修复 1 · Job 10s（20 秒前）
 敏感   ✅ 门禁通过 · 共 15 条 / 历史豁免 15 / 当前有效 0
 必过   — 无本轮结论（建议性）
-阻塞   ee81ac3eb3 · 中 · 逻辑错误；…（只列未处置）
-豁免   c3d4e5f6a7 · #ai-wontfix（评论 #75200） · 遗留文件本轮不动
+阻塞   无
+豁免   ee81ac3eb3 · #ai-waive（评论 #75200） · 风险已评估；c3d4e5f6a7 · #ai-wontfix（评论 #75201） · 遗留文件本轮不动
+指令   ⚠️ 无效指令 1 条（格式不对，未生效）
 待点头  （无）
-合并   ⛔ 差 1 项：评审有 1 处需要关注的问题…（流水线 #7181 通过 · detailed_merge_status=mergeable）
+合并   ✅ 可合 · 流水线 #7181 success
 ```
 
 状态符号固定：`✅` 通过、`⛔` 阻塞、`⏳` 未出/待定、`⚠️` 弱绑定或降级判定、`—` 无结论 / 字段缺失占位。
 
-口径补充（T1）：
+口径补充（T1 / 首轮评审反馈）：
 
-- `评审` 行的「发现 N」= 本轮评审的**全部** finding（含已被 MR 指令豁免的），`本轮新增 M` 同理；有豁免时括号里补 `，已豁免 K`，所以全部豁免时仍能看出「发现 1（本轮新增 1，已豁免 1）」。`合并` / `阻塞` 行用未处置口径（扣掉账本处置与指令豁免），两者不矛盾：一个说「发现过多少」，一个说「还差多少」。
+- `评审` 行的「发现 N」= 本轮评审的**全部** finding（含已被 MR 指令豁免的）；`本轮新增 M` 统一为**全部 finding** 口径（与 `reviewTodo.fresh` 同源），有豁免时括号里补 `，已豁免 K`，所以全部豁免时仍能看出「发现 2（本轮新增 2，已豁免 2）」。`合并` / `阻塞` 行用未处置口径（扣掉账本处置与指令豁免），两者不矛盾：一个说「发现过多少」，一个说「还差多少」。
+- **I3（verdict=changes + 问题全豁免）**：当 `verdict === 'changes'` 但 `reviewTodo.total === 0` 且 `historicalUnresolved === 0` 时，verdict 不再计入 `missing`；报告评审行仍如实写 `⛔ 需要修改`，并在后面补 ` · 问题已全部豁免`，合并行照常按剩余缺口判定（可能是 ✅ 可合）。
 - `豁免` 行只在有有效指令时出现：`FID · #ai-waive|skip|wontfix（评论 #noteId） · reason 摘要`，多条用 `；` 连接，超过 3 条折叠 `等 N 条`；账本 decisions 的处置不重复展示（它没有可引用的评论）。
+- `指令` 行只在有无效指令时出现：`⚠️ 无效指令 N 条（格式不对，未生效）`，只给条数，不展开原始行。
+- 缺口文案里的「本轮新增」只强调**未处置**的子集（`其中 N 处本轮新增未处置`），与评审行的全部 finding 口径用标签区分。
 
 报告永远是纯事实：有未处置 finding 时，动作指令只加在唤醒消息的正文前（§5.4），不改变报告的形状与「差 N 项」的口径。
 
@@ -426,7 +438,7 @@ mr-loop/
   src/host/gitlab.js      REST 客户端：6 个方法、错误分类、安全不变量（≤450）
   src/host/parse-review.js 移植 review-parser（≤360）
   src/host/parse-gates.js  敏感门禁 / 必过项 note 解析（≤180）
-  src/host/parse-directives.js MR 指令 #ai-* 解析（豁免判定、invalid、截断；≤200）
+  src/host/parse-directives.js MR 指令 #ai-* 解析（豁免判定、可信来源、有界输出；≤300）
   src/host/rounds.js       sha 绑定矩阵、轮次归并、去重（≤220）
   src/host/mergeable.js    处置口径、reviewTodo、可合并判定（≤210）
   src/host/ledger.js       JSON 账本：原子写、裁剪、读取（≤180）

@@ -213,6 +213,13 @@ const FINDING_CC = {
 }
 const reviewOf = (blocking, over = {}) => ({ noteId: 100, verdict: 'changes', blocking, nonBlocking: [], historicalUnresolved: 0, ...over })
 const waiverOf = (fid, kind = 'waive', over = {}) => ({ fid, kind, reason: `${kind} 原因`, noteId: 74000, ...over })
+const roundDirectives = (list, over = {}) => ({
+  directives: list,
+  directiveNotes: [],
+  invalid: { count: 0, samples: [] },
+  truncated: { directives: 0, directiveNotes: 0, notes: 0, lines: 0 },
+  ...over,
+})
 
 test('有未处置 finding → 指令段 + 报告 + 全量问题明细三段；已豁免 FID 不进明细', async () => {
   const h = harness({
@@ -222,7 +229,7 @@ test('有未处置 finding → 指令段 + 报告 + 全量问题明细三段；�
       {
         review: reviewOf([FINDING_AA, FINDING_BB, FINDING_CC]),
         // cc 已被指令豁免：它不出现在待处置数里，也不进明细；但「已收到 M 条」要算它。
-        directives: { directives: [waiverOf('cc')], invalid: [] },
+        directives: roundDirectives([waiverOf('cc')]),
       },
       { reviewArrived: true },
     ),
@@ -678,7 +685,7 @@ test('全部豁免 → 唤醒正文只有报告，不追加指令段与明细段
     snapshot: snapshotRound(
       {
         review: reviewOf([FINDING_AA, FINDING_BB]),
-        directives: { directives: [waiverOf('aa', 'waive'), waiverOf('bb', 'wontfix')], invalid: [] },
+        directives: roundDirectives([waiverOf('aa', 'waive'), waiverOf('bb', 'wontfix')]),
       },
       { reviewArrived: true },
     ),
@@ -768,4 +775,47 @@ test('明细段：问题/建议单行化并截断 ≤200 字，第三方文本�
   const problemLine = text.split('\n').find((line) => line.startsWith('  问题：'))
   assert.equal(problemLine.length, '  问题：'.length + 200)
   assert.equal(problemLine.endsWith('…'), true)
+})
+
+// ---------------------------------------------------------------------------
+// #8 / #6：唤醒里的指令计数只算命中本轮、无效指令只提示 count
+// ---------------------------------------------------------------------------
+
+test('#8：「已收到 M 条 MR 指令」用真正命中本轮的豁免条数，不是指令总数', async () => {
+  const h = harness({
+    notes: [{ id: 1, body: 'AI Code Review' }],
+    report: () => 'REPORT',
+    snapshot: snapshotRound(
+      {
+        review: reviewOf([FINDING_AA, FINDING_BB]),
+        // 第二条指令属于旧问题（FID 不在本轮 review）：计入 directive 总数，但不是本轮豁免。
+        directives: roundDirectives([waiverOf('aa'), waiverOf('zzzz9999')]),
+      },
+      { reviewArrived: true },
+    ),
+  })
+  await h.watcher.tick('s')
+  const text = h.notified[0]
+  assert.match(text, /已收到 1 条 MR 指令/)
+  assert.doesNotMatch(text, /已收到 2 条/)
+})
+
+test('#6：唤醒里提示无效指令条数（只给 count），待处置计数不受影响', async () => {
+  const h = harness({
+    notes: [{ id: 1, body: 'AI Code Review' }],
+    report: () => 'REPORT',
+    snapshot: snapshotRound(
+      {
+        review: reviewOf([FINDING_AA]),
+        directives: roundDirectives([], {
+          invalid: { count: 3, samples: [{ noteId: 9, line: 1, why: 'invalid-fid' }] },
+        }),
+      },
+      { reviewArrived: true },
+    ),
+  })
+  await h.watcher.tick('s')
+  const text = h.notified[0]
+  assert.match(text, /有 1 处评审问题待处置/)
+  assert.match(text, /另有 3 条 #ai-\* 指令格式不对，未生效。/)
 })

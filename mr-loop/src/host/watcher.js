@@ -73,6 +73,13 @@ function findingDetail(item, index, total) {
   ].join('\n')
 }
 
+/** 无效指令条数：新结构 `{count,samples}`，旧账本里可能还是数组（只用于提示，不参与判定）。 */
+function invalidCountOf(round) {
+  const invalid = round?.directives?.invalid
+  if (Array.isArray(invalid)) return invalid.length
+  return typeof invalid?.count === 'number' ? invalid.count : 0
+}
+
 /** 全量问题明细段：只列未处置 finding（已豁免的不进，避免让主代理重复决策）。 */
 function findingsDetail(open) {
   return `问题明细：\n${open.map((item, index) => findingDetail(item, index, open.length)).join('\n')}`
@@ -89,13 +96,16 @@ function withReviewDirective(state, text) {
   if (todo.total === 0) return text
   const open = openFindings(round, state?.decisions)
   const preview = `${todo.fids.join('、')}${todo.total > todo.fids.length ? '、…' : ''}`
-  const directives = Array.isArray(round?.directives?.directives) ? round.directives.directives : []
   const lines = [
     `有 ${todo.total} 处评审问题待处置（${preview}）：全部问题见下方明细，修哪些由你决定；可以按问题分组并行派 subagent。`,
   ]
-  if (directives.length > 0) {
-    lines.push(`已收到 ${directives.length} 条 MR 指令（#ai-waive/#ai-skip/#ai-wontfix），对应 FID 已计入豁免。`)
+  // #8：只算真正命中本轮的豁免条数——旧轮 / 不相关 FID 的指令不该冒充「已豁免 M 条」。
+  if (todo.waived.length > 0) {
+    lines.push(`已收到 ${todo.waived.length} 条 MR 指令（#ai-waive/#ai-skip/#ai-wontfix），对应 FID 已计入豁免。`)
   }
+  // #6：格式不对的指令不生效，但要让主代理知道「写了但没生效」，只提示条数。
+  const invalidCount = invalidCountOf(round)
+  if (invalidCount > 0) lines.push(`另有 ${invalidCount} 条 #ai-* 指令格式不对，未生效。`)
   lines.push(WAIVER_HINT)
   return `${lines.join('\n')}\n\n${text}\n\n${findingsDetail(open)}`
 }

@@ -115,7 +115,9 @@ export function reviewTodo(round, decisions = {}) {
   }
   return {
     total: open.length,
-    fresh: open.filter(isNewFinding).length,
+    // 「本轮新增」统一为全部 finding 口径（含已豁免），报告直接用它；合并缺口里的
+    // 「其中 N 处本轮新增未处置」只取未处置子集，标签写清，两个数字含义不混。
+    fresh: findings.filter(isNewFinding).length,
     fids: open.slice(0, FID_PREVIEW).map(fidLabel),
     waived,
   }
@@ -123,11 +125,12 @@ export function reviewTodo(round, decisions = {}) {
 
 /**
  * 把「需要关注的问题」与「本轮新增」合成一条 missing：
- * `评审有 2 处需要关注的问题（其中 1 处本轮新增）：FID a1b2c3d4（低）、…`。
- * 两者有重叠，但不拆成两条——用户要的是一个结论，不是重复计数。
+ * `评审有 2 处需要关注的问题（其中 1 处本轮新增未处置）：FID a1b2c3d4（低）、…`。
+ * 缺口里只强调**未处置**的新增（已豁免的不用再修）；报告行的「本轮新增」是全部
+ * finding 口径（`reviewTodo.fresh`），两处标签写清，数字含义不混。
  */
 function findingGap({ total, fresh, fids }) {
-  const freshSuffix = fresh > 0 ? `（其中 ${fresh} 处本轮新增）` : ''
+  const freshSuffix = fresh > 0 ? `（其中 ${fresh} 处本轮新增未处置）` : ''
   const more = total > fids.length ? `等 ${total} 处` : ''
   return `评审有 ${total} 处需要关注的问题${freshSuffix}：${fids.join('、')}${more}`
 }
@@ -160,15 +163,22 @@ export function evaluateMergeable({ mr, round, decisions = {} }) {
   if (review === null) {
     missing.push('AI 评审结论未知（未出或解析失败）')
   } else {
+    // 用户口径：结论 + 需要关注的问题 + 历史未收敛 + 本轮新增，四个维度都为 0/通过才提示合并。
+    const todo = reviewTodo(round, decisions)
+    const history = historyGap(review)
     if (round?.binding !== 'strong') {
       missing.push('AI 评审为弱绑定（无 SHA 证明），需人工确认')
     } else if (verdict !== 'pass') {
-      missing.push(verdict === 'changes' ? 'AI 评审结论为需要修改' : 'AI 评审结论未知（未出或解析失败）')
+      // I3：verdict=changes 但所有 finding 都已被指令/账本处置、且历史未收敛为 0 时，
+      // 不再把 verdict 本身当成缺口——决策文档「有效指令的 FID 视为已处置，不拦合并」。
+      const excused = verdict === 'changes' && todo.total === 0 && history === null
+      if (!excused) missing.push(verdict === 'changes' ? 'AI 评审结论为需要修改' : 'AI 评审结论未知（未出或解析失败）')
     }
-    // 用户口径：结论 + 需要关注的问题 + 历史未收敛 + 本轮新增，四个维度都为 0/通过才提示合并。
-    const todo = reviewTodo(round, decisions)
-    if (todo.total > 0) missing.push(findingGap(todo))
-    const history = historyGap(review)
+    if (todo.total > 0) {
+      // 缺口里的「本轮新增」只算未处置（已豁免的不必再修）；todo.fresh 是全部 finding 口径。
+      const openFresh = openFindings(round, decisions).filter(isNewFinding).length
+      missing.push(findingGap({ ...todo, fresh: openFresh }))
+    }
     if (history !== null) missing.push(history)
   }
 

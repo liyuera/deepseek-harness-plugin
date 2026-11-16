@@ -10,7 +10,7 @@
 import { readdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { expandHome } from './ledger.js'
-import { evaluateMergeable, reviewTodo, isDisposed } from './mergeable.js'
+import { evaluateMergeable, reviewTodo, isDisposed, isDisposedFinding, directiveFor } from './mergeable.js'
 
 const MAX_TEXT = 400
 const MAX_COMMENTS = 5
@@ -72,6 +72,8 @@ const kindOfDecision = (decision) => (isDisposed(decision) ? decision.kind : nul
 
 /**
  * 问题状态：open / waived(含 skip/wontfix) / fixed。
+ * 处置来源有两处（决策文档 §2.1）：账本 decisions，以及 MR 评论里的有效 `#ai-*` 指令；
+ * 任何一个命中都算已处置，和报告 / 合并判定同口径（#9）。
  * fixed = 上一轮有、本轮没有（有前一轮可比时才判定，否则不猜）。
  */
 function problemsOf(record) {
@@ -85,7 +87,11 @@ function problemsOf(record) {
   const problems = current.map((item) => {
     const fid = sanitizeId(item?.fid) ?? '?'
     const decision = decisions[fid] ?? decisions[String(item?.fid ?? '')]
-    const kind = kindOfDecision(decision)
+    const fromLedger = kindOfDecision(decision)
+    // 账本处置优先；没有时看 MR 评论里的指令（旧的线上账本 round 里没有 directives 也不抛）。
+    const directive = directiveFor(round, item?.fid)
+    const source = fromLedger !== null ? decision : directive
+    const kind = fromLedger ?? directive?.kind ?? null
     return {
       fid,
       level: text(item?.level, 40) ?? '',
@@ -96,10 +102,10 @@ function problemsOf(record) {
       suggestion: text(item?.suggestion),
       snippet: text(item?.snippet ?? item?.sourceSnippet),
       status: kind === null ? 'open' : 'waived',
-      instruction: kind === null ? undefined : {
+      instruction: source === null || source === undefined ? undefined : {
         kind,
-        reason: text(decision?.reason, 200),
-        noteId: Number.isSafeInteger(decision?.noteId) ? decision.noteId : undefined,
+        reason: text(source?.reason, 200),
+        noteId: Number.isSafeInteger(source?.noteId) ? source.noteId : undefined,
       },
     }
   })
@@ -108,7 +114,8 @@ function problemsOf(record) {
   for (const item of findingsOf(previous)) {
     const fid = String(item?.fid ?? '')
     if (fid === '' || currentFids.has(fid.toUpperCase())) continue
-    if (decisions[fid] !== undefined || decisions[fid.toUpperCase()] !== undefined) continue
+    // 上一轮的问题已被指令 / 账本处置：不再标成 fixed（它没有「本轮消失后修好」的含义）。
+    if (isDisposedFinding(round, decisions, fid)) continue
     problems.push({
       fid,
       level: text(item?.level, 40) ?? '',

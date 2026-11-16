@@ -33,7 +33,10 @@ test('弱绑定 + pass → 不可合并，要求人工确认', () => {
 })
 
 test('评审 changes / 敏感阻止 / 冲突 / 合并态不许', () => {
-  const changes = { verdict: 'changes', blocking: [], nonBlocking: [], historicalUnresolved: 0 }
+  // changes 且没有任何 finding：按 I3 口径 verdict 不再单独拦（真实模板不会产出这种评审）。
+  const emptyChanges = { verdict: 'changes', blocking: [], nonBlocking: [], historicalUnresolved: 0 }
+  assert.equal(evaluateMergeable({ mr: mr(), round: round({ review: emptyChanges }), decisions: {} }).mergeable, true)
+  const changes = { verdict: 'changes', blocking: [{ fid: 'aa', level: '中' }], nonBlocking: [], historicalUnresolved: 0 }
   assert.equal(evaluateMergeable({ mr: mr(), round: round({ review: changes }), decisions: {} }).mergeable, false)
   assert.equal(evaluateMergeable({ mr: mr(), round: round({ sensitive: { verdict: 'block' } }), decisions: {} }).mergeable, false)
   assert.equal(evaluateMergeable({ mr: mr({ has_conflicts: true }), round: round(), decisions: {} }).mergeable, false)
@@ -68,7 +71,7 @@ test('pass 但仍有未处置问题 → 只有豁免过才可合并', () => {
   const r1 = evaluateMergeable({ mr: mr(), round: round({ review }), decisions: {} })
   assert.equal(r1.mergeable, false)
   assert.equal(r1.missing.length, 1)
-  assert.match(r1.missing[0], /评审有 2 处需要关注的问题（其中 2 处本轮新增）/)
+  assert.match(r1.missing[0], /评审有 2 处需要关注的问题（其中 2 处本轮新增未处置）/)
   assert.match(r1.missing[0], /FID aa（中）、FID bb（低）/)
   const r2 = evaluateMergeable({ mr: mr(), round: round({ review }), decisions: { aa: { kind: 'waive' }, bb: { kind: 'skip' } } })
   assert.equal(r2.mergeable, true)
@@ -122,7 +125,7 @@ test('本轮新增按复验次数判定：缺失 / <= 1 算本轮首次发现，
   }
   const r = evaluateMergeable({ mr: mr(), round: round({ review }), decisions: {} })
   assert.equal(r.mergeable, false)
-  assert.match(r.missing[0], /评审有 3 处需要关注的问题（其中 2 处本轮新增）/)
+  assert.match(r.missing[0], /评审有 3 处需要关注的问题（其中 2 处本轮新增未处置）/)
 })
 
 test('三类缺口合成 1~2 条 missing：findings 一条、历史未收敛一条，不重复', () => {
@@ -135,7 +138,7 @@ test('三类缺口合成 1~2 条 missing：findings 一条、历史未收敛一�
   const r = evaluateMergeable({ mr: mr(), round: round({ review }), decisions: {} })
   assert.equal(r.mergeable, false)
   assert.equal(r.missing.length, 2)
-  assert.match(r.missing[0], /评审有 1 处需要关注的问题（其中 1 处本轮新增）：FID a1b2c3d4（低）/)
+  assert.match(r.missing[0], /评审有 1 处需要关注的问题（其中 1 处本轮新增未处置）：FID a1b2c3d4（低）/)
   assert.match(r.missing[1], /历史未收敛问题 1 条/)
 })
 
@@ -251,7 +254,8 @@ test('reviewTodo：只有 waive / skip / wontfix 终结；fix / pending / 未知
     cc: { kind: 'wontfix' },
     dd: { kind: 'fix' },
   })
-  assert.deepEqual(waived, { total: 1, fresh: 1, fids: ['FID dd（低）'], waived: [] })
+  // fresh 是全部 finding 口径：aa/bb/cc/dd 都没有复验次数 → 4 条都算本轮新增。
+  assert.deepEqual(waived, { total: 1, fresh: 4, fids: ['FID dd（低）'], waived: [] })
 
   const pending = mergeable.reviewTodo(todoRound(review), {
     aa: { kind: 'pending' },
@@ -276,7 +280,12 @@ test('reviewTodo：无评审 / 无 finding → 零值，fids 为空', () => {
 /** 带指令的 round：结构同 buildRound 输出的 round.directives。 */
 const directiveRound = (review, directives) => ({
   review,
-  directives: { directives, invalid: [] },
+  directives: {
+    directives,
+    directiveNotes: [],
+    invalid: { count: 0, samples: [] },
+    truncated: { directives: 0, directiveNotes: 0, notes: 0, lines: 0 },
+  },
 })
 const directive = (fid, kind = 'waive', over = {}) => ({ fid, kind, reason: `${kind} 原因`, noteId: 75200, ...over })
 
@@ -306,7 +315,8 @@ test('reviewTodo：指令处置后 total/fids 只算剩余，waived 带出指令
   const round = directiveRound(review, [directive('aa', 'waive', { reason: '风险已评估' })])
   assert.deepEqual(mergeable.reviewTodo(round, {}), {
     total: 1,
-    fresh: 0,
+    // fresh 统一为「全部 finding 的本轮新增」口径（含已豁免），报告与合并缺口共用。
+    fresh: 1,
     fids: ['FID bb（低）'],
     waived: [{ fid: 'aa', kind: 'waive', reason: '风险已评估', noteId: 75200 }],
   })
@@ -322,7 +332,7 @@ test('reviewTodo：全部豁免 → 零未处置，waived 保留全部指令（�
   const round = directiveRound(review, [directive('aa', 'skip'), directive('bb', 'wontfix')])
   assert.deepEqual(mergeable.reviewTodo(round, {}), {
     total: 0,
-    fresh: 0,
+    fresh: 2,
     fids: [],
     waived: [
       { fid: 'bb', kind: 'wontfix', reason: 'wontfix 原因', noteId: 75200 },
@@ -345,7 +355,8 @@ test('reviewTodo：指令与账本处置叠加计数一致；waived 只来自指
   const round = directiveRound(review, [directive('aa')])
   const todo = mergeable.reviewTodo(round, { bb: { kind: 'skip' } })
   assert.equal(todo.total, 1)
-  assert.equal(todo.fresh, 0) // aa 被指令豁免、bb 被账本豁免：fresh 只剩未处置的 cc（复验 2 → 不算新增）
+  // fresh 用全部 finding 口径：aa/bb 复验 1 算本轮新增，cc 复验 2 不算 → 2。
+  assert.equal(todo.fresh, 2)
   assert.deepEqual(todo.fids, ['FID cc（低）'])
   assert.deepEqual(todo.waived, [{ fid: 'aa', kind: 'waive', reason: 'waive 原因', noteId: 75200 }])
 })
@@ -396,7 +407,7 @@ test('evaluateMergeable：有指令时「需要关注 / 本轮新增」只统计
   const review = {
     verdict: 'pass',
     blocking: [
-      { fid: 'aa', level: '中', reverifyCount: 1 }, // 已豁免且是本轮新增：不进计数
+      { fid: 'aa', level: '中', reverifyCount: 1 }, // 已豁免且是本轮新增：进 fresh，但不进缺口
       { fid: 'bb', level: '高', reverifyCount: 2 }, // 未处置、旧问题
       { fid: 'cc', level: '低', reverifyCount: 1 }, // 未处置、本轮新增
     ],
@@ -409,6 +420,58 @@ test('evaluateMergeable：有指令时「需要关注 / 本轮新增」只统计
     decisions: {},
   })
   assert.equal(r.mergeable, false)
-  assert.match(r.missing[0], /评审有 2 处需要关注的问题（其中 1 处本轮新增）：FID bb（高）、FID cc（低）/)
+  // fresh 统一为全部 finding：aa（已豁免）与 cc 都算本轮新增 → 2。
+  assert.match(r.missing[0], /评审有 2 处需要关注的问题（其中 1 处本轮新增未处置）：FID bb（高）、FID cc（低）/)
   assert.doesNotMatch(r.missing[0], /FID aa/)
+})
+
+// ---------------------------------------------------------------------------
+// I3：verdict=changes 但问题已全部豁免 → 不再因 verdict 拦合并
+// ---------------------------------------------------------------------------
+
+const changesReview = (blocking, over = {}) => ({
+  verdict: 'changes', blocking, nonBlocking: [], historicalUnresolved: 0, ...over,
+})
+
+test('I3：changes + 问题全被指令豁免 + 历史未收敛 0 → 可合；报告口径另测', () => {
+  const review = changesReview([{ fid: 'aa', level: '中', reverifyCount: 1 }, { fid: 'bb', level: '低', reverifyCount: 1 }])
+  const roundWithWaivers = round({ review, ...directiveRound(review, [directive('aa'), directive('bb', 'wontfix')]) })
+  const r = evaluateMergeable({ mr: mr(), round: roundWithWaivers, decisions: {} })
+  assert.equal(r.mergeable, true)
+  assert.deepEqual(r.missing, [])
+
+  // 账本处置同样算「已处置」：changes + 全部 waive 也能放行。
+  const byLedger = evaluateMergeable({
+    mr: mr(),
+    round: round({ review, ...directiveRound(review, []) }),
+    decisions: { aa: { kind: 'waive' }, bb: { kind: 'skip' } },
+  })
+  assert.equal(byLedger.mergeable, true)
+})
+
+test('I3：还有未处置 finding 时 changes 仍然拦（不因豁免了一部分就放行 verdict）', () => {
+  const review = changesReview([{ fid: 'aa', level: '中', reverifyCount: 1 }, { fid: 'bb', level: '低', reverifyCount: 1 }])
+  const r = evaluateMergeable({
+    mr: mr(),
+    round: round({ review, ...directiveRound(review, [directive('aa')]) }),
+    decisions: {},
+  })
+  assert.equal(r.mergeable, false)
+  assert.deepEqual(r.missing, [
+    'AI 评审结论为需要修改',
+    '评审有 1 处需要关注的问题（其中 1 处本轮新增未处置）：FID bb（低）',
+  ])
+})
+
+test('I3：历史未收敛非 0 / 未声明时，changes 不因全豁免而放行 verdict', () => {
+  const review = changesReview([{ fid: 'aa', level: '中', reverifyCount: 1 }], { historicalUnresolved: 1 })
+  const roundWaived = round({ review, ...directiveRound(review, [directive('aa')]) })
+  const withHistory = evaluateMergeable({ mr: mr(), round: roundWaived, decisions: {} })
+  assert.equal(withHistory.mergeable, false)
+  assert.deepEqual(withHistory.missing, ['AI 评审结论为需要修改', '历史未收敛问题 1 条'])
+
+  const undeclared = changesReview([{ fid: 'aa', level: '中', reverifyCount: 1 }], { historicalUnresolved: null })
+  const nullHistory = evaluateMergeable({ mr: mr(), round: round({ review: undeclared, ...directiveRound(undeclared, [directive('aa')]) }), decisions: {} })
+  assert.equal(nullHistory.mergeable, false)
+  assert.deepEqual(nullHistory.missing, ['AI 评审结论为需要修改', '历史未收敛问题未声明'])
 })

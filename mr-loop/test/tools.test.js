@@ -79,19 +79,29 @@ test('mr_review 返回 directives / comments 结构化数据，并渲染进模�
   const directives = {
     directives: [{
       kind: 'waive', fid: 'a1b2c3d4', reason: '风险已评估', noteId: 75200,
-      author: 'alice', createdAt: '2026-11-16T10:00:00Z', body: '#ai-waive a1b2c3d4 reason=风险已评估',
+      author: 'alice', createdAt: '2026-11-16T10:00:00Z',
     }],
-    invalid: [{ noteId: 9, line: 1, why: 'invalid-fid' }],
+    directiveNotes: [{ noteId: 75200, body: '#ai-waive a1b2c3d4 reason=风险已评估' }],
+    invalid: { count: 1, samples: [{ noteId: 9, line: 1, why: 'invalid-fid' }] },
+    truncated: { directives: 0, directiveNotes: 0, notes: 0, lines: 0 },
   }
+  const directiveNotes = [{ noteId: 75200, body: '#ai-waive a1b2c3d4 reason=风险已评估' }]
   const comments = [{ noteId: 31, author: 'bob', createdAt: '2026-11-16T10:01:00Z', excerpt: '顺手改个命名' }]
   const service = fakeService({
-    review: () => ({ round: { sha: 'abc', n: 2, directives, comments }, decisions: {} }),
+    review: () => ({ round: { sha: 'abc', n: 2, directives, directiveNotes, comments }, decisions: {} }),
   })
   const reviewDef = byName(createTools({ service }), 'mr_review')
   const review = await reviewDef.execute({}, exec)
   assert.equal(review.ok, true)
   assert.deepEqual(review.data.directives, directives)
+  assert.deepEqual(review.data.directiveNotes, directiveNotes)
   assert.deepEqual(review.data.comments, comments)
+  // #10：directives / comments 不在 round 里重复回一遍（只保留顶层一份，避免返回体翻倍）。
+  assert.equal('directives' in review.data.round, false)
+  assert.equal('directiveNotes' in review.data.round, false)
+  assert.equal('comments' in review.data.round, false)
+  assert.equal(JSON.stringify(review.data.round).includes('"directives"'), false)
+  assert.equal(JSON.stringify(review.data.round).includes('"comments"'), false)
   // 工具描述承诺的结构必须真的进到模型可见文本，不能只剩摘要。
   const rendered = reviewDef.output.render({}, review).map((part) => part.text).join('')
   assert.match(rendered, /"directives"/)
@@ -106,5 +116,6 @@ test('mr_review：旧 round 没有 directives / comments 时回落到 null / []�
   const review = await byName(tools, 'mr_review').execute({}, exec)
   assert.equal(review.ok, true)
   assert.equal(review.data.directives, null)
+  assert.deepEqual(review.data.directiveNotes, [])
   assert.deepEqual(review.data.comments, [])
 })

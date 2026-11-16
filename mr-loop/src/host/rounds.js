@@ -8,7 +8,7 @@
  */
 import { parseReview, isReviewBody } from './parse-review.js'
 import { parseSensitiveGate, parseMandatoryGate } from './parse-gates.js'
-import { parseDirectives, authorOf, clipText } from './parse-directives.js'
+import { parseDirectives, authorOf, clipText, hasDirectiveLine } from './parse-directives.js'
 
 const SHA_MARKER_RE = /<!--\s*AI_REVIEW_SHA\s+([0-9a-f]{7,64})\s*-->/i
 
@@ -77,18 +77,35 @@ const COMMENT_LIMIT = 5
 const EXCERPT_LIMIT = 120
 
 /**
+ * 指令扫描的输入（I2）：只有「非系统 + 不是评审 note + 不是敏感/必过门禁 note」的
+ * 评论才可能携带有效指令。评审 / 门禁正文里写 `#ai-*` 不能豁免任何东西——否则机器人
+ * 或引用文本可以自己放行自己。
+ */
+function directiveCandidates({ notes, reviewOptions, cfg }) {
+  const candidates = []
+  for (const note of notes ?? []) {
+    if (!note || typeof note !== 'object' || note.system === true) continue
+    const body = String(note.body ?? '')
+    if (isReviewBody(body, reviewOptions)) continue
+    if (isSensitiveNote(body, cfg) || isMandatoryNote(body, cfg)) continue
+    candidates.push(note)
+  }
+  return candidates
+}
+
+/**
  * 其它评论（非系统 / 非评审 / 非门禁 / 非指令）：最近 5 条，新的在前。
  * 指令评论（含 reason 写错的无效指令）不进这里——它们已在 directives 里单独呈现，
- * 混进「普通评论」只会让主代理重复读同一段文本。
+ * 混进「普通评论」只会让主代理重复读同一段文本；原文由 directiveNotes 有界保存。
  */
-function otherComments({ notes, reviewOptions, cfg, directiveNoteIds }) {
+function otherComments({ notes, reviewOptions, cfg }) {
   const comments = []
   for (const note of notes ?? []) {
     if (!note || note.system === true) continue
     const body = String(note.body ?? '')
     if (isReviewBody(body, reviewOptions)) continue
     if (isSensitiveNote(body, cfg) || isMandatoryNote(body, cfg)) continue
-    if (directiveNoteIds.has(note.id)) continue
+    if (hasDirectiveLine(body)) continue
     comments.push({
       noteId: note.id ?? null,
       author: authorOf(note),
@@ -118,11 +135,10 @@ export function buildRound({ mr, notes, cfg, observedAt }) {
   // 评审标记来自配置 reviewMarker：与 reviewTitlePrefix / sensitiveTitle 一样是
   // 「评审机器人格式变了」时的可配置出口（设计 §12）。
   const reviewOptions = { marker: cfg?.reviewMarker }
-  const directives = parseDirectives(notes)
-  const directiveNoteIds = new Set([
-    ...directives.directives.map((item) => item.noteId),
-    ...directives.invalid.map((item) => item.noteId),
-  ])
+  const parsedDirectives = parseDirectives(directiveCandidates({ notes, reviewOptions, cfg }))
+  // 评论原文（directiveNotes）单独放 round 顶层：directive 条目本身不再复制 body，
+  // 账本 / mr_review 里每条指令只留结构化字段（C1 有界）。
+  const { directiveNotes, ...directives } = parsedDirectives
 
   for (const note of notes ?? []) {
     if (!note || note.system === true) continue
@@ -182,7 +198,8 @@ export function buildRound({ mr, notes, cfg, observedAt }) {
     sensitive: sensitive === null ? null : { noteId: sensitive.note.id, ...sensitive.parsed },
     mandatory: mandatory === null ? null : { noteId: mandatory.note.id, ...mandatory.parsed },
     directives,
-    comments: otherComments({ notes, reviewOptions, cfg, directiveNoteIds }),
+    directiveNotes,
+    comments: otherComments({ notes, reviewOptions, cfg }),
     dropped,
   }
 }

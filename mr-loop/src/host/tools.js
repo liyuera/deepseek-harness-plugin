@@ -112,12 +112,16 @@ export function createTools({ service, watcher = undefined }) {
         const { round, decisions } = service.review({ sessionId })
         // T1 读路径：指令与其它评论直接给模型看，主代理据此决定修哪些 / 豁免哪些；
         // 旧账本里的轮次可能没有这两个字段，回落到 null / [] 而不是 undefined。
-        const data = {
-          round,
-          decisions,
-          directives: round?.directives ?? null,
-          comments: Array.isArray(round?.comments) ? round.comments : [],
+        const directives = round?.directives ?? null
+        const directiveNotes = Array.isArray(round?.directiveNotes) ? round.directiveNotes : []
+        const comments = Array.isArray(round?.comments) ? round.comments : []
+        // #10：directives / directiveNotes / comments 只回顶层一份——留在 round 里会让返回体翻倍。
+        let roundView = round
+        if (round !== null && typeof round === 'object') {
+          const { directives: _directives, directiveNotes: _directiveNotes, comments: _comments, ...rest } = round
+          roundView = rest
         }
+        const data = { round: roundView, decisions, directives, directiveNotes, comments }
         if (args?.history === true) {
           const state = service.getState(sessionId)
           data.history = (state?.rounds ?? []).map((item) => ({
