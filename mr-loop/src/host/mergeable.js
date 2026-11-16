@@ -56,20 +56,36 @@ function scalar(value) {
 
 const FID_PREVIEW = 3
 
+/** 单条 finding 的 FID 预览：`FID a1b2c3d4（低）`，级别缺失时省略括号。 */
+function fidLabel(item) {
+  const fid = scalar(item?.fid) || '?'
+  const level = scalar(item?.level)
+  return `FID ${fid}${level ? `（${level}）` : ''}`
+}
+
+/**
+ * 未处置 finding 的统一口径：报告（合并行的缺口）与唤醒（前置指令）共用，
+ * 避免「报告说有 1 处、唤醒却说没有」。`fids` 只给前 3 个预览，总数看 `total`。
+ * @returns {{ total: number, fresh: number, fids: string[] }}
+ */
+export function reviewTodo(round, decisions = {}) {
+  const open = openFindings(round?.review, decisions)
+  return {
+    total: open.length,
+    fresh: open.filter(isNewFinding).length,
+    fids: open.slice(0, FID_PREVIEW).map(fidLabel),
+  }
+}
+
 /**
  * 把「需要关注的问题」与「本轮新增」合成一条 missing：
  * `评审有 2 处需要关注的问题（其中 1 处本轮新增）：FID a1b2c3d4（低）、…`。
  * 两者有重叠，但不拆成两条——用户要的是一个结论，不是重复计数。
  */
-function findingGap(open, fresh) {
+function findingGap({ total, fresh, fids }) {
   const freshSuffix = fresh > 0 ? `（其中 ${fresh} 处本轮新增）` : ''
-  const preview = open.slice(0, FID_PREVIEW).map((item) => {
-    const fid = scalar(item?.fid) || '?'
-    const level = scalar(item?.level)
-    return `FID ${fid}${level ? `（${level}）` : ''}`
-  })
-  const more = open.length > FID_PREVIEW ? `等 ${open.length} 处` : ''
-  return `评审有 ${open.length} 处需要关注的问题${freshSuffix}：${preview.join('、')}${more}`
+  const more = total > fids.length ? `等 ${total} 处` : ''
+  return `评审有 ${total} 处需要关注的问题${freshSuffix}：${fids.join('、')}${more}`
 }
 
 /**
@@ -106,8 +122,8 @@ export function evaluateMergeable({ mr, round, decisions = {} }) {
       missing.push(verdict === 'changes' ? 'AI 评审结论为需要修改' : 'AI 评审结论未知（未出或解析失败）')
     }
     // 用户口径：结论 + 需要关注的问题 + 历史未收敛 + 本轮新增，四个维度都为 0/通过才提示合并。
-    const open = openFindings(review, decisions)
-    if (open.length > 0) missing.push(findingGap(open, open.filter(isNewFinding).length))
+    const todo = reviewTodo(round, decisions)
+    if (todo.total > 0) missing.push(findingGap(todo))
     const history = historyGap(review)
     if (history !== null) missing.push(history)
   }

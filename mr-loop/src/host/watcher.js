@@ -6,6 +6,7 @@
  * 终止路径（守卫暂停 / token / merged / closed / 可合）没有下一个 tick，唤醒立即送达。
  */
 import { evaluateGuards } from './guards.js'
+import { reviewTodo } from './mergeable.js'
 
 const WAKE_MIN_GAP_MS = 30000
 const TERMINAL_PIPELINE = new Set(['success', 'failed', 'canceled'])
@@ -21,6 +22,18 @@ function wakeKey(round) {
   const sensitive = round?.sensitive?.verdict ?? 'none'
   const mandatory = round?.mandatory?.verdict ?? 'none'
   return `review:${sha}:${review}:${sensitive}:${mandatory}`
+}
+
+/**
+ * 唤醒正文 = 报告；有未处置 finding 时最前面加一段可执行指令。
+ * 指令只属于唤醒这一层，报告本身仍是事实陈述（「合并」行说差几项）；
+ * 没有待处置问题就原样返回，避免给既有唤醒加噪音。
+ */
+function withReviewDirective(state, text) {
+  const todo = reviewTodo(state?.round, state?.decisions)
+  if (todo.total === 0) return text
+  const preview = `${todo.fids.join('、')}${todo.total > todo.fids.length ? '、…' : ''}`
+  return `有 ${todo.total} 处评审问题待处置（${preview}）：现在派发修复（按 FID 定位、TDD、跑测试、push），push 后用 mr_status 取新一轮；不打算改就在 GitLab 回帖豁免（写回未实现，需人工）。\n\n${text}`
 }
 
 /**
@@ -221,17 +234,17 @@ export function createWatcher({ cfg, gitlab, service, notify, logger = undefined
     if (next.mergeability?.mergeable === true) {
       if (result.becameMergeable === true) {
         // 可合并没有下一个 tick：立即送达。
-        wake(sessionId, `${service.report(next)}\n\n可合并，监视结束。`, `mergeable:${String(next.round?.sha ?? '')}`, true)
+        wake(sessionId, withReviewDirective(next, `${service.report(next)}\n\n可合并，监视结束。`), `mergeable:${String(next.round?.sha ?? '')}`, true)
       }
       clear(sessionId)
       return
     }
-    if (reviewArrived) wake(sessionId, service.report(next), wakeKey(next.round))
+    if (reviewArrived) wake(sessionId, withReviewDirective(next, service.report(next)), wakeKey(next.round))
     // 评审已经到、门禁后来才翻面（同 sha）时 reviewArrived 为假：单独补一条门禁唤醒。
     // 两个条件同时为真时只走上面那条，wake key 已含三套 verdict，不会双唤醒。
     // 新 sha 的首个快照还没有本轮评审：门禁只是先到，不能当成「门禁变化」唤醒，
     // 否则每次 push 都可能多一条「评审未出」的噪声；评审到达走上面的 reviewArrived。
-    else if (result.gatesChanged === true && reviewPresent) wake(sessionId, service.report(next), wakeKey(next.round))
+    else if (result.gatesChanged === true && reviewPresent) wake(sessionId, withReviewDirective(next, service.report(next)), wakeKey(next.round))
 
     // 单轮计时：新 sha 观测到就重开；评审首次出现记 reviewSettledAt。
     const tickAt = now()

@@ -10,6 +10,22 @@ const mrOf = (over = {}) => ({
   head_pipeline: { status: 'running', created_at: '2026-11-13T09:59:00Z' }, ...over,
 })
 
+/** 一条未处置的评审问题：用于断言唤醒消息前置修复指令。 */
+const REVIEW_WITH_FINDING = {
+  verdict: 'changes',
+  blocking: [{ fid: 'a1b2c3d4', level: '低', gateCategory: '非阻塞建议', reverifyCount: 1 }],
+  nonBlocking: [],
+  historicalUnresolved: 0,
+}
+
+/** 自定义快照：把状态推进到「本轮评审已到」，用于控制唤醒正文的输入。 */
+const snapshotWithReview = (review) => ({ mr: nextMr, setState }) => ({
+  state: setState({ mr: nextMr, round: { sha: SHA, n: 1, observedAt: 1, review, sensitive: null, mandatory: null } }),
+  newRound: false,
+  reviewArrived: true,
+  becameMergeable: false,
+})
+
 /**
  * 假时钟 + 假定时器：`advance` 推进 now，`timers` 记录所有 setTimer 调用，
  * 这样「不再排下一次」是真的计数断言，30s 节流也能被测到。
@@ -145,6 +161,43 @@ test('gatesChanged：同 sha 评审在场、敏感门禁翻面 → 唤醒一次'
 
   await h.watcher.tick('s')
   assert.equal(h.notified.filter((text) => /REPORT/.test(text)).length, 1)
+})
+
+test('有未处置 finding → 唤醒消息以派发修复指令开头并含 FID', async () => {
+  const h = harness({
+    notes: [{ id: 1, body: 'AI Code Review' }],
+    report: () => 'REPORT',
+    snapshot: snapshotWithReview(REVIEW_WITH_FINDING),
+  })
+
+  await h.watcher.tick('s')
+  assert.equal(h.notified.length, 1)
+  const text = h.notified[0]
+  assert.ok(
+    text.startsWith('有 1 处评审问题待处置（FID a1b2c3d4（低））：现在派发修复（按 FID 定位、TDD、跑测试、push），push 后用 mr_status 取新一轮；不打算改就在 GitLab 回帖豁免（写回未实现，需人工）。\n\n'),
+    text,
+  )
+  // 指令之后必须仍是原报告正文，不能被替换掉。
+  assert.ok(text.endsWith('REPORT'), text)
+})
+
+test('没有未处置 finding → 唤醒消息保持原样，不追加派发指令', async () => {
+  const plain = harness({ notes: [{ id: 1, body: 'AI Code Review' }] })
+  await plain.watcher.tick('s')
+  assert.equal(plain.notified.length, 1)
+  assert.equal(plain.notified[0], 'REPORT')
+
+  // 已 waive 的 finding 也不再触发前缀：唤醒与报告共用同一处置口径。
+  const waived = harness({
+    notes: [{ id: 1, body: 'AI Code Review' }],
+    report: () => 'REPORT',
+    stateOver: { decisions: { a1b2c3d4: { kind: 'waive' } } },
+    snapshot: snapshotWithReview(REVIEW_WITH_FINDING),
+  })
+  await waived.watcher.tick('s')
+  assert.equal(waived.notified.length, 1)
+  assert.equal(waived.notified[0], 'REPORT')
+  assert.doesNotMatch(waived.notified[0], /派发修复|评审问题待处置/)
 })
 
 test('守卫触发 → pause 且不再排下一次', async () => {

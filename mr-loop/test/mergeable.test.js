@@ -1,6 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { evaluateMergeable } from '../src/host/mergeable.js'
+// 命名空间导入：reviewTodo 缺失时是测试体失败，而不是整个文件在 import 阶段就报错。
+import * as mergeable from '../src/host/mergeable.js'
 
 const mr = (over = {}) => ({ state: 'opened', draft: false, has_conflicts: false, detailed_merge_status: 'mergeable', ...over })
 const round = (over = {}) => ({
@@ -205,4 +207,64 @@ test('降级判定的 head pipeline：failed / canceled 未通过，running / pe
   // 没有挂 CI 是文档里的合法路径：字段缺失 / null 都不能拦。
   assert.equal(evaluateMergeable({ mr: degradedMr(), round: round(), decisions: {} }).mergeable, true)
   assert.equal(evaluateMergeable({ mr: degradedMr({ head_pipeline: null }), round: round(), decisions: {} }).mergeable, true)
+})
+
+// ---------------------------------------------------------------------------
+// reviewTodo：报告与唤醒共用的未处置 finding 口径
+// ---------------------------------------------------------------------------
+
+const todoRound = (review) => ({ review })
+
+test('reviewTodo：total / fresh / fids 口径一致，fids 最多 3 个', () => {
+  const review = {
+    verdict: 'changes',
+    blocking: [
+      { fid: 'a1b2c3d4', level: '中', gateCategory: '逻辑错误', reverifyCount: 1 },
+      { fid: 'b2c3d4e5', level: '低', gateCategory: '非阻塞建议' },
+      { fid: 'c3d4e5f6', level: '中', gateCategory: '逻辑错误', reverifyCount: 2 },
+    ],
+    nonBlocking: [{ fid: 'd4e5f6a7', level: '低', gateCategory: '非阻塞建议', reverifyCount: 1 }],
+    historicalUnresolved: 0,
+  }
+  const todo = mergeable.reviewTodo(todoRound(review), {})
+  assert.equal(todo.total, 4)
+  // 复验次数缺失（b2c3d4e5）或 <= 1（a1b2c3d4 / d4e5f6a7）算本轮新增。
+  assert.equal(todo.fresh, 3)
+  assert.deepEqual(todo.fids, ['FID a1b2c3d4（中）', 'FID b2c3d4e5（低）', 'FID c3d4e5f6（中）'])
+})
+
+test('reviewTodo：只有 waive / skip / wontfix 终结；fix / pending / 未知 kind 仍计入', () => {
+  const review = {
+    verdict: 'changes',
+    blocking: [
+      { fid: 'aa', level: '中' },
+      { fid: 'bb', level: '低' },
+      { fid: 'cc', level: '低' },
+      { fid: 'dd', level: '低' },
+    ],
+    nonBlocking: [],
+    historicalUnresolved: 0,
+  }
+  const waived = mergeable.reviewTodo(todoRound(review), {
+    aa: { kind: 'waive' },
+    bb: { kind: 'skip' },
+    cc: { kind: 'wontfix' },
+    dd: { kind: 'fix' },
+  })
+  assert.deepEqual(waived, { total: 1, fresh: 1, fids: ['FID dd（低）'] })
+
+  const pending = mergeable.reviewTodo(todoRound(review), {
+    aa: { kind: 'pending' },
+    bb: { kind: 'fix' },
+    cc: { kind: 'unknown' },
+  })
+  assert.equal(pending.total, 4)
+})
+
+test('reviewTodo：无评审 / 无 finding → 零值，fids 为空', () => {
+  assert.deepEqual(mergeable.reviewTodo(null, {}), { total: 0, fresh: 0, fids: [] })
+  assert.deepEqual(
+    mergeable.reviewTodo(todoRound({ verdict: 'pass', blocking: [], nonBlocking: [] }), {}),
+    { total: 0, fresh: 0, fids: [] },
+  )
 })

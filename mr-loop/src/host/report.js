@@ -3,7 +3,7 @@
  * 只陈述事实（含 unknown 与取证片段），不写「请修复」这类指令——修不修由主代理判断。
  * 「阻塞」与「可合并」共用 mergeable.js 的处置口径，避免两处说法不一致。
  */
-import { openFindings, isNewFinding } from './mergeable.js'
+import { openFindings, reviewTodo } from './mergeable.js'
 
 const OK = '✅'
 const BAD = '⛔'
@@ -63,12 +63,12 @@ export function renderReport({ binding, mr, round, decisions = {}, mergeability,
   lines.push(`${binding.sourceBranch} → ${binding.targetBranch} · 第 ${round?.n ?? 0} 轮 · sha ${String(mr.sha ?? '').slice(0, 8)}（${bindingLabel}）`)
 
   const review = round?.review ?? null
-  // 三个计数与合并判定同源：需要关注 = 未处置 finding（含非阻塞/低），本轮新增 = 复验次数缺失或 <= 1。
+  // 三个计数与合并判定、唤醒指令同源（reviewTodo）；阻塞行仍取完整条目展示门禁分类。
+  const todo = reviewTodo(round, decisions)
   const openItems = openFindings(review, decisions)
-  const freshCount = openItems.filter(isNewFinding).length
   const reviewTail = review === null
     ? ''
-    : ` · 发现 ${openItems.length}（本轮新增 ${freshCount}） · 历史未收敛 ${review.historicalUnresolved ?? DASH} · 本轮已验证修复 ${review.verifiedFixed ?? DASH}${review.jobDuration ? ` · Job ${noteText(review.jobDuration)}` : ''}`
+    : ` · 发现 ${todo.total}（本轮新增 ${todo.fresh}） · 历史未收敛 ${review.historicalUnresolved ?? DASH} · 本轮已验证修复 ${review.verifiedFixed ?? DASH}${review.jobDuration ? ` · Job ${noteText(review.jobDuration)}` : ''}`
   lines.push(`${pad('评审')}${verdictLine(review)}${reviewTail}`)
 
   const sensitive = round?.sensitive ?? null
