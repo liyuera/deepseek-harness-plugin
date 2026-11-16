@@ -1,6 +1,6 @@
 # mr-loop 下一阶段决策记录（2026-11-16）
 
-> 状态：**T1 / T2 已实现（读路径 + 写路径）**；T3 / T4 / T5 与 UI 待开工。实现已回写主 spec。
+> 状态：**T1 / T2 / T3 已实现（读路径 + 写路径 + 盯到合并）**；T4 / T5 与 UI 待开工。实现已回写主 spec。
 > 本文件与 `2026-11-13-mr-loop-design.md` 冲突时，以本文件的决策为准（实现完成后回写进主 spec）。
 
 ## 一、用户已拍板的 6 条决策
@@ -56,7 +56,7 @@
   `sha / round / noteId / fid / file / lineRange / level / type / gateCategory / problem / suggestion / reverifyCount / firstSeenAt / lastSeenAt / disposition(open|fixed|waived|skip|wontfix) / dispositionSource(noteId 或 ledger)`
 - 只在状态变化时追加新行，不重写历史；供后续挖掘，不做任何分析、不参与判定。
 
-## 三、任务拆分（T1/T2 已完成，T3-T5 待开工）
+## 三、任务拆分（T1-T3 已完成，T4/T5 待开工）
 
 | 任务 | 内容 | 依赖 | 验收 |
 | --- | --- | --- | --- |

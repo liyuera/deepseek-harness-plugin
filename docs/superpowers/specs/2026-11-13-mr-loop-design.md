@@ -37,7 +37,7 @@
 3. 三套门禁统一成一个状态面，`unknown` 不当 `pass`（fail-closed）。
 4. 豁免回帖是唯一对外写动作，必须**先草稿、再经用户「可以 / 自定义」确认、才允许发送**（未确认绝不发）。
 5. 账本落盘，重开会话能查：每个 MR 的轮次、FID 处置、门禁历史。
-6. **轮次不设上限**：跟到「可合并且没有待修问题」为止；没有进展时自动暂停并交回人，`/mr stop` 是随时可用的人工出口。
+6. **轮次不设上限**：跟到 MR 合并（或关闭）为止——可合后**继续监视**，不停表；未可合时「没进展」才自动暂停并交回人，`/mr stop` 是随时可用的人工出口。
 
 非目标（v1 明确不做）：
 
@@ -175,11 +175,15 @@ idle ──bind──▶ watching(sha) ──head sha 变化──▶ awaiting(s
                     │                                   ├─ 评审 note 到位 ──▶ settled ──▶ wake ──▶ watching
                     │                                   ├─ 其余门禁未定 ──▶ gateSettle 窗口（≤3min）──▶ wake
                     │                                   └─ 流水线失败 / 超时 ──▶ wake ──▶ watching
-                    └──任一状态满足可合并条件──▶ mergeable ──▶ wake(收尾) ──▶ idle
+                    └──任一状态满足可合并条件──▶ mergeable ──▶ wake(可合) ──▶ 继续轮询（不停表）
+                                                                 │
+                                                                 ├─ merged ──▶ wake(已合并收尾) ──▶ idle
+                                                                 └─ closed ──▶ wake(未合并关闭) ──▶ idle
 ```
 
 其余规则：
 
+- **终止条件是 `merged` / `closed`，可合不是终点（决策 §2.4）**：`mergeable` 只唤醒一次（去重 key `mergeable:<sha>`，正文=报告 + `可合并，继续监视到合并。`）后**不停 watcher**，继续按 §5.4 / §6.5 的原节拍轮询，不因可合降频、也不新加 30s 轮询特例（30s 是唤醒最小间隔）。`merged` 时唤醒一次 `MR !<iid> 已合并（sha <sha>），监视结束；不需要发评论。` 并停表（**不写 MR 评论**）；`closed` 时唤醒一次 `MR 已关闭（未合并），监视结束。` 并停表。同一 `(state, sha)` 的终态只唤醒一次，会话被下一句话重新拉起也不会重复推。
 - **唤醒去抖**：同一 `sha + 评审 note.id + findings 签名（FID + 级别 + 复验次数的稳定序列）+ 三套门禁 verdict` 只唤醒一次；两次唤醒最小间隔 30s。唤醒用 `agent.followup(message)`，`source.kind = 'plugin:mr-loop'`。同 sha 上「评论触发的新评审」（note.id 或 findings 签名变化）必须能再唤醒；同一轮内容不变（含豁免 reason 变更）不重复唤醒。
 - 有未处置 finding（`reviewTodo.total > 0`）时，唤醒正文固定三段：**动作指令段 → 报告 → 全量问题明细段**。
   - 指令段：`有 N 处评审问题待处置（FID …）：全部问题见下方明细，修哪些由你决定；可以按问题分组并行派 subagent。`；已有有效指令时补一条 `已收到 M 条 MR 指令（#ai-waive/#ai-skip/#ai-wontfix），对应 FID 已计入豁免。`（**M 只算真正命中本轮的豁免数 `reviewTodo.waived.length`**，不是评论里的指令总数）；有格式不对的指令时再补 `另有 K 条 #ai-* 指令格式不对，未生效。`；最后 `不打算改的用 mr_waive 出草稿，经用户「可以 / 自定义」确认后 post:true 回帖（#ai-skip / #ai-wontfix 同理）；最后给出结论：修了哪些、用了什么指令、并引用对应 MR 评论。`
@@ -251,11 +255,11 @@ idle ──bind──▶ watching(sha) ──head sha 变化──▶ awaiting(s
 
 > **口径修正（2026-11-16，真机验收后）**：可合 = 结论 pass + 需要关注 0 + 历史未收敛 0 + 本轮新增 0；任何未处置 finding（含低 / 非阻塞建议）都拦；敏感门禁只有 `block` 才拦。旧版本「低 / 非阻塞建议不拦合并」「敏感非 pass 即拦」的表述作废。
 
-满足后：唤醒一次，附收尾报告（§6.4），停 watcher，账本写 `mergeableAt`。**插件不合并**。
+满足后：唤醒一次（正文=报告 + `可合并，继续监视到合并。`，去重 key `mergeable:<sha>`），**不停 watcher**，继续轮询到 `merged` / `closed`；账本写 `mergeableAt`。`merged` 时唤醒一次收尾（**只落账本、不写评论**，§2.4）；`closed` 时唤醒说明未合并关闭。**插件不合并**。
 
 ### 5.7 无限轮次、进度守卫与手动终结
 
-**轮次不设上限**（`maxRounds: 0`，0 = 不限）：只要还在改善，就一直跟到「可合并、且没有待修问题」为止。防死循环不靠轮数，靠「有没有进展」——真正该停的是「没在改善」，不是「轮数多」。
+**轮次不设上限**（`maxRounds: 0`，0 = 不限）：可合后**继续盯到 MR 合并 / 关闭**（§2.4），不是「可合即收工」。防死循环不靠轮数，靠「有没有进展」——真正该停的是「没在改善」，不是「轮数多」；而「等待合并」不属于「没改善」（见下）。
 
 同 sha 重绑复用轮次号与 `observedAt` 基线，但守卫计时（`stallStreak` / `reverifyStreak` / `lastProgressAt` / `startedAt`）从重绑时刻重新开始——这些计数本来就不落账本。
 
@@ -267,8 +271,9 @@ idle ──bind──▶ watching(sha) ──head sha 变化──▶ awaiting(s
 | `idleStopMs` | 30min | 无新 sha 也无门禁变化 | `paused(idle)` |
 
 - 守卫触发只**暂停**，不销毁绑定：watcher 停、唤醒一次说明原因（含已用轮次与剩余问题）、账本保留；`/mr resume` 从当前 sha 继续。
+- **可合后不触发进度守卫（决策 §2.4）**：等待合并期间跳过 `stallRounds` / `reverifyStreak` / `idleStopMs`（等待合并不是「没进展」，否则永远等不到 `merged`）；`maxRounds` 同理不生效。`wallClockMs` 墙钟预算仍兜底（超时暂停可 `/mr resume`）；单轮兜底超时 `roundTimeoutMs` 保持「只唤醒一次、不停表」语义不变。
 - **手动终结**是唯一的人工出口：`/mr stop` 或 `mr_stop` 随时可停（保留绑定与账本）；`/mr stop --forget` 解绑并删账本。用户说「不用改了」时主代理必须调它，插件不会自己决定放弃。
-- 硬退出只有四种：可合并（成功）、MR closed/merged（终态）、手动终结、守卫暂停（可恢复）。
+- 硬退出只有三种：MR `merged` / `closed`（终态）、手动终结、守卫暂停（可恢复）。**可合不是硬退出**：可合后继续监视，直到合并 / 关闭。
 
 | 其它情况 | 处理 |
 |---|---|
@@ -276,7 +281,7 @@ idle ──bind──▶ watching(sha) ──head sha 变化──▶ awaiting(s
 | 单轮兜底超时 `roundTimeoutMs`（15min） | 唤醒说明「评审未出」并附 pipeline / job 状态；继续下一 tick，不算失败 |
 | 解析 `unknown` | 唤醒附原文片段；不算通过，也不推进轮次 |
 | 网络连续失败 ≥5 次 | 退避到 60s；达 `idleStopMs` 暂停 |
-| MR 被 closed / merged | 停 watcher，账本记终态，唤醒一次 |
+| MR 被 closed / merged | 停 watcher，账本记终态，唤醒一次（merged：收尾不评论；closed：说明未合并关闭） |
 | 绑定会话被销毁 | 静默停，账本保留；重开后可 `/mr resume` |
 
 ## 6. 数据契约

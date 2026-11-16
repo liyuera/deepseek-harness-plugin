@@ -23,3 +23,18 @@ test('轮次上限只在 maxRounds > 0 时生效', () => {
   assert.equal(evaluateGuards({ state: { ...base, rounds: [{ n: 1 }, { n: 2 }] }, now: 1, cfg: capped })?.reason, 'stalled')
   assert.equal(evaluateGuards({ state: { ...base, rounds: Array.from({ length: 99 }, (_, index) => ({ n: index + 1 })) }, now: 1, cfg }), null)
 })
+
+test('可合（等待合并）→ stall / reverify / idle 不暂停，墙钟预算仍兜底', () => {
+  const merging = { ...base, mergeability: { mergeable: true } }
+  const capped = resolveConfig({ maxRounds: 2 })
+  // 决策 §2.4：可合之后是「等合并」不是「没进展」，否则永远等不到 merged。
+  assert.equal(evaluateGuards({ state: { ...merging, rounds: [{ n: 1 }, { n: 2 }] }, now: 1, cfg: capped }), null)
+  assert.equal(evaluateGuards({ state: { ...merging, stallStreak: cfg.stallRounds }, now: 1, cfg }), null)
+  assert.equal(evaluateGuards({ state: { ...merging, reverifyStreak: cfg.reverifyStreak }, now: 1, cfg }), null)
+  assert.equal(evaluateGuards({ state: merging, now: cfg.idleStopMs + 1, cfg }), null)
+  // 12h 墙钟预算仍是兜底（暂停可 /mr resume）；可合不解除全部守卫。
+  assert.equal(evaluateGuards({ state: merging, now: cfg.wallClockMs + 1, cfg })?.reason, 'budget')
+  // 非可合时同样的计数照旧触发，跳过只属于「等待合并」。
+  assert.equal(evaluateGuards({ state: { ...base, stallStreak: cfg.stallRounds }, now: 1, cfg })?.reason, 'stalled')
+  assert.equal(evaluateGuards({ state: base, now: cfg.idleStopMs + 1, cfg })?.reason, 'idle')
+})

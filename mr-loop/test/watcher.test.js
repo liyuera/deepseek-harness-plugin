@@ -385,25 +385,140 @@ test('token 失效 → pause(token) + 一次唤醒 + 不再排下一次', async 
   assert.equal(h.timers.length, 0)
 })
 
-test('merged / 可合 → 唤醒后不再排下一次', async () => {
-  const merged = harness({ mr: mrOf({ state: 'merged' }) })
-  await merged.watcher.tick('s')
-  assert.equal(merged.notified.length, 1)
-  assert.match(merged.notified[0], /merged/)
-  assert.equal(merged.timers.length, 0)
+// ---------------------------------------------------------------------------
+// T3：盯到合并——可合不停表、merged / closed 才是终点、可合后不触发 stall/idle 守卫
+// ---------------------------------------------------------------------------
 
-  const mergeable = harness({
-    snapshot: ({ mr: nextMr, setState }) => ({
+/** 可合快照：第 transitionTick 次 tick 报 `becameMergeable`，之后保持可合（模拟「已可合」稳态）。 */
+const becameMergeableSnapshot = (transitionTick = 0) => {
+  let call = 0
+  return ({ mr: nextMr, setState }) => {
+    const isTransition = call === transitionTick
+    call += 1
+    return {
       state: setState({ mr: nextMr, mergeability: { mergeable: true, missing: [], degraded: false } }),
       newRound: false,
       reviewArrived: false,
-      becameMergeable: true,
-    }),
+      gatesChanged: false,
+      becameMergeable: isTransition,
+    }
+  }
+}
+
+test('可合 → 唤醒一次「可合并，继续监视到合并」但不停表，后续 tick 不重复唤醒', async () => {
+  const h = harness({ snapshot: becameMergeableSnapshot() })
+  await h.watcher.tick('s')
+  assert.equal(h.notified.length, 1)
+  assert.equal(h.notified[0], 'REPORT\n\n可合并，继续监视到合并。')
+  assert.equal(h.timers.length, 1) // 可合不再停表：继续排下一次
+  assert.equal(h.watcher.isWatching('s'), true)
+
+  h.advance(31000)
+  await h.watcher.tick('s')
+  h.advance(31000)
+  await h.watcher.tick('s')
+  assert.equal(h.notified.length, 1) // 同一 sha 的可合只唤醒一次
+  assert.equal(h.timers.length, 3) // 每次 tick 都继续排下一次
+  assert.equal(h.watcher.isWatching('s'), true)
+})
+
+test('可合后 MR 变 merged → 唤醒「已合并」一次并停表', async () => {
+  let currentMr = mrOf()
+  const h = harness({
+    gitlabOver: { getMergeRequest: async () => currentMr },
+    snapshot: becameMergeableSnapshot(),
   })
-  await mergeable.watcher.tick('s')
-  assert.equal(mergeable.notified.length, 1)
-  assert.match(mergeable.notified[0], /可合并/)
-  assert.equal(mergeable.timers.length, 0)
+  await h.watcher.tick('s')
+  assert.equal(h.notified.length, 1)
+  assert.equal(h.watcher.isWatching('s'), true)
+  const timersBefore = h.timers.length
+
+  currentMr = mrOf({ state: 'merged' })
+  h.advance(31000)
+  await h.watcher.tick('s')
+  assert.equal(h.notified.length, 2)
+  assert.equal(h.notified[1], `MR !240 已合并（sha ${SHA}），监视结束；不需要发评论。`)
+  assert.equal(h.timers.length, timersBefore) // 终态不再排下一次
+  assert.equal(h.watcher.isWatching('s'), false)
+})
+
+test('closed → 唤醒「未合并关闭」一次并停表；同一 (state, sha) 不重复', async () => {
+  const h = harness({ mr: mrOf({ state: 'closed' }) })
+  await h.watcher.tick('s')
+  assert.equal(h.notified.length, 1)
+  assert.equal(h.notified[0], 'MR 已关闭（未合并），监视结束。')
+  assert.equal(h.timers.length, 0)
+  assert.equal(h.watcher.isWatching('s'), false)
+
+  // 再 tick 一次：同一个 (state, sha) 不能重复唤醒。
+  await h.watcher.tick('s')
+  assert.equal(h.notified.length, 1)
+  assert.equal(h.timers.length, 0)
+})
+
+test('merged 之后会话再触发 tick → 去重、不复活监视', async () => {
+  const h = harness({ mr: mrOf({ state: 'merged' }) })
+  await h.watcher.tick('s')
+  assert.equal(h.notified.length, 1)
+  assert.equal(h.timers.length, 0)
+
+  // 等价于 index.js 在用户发言后 watcher.start：再拉起来也只会走终态分支。
+  h.watcher.start('s')
+  assert.equal(h.timers.length, 1)
+  h.timers.at(-1).fn()
+  await new Promise((resolve) => setImmediate(resolve))
+
+  assert.equal(h.notified.length, 1) // 同一 (state, sha) 只唤醒一次
+  assert.equal(h.timers.length, 1) // 没有新排
+  assert.equal(h.watcher.isWatching('s'), false) // 又停表，不会复活
+})
+
+test('可合后等 30 分钟：stall / idle 守卫不暂停会话', async () => {
+  const h = harness({
+    stateOver: {
+      mergeability: { mergeable: true, missing: [], degraded: false },
+      stallStreak: 99,
+      lastProgressAt: 0,
+    },
+    snapshot: pinnedSnapshot,
+  })
+  h.advance(cfg.idleStopMs + 1) // 非可合状态在这里必定 stalled / idle
+  await h.watcher.tick('s')
+  assert.equal(h.getState().paused, null)
+  assert.equal(h.watcher.isWatching('s'), true)
+  assert.equal(h.timers.length, 1)
+})
+
+test('可合唤醒也走既有 30s 节流：被压住时挂起，由下一 tick 补发', async () => {
+  let call = 0
+  const h = harness({
+    snapshot: (input) => {
+      const phase = call
+      call += 1
+      if (phase === 0) {
+        // 首次 tick：评审（pass、无未处置问题）到达 → 普通唤醒。
+        return snapshotRound({ review: reviewOf([], { verdict: 'pass' }) }, { reviewArrived: true })(input)
+      }
+      return {
+        state: input.setState({ mr: input.mr, mergeability: { mergeable: true, missing: [], degraded: false } }),
+        newRound: false,
+        reviewArrived: false,
+        gatesChanged: false,
+        becameMergeable: phase === 1,
+      }
+    },
+  })
+
+  await h.watcher.tick('s')
+  assert.equal(h.notified.length, 1)
+  h.advance(1000)
+  await h.watcher.tick('s') // 距上次唤醒 1s：可合唤醒被 30s 节流压住
+  assert.equal(h.notified.length, 1)
+  h.advance(30000)
+  await h.watcher.tick('s') // 越过 30s：补发挂起的可合唤醒
+  assert.equal(h.notified.length, 2)
+  assert.equal(h.notified[1], 'REPORT\n\n可合并，继续监视到合并。')
+  assert.equal(h.watcher.isWatching('s'), true) // 可合后仍继续监视
 })
 
 test('notify 返回 false → 不推进 lastWake，下一次 tick 补发同一份报告', async () => {

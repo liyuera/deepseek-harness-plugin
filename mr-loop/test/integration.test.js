@@ -1,6 +1,6 @@
 /**
  * 服务层 + watcher 的真实接缝：不替身任何一方，只替换 GitLab / 时钟 / 定时器 / 账本目录。
- * 覆盖「评审先到、门禁后翻面唤醒」→「新 sha 可合停表」这条主链路。
+ * 覆盖「评审先到、门禁后翻面唤醒」→「新 sha 可合但不停表」→「merged 收尾停表」这条主链路。
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -120,20 +120,31 @@ test('service + watcher：评审先到 → 门禁翻面唤醒 → 新 sha 可合
   assert.match(notified[0], /敏感 {3}⛔ 阻止合并/)
   assert.equal(watcher.isWatching('s'), true)
 
-  // 3. push 新 sha：强绑定 pass 评审 + 敏感 pass，门禁全绿 → 可合并并停表。
+  // 3. push 新 sha：强绑定 pass 评审 + 敏感 pass，门禁全绿 → 可合并，但**不停表**（T3）。
   current += 60000
   notes = [reviewA, sensitiveBlock, reviewB, sensitivePass]
   mr = mrOf({ sha: SHA_B, notesCount: 4, baseline: BASELINE_B })
-  const timersBefore = timers.length
   await watcher.tick('s')
 
-  // 4. 恰好 2 次唤醒；可合之后不再排定时器；账本落盘 2 轮。
+  // 4. 恰好 2 次唤醒；可合之后继续盯着（还有下一次 tick），账本已落 2 轮。
   assert.equal(notified.length, 2)
   assert.match(notified[1], /可合/)
-  assert.match(notified[1], /可合并，监视结束/)
+  assert.match(notified[1], /可合并，继续监视到合并/)
+  assert.equal(watcher.isWatching('s'), true)
+
+  // 5. MR 合并：唤醒一次「已合并」并停表；之后再 tick 也不会复活。
+  current += 60000
+  mr = { ...mr, state: 'merged' }
+  const timersBefore = timers.length
+  await watcher.tick('s')
+  assert.equal(notified.length, 3)
+  assert.equal(notified[2], `MR !240 已合并（sha ${SHA_B}），监视结束；不需要发评论。`)
   assert.equal(watcher.isWatching('s'), false)
-  assert.equal(timers.length, timersBefore)
+  assert.equal(timers.length, timersBefore) // 终态不再排下一次
   assert.ok(cleared.length > 0)
+
+  await watcher.tick('s') // 用户再说一句话把 watcher 拉起来：终态去重，不重复唤醒
+  assert.equal(notified.length, 3)
 
   await service.stop({ sessionId: 's' })
   const saved = await service.ledger.load({ projectPath: 'g/p', iid: 240 })

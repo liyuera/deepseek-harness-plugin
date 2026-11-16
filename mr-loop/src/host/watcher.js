@@ -3,7 +3,8 @@
  * 没有 LLM 调用；所有定时器可注入，单测里用假时钟。
  * 唤醒去抖：同一 (sha, verdict, 门禁摘要) 只唤醒一次，两次唤醒最小间隔 30s；
  * 被 30s 节流压住的报告不能丢——挂进 pendingWake，由下一个 tick 开头补发。
- * 终止路径（守卫暂停 / token / merged / closed / 可合）没有下一个 tick，唤醒立即送达。
+ * 终止路径（守卫暂停 / token / merged / closed）没有下一个 tick，唤醒立即送达；
+ * 可合不是终止路径（决策 §2.4）：唤醒一次后继续轮询到合并，因此走普通 30s 节流。
  */
 import { evaluateGuards } from './guards.js'
 import { openFindings, reviewTodo } from './mergeable.js'
@@ -258,8 +259,12 @@ export function createWatcher({ cfg, gitlab, service, notify, logger = undefined
 
     if (mr.state === 'merged' || mr.state === 'closed') {
       // 终态是永久的：同一个 (state, sha) 只唤醒一次，避免用户下一句话又把 watcher 拉起来重复唤醒。
-      // 终态后没有下一个 tick：立即送达。
-      wake(sessionId, `MR 已 ${mr.state}，停止监视。`, `mr:${mr.state}:${String(mr.sha ?? '')}`, true)
+      // 终态后没有下一个 tick：立即送达。文案只说事实，合并收尾不写评论（决策 §2.4 / 用户决策 5）。
+      const iid = state.binding.iid
+      const text = mr.state === 'merged'
+        ? `MR !${iid} 已合并（sha ${String(mr.sha ?? '?')}），监视结束；不需要发评论。`
+        : 'MR 已关闭（未合并），监视结束。'
+      wake(sessionId, text, `mr:${mr.state}:${String(mr.sha ?? '')}`, true)
       clear(sessionId)
       return
     }
@@ -310,22 +315,23 @@ export function createWatcher({ cfg, gitlab, service, notify, logger = undefined
     const identityBefore = reviewIdentity(reviewBefore)
     const identityAfter = reviewIdentity(next.round?.review)
     const reviewChanged = result.newRound !== true && identityBefore !== null && identityAfter !== null && identityBefore !== identityAfter
-    // 可合并是终点：无论是否在本次 tick 里「变成」可合并，都必须停表；
-    // 但只有状态真的发生变化时才唤醒，避免 bind 已经给过报告后又重复推一遍。
-    if (next.mergeability?.mergeable === true) {
-      if (result.becameMergeable === true) {
-        // 可合并没有下一个 tick：立即送达。
-        wake(sessionId, withReviewDirective(next, `${service.report(next)}\n\n可合并，监视结束。`), `mergeable:${String(next.round?.sha ?? '')}`, true)
-      }
-      clear(sessionId)
-      return
+    // 可合不是终点（决策 §2.4）：唤醒一次「可合并，继续监视到合并」，但**不停表**，
+    // 继续按原节拍轮询直到 merged / closed；去重靠 `mergeable:<sha>`，同一 sha 只推一次。
+    // 此时还有下一个 tick 可补发，所以走普通 30s 节流，不再 immediate。
+    const mergeableNow = next.mergeability?.mergeable === true
+    const mergeableWoken = mergeableNow && result.becameMergeable === true
+    if (mergeableWoken) {
+      wake(sessionId, withReviewDirective(next, `${service.report(next)}\n\n可合并，继续监视到合并。`), `mergeable:${String(next.round?.sha ?? '')}`)
     }
-    if (reviewArrived || reviewChanged) wake(sessionId, withReviewDirective(next, service.report(next)), wakeKey(next.round))
-    // 评审已经到、门禁后来才翻面（同 sha）时 reviewArrived 为假：单独补一条门禁唤醒。
-    // 两个条件同时为真时只走上面那条，wake key 已含三套 verdict，不会双唤醒。
-    // 新 sha 的首个快照还没有本轮评审：门禁只是先到，不能当成「门禁变化」唤醒，
-    // 否则每次 push 都可能多一条「评审未出」的噪声；评审到达走上面的 reviewArrived。
-    else if (result.gatesChanged === true && reviewPresent) wake(sessionId, withReviewDirective(next, service.report(next)), wakeKey(next.round))
+    // 「变成可合」的那次快照里往往同时有评审到达：报告已经在上面推过，同一 tick 不再推第二条。
+    if (mergeableWoken === false) {
+      if (reviewArrived || reviewChanged) wake(sessionId, withReviewDirective(next, service.report(next)), wakeKey(next.round))
+      // 评审已经到、门禁后来才翻面（同 sha）时 reviewArrived 为假：单独补一条门禁唤醒。
+      // 两个条件同时为真时只走上面那条，wake key 已含三套 verdict，不会双唤醒。
+      // 新 sha 的首个快照还没有本轮评审：门禁只是先到，不能当成「门禁变化」唤醒，
+      // 否则每次 push 都可能多一条「评审未出」的噪声；评审到达走上面的 reviewArrived。
+      else if (result.gatesChanged === true && reviewPresent) wake(sessionId, withReviewDirective(next, service.report(next)), wakeKey(next.round))
+    }
 
     // 单轮计时：新 sha 观测到就重开；评审首次出现记 reviewSettledAt。
     const tickAt = now()
