@@ -118,6 +118,10 @@ test('合并行展示流水线现状：预绑定失败不再被降级判定掩�
   const base = { binding, round, decisions: {}, paused: null, now: Date.parse('2026-11-13T10:00:30Z') }
   const failed = renderReport({ ...base, mr: { ...mr, head_pipeline: { id: 7181, status: 'failed' } }, mergeability: { mergeable: false, missing: ['流水线未通过（failed）'], degraded: true } })
   assert.match(failed, /合并 {3}⛔ 差 1 项：流水线未通过（failed）（⚠️ 降级判定） · 流水线 #7181 failed/)
+  // 未完成的流水线不是「未通过」：只陈述未完成，不误报失败。
+  const running = renderReport({ ...base, mr: { ...mr, head_pipeline: { id: 7181, status: 'running' } }, mergeability: { mergeable: false, missing: ['流水线未完成（running）'], degraded: true } })
+  assert.match(running, /合并 {3}⛔ 差 1 项：流水线未完成（running）（⚠️ 降级判定） · 流水线 #7181 running/)
+  assert.doesNotMatch(running, /未通过/)
   const ok = renderReport({ ...base, mr: { ...mr, head_pipeline: { id: 7181, status: 'success' } }, mergeability: { mergeable: true, missing: [], degraded: false } })
   assert.match(ok, /合并 {3}✅ 可合 · 流水线 #7181 success/)
   const none = renderReport({ ...base, mr, mergeability: { mergeable: true, missing: [], degraded: false } })

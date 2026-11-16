@@ -6,6 +6,13 @@
 /** 只有这三种处置算「对外终结」；fix/pending/空壳对象都不算（fail-closed）。 */
 export const DISPOSED_KINDS = new Set(['waive', 'skip', 'wontfix'])
 
+/**
+ * 流水线终态里只有 failed / canceled 算「未通过」；running / pending / created
+ * 等只是「未完成」。两种说法都拦合并，但报告不能把还没跑完的流水线写成失败。
+ */
+const PIPELINE_FAILED_STATUSES = new Set(['failed', 'canceled'])
+const pipelineGap = (status) => `${PIPELINE_FAILED_STATUSES.has(status) ? '流水线未通过' : '流水线未完成'}（${status}）`
+
 /** 报告与判定共用同一口径，避免「报告说无阻塞、判定说不能合」。 */
 export function isDisposed(decision) {
   return typeof decision?.kind === 'string' && DISPOSED_KINDS.has(decision.kind)
@@ -47,7 +54,7 @@ export function evaluateMergeable({ mr, round, decisions = {} }) {
   // 字段缺失 / null 是文档里的「没有挂 CI」路径，不拦。
   const pipeline = mr?.head_pipeline
   if (pipeline !== null && pipeline !== undefined && pipeline.status !== 'success') {
-    missing.push(`流水线未通过（${pipeline.status ?? 'unknown'}）`)
+    missing.push(pipelineGap(pipeline.status ?? 'unknown'))
   }
 
   if (typeof mr?.detailed_merge_status === 'string') {

@@ -67,16 +67,24 @@ test('缺 detailed_merge_status → 降级到 merge_status 并标注', () => {
   assert.equal(r2.mergeable, false)
 })
 
-test('降级判定的 head pipeline：failed / running 拦，success / 无流水线不拦', () => {
+test('降级判定的 head pipeline：failed / canceled 未通过，running / pending 未完成，success / 无流水线不拦', () => {
   const degradedMr = (over = {}) => ({ state: 'opened', draft: false, has_conflicts: false, merge_status: 'can_be_merged', ...over })
 
   const failed = evaluateMergeable({ mr: degradedMr({ head_pipeline: { status: 'failed' } }), round: round(), decisions: {} })
   assert.equal(failed.mergeable, false)
   assert.deepEqual(failed.missing, ['流水线未通过（failed）'])
 
+  const canceled = evaluateMergeable({ mr: degradedMr({ head_pipeline: { status: 'canceled' } }), round: round(), decisions: {} })
+  assert.equal(canceled.mergeable, false)
+  assert.deepEqual(canceled.missing, ['流水线未通过（canceled）'])
+
   const running = evaluateMergeable({ mr: degradedMr({ head_pipeline: { status: 'running' } }), round: round(), decisions: {} })
   assert.equal(running.mergeable, false)
-  assert.deepEqual(running.missing, ['流水线未通过（running）'])
+  assert.deepEqual(running.missing, ['流水线未完成（running）'])
+
+  const pending = evaluateMergeable({ mr: degradedMr({ head_pipeline: { status: 'pending' } }), round: round(), decisions: {} })
+  assert.equal(pending.mergeable, false)
+  assert.deepEqual(pending.missing, ['流水线未完成（pending）'])
 
   const success = evaluateMergeable({ mr: degradedMr({ head_pipeline: { status: 'success' } }), round: round(), decisions: {} })
   assert.equal(success.mergeable, true)
