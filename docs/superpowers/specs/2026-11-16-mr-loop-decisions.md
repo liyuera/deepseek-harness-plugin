@@ -43,7 +43,8 @@
 - 轮询 30s 不变；每 tick 仍只 1 次 MR 请求（必要时再拉 notes）。
 
 ### 2.5 findings 沉淀（只记录）
-- 位置：`~/.dsh/mr-loop/findings/<workspace>/<project>__<iid>.jsonl`（append-only，不写进用户仓库）。
+- 位置：`~/.dsh/workspace/<workspace>/findings/<project>__<iid>.jsonl`（append-only，不写进用户仓库）。
+  - 粒度：**一个工作区 + 一个 MR 一个 JSONL**；`<workspace>` 取 DSH 工作区名，`<project>` 为 GitLab 全路径（`/` 换成 `__`）+ `__<iid>`。
 - 每条记录（FID 粒度）：
   `sha / round / noteId / fid / file / lineRange / level / type / gateCategory / problem / suggestion / reverifyCount / firstSeenAt / lastSeenAt / disposition(open|fixed|waived|skip|wontfix) / dispositionSource(noteId 或 ledger)`
 - 只在状态变化时追加新行，不重写历史；供后续挖掘，不做任何分析、不参与判定。
@@ -59,8 +60,27 @@
 | T5 文档与技能 | skill 规程（决策权、并行 subagent、结论格式、先评论后提交、豁免流程）；spec/plan 回写 | T1-T4 | 文档 diff + 全量绿 |
 | UI（仅计划） | 客户端插件页：会话内 MR 列表 / 问题 / 修复状态 / 指令；数据来自 MR + 账本 + findings | T1-T4 | **本阶段不实现**，仅保留设计 |
 
-## 四、待确认（开工前）
+## 四、已确认
 
-1. findings 存放位置：`~/.dsh/mr-loop/findings/` 是否符合你「按工作区单独存放」的意思？还是希望放在工作区目录内（如 `<workspace>/.dsh/findings/`）？
-2. findings 文件粒度：一个 MR 一个 JSONL（当前方案）还是一个工作区一个 JSONL？
-3. T1-T4 的先后顺序：按上表（T1 → T2/T3 → T4 → T5）可以吗？
+1. findings 位置：`~/.dsh/workspace/<workspace>/findings/`（用户确认）。
+2. 粒度：一个工作区 + 一个 MR 一个 JSONL（用户确认）。
+3. 第三节的 T1-T5 是**开发顺序**，不是运行时写入顺序。
+
+## 五、两种「顺序」不要混淆
+
+**开发顺序（做插件的顺序）**：T1 读路径 → T2 写路径 / T3 盯到合并 → T4 findings 沉淀 → T5 文档技能 →（后续）UI。
+
+**运行时顺序（插件跑起来后的数据流）**：
+
+```
+轮询(30s) → 拉 MR/notes → 解析本轮(评审/门禁/指令)
+   → ① findings 增量落盘（新 FID=open；FID 消失且有新一轮评审=fixed）
+   → ② 有未处置问题/状态变化 → 唤醒主 agent（全量问题 + 已有指令）
+   → ③ 主 agent 决策：修哪些 / 放弃哪些
+        - 放弃的：#ai-waive 评论（经「可以/自定义」确认）→ POST /notes → 记 waived/skip/wontfix
+        - 要修的：改代码 → commit → push（顺序：先评论、后提交）
+   → ④ 新一轮评审（指令触发一次 / push 再触发一次）→ 回到 ①
+   → ⑤ merged：唤醒一次收尾 + 落账本（不评论）；closed：唤醒说明未合并关闭
+```
+
+要点：findings 的**写入时机**是每轮快照后立即增量追加（不等主 agent 决定），主 agent 的决策只改变「同一 FID 的 disposition 字段」并再追加一行，历史行不重写。
