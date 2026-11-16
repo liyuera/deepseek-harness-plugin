@@ -151,65 +151,6 @@ export function apply(ctx, rawConfig = {}) {
     ctx.logger?.warn?.(`[mr-loop] UI 路由注册失败：${error.message}`)
   }
 
-  // TEMP diag: 宿主侧 client bundle 自检（验证完删除）
-  try {
-    ctx.inject(['webServer'], (scoped) => scoped.effect(() => scoped.webServer.register({
-      kind: 'exact',
-      path: '/mr-loop/ui/diag',
-      handler: async (request, res) => {
-        const out = { at: new Date().toISOString() }
-        const url = new URL(request.url ?? '/mr-loop/ui/diag', 'http://localhost')
-        out.query = url.search
-        try {
-          const clientModules = ctx.get?.('clientModules')
-          out.hasService = clientModules !== undefined
-          if (clientModules !== undefined) {
-            const graph = typeof clientModules.graph === 'function' ? clientModules.graph() : null
-            out.entries = graph && Array.isArray(graph.entries)
-              ? graph.entries.filter((e) => String(e?.id ?? '').includes('mr-loop')).map((e) => ({ id: e.id, url: e.url, path: e.path, rev: e.rev }))
-              : null
-            const path = typeof clientModules.clientPath === 'function' ? clientModules.clientPath('@liyuera/dsh-mr-loop') : undefined
-            out.clientPath = path
-            if (typeof path === 'string') {
-              const { readFile } = await import('node:fs/promises')
-              const text = await readFile(path, 'utf8')
-              out.bundle = { length: text.length, hasMergeIcon: text.includes('mergeIcon'), hasOldMergeText: text.includes('— 历史账本（未在跟踪）') }
-            }
-            if (url.searchParams.get('rebuild') === '1' && typeof clientModules.rebuilt === 'function') {
-              const before = out.entries && out.entries[0] ? out.entries[0].rev : null
-              const next = clientModules.rebuilt('@liyuera/dsh-mr-loop')
-              out.rebuilt = { before, next }
-            }
-            // 浏览器真正拿到的内容：走 fetchBundle（与 /plugins 路由同一实现）
-            try {
-              const origin = ctx.get?.('webServer')?.getOrigin?.() ?? 'http://127.0.0.1'
-              const entry = out.entries && out.entries[0]
-              if (entry && typeof clientModules.fetchBundle === 'function') {
-                const response = await clientModules.fetchBundle(new Request(new URL(entry.url.replace('??', ''), origin)))
-                const text = await response.text()
-                out.served = {
-                  status: response.status,
-                  length: text.length,
-                  hasMergeIcon: text.includes('mergeIcon'),
-                  hasOldMergeText: text.includes('— 历史账本（未在跟踪）'),
-                  head: text.slice(0, 120),
-                }
-              }
-            } catch (error) {
-              out.servedError = error.message
-            }
-          }
-        } catch (error) {
-          out.error = error.message
-        }
-        res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
-        res.end(JSON.stringify(out))
-      },
-    }), 'mr-loop: diag'))
-  } catch (error) {
-    ctx.logger?.warn?.(`[mr-loop] diag 注册失败：${error.message}`)
-  }
-
   registerMrLoopSkill(ctx)
   ctx.logger?.info?.(`[mr-loop] loaded baseUrl=${config.baseUrl}`)
 }
