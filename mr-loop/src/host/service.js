@@ -78,9 +78,10 @@ function reverifyIncreased(previousRound, round) {
 }
 
 /**
- * @param {{ config: object, ledger: object, gitlab: object, repoState?: Function, now?: () => number }} deps
+ * @param {{ config: object, ledger: object, gitlab: object, repoState?: Function, now?: () => number,
+ *   onBound?: Function, findings?: { record: Function }, logger?: { warn?: Function } }} deps
  */
-export function createService({ config, ledger, gitlab, repoState = readRepoState, now = Date.now, onBound = undefined }) {
+export function createService({ config, ledger, gitlab, repoState = readRepoState, now = Date.now, onBound = undefined, findings = undefined, logger = undefined }) {
   /** @type {Map<string, object>} sessionId → state */
   const bindings = new Map()
 
@@ -100,6 +101,21 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
       paused: state.paused,
       now: now(),
     })
+  }
+
+  /**
+   * T4：findings 落盘是旁路记录（只记录、不参与判定）。
+   * fire-and-forget：同步抛错与 rejected Promise 都只 log warn，绝不打断绑定 / 监视 / 回帖。
+   */
+  function record(state) {
+    if (findings === undefined || findings === null) return
+    const failed = (error) => logger?.warn?.(`[mr-loop] findings 写入失败：${error?.message ?? error}`)
+    try {
+      const pending = findings.record(state)
+      if (pending !== null && typeof pending === 'object' && typeof pending.catch === 'function') pending.catch(failed)
+    } catch (error) {
+      failed(error)
+    }
   }
 
   async function persist(state, extra = {}) {
@@ -228,6 +244,7 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
     // 先落盘再登记：写失败时不留一个「半绑定」的会话状态。
     await persist(state)
     bindings.set(sessionId, state)
+    record(state)
 
     const warnings = repo.branch !== mr.source_branch
       ? [{ code: 'branch-mismatch', message: `当前分支是 ${repo.branch}，MR 源分支是 ${mr.source_branch}` }]
@@ -292,6 +309,7 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
     if (state.mergeability.mergeable && state.mergeableAt === undefined) state.mergeableAt = new Date(now()).toISOString()
 
     void persist(state).catch(() => {})
+    record(state)
     return {
       state,
       newRound,
@@ -545,6 +563,7 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
       result.persisted = false
       result.warning = typeof error?.message === 'string' && error.message !== '' ? error.message : '账本写入失败'
     }
+    record(state)
     return result
   }
 

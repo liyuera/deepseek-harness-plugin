@@ -1,6 +1,6 @@
 # mr-loop 下一阶段决策记录（2026-11-16）
 
-> 状态：**T1 / T2 / T3 已实现（读路径 + 写路径 + 盯到合并）**；T4 / T5 与 UI 待开工。实现已回写主 spec。
+> 状态：**T1 / T2 / T3 / T4 已实现（读路径 + 写路径 + 盯到合并 + findings 沉淀）**；T5 与 UI 待开工。实现已回写主 spec。
 > 本文件与 `2026-11-13-mr-loop-design.md` 冲突时，以本文件的决策为准（实现完成后回写进主 spec）。
 
 ## 一、用户已拍板的 6 条决策
@@ -49,12 +49,23 @@
 - `merged`：唤醒一次收尾（只落账本，不评论）。`closed`：唤醒一次说明未合并关闭。
 - 轮询 30s 不变；每 tick 仍只 1 次 MR 请求（必要时再拉 notes）。
 
-### 2.5 findings 沉淀（只记录）
+### 2.5 findings 沉淀（只记录）— T4 已实现
 - 位置：`~/.dsh/workspace/<workspace>/findings/<project>__<iid>.jsonl`（append-only，不写进用户仓库）。
-  - 粒度：**一个工作区 + 一个 MR 一个 JSONL**；`<workspace>` 取 DSH 工作区名，`<project>` 为 GitLab 全路径（`/` 换成 `__`）+ `__<iid>`。
-- 每条记录（FID 粒度）：
-  `sha / round / noteId / fid / file / lineRange / level / type / gateCategory / problem / suggestion / reverifyCount / firstSeenAt / lastSeenAt / disposition(open|fixed|waived|skip|wontfix) / dispositionSource(noteId 或 ledger)`
-- 只在状态变化时追加新行，不重写历史；供后续挖掘，不做任何分析、不参与判定。
+  - `<workspace>` = 仓库根目录名（`basename(binding.repoRoot)`，取不到用 `unknown`）；
+  - `<project>` = GitLab 项目全路径，`/` 换成 `__`；
+  - 粒度：**一个工作区 + 一个 MR 一个 JSONL**；目录 `0700`、文件 `0600`（与账本一致）；
+  - 单文件超过 `findingsMaxBytes`（默认 5 MiB）滚动成 `<file>.1.jsonl`（只保留一代）。
+- 每行一条（`v:1`，FID 粒度）：
+  `{ v, at, workspace, projectPath, iid, sha, round, fid, file, line, level, type, gateCategory, problem, suggestion, reverifyCount, status, instruction: {kind, reason, noteId} | null }`
+  - 文本字段单行化 + 截断：problem / suggestion ≤ 500，file ≤ 300，控制字符压掉；`reverifyCount` 缺失为 `null`。
+- `status ∈ open|fixed|waived|skip|wontfix`：**复用现有判定**（`round.directives` + 账本 `decisions` + 与上一轮 FID 对比），
+  共享函数 `collectFindings(record)`（`src/host/findings.js`）同时被 UI（`ui.js`）与落盘使用，避免两处漂移。
+- 去重：同一 MR 内以 `(fid, status, instruction.kind, instruction.noteId)` 为键，键没变不追加；服务启动后第一次写某文件前
+  读回已有文件（含 `.1`）建立键集合（跨重启不重复）；坏行按尽力而为跳过。
+- 触发点：`service.bind` 成功后、`applySnapshot` 更新后（新轮或同 sha 刷新）、`postWaiver` 写 decisions 后；
+  统一走 fire-and-forget 的 `record(state)`，**失败只 log warn，绝不打断绑定 / 监视 / 回帖**。
+- 配置：`findingsDir`（默认 `~/.dsh/workspace`）、`findingsMaxBytes`（默认 `5 * 1024 * 1024`）。
+- 只记录，不做统计 / 分析 / 上报，不参与判定；实现已回写主 spec §5.8 / §6.5 / §9 / §10。
 
 ## 三、任务拆分（T1-T3 已完成，T4/T5 待开工）
 
@@ -63,7 +74,7 @@
 | T1 读路径 | `parse-directives.js`；`buildRound` 输出 directives/comments；mergeable 接入指令处置；报告加「豁免」行；唤醒带全量问题 + 三段指令；唤醒 key 扩展；`mr_review` 返回 directives/comments | — | 新增 parse-directives 测试 + 既有模块用例；全量 155 → ≥165 全绿 |
 | T2 写路径 | `mr_waive` 草稿/回帖/幂等/错误映射；账本 decisions 落盘；`mr_review` 显示来源；「先评论后提交」写进技能规程 | T1 | 工具 + service 用例；全量绿 |
 | T3 盯到合并 | 取消 mergeable 停表；merged/closed 收尾唤醒；30s 不变 | — | watcher 用例：可合后继续 tick、merged、closed、去重 |
-| T4 findings 沉淀 | 按工作区 append-only JSONL；状态变化才追加 | T1 | 断言文件路径/结构/去重追加 |
+| T4 findings 沉淀（已实现） | 按工作区 append-only JSONL；状态变化才追加；失败不打断主流程 | T1 | 断言文件路径/结构/去重追加 |
 | T5 文档与技能 | skill 规程（决策权、并行 subagent、结论格式、先评论后提交、豁免流程）；spec/plan 回写 | T1-T4 | 文档 diff + 全量绿 |
 | UI（仅计划） | 客户端插件页：会话内 MR 列表 / 问题 / 修复状态 / 指令；数据来自 MR + 账本 + findings | T1-T4 | **本阶段不实现**，仅保留设计 |
 

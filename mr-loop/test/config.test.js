@@ -31,3 +31,24 @@ test('未知键忽略、字符串不能为空', () => {
   assert.doesNotThrow(() => resolveConfig({ whatever: 1 }))
   assert.throws(() => resolveConfig({ tokenFile: '' }), /tokenFile/)
 })
+
+test('findings 配置：默认 ~/.dsh/workspace + 5MiB，非法值抛 ConfigError', () => {
+  const cfg = resolveConfig({})
+  assert.equal(cfg.findingsDir, '~/.dsh/workspace')
+  assert.equal(cfg.findingsMaxBytes, 5 * 1024 * 1024)
+  assert.equal(resolveConfig({ findingsDir: '~/custom', findingsMaxBytes: 1 }).findingsDir, '~/custom')
+  for (const bad of ['', 1, null]) {
+    assert.throws(
+      () => resolveConfig({ findingsDir: bad }),
+      (err) => err instanceof ConfigError && err.code === 'invalid-config',
+      `findingsDir=${String(bad)} 应被拒绝`,
+    )
+  }
+  for (const bad of [-1, 0, '5242880', 1.5, null]) {
+    assert.throws(
+      () => resolveConfig({ findingsMaxBytes: bad }),
+      (err) => err instanceof ConfigError && err.code === 'invalid-config',
+      `findingsMaxBytes=${String(bad)} 应被拒绝`,
+    )
+  }
+})

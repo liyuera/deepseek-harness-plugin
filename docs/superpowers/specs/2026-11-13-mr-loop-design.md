@@ -284,6 +284,21 @@ idle ──bind──▶ watching(sha) ──head sha 变化──▶ awaiting(s
 | MR 被 closed / merged | 停 watcher，账本记终态，唤醒一次（merged：收尾不评论；closed：说明未合并关闭） |
 | 绑定会话被销毁 | 静默停，账本保留；重开后可 `/mr resume` |
 
+### 5.8 findings 沉淀（T4，只记录）
+
+把每条 FID 的问题单独提取、按工作区沉淀，供以后做「AI 生成代码的规范与评审方向」；**只记录，不做分析 / 统计 / 上报，不参与任何判定，也不写进用户仓库**。
+
+- 位置：`<findingsDir>/<workspace>/findings/<projectPath 的 / 换成 __>__<iid>.jsonl`（append-only，默认 `findingsDir = ~/.dsh/workspace`）。
+  - `<workspace>` = 仓库根目录名（`basename(binding.repoRoot)`，取不到用 `unknown`）；
+  - 粒度：一个工作区 + 一个 MR 一个 JSONL；目录 `0700`、文件 `0600`（与账本一致）；
+  - 实例如：`~/.dsh/workspace/wisdom-financial-credit-platform-web/findings/wisdom-financial-service-platform__wisdom-financial-credit-platform-web__240.jsonl`；
+  - 单文件超过 `findingsMaxBytes`（默认 5 MiB）滚动成 `<name>.1.jsonl`（只保留一代）。
+- 每行一条（v1）：`{ v:1, at, workspace, projectPath, iid, sha, round, fid, file, line, level, type, gateCategory, problem, suggestion, reverifyCount, status, instruction: {kind, reason, noteId}|null }`；文本字段单行化并截断（problem / suggestion ≤ 500、file ≤ 300），控制字符压掉。
+- `status ∈ open | fixed | waived | skip | wontfix`：复用 `mergeable.js` 的处置口径（MR 评论里的有效 `#ai-*` 指令 + 账本 `decisions` + 与上一轮 FID 对比），`src/host/findings.js` 的 `collectFindings(record)` 同时供 UI 与落盘使用，避免两处漂移。
+- 只在状态变化时追加：同一 MR 内以 `(fid, status, instruction.kind, instruction.noteId)` 为键去重；进程启动后第一次写某文件前读回已有文件（含滚动的 `.1`）建立键集合，跨重启不重复；坏行 / 超大文件按「尽力而为」处理（坏行跳过）。
+- 触发点：`bind` 成功后、`applySnapshot` 更新后（新轮或同 sha 刷新）、`mr_waive` 回帖写 `decisions` 后；统一走一个 fire-and-forget 的 `record(state)`，写失败只 `log warn`，**绝不打断绑定 / 监视 / 回帖**。
+- 配置：`findingsDir`（默认 `~/.dsh/workspace`）、`findingsMaxBytes`（默认 `5242880`）。
+
 ## 6. 数据契约
 
 ### 6.1 评审 / 门禁 → 结构化
@@ -384,6 +399,8 @@ feat-V1.7.0.20261119-ly → feature-V1.7.0.20261119 · 第 3 轮 · sha 0e2a9007
 | `sensitiveTitle` | `Sensitive Content Gate` | 门禁 note 标题 |
 | `mandatoryTitle` | `必过项完整性检查` | 门禁 note 标题 |
 | `ledgerKeepRounds` | `50` | 账本裁剪 |
+| `findingsDir` | `~/.dsh/workspace` | findings 沉淀根目录（按工作区分子目录；不写进用户仓库） |
+| `findingsMaxBytes` | `5242880` | 单 MR JSONL 滚动阈值（5 MiB；滚动只保留一代 `.1`） |
 | `enabled` | `true` | 关闭后只有工具与命令、无 watcher |
 
 ### 6.6 命令与工具面
@@ -459,6 +476,7 @@ mr-loop/
   src/host/service.js     绑定编排 + 草稿 / 确认 / 回帖（幂等、恢复、写锁；≤620）
   src/host/mergeable.js    处置口径、reviewTodo、可合并判定（≤210）
   src/host/ledger.js       JSON 账本：原子写、裁剪、读取（≤180）
+  src/host/findings.js     findings 沉淀：FID 粒度、按工作区 append-only JSONL（≤360）
   src/host/watcher.js      轮询状态机、退避、唤醒去抖、abort（≤420）
   src/host/report.js       固定模板渲染（≤200）
   src/host/tools.js        6 个工具定义与参数校验（≤440）
@@ -480,6 +498,7 @@ mr-loop/
 - `watcher`：假定时器 + 假 fetch，覆盖 head 变化、评审先到、门禁后到、流水线失败、兜底超时、401、连续失败退避、唤醒去抖、会话销毁、四类守卫暂停（stall / reverify / wallClock / idle）与 `/mr resume`；另断言稳态 tick 只发 1 个请求、`user_notes_count` 不变时不拉 notes。
 - `waive`（service + tools + 真实接缝）：草稿不落账本；非法 kind / FID / reason；`post` 必须先出草稿（`draft-required`）；草稿后换绑或 sha 变化（`stale-round`）；同 FID 新草稿取代旧草稿（`draft-superseded`）；多 FID 草稿互不覆盖；跨会话重复写（`bound-elsewhere`）与会话销毁 `service.release` 释放后恢复可写；重复 post 幂等；结果未知（timeout / network / bad-response）按 body + 超时余量找回已创建评论（`recovered`）；persist 失败降级（`persisted:false`）；并发 post 只发一条。
 - `ledger`：原子写（写一半崩溃不留坏文件）、裁剪、并发写串行化。
+- `findings`：路径（工作区 / projectPath 转义 / MR 分文件）、append-only 且只在状态变化时追加、跨重启去重、文本单行化 / 截断、坏行容错、目录 0700 / 文件 0600、超阈值滚动；service 三个触发点与「失败只 warn 不打断」；`collectFindings` 与 UI 同口径。
 - `report`：强/弱绑定、unknown 门禁、降级判定各一份快照。
 - `config`：默认与非法值。
 - `tools`：参数校验与错误码。

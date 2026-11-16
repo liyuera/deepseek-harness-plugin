@@ -1,6 +1,7 @@
 /** Host 半边：装配 service、watcher 与工具/命令/技能。无 client 半边。 */
 import { resolveConfig } from './src/host/config.js'
 import { createLedger } from './src/host/ledger.js'
+import { createFindingsStore } from './src/host/findings.js'
 import { createGitlabClient } from './src/host/gitlab.js'
 import { readToken } from './src/host/token.js'
 import { createService } from './src/host/service.js'
@@ -39,6 +40,12 @@ export function releaseSession({ watcher, service }, sessionId) {
 export function apply(ctx, rawConfig = {}) {
   const config = resolveConfig(rawConfig)
   const ledger = createLedger({ dir: config.ledgerDir, keepRounds: config.ledgerKeepRounds })
+  // T4：findings 只记录（不进判定、不写用户仓库）；写失败只 warn，不影响绑定与监视。
+  const findings = createFindingsStore({
+    dir: config.findingsDir,
+    maxBytes: config.findingsMaxBytes,
+    logger: ctx.logger,
+  })
   // token 文件权限告警每个插件实例只记一次日志；告警文本只有路径，永远不含 token。
   let tokenWarningLogged = false
   const gitlab = createGitlabClient({
@@ -59,6 +66,8 @@ export function apply(ctx, rawConfig = {}) {
     config,
     ledger,
     gitlab,
+    findings,
+    logger: ctx.logger,
     onBound: ({ sessionId }) => {
       try {
         watcherRef?.start(sessionId)

@@ -15,6 +15,8 @@ const DEFAULTS = Object.freeze({
   baseUrl: 'https://git.htwisdom.cn',
   tokenFile: '~/.dsh/mr-loop/gitlab-token',
   ledgerDir: '~/.dsh/mr-loop/ledger',
+  findingsDir: '~/.dsh/workspace',
+  findingsMaxBytes: 5 * 1024 * 1024,
   pollWatchingMs: 30000,
   pollAwaitingMs: 10000,
   pollSettleMs: 15000,
@@ -48,10 +50,11 @@ const MIN = Object.freeze({
   idleStopMs: 60000,
   requestTimeoutMs: 1000,
   ledgerKeepRounds: 1,
+  findingsMaxBytes: 1,
 })
 
 const STRING_KEYS = Object.freeze([
-  'tokenFile', 'ledgerDir', 'reviewMarker', 'reviewTitlePrefix', 'sensitiveTitle', 'mandatoryTitle',
+  'tokenFile', 'ledgerDir', 'findingsDir', 'reviewMarker', 'reviewTitlePrefix', 'sensitiveTitle', 'mandatoryTitle',
 ])
 
 function normalizeBaseUrl(raw) {

@@ -5,28 +5,16 @@
  *   - live：本进程里仍在跟踪的绑定（有 mr 快照，可算可合并判定）
  *   - ledger：磁盘上每个 MR 的账本（进程重启/已解绑后仍能展示历史）
  *
- * 只读、无副作用；不碰 token，不写账本。UI 是「观测面」，判定口径与 CLI 报告一致。
+ * 只读、无副作用；不碰 token，不写账本。UI 是「观测面」，判定口径与 CLI 报告一致；
+ * 问题状态与 findings 落盘共用 findings.js 的 `collectFindings`，不在这里另写一套判定。
  */
 import { readdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { expandHome } from './ledger.js'
-import { evaluateMergeable, reviewTodo, isDisposed, isDisposedFinding, directiveFor, decisionFor } from './mergeable.js'
+import { evaluateMergeable, reviewTodo } from './mergeable.js'
+import { collectFindings } from './findings.js'
 
-const MAX_TEXT = 400
 const MAX_COMMENTS = 5
-
-/** note 正文/评论一律压成单行并截断：第三方内容不能改写前端结构。 */
-function text(value, limit = MAX_TEXT) {
-  if (value === null || value === undefined) return undefined
-  const collapsed = String(value)
-    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ')
-    .replace(/ {2,}/g, ' ')
-    .trim()
-  if (collapsed === '') return undefined
-  return collapsed.length > limit ? `${collapsed.slice(0, limit)}…` : collapsed
-}
-
-const sanitizeId = (value) => (typeof value === 'string' && value !== '' ? value : undefined)
 
 /**
  * 账本目录里每个文件即一个 MR。读坏的文件按「没有」处理（与 ledger.load 同口径）。
@@ -57,79 +45,26 @@ const roundOf = (record) => {
   return rounds.length === 0 ? null : rounds[rounds.length - 1]
 }
 
-const previousRoundOf = (record) => {
-  const rounds = Array.isArray(record?.rounds) ? record.rounds : []
-  return rounds.length < 2 ? null : rounds[rounds.length - 2]
-}
-
-const findingsOf = (round) => {
-  const blocking = Array.isArray(round?.review?.blocking) ? round.review.blocking : []
-  const nonBlocking = Array.isArray(round?.review?.nonBlocking) ? round.review.nonBlocking : []
-  return [...blocking, ...nonBlocking]
-}
-
-const kindOfDecision = (decision) => (isDisposed(decision) ? decision.kind : null)
-
 /**
- * 问题状态：open / waived(含 skip/wontfix) / fixed。
- * 处置来源有两处（决策文档 §2.1）：账本 decisions，以及 MR 评论里的有效 `#ai-*` 指令；
- * 任何一个命中都算已处置，和报告 / 合并判定同口径（#9）。
- * fixed = 上一轮有、本轮没有（有前一轮可比时才判定，否则不猜）。
+ * 共享 findings 判定（findings.js）→ UI 展示形状：面板只有 open / waived / fixed 三态，
+ * skip / wontfix 都显示为 waived；真正的处置方式保留在 instruction.kind。
  */
-function problemsOf(record) {
-  const round = roundOf(record)
-  const previous = previousRoundOf(record)
-  const decisions = record?.decisions !== null && typeof record.decisions === 'object' ? record.decisions : {}
-  const current = findingsOf(round)
-  const previousFids = new Set(findingsOf(previous).map((item) => String(item?.fid ?? '').toUpperCase()))
-  const currentFids = new Set(current.map((item) => String(item?.fid ?? '').toUpperCase()))
-
-  const problems = current.map((item) => {
-    const fid = sanitizeId(item?.fid) ?? '?'
-    // M3：与 mergeable.js 共用 decisionFor 的大小写兜底，不再用精确 key 查 decisions。
-    const decision = decisionFor(decisions, item?.fid)
-    const fromLedger = kindOfDecision(decision)
-    // 账本处置优先；没有时看 MR 评论里的指令（旧的线上账本 round 里没有 directives 也不抛）。
-    const directive = directiveFor(round, item?.fid)
-    const source = fromLedger !== null ? decision : directive
-    const kind = fromLedger ?? directive?.kind ?? null
-    return {
-      fid,
-      level: text(item?.level, 40) ?? '',
-      type: text(item?.gateCategory ?? item?.type, 60) ?? '',
-      file: text(item?.file, 300),
-      line: Number.isSafeInteger(item?.line) ? item.line : undefined,
-      problem: text(item?.problem) ?? '',
-      suggestion: text(item?.suggestion),
-      snippet: text(item?.snippet ?? item?.sourceSnippet),
-      status: kind === null ? 'open' : 'waived',
-      instruction: source === null || source === undefined ? undefined : {
-        kind,
-        reason: text(source?.reason, 200),
-        noteId: Number.isSafeInteger(source?.noteId) ? source.noteId : undefined,
-      },
-    }
-  })
-
-  // 上一轮存在、本轮消失的 FID 记 fixed（不重复计入当前问题）
-  for (const item of findingsOf(previous)) {
-    const fid = String(item?.fid ?? '')
-    if (fid === '' || currentFids.has(fid.toUpperCase())) continue
-    // 上一轮的问题已被指令 / 账本处置：不再标成 fixed（它没有「本轮消失后修好」的含义）。
-    if (isDisposedFinding(round, decisions, fid)) continue
-    problems.push({
-      fid,
-      level: text(item?.level, 40) ?? '',
-      type: text(item?.gateCategory ?? item?.type, 60) ?? '',
-      file: text(item?.file, 300),
-      problem: text(item?.problem) ?? '',
-      suggestion: text(item?.suggestion),
-      status: 'fixed',
-      fixedAtRound: round?.n,
-    })
+function uiProblemOf(finding) {
+  const status = finding.status === 'open' || finding.status === 'fixed' ? finding.status : 'waived'
+  const problem = {
+    fid: finding.fid,
+    level: finding.level,
+    type: finding.gateCategory ?? finding.type ?? '',
+    file: finding.file,
+    line: finding.line,
+    problem: finding.problem,
+    suggestion: finding.suggestion,
+    snippet: finding.snippet,
+    status,
+    instruction: finding.instruction === null ? undefined : finding.instruction,
   }
-  void previousFids
-  return problems
+  if (finding.fixedAtRound !== undefined) problem.fixedAtRound = finding.fixedAtRound
+  return problem
 }
 
 function resultOf(record, live) {
@@ -171,7 +106,8 @@ function resultOf(record, live) {
         ? null
         : { id: mr.head_pipeline.id, status: mr.head_pipeline.status },
     },
-    problems: problemsOf(record),
+    // #9：问题状态与落盘共用 collectFindings，避免面板和 findings 各写一套判定。
+    problems: collectFindings(record).map(uiProblemOf),
     pending: todo.total,
   }
 }
