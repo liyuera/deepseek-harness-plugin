@@ -125,8 +125,9 @@ watcher 每 tick 拉 `notes?per_page=50&sort=desc`（过滤 `system: true`），
 
 规则：
 
-- 解析复用并移植 `bug-workflow/src/host/review-parser.js` 的全部判据（引用行、代码块、缩进代码块剔除；`需要关注的问题` / `历史未收敛问题` 两段；`门禁分类=非阻塞建议` 或 `级别=低` 归非阻塞；拿不准返回 `unknown`）。
-- **fail-closed**：任一命中的 note 解析为 `unknown` → 该门禁记 `unknown`，不视为通过；报告里附原文前 200 字，并唤醒主代理。
+- 解析复用并移植 `bug-workflow/src/host/review-parser.js` 的全部判据（引用行、代码块、缩进代码块剔除；`需要关注的问题` / `历史未收敛问题` 两段；`门禁分类=非阻塞建议` 或 `级别=低` 归 `nonBlocking`；拿不准返回 `unknown`）。
+- **分组只影响展示，不影响可合判定**：`blocking` / `nonBlocking` 里的每一条 finding 都算「需要关注的问题」；只有拿到 `waive` / `skip` / `wontfix` 处置记录才不再计入（§5.6 第 2 条）。旧口径「低级别 / 非阻塞建议不拦合并」已废弃。
+- **fail-closed**：任一命中的 note 解析为 `unknown` → 该门禁记 `unknown`，不视为通过；报告里附原文前 200 字，并唤醒主代理。但可合判定对三套门禁的处置不同：评审 `unknown` 拦；敏感 `unknown` **不拦**（只有 `block` 才拦，§5.6 第 3 条）；必过项只在 `block` 时拦（建议性）。
 - 必过项 note 可能只在早期出现一次、之后不再重发（本 MR 观察到），因此它的状态是「最近一次观测值 + observedAt」，报告里标注时间，不冒充实时。
 - 同一 sha 上同一门禁出现多条 → 取最新 id。
 
@@ -211,11 +212,17 @@ idle ──bind──▶ watching(sha) ──head sha 变化──▶ awaiting(s
 全部满足才算 `mergeable`（缺一项即不满足，并在报告里列出差哪一项）：
 
 1. `state === 'opened'` 且非 draft；
-2. 已完成绑定的那个 sha 的评审：`verdict === 'pass'`；且**每一条**列在「需要关注的问题 / 历史未收敛问题」里的阻塞项，要么已被本轮证明修复（不再出现），要么有 `waive` / `skip` / `wontfix` 处置记录。`verdict === 'changes'` 一律不可合并；
-3. 敏感门禁**本轮**（基线之后）`verdict === 'pass'`（`当前有效 0 条`）；该 sha 上还没有 → 还在 settle 窗口，不算可合并；
-4. 必过项是**建议性**的：只有存在基线之后的 note 才计入；没有则忽略并在报告里标「无本轮结论」，最终由 `detailed_merge_status` 兜底（该 notes 只在早期出现一次，若强制要求 pass 会让可合并永远判不出来）；
+2. 已完成绑定的那个 sha 的评审：`verdict === 'pass'`，且**三个计数全部为 0**：
+   - **需要关注的问题** = 「需要关注的问题」+「历史未收敛问题」两段里的**全部** finding，**不再区分 `blocking` / `nonBlocking`**（低级别、非阻塞建议同样计入）；排除已有 `waive` / `skip` / `wontfix` 处置记录的条目后必须为 0。`fix` / `pending` / 空壳对象都不算处置。
+   - **历史未收敛问题** = note 的 `历史未收敛: N` 必须为 `0`。字段缺失（`null`）表示 note 没写这个字段，无法证明为 0，按 fail-closed 判不可合，报告写「历史未收敛问题未声明」。
+   - **本轮新增** = 上述未处置 finding 中 `复验次数` 缺失或 `<= 1`（首次被本轮评审看到）的条数，必须为 0。它与「需要关注的问题」有重叠，但报告里单独显示，用户能一眼看到本轮新出现几处。
+   `verdict === 'changes'` 或弱绑定一律不可合并；报告同时显示 `发现 N（本轮新增 M）` 与 `历史未收敛 X`，FID 最多列 3 个、级别随行。
+3. 敏感门禁**只有**本轮（基线之后）`verdict === 'block'` 才拦合并：`pass` 放行；`unknown` 与「本轮无结论」**不拦合并**，但报告如实显示并明确标注「不拦合并」（14.9 上该 bot 并非每次重发；旧口径「非 pass 即拦」已废弃）。`block` 报告为 `⛔ 阻止合并 · 有效 N 条 / 阻断项 M`。
+4. 必过项是**建议性**的：只有存在基线之后的 note 才计入；没有则忽略并在报告里标「— 无本轮结论（建议性）」，解析失败标「— 未解析（建议性）」；最终由 `detailed_merge_status` 兜底（该 notes 只在早期出现一次，若强制要求 pass 会让可合并永远判不出来）；
 5. GitLab 自己的合并态：有 `detailed_merge_status`（15.6+）时要求为 `'mergeable'`；14.9 实测**没有该字段**，降级为 `merge_status === 'can_be_merged'` + `blocking_discussions_resolved !== false` + **`head_pipeline.status === 'success'`**（14.9 的 `merge_status` 只反映冲突，不看 CI；没有流水线时视为「无 CI」放行），报告标注「降级判定」——在本实例上降级是**常态**，不是例外；
 6. `has_conflicts === false`。
+
+> **口径修正（2026-11-16，真机验收后）**：可合 = 结论 pass + 需要关注 0 + 历史未收敛 0 + 本轮新增 0；任何未处置 finding（含低 / 非阻塞建议）都拦；敏感门禁只有 `block` 才拦。旧版本「低 / 非阻塞建议不拦合并」「敏感非 pass 即拦」的表述作废。
 
 满足后：唤醒一次，附收尾报告（§6.4），停 watcher，账本写 `mergeableAt`。**插件不合并**。
 
@@ -294,15 +301,21 @@ Finding = { fid, file, level, gateCategory, location, problem, suggestion, rever
 ```
 MR !240 · wisdom-financial-service-platform/wisdom-financial-credit-platform-web
 feat-V1.7.0.20261119-ly → feature-V1.7.0.20261119 · 第 3 轮 · sha 0e2a9007（强绑定）
-评审   ✅ 可直接合并 · 历史未收敛 0 · 本轮已验证修复 1 · Job 10s（20 秒前）
+评审   ✅ 可直接合并 · 发现 0（本轮新增 0） · 历史未收敛 0 · 本轮已验证修复 1 · Job 10s（20 秒前）
 敏感   ✅ 门禁通过 · 共 15 条 / 历史豁免 15 / 当前有效 0
-必过   ⏳ 未出（最近一次 18:17 阻止合并）
+必过   — 无本轮结论（建议性）
 阻塞   无
 待点头 #ai-waive ee81ac3eb3 reason=…（草稿，等你确认）
 合并   ✅ 可合（流水线 #7181 通过 · detailed_merge_status=mergeable）
 ```
 
-状态符号固定：`✅` 通过、`⛔` 阻塞、`⏳` 未出/待定、`⚠️` 弱绑定或降级判定。
+状态符号固定：`✅` 通过、`⛔` 阻塞、`⏳` 未出/待定、`⚠️` 弱绑定或降级判定、`—` 无结论 / 字段缺失占位。
+
+门禁行的失败与非失败态：
+
+- 敏感门禁：`block` → `⛔ 阻止合并 · 有效 N 条 / 阻断项 M`（拦合并）；`unknown` → `⏳ 未解析（不拦合并）`；本轮无结论 → `— 无本轮结论（不拦合并）`。
+- 必过项：本轮无结论 → `— 无本轮结论（建议性）`；解析失败 → `— 未解析（建议性）`。
+- 「阻塞」行列出**所有未处置 finding**（含 `nonBlocking`），格式 `FID · 级别 · 门禁分类`，多个用 `；` 连接；超过 3 条用 `等 N 条` 收口。
 
 ### 6.5 配置面
 
