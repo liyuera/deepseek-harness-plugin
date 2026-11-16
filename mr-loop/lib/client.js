@@ -15,6 +15,10 @@ window.__ModuleLoader__.load({
       ".mrl-chip{display:inline-flex;align-items:center;gap:6px;margin:0 2px}",
       ".mrl-chip-tag{display:inline-flex;align-items:center;gap:5px;height:24px;padding:0 8px;border-radius:7px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-button-elevated-fill);color:var(--dsw-alias-label-primary);font-size:11.5px;line-height:1;white-space:nowrap;cursor:pointer}",
       ".mrl-chip-tag:hover{background:var(--dsw-alias-button-floating-hover)}",
+      ".mrl-chip-tag.warn{border-color:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 32%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 10%,transparent)}",
+      ".mrl-chip-tag.err{border-color:color-mix(in srgb,var(--dsw-alias-state-error-primary) 32%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 10%,transparent)}",
+      ".mrl-chip-tag.ok{border-color:color-mix(in srgb,var(--dsw-alias-state-success-primary) 32%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-success-primary) 10%,transparent)}",
+      ".mrl-chip-tag.brand{background:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary);color:#fff}",
       ".mrl-chip-tag:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:-2px}",
       ".mrl-dot{width:6px;height:6px;border-radius:50%;background:var(--dsw-alias-state-idle-primary);flex:none}",
       ".mrl-dot.ok{background:var(--dsw-alias-state-success-primary)}",
@@ -38,14 +42,14 @@ window.__ModuleLoader__.load({
       ".mrl-mr-sub{font-size:11.5px;color:var(--dsw-alias-label-secondary);margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:290px}",
       ".mrl-tags{margin-left:auto;display:flex;gap:5px;flex-shrink:0}",
       ".mrl-tag{font-size:11px;padding:0 7px;line-height:18px;border-radius:20px;border:1px solid var(--dsw-alias-border-l1);color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-2);white-space:nowrap}",
-      ".mrl-tag.brand{color:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary);background:transparent}",
-      ".mrl-tag.ok{color:var(--dsw-alias-state-success-primary);border-color:var(--dsw-alias-state-success-primary);background:transparent}",
-      ".mrl-tag.err{color:var(--dsw-alias-state-error-primary);border-color:var(--dsw-alias-state-error-primary);background:transparent}",
+      ".mrl-tag.brand{color:var(--dsw-alias-brand-primary);border-color:color-mix(in srgb,var(--dsw-alias-brand-primary) 32%,transparent);background:color-mix(in srgb,var(--dsw-alias-brand-primary) 10%,transparent)}",
+      ".mrl-tag.ok{color:var(--dsw-alias-state-success-primary);border-color:color-mix(in srgb,var(--dsw-alias-state-success-primary) 32%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-success-primary) 10%,transparent)}",
+      ".mrl-tag.err{color:var(--dsw-alias-state-error-primary);border-color:color-mix(in srgb,var(--dsw-alias-state-error-primary) 32%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 10%,transparent)}",
       ".mrl-gates{display:flex;gap:5px;flex-wrap:wrap;padding:0 12px 9px}",
       ".mrl-gate{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-2);border-radius:7px;padding:2px 8px;white-space:nowrap}",
       ".mrl-merge{display:flex;align-items:center;gap:7px;margin:0 12px 10px;padding:7px 10px;border-radius:9px;font-size:12px;color:var(--dsw-alias-label-primary);border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-2)}",
-      ".mrl-merge[data-kind=bad]{border-color:var(--dsw-alias-state-error-primary);background:transparent}",
-      ".mrl-merge[data-kind=ok]{border-color:var(--dsw-alias-state-success-primary);background:transparent}",
+      ".mrl-merge[data-kind=bad]{border-color:color-mix(in srgb,var(--dsw-alias-state-error-primary) 20%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 8%,transparent)}",
+      ".mrl-merge[data-kind=ok]{border-color:color-mix(in srgb,var(--dsw-alias-state-success-primary) 20%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-success-primary) 8%,transparent)}",
       ".mrl-merge .txt{flex:1;min-width:0}",
       ".mrl-merge-icon{flex:none;font-size:12px;line-height:1}",
       ".mrl-link{color:var(--dsw-alias-brand-primary);font-size:11.5px;white-space:nowrap;cursor:pointer;background:none;border:0;padding:0}",
@@ -60,8 +64,8 @@ window.__ModuleLoader__.load({
       ".mrl-lv[data-lv=中]{color:var(--dsw-alias-state-warn-primary)}",
       ".mrl-lv[data-lv=低]{color:var(--dsw-alias-brand-primary)}",
       ".mrl-st{font-size:10.5px;line-height:17px;padding:0 7px;border-radius:20px;white-space:nowrap;margin-left:auto}",
-      ".mrl-st[data-st=open]{color:var(--dsw-alias-state-warn-primary);background:var(--dsw-alias-bg-layer-2)}",
-      ".mrl-st[data-st=fixed]{color:var(--dsw-alias-state-success-primary);background:var(--dsw-alias-bg-layer-2)}",
+      ".mrl-st[data-st=open]{color:var(--dsw-alias-state-warn-primary);background:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 13%,transparent)}",
+      ".mrl-st[data-st=fixed]{color:var(--dsw-alias-state-success-primary);background:color-mix(in srgb,var(--dsw-alias-state-success-primary) 13%,transparent)}",
       ".mrl-st[data-st=waived]{color:var(--dsw-alias-state-idle-primary);background:var(--dsw-alias-bg-layer-2)}",
       ".mrl-chev{font-size:10.5px;color:var(--dsw-alias-label-secondary);cursor:pointer;background:none;border:0;padding:0;margin-left:6px}",
       ".mrl-file{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;color:var(--dsw-alias-label-secondary);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
@@ -188,6 +192,18 @@ window.__ModuleLoader__.load({
       return { text: "● 未处理", tone: "open" };
     }
 
+    /** 相对时间：<1h 显示「N 分钟前」，否则显示日期时间。 */
+    function relativeTime(value) {
+      var time = Date.parse(value === null || value === undefined ? "" : String(value));
+      if (!Number.isFinite(time)) return "";
+      var diff = Date.now() - time;
+      if (diff >= 0 && diff < 60 * 60 * 1000) {
+        var minutes = Math.max(1, Math.round(diff / 60000));
+        return minutes + " 分钟前";
+      }
+      return String(value).replace("T", " ").slice(0, 16);
+    }
+
     function copyText(text) {
       try {
         if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -232,12 +248,12 @@ window.__ModuleLoader__.load({
         : scoped.reduce(function (sum, mr) { return sum + (typeof mr.pending === "number" ? mr.pending : 0); }, 0);
       var initialScope = currentSessionId !== null && scoped.length > 0 ? "session" : "all";
       var shown = scoped.slice(0, 2);
-      var tags = shown.map(function (mr) {
+      var tags = shown.map(function (mr, index) {
         var label = "!" + mr.iid;
-        var tone = mr.merge && mr.merge.mergeable === true ? "ok" : (mr.pending > 0 ? "warn" : "");
+        var tone = index === 0 ? "brand" : (mr.merge && mr.merge.mergeable === true ? "ok" : (mr.pending > 0 ? "warn" : ""));
         return h("button", {
           key: "mr-" + mr.iid,
-          className: "mrl-chip-tag",
+          className: "mrl-chip-tag " + tone,
           type: "button",
           title: mr.sourceBranch + " → " + mr.targetBranch,
           onClick: function () { setStore({ open: true, expanded: {}, scope: initialScope }); },
@@ -253,7 +269,7 @@ window.__ModuleLoader__.load({
         : null;
       return h("span", { className: "mrl-chip" }, tags, more, pendingTag,
         h("button", {
-          className: "mrl-chip-tag",
+          className: "mrl-chip-tag brand",
           type: "button",
           onClick: function () { setStore({ open: true, expanded: {}, scope: initialScope }); },
         }, "看板"));
@@ -286,6 +302,10 @@ window.__ModuleLoader__.load({
           if (problem.comment.author) metaParts.push(problem.comment.author);
           if (problem.comment.createdAt) metaParts.push(String(problem.comment.createdAt).replace("T", " ").slice(0, 16));
           metaParts.push("评论 #" + problem.comment.noteId);
+          if (problem.instruction) {
+            var kindLabel = problem.instruction.kind === "skip" ? "不适用" : (problem.instruction.kind === "wontfix" ? "不修" : "已豁免");
+            metaParts.push("★ " + kindLabel + "该问题");
+          }
           rows.push(h("div", { className: "mrl-d-row", key: "comment" },
             h("span", { className: "mrl-d-k" }, "评论原文"),
             h("span", { className: "mrl-d-v mrl-quote" },
@@ -349,15 +369,16 @@ window.__ModuleLoader__.load({
         copyText("#ai-waive " + openProblem.fid + " reason=");
       };
 
+      var statusTag = mr.state === "merged"
+        ? h("span", { className: "mrl-tag", key: "state" }, "已合并")
+        : merge === null
+          ? null
+          : (merge.mergeable === true
+              ? h("span", { className: "mrl-tag ok", key: "state" }, "可合")
+              : h("span", { className: "mrl-tag err", key: "state" }, "差 " + (merge.missing ? merge.missing.length : 0) + " 项"));
       var tags = [
         h("span", { className: "mrl-tag brand", key: "round" }, "第 " + (mr.round || 0) + " 轮"),
-        mr.state === "merged"
-          ? h("span", { className: "mrl-tag", key: "state" }, "已合并")
-          : (pending > 0
-              ? h("span", { className: "mrl-tag err", key: "state" }, pending + " 待处理")
-              : (merge && merge.mergeable === true
-                  ? h("span", { className: "mrl-tag ok", key: "state" }, "可合")
-                  : null)),
+        statusTag,
       ];
 
       return h("div", { className: "mrl-mr" },
@@ -365,9 +386,10 @@ window.__ModuleLoader__.load({
           h("div", { style: { minWidth: 0 } },
             h("div", { className: "mrl-mr-id" },
               "!" + mr.iid,
-              mr.live === true ? h("span", { className: "mrl-tag" }, "跟踪中") : null,
-              h("span", { className: "mrl-tag", style: { color: "var(--dsw-alias-label-secondary)" } },
-              MR_STATE_LABEL[mr.state] || (mr.live === true ? "跟踪中" : "历史账本"))),
+              h("span", {
+                className: "mrl-tag",
+                title: mr.session && mr.session.title ? mr.session.title : undefined,
+              }, mr.live === true ? "本会话" : "历史账本")),
             h("div", { className: "mrl-mr-sub", title: mr.sourceBranch + " → " + mr.targetBranch },
               (mr.sourceBranch || "?") + " → " + (mr.targetBranch || "?"))),
           h("div", { className: "mrl-tags" }, tags)),
@@ -401,7 +423,7 @@ window.__ModuleLoader__.load({
           : null,
         h("div", { className: "mrl-f" },
           h("span", { className: "mrl-mono" }, "sha " + String(mr.sha || "").slice(0, 8)),
-          mr.updatedAt ? h("span", null, "· " + String(mr.updatedAt).replace("T", " ").slice(0, 16)) : null,
+          mr.updatedAt ? h("span", null, "· " + relativeTime(mr.updatedAt)) : null,
           h("span", { className: "mrl-sp" }),
           h("button", {
             className: "mrl-btn",

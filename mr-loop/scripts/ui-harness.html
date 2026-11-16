@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>mr-loop UI harness（真实 client bundle + 假数据）</title>
+<style>
+  :root{
+    --dsw-alias-bg-base:#f4f5f7;
+    --dsw-alias-bg-layer-1:#ffffff;
+    --dsw-alias-bg-layer-2:#f1f2f4;
+    --dsw-alias-bg-overlay:#ffffff;
+    --dsw-alias-border-l1:#e7e8eb;
+    --dsw-alias-border-l2:#d8dade;
+    --dsw-alias-brand-primary:#4d6bfe;
+    --dsw-alias-label-primary:#1b1c1e;
+    --dsw-alias-label-secondary:#6b7076;
+    --dsw-alias-state-error-primary:#dc2626;
+    --dsw-alias-state-idle-primary:#9aa0a6;
+    --dsw-alias-state-success-primary:#16a34a;
+    --dsw-alias-state-warn-primary:#d97706;
+    --dsw-specific-sidebar-fill:#f4f5f7;
+    --dsw-alias-button-elevated-fill:#ffffff;
+    --dsw-alias-button-floating-hover:#f4f5f7;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:#e9eaee;font:13px/1.55 -apple-system,"PingFang SC","Helvetica Neue",Arial,sans-serif;color:#1b1c1e}
+  #stage{position:relative;width:900px;height:1080px;background:var(--dsw-alias-bg-base);overflow:hidden;margin:0 auto}
+  /* 仅为了验收截图：把 fixed dialog 放进 stage，位置/尺寸/颜色不变 */
+  .mrl-dialog{position:absolute !important;top:24px !important;right:24px !important}
+  #chip-box{position:absolute;top:24px;left:24px;right:500px}
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="chip-box"></div>
+  <div id="root"></div>
+</div>
+
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script>
+  // 假数据：覆盖 未处理 / 已修 / 已豁免（带评论原文）/ 可合 / 已合并
+  const STATE = {
+    scope: 'all',
+    updatedAt: '2026-11-16T10:50:00Z',
+    counts: { total: 3, pending: 1, mergeable: 1, merged: 1 },
+    mrs: [
+      {
+        projectPath: 'wisdom-financial-service-platform/wisdom-financial-credit-platform-web',
+        iid: 241,
+        webUrl: 'https://git.example.com/x/-/merge_requests/241',
+        sourceBranch: 'feat-V1.7.0.20261119-ly',
+        targetBranch: 'feature-V1.7.0.20261119',
+        state: 'opened', sha: '8a282d1540224ada925e502354b9f5866acec588', round: 1,
+        updatedAt: '2026-11-16T10:48:07Z', live: true,
+        session: { id: 'session-1', title: '财务服务平台 · 报告管理' },
+        review: { verdict: 'pass', historicalUnresolved: 0, verifiedFixed: null, newThisRound: 1 },
+        gates: { sensitive: 'pass', mandatory: null },
+        merge: { mergeable: false, missing: ['评审有 1 处需要关注的问题（其中 1 处本轮新增）：FID aea50825a5（低）'], pipeline: { id: 7298, status: 'success' } },
+        pending: 1,
+        problems: [
+          {
+            fid: 'aea50825a5', level: '低', type: '非阻塞建议',
+            file: 'src/pages/report-manage/components/ReportUploadModal/index.tsx', line: 81,
+            problem: '回显加载态首帧未挂载字段，打开弹窗先闪一帧空表单',
+            suggestion: '把加载态与数据就绪度绑定：将 useState(false) 改为 useState(!!record?.id)。',
+            status: 'open',
+          },
+          {
+            fid: 'c3f0e7a1', level: '中', type: '逻辑错误',
+            file: 'src/pages/report-manage/utils/loadReportEcho.ts', line: 44,
+            problem: 'allSettled 后未区分 rejected，失败时把空对象写进表单',
+            suggestion: '区分 rejected 分支并降级。',
+            status: 'fixed', fixedAtRound: 2,
+          },
+          {
+            fid: 'b71c9d02', level: '低', type: '非阻塞建议',
+            file: 'src/types/BaoGaoGuanLi.ts', line: 12,
+            problem: '类型字段与后端 DTO 命名不一致',
+            suggestion: '把 orderer 字段对齐后端 DTO。',
+            snippet: 'export interface BaoGaoGuanLiVO {\n  ordererName: string   // 后端已改为 orderer\n}',
+            status: 'waived',
+            instruction: { kind: 'waive', reason: '后端 DTO 已确认，本单不改', noteId: 75200 },
+            comment: { noteId: 75200, body: '#ai-waive b71c9d02 reason=后端 DTO 已确认，本单不改', author: 'liyu', createdAt: '2026-11-16T10:02:00Z' },
+          },
+        ],
+      },
+      {
+        projectPath: 'group/other', iid: 238, webUrl: 'https://git.example.com/g/p/-/merge_requests/238',
+        sourceBranch: 'fix-V1.7.0.20261119', targetBranch: 'feature-V1.7.0.20261119',
+        state: 'opened', sha: '3f1d9c02', round: 3, updatedAt: '2026-11-16T09:40:00Z',
+        live: false, session: { id: 'session-2', title: '报告管理重构' },
+        review: { verdict: 'pass', historicalUnresolved: 0, verifiedFixed: 2, newThisRound: 0 },
+        gates: { sensitive: 'pass', mandatory: null },
+        merge: { mergeable: true, missing: [], pipeline: { id: 7181, status: 'success' } },
+        pending: 0, problems: [],
+      },
+      {
+        projectPath: 'group/third', iid: 236, webUrl: 'https://git.example.com/g/p/-/merge_requests/236',
+        sourceBranch: 'feat-V1.7.0.20261112', targetBranch: 'feature-V1.7.0.20261112',
+        state: 'merged', sha: 'aa11bb22', round: 4, updatedAt: '2026-11-13T09:40:00Z',
+        live: false, session: { id: 'session-3', title: '交付率口径' },
+        review: { verdict: 'pass', historicalUnresolved: 0, verifiedFixed: 3, newThisRound: 0 },
+        gates: { sensitive: 'pass', mandatory: null },
+        merge: { mergeable: false, missing: [], pipeline: { id: 7001, status: 'success' } },
+        pending: 0, problems: [],
+      },
+    ],
+  }
+
+  window.fetch = function () {
+    return Promise.resolve({ ok: true, json: function () { return Promise.resolve(STATE) } })
+  }
+
+  window.__ModuleLoader__ = {
+    load: function (spec) {
+      window.__client = spec.factory(function (name) {
+        if (name === 'react') return window.React
+        if (name === 'react-dom') return window.ReactDOM
+        throw new Error('unexpected require: ' + name)
+      })
+    },
+  }
+</script>
+<script src="../lib/client.js"></script>
+<script>
+  const captured = []
+  const ctx = {
+    slots: {
+      inject: function (_name, cb) { cb() },
+      register: function (def, Comp) { captured.push({ def: def, Comp: Comp }); return function () {} },
+    },
+    effect: function (f) { const d = f(); return d },
+  }
+  window.__client.apply(ctx)
+
+  const chip = captured.find(c => c.def.name === 'conversation.session.header.actions').Comp
+  const drawer = captured.find(c => c.def.name === 'shell.overlay').Comp
+
+  const React = window.React
+  const ReactDOM = window.ReactDOM
+  ReactDOM.createRoot(document.getElementById('chip-box')).render(React.createElement(chip, { sessionId: 'session-1' }))
+  ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(drawer))
+
+  // 等 fetch 落定后点开看板
+  setTimeout(function () {
+    const buttons = Array.from(document.querySelectorAll('button'))
+    const open = buttons.find(b => b.textContent.trim() === '看板')
+    if (open) open.click()
+  }, 300)
+</script>
+</body>
+</html>
