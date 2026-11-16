@@ -20,8 +20,8 @@ window.__ModuleLoader__.load({
       ".mrl-dot.ok{background:var(--dsw-alias-state-success-primary)}",
       ".mrl-dot.warn{background:var(--dsw-alias-state-warn-primary)}",
       ".mrl-dot.err{background:var(--dsw-alias-state-error-primary)}",
-      ".mrl-dialog{position:fixed;top:28px;right:28px;z-index:1000;display:flex;align-items:flex-start;justify-content:flex-end;pointer-events:auto}",
-      ".mrl-panel{width:560px;max-width:calc(100vw - 56px);max-height:calc(100vh - 56px);display:flex;flex-direction:column;background:var(--dsw-alias-bg-overlay);border:1px solid var(--dsw-alias-border-l1);border-radius:12px;box-shadow:0 18px 48px rgba(0,0,0,.18);overflow:hidden;pointer-events:auto}",
+      ".mrl-dialog{position:fixed;top:64px;right:24px;z-index:1000;display:flex;align-items:flex-start;justify-content:flex-end;pointer-events:auto}",
+      ".mrl-panel{width:420px;max-width:calc(100vw - 48px);min-height:300px;max-height:calc(100vh - 88px);display:flex;flex-direction:column;background:var(--dsw-alias-bg-overlay);border:1px solid var(--dsw-alias-border-l1);border-radius:12px;box-shadow:0 18px 48px rgba(0,0,0,.18);overflow:hidden;pointer-events:auto}",
       ".mrl-hd{padding:13px 14px 0;border-bottom:1px solid var(--dsw-alias-border-l1);flex:none}",
       ".mrl-hd-row{display:flex;align-items:center;gap:8px}",
       ".mrl-title{font-size:14px;font-weight:650;margin:0;color:var(--dsw-alias-label-primary)}",
@@ -211,6 +211,13 @@ window.__ModuleLoader__.load({
       var data = state.data;
       if (data === null || !Array.isArray(data.mrs) || data.mrs.length === 0) return null;
       var pending = data.counts && typeof data.counts.pending === "number" ? data.counts.pending : 0;
+      var currentSessionId = state.sessionId;
+      var hasSessionMrs = currentSessionId === null
+        ? false
+        : data.mrs.some(function (mr) {
+            return mr.session !== undefined && mr.session !== null && String(mr.session.id) === currentSessionId;
+          });
+      var initialScope = hasSessionMrs ? "session" : "all";
       var shown = data.mrs.slice(0, 2);
       var tags = shown.map(function (mr) {
         var label = "!" + mr.iid;
@@ -220,7 +227,7 @@ window.__ModuleLoader__.load({
           className: "mrl-chip-tag",
           type: "button",
           title: mr.sourceBranch + " → " + mr.targetBranch,
-          onClick: function () { setStore({ open: true, expanded: {} }); },
+          onClick: function () { setStore({ open: true, expanded: {}, scope: initialScope }); },
         },
         h("span", { className: "mrl-dot " + tone }),
         h("span", null, label + " · 第 " + (mr.round || 0) + " 轮"));
@@ -235,7 +242,7 @@ window.__ModuleLoader__.load({
         h("button", {
           className: "mrl-chip-tag",
           type: "button",
-          onClick: function () { setStore({ open: true, expanded: {} }); },
+          onClick: function () { setStore({ open: true, expanded: {}, scope: initialScope }); },
         }, "看板"));
     }
 
@@ -388,19 +395,6 @@ window.__ModuleLoader__.load({
     // ---------------------------------------------------------------- drawer
     function Drawer() {
       var state = useStore();
-      var allMrs = state.data && Array.isArray(state.data.mrs) ? state.data.mrs : [];
-      var sessionIdForDrawer = store.sessionId;
-      var sessionCount = sessionIdForDrawer === null
-        ? 0
-        : allMrs.filter(function (mr) {
-            return mr.session !== undefined && mr.session !== null && String(mr.session.id) === sessionIdForDrawer;
-          }).length;
-      // 打开抽屉时若「本会话」为空，自动落到「全部」，避免一进来就是空页。
-      React.useEffect(function () {
-        if (state.open === true && state.scope === "session" && sessionCount === 0 && allMrs.length > 0) {
-          setStore({ scope: "all" });
-        }
-      }, [state.open, state.scope, sessionCount, allMrs.length]);
       React.useEffect(function () {
         if (state.open !== true) return undefined;
         var onKey = function (event) {

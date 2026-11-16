@@ -17,7 +17,7 @@
 | 层级 | 位置 | 插槽 | 说明 |
 | --- | --- | --- | --- |
 | 主入口 | 会话头 chip | `conversation.session.header.actions` | 常驻；显示 `!241 · 第 1 轮 / 1 待处理 / !238 · 可合 / [看板]` |
-| 看板 | **右上角 dialog（无遮罩）** | `shell.overlay` 挂载 + `react-dom` portal 到 `document.body` | 宽 560px、距顶/右各 28px；`本会话 / 全部 / 已合并` 三段；点 chip 打开；只能点右上角 ✕ 关闭（Esc 同效） |
+| 看板 | **右上角 dialog（无遮罩）** | `shell.overlay` 挂载 + `react-dom` portal 到 `document.body` | 宽 420px、距顶 64px 距右 24px、min-height 300px / max-height `100vh-88px`、内部滚动；`本会话 / 全部 / 已合并` 三段；点 chip 打开；只能点右上角 ✕ 关闭（Esc 同效） |
 | 每轮报告 | 工具结果内联卡 | `tool.call.toolview`（keyed `mr_bind`/`mr_status`/`mr_review`） | 报告就地变卡，不跳转 |
 | 后续 | 右侧页签 / 左侧全局面板 | `sidebar.right.pane.tab` / `sidebar.panellist` | v2 再评估，不阻塞 v1 |
 
@@ -55,7 +55,7 @@
 
 | 元素 | 规格 |
 | --- | --- |
-| Dialog | `bg-overlay`，宽 560px，距顶/右 28px，圆角 12，阴影 `0 18px 48px rgba(0,0,0,.18)`；**无遮罩、不点外部关闭**；✕ 关闭 + Esc |
+| Dialog | `bg-overlay`，宽 420px，top 64 / right 24，圆角 12，阴影 `0 18px 48px rgba(0,0,0,.18)`；**无遮罩、不点外部关闭**；✕ 关闭 + Esc；内容超过最大高度时列表内部滚动 |
 | MR 卡 | `bg-layer-1` + 1px `border-l1`，圆角 12，卡间距 10，卡内边距 12 |
 | 嵌套块（门禁 chip、详情块） | `bg-layer-2`，圆角 8–9 |
 | 文字 | 主 `label-primary`，次 `label-secondary`；FID/路径/代码用等宽 10.5–11px |
