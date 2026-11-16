@@ -314,10 +314,10 @@ window.__ModuleLoader__.load({
       var openMr = function () { if (mr.webUrl) window.open(mr.webUrl, "_blank", "noopener,noreferrer"); };
       var removeEscaped = function () { /* hooks not used here */ };
       void removeEscaped;
+      var openProblem = problems.filter(function (p) { return p.status === "open"; })[0];
       var copyDraft = function () {
-        var fid = problems.filter(function (p) { return p.status === "open"; }).map(function (p) { return p.fid; })[0];
-        if (fid === undefined) return;
-        copyText("#ai-waive " + fid + " reason=");
+        if (openProblem === undefined) return;
+        copyText("#ai-waive " + openProblem.fid + " reason=");
       };
 
       var tags = [
@@ -372,7 +372,13 @@ window.__ModuleLoader__.load({
           h("span", { className: "mrl-mono" }, "sha " + String(mr.sha || "").slice(0, 8)),
           mr.updatedAt ? h("span", null, "· " + String(mr.updatedAt).replace("T", " ").slice(0, 16)) : null,
           h("span", { className: "mrl-sp" }),
-          h("button", { className: "mrl-btn", type: "button", onClick: copyDraft }, "复制指令"),
+          h("button", {
+            className: "mrl-btn",
+            type: "button",
+            disabled: openProblem === undefined,
+            title: openProblem === undefined ? "没有待处理问题" : "复制 #ai-waive " + openProblem.fid + " reason=",
+            onClick: copyDraft,
+          }, "复制指令"),
           h("button", { className: "mrl-btn", type: "button", onClick: openMr }, "详情")));
     }
 
