@@ -227,3 +227,18 @@ test('M2：账本记录的 webUrl 用 config.baseUrl 拼（含子路径）', asy
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+test('指令豁免的问题带评论原文（body/author/createdAt/noteId），供面板展开显示', async () => {
+  const round = roundOf({ directives: [{ kind: 'waive', fid: 'aaaaaaaaaa', reason: '风险已评估', noteId: 75200, author: 'liyu', createdAt: '2026-11-16T10:00:00Z' }] })
+  round.directiveNotes = [{ noteId: 75200, body: '#ai-waive aaaaaaaaaa reason=风险已评估' }]
+  const record = recordOf({ iid: 242, round, decisions: {} })
+
+  const snapshot = await snapshotOf([record])
+  const problem = snapshot.mrs[0].problems[0]
+  assert.equal(problem.status, 'waived')
+  assert.equal(problem.instruction.noteId, 75200)
+  assert.equal(problem.comment.noteId, 75200)
+  assert.equal(problem.comment.body, '#ai-waive aaaaaaaaaa reason=风险已评估')
+  assert.equal(problem.comment.author, 'liyu')
+  assert.equal(problem.comment.createdAt, '2026-11-16T10:00:00Z')
+})

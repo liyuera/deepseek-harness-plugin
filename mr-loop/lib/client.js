@@ -47,6 +47,7 @@ window.__ModuleLoader__.load({
       ".mrl-merge[data-kind=bad]{border-color:var(--dsw-alias-state-error-primary);background:transparent}",
       ".mrl-merge[data-kind=ok]{border-color:var(--dsw-alias-state-success-primary);background:transparent}",
       ".mrl-merge .txt{flex:1;min-width:0}",
+      ".mrl-merge-icon{flex:none;font-size:12px;line-height:1}",
       ".mrl-link{color:var(--dsw-alias-brand-primary);font-size:11.5px;white-space:nowrap;cursor:pointer;background:none;border:0;padding:0}",
       ".mrl-issues{border-top:1px solid var(--dsw-alias-border-l1)}",
       ".mrl-issue{padding:9px 12px;border-bottom:1px solid var(--dsw-alias-border-l1)}",
@@ -58,11 +59,11 @@ window.__ModuleLoader__.load({
       ".mrl-lv[data-lv=高]{color:var(--dsw-alias-state-error-primary)}",
       ".mrl-lv[data-lv=中]{color:var(--dsw-alias-state-warn-primary)}",
       ".mrl-lv[data-lv=低]{color:var(--dsw-alias-brand-primary)}",
-      ".mrl-st{font-size:10.5px;line-height:17px;padding:0 7px;border-radius:20px;white-space:nowrap}",
+      ".mrl-st{font-size:10.5px;line-height:17px;padding:0 7px;border-radius:20px;white-space:nowrap;margin-left:auto}",
       ".mrl-st[data-st=open]{color:var(--dsw-alias-state-warn-primary);background:var(--dsw-alias-bg-layer-2)}",
       ".mrl-st[data-st=fixed]{color:var(--dsw-alias-state-success-primary);background:var(--dsw-alias-bg-layer-2)}",
       ".mrl-st[data-st=waived]{color:var(--dsw-alias-state-idle-primary);background:var(--dsw-alias-bg-layer-2)}",
-      ".mrl-chev{font-size:10.5px;color:var(--dsw-alias-label-secondary);cursor:pointer;background:none;border:0;padding:0;margin-left:auto}",
+      ".mrl-chev{font-size:10.5px;color:var(--dsw-alias-label-secondary);cursor:pointer;background:none;border:0;padding:0;margin-left:6px}",
       ".mrl-file{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;color:var(--dsw-alias-label-secondary);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
       ".mrl-prob{font-size:12px;margin-top:3px;color:var(--dsw-alias-label-primary)}",
       ".mrl-instr{margin-top:4px;font-size:11px;color:var(--dsw-alias-label-secondary);display:flex;gap:5px;align-items:baseline;flex-wrap:wrap}",
@@ -71,6 +72,8 @@ window.__ModuleLoader__.load({
       ".mrl-d-row{display:grid;grid-template-columns:54px 1fr;gap:8px;font-size:11.5px;line-height:1.65}",
       ".mrl-d-k{color:var(--dsw-alias-label-secondary);font-size:10.5px;padding-top:1px}",
       ".mrl-d-v{color:var(--dsw-alias-label-secondary);min-width:0;white-space:pre-wrap;word-break:break-word}",
+      ".mrl-quote{border-left:2px solid var(--dsw-alias-border-l2);padding-left:8px;white-space:pre-wrap;word-break:break-word}",
+      ".mrl-meta2{display:block;color:var(--dsw-alias-label-secondary);font-size:10.5px;margin-top:2px}",
       ".mrl-snippet{display:block;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;line-height:1.7;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l1);border-radius:6px;padding:6px 8px;color:var(--dsw-alias-label-primary);white-space:pre-wrap;word-break:break-word}",
       ".mrl-f{padding:8px 12px;border-top:1px solid var(--dsw-alias-border-l1);display:flex;align-items:center;gap:7px;color:var(--dsw-alias-label-secondary);font-size:11px;background:var(--dsw-alias-bg-layer-2)}",
       ".mrl-btn{font-size:11.5px;padding:3px 9px;border-radius:7px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);cursor:pointer;white-space:nowrap}",
@@ -155,23 +158,23 @@ window.__ModuleLoader__.load({
     }
 
     function verdictLabel(review) {
-      if (review === null || review === undefined) return "— 未出";
-      if (review.verdict === "pass") return "✅ 可直接合并";
-      if (review.verdict === "changes") return "⛔ 需要修改";
-      return "⏳ 未解析";
+      if (review === null || review === undefined) return "未出";
+      if (review.verdict === "pass") return "可直接合并";
+      if (review.verdict === "changes") return "需要修改";
+      return "未解析";
     }
 
     function sensitiveLabel(value) {
-      if (value === "pass") return "✅ 通过";
-      if (value === "block") return "⛔ 阻止合并";
-      if (value === "unknown") return "⏳ 未解析（不拦合并）";
-      return "— 无本轮结论";
+      if (value === "pass") return "通过";
+      if (value === "block") return "阻止合并";
+      if (value === "unknown") return "未解析（不拦合并）";
+      return "无本轮结论";
     }
 
     function mandatoryLabel(value) {
-      if (value === "pass") return "✅ 通过";
-      if (value === "block") return "⛔ 阻止合并";
-      return "— 建议性";
+      if (value === "pass") return "通过";
+      if (value === "block") return "阻止合并";
+      return "建议性";
     }
 
     function problemStatusLabel(problem) {
@@ -278,10 +281,16 @@ window.__ModuleLoader__.load({
             h("span", { className: "mrl-d-k" }, "代码"),
             h("span", { className: "mrl-d-v" }, h("code", { className: "mrl-snippet" }, problem.snippet))));
         }
-        if (instruction && instruction.reason) {
-          rows.push(h("div", { className: "mrl-d-row", key: "instruction" },
-            h("span", { className: "mrl-d-k" }, "指令"),
-            h("span", { className: "mrl-d-v" }, "#" + instruction.kind + " · reason=" + instruction.reason)));
+        if (problem.comment && problem.comment.body) {
+          var metaParts = [];
+          if (problem.comment.author) metaParts.push(problem.comment.author);
+          if (problem.comment.createdAt) metaParts.push(String(problem.comment.createdAt).replace("T", " ").slice(0, 16));
+          metaParts.push("评论 #" + problem.comment.noteId);
+          rows.push(h("div", { className: "mrl-d-row", key: "comment" },
+            h("span", { className: "mrl-d-k" }, "评论原文"),
+            h("span", { className: "mrl-d-v mrl-quote" },
+              problem.comment.body,
+              h("span", { className: "mrl-meta2" }, metaParts.join(" · ")))));
         }
         if (rows.length > 0) detail = h("div", { className: "mrl-detail" }, rows);
       }
@@ -320,13 +329,14 @@ window.__ModuleLoader__.load({
       var pending = mr.pending || 0;
       var merge = mr.merge;
       var mergeKind = merge === null ? "none" : (merge.mergeable === true ? "ok" : "bad");
+      var mergeIcon = merge === null ? "—" : (merge.mergeable === true ? "✅" : "⛔");
       var mergeText = merge === null
-        ? "— 历史账本（未在跟踪）"
+        ? "历史账本（未在跟踪）"
         : (merge.mergeable === true
-            ? "✅ 可合"
-            : "⛔ 差 " + (merge.missing ? merge.missing.length : 0) + " 项：" + (merge.missing || []).join("；"));
+            ? "可合"
+            : "差 " + (merge.missing ? merge.missing.length : 0) + " 项：" + (merge.missing || []).join("；"));
       var pipeline = merge && merge.pipeline
-        ? "流水线 #" + merge.pipeline.id + " " + merge.pipeline.status
+        ? "流水线 #" + merge.pipeline.id + (merge.pipeline.status === "success" ? " ✓" : " " + merge.pipeline.status)
         : null;
       var gates = mr.gates || {};
       var review = mr.review;
@@ -380,6 +390,7 @@ window.__ModuleLoader__.load({
                 pipeline)
             : null),
         h("div", { className: "mrl-merge", "data-kind": mergeKind === "none" ? undefined : mergeKind },
+          h("span", { className: "mrl-merge-icon" }, mergeIcon),
           h("span", { className: "txt" }, mergeText),
           h("button", { className: "mrl-link", type: "button", onClick: openMr }, "打开 MR ↗")),
         problems.length > 0

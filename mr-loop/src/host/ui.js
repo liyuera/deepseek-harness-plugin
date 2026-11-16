@@ -81,6 +81,30 @@ function webUrlOf(config, binding) {
   return `${base.origin}${basePath}/${project}/-/merge_requests/${iid}`
 }
 
+/** 指令评论原文：directiveNotes 只有 noteId/body，作者与时间从 directives 里捞（同一 noteId）。 */
+function commentMapOf(round) {
+  const notes = Array.isArray(round?.directiveNotes) ? round.directiveNotes : []
+  const directives = Array.isArray(round?.directives?.directives) ? round.directives.directives : []
+  const meta = new Map()
+  for (const directive of directives) {
+    if (Number.isSafeInteger(directive?.noteId) && !meta.has(directive.noteId)) {
+      meta.set(directive.noteId, { author: directive.author ?? null, createdAt: directive.createdAt ?? null })
+    }
+  }
+  const map = new Map()
+  for (const note of notes) {
+    if (!Number.isSafeInteger(note?.noteId)) continue
+    const extra = meta.get(note.noteId) ?? { author: null, createdAt: null }
+    map.set(note.noteId, {
+      noteId: note.noteId,
+      body: note.body ?? '',
+      author: extra.author,
+      createdAt: extra.createdAt,
+    })
+  }
+  return map
+}
+
 function resultOf(record, live, config) {
   const round = roundOf(record)
   const binding = record?.binding ?? {}
@@ -128,7 +152,13 @@ function resultOf(record, live, config) {
         : { id: mr.head_pipeline.id, status: mr.head_pipeline.status },
     },
     // #9：问题状态与落盘共用 collectFindings，避免面板和 findings 各写一套判定。
-    problems: collectFindings(record).map(uiProblemOf),
+    problems: collectFindings(record).map((finding) => {
+      const problem = uiProblemOf(finding)
+      const noteId = problem.instruction?.noteId
+      const comment = noteId === undefined ? undefined : commentMapOf(round).get(noteId)
+      if (comment !== undefined) problem.comment = comment
+      return problem
+    }),
     pending: todo.total,
   }
 }
