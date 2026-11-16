@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>mr-loop UI mock v2</title>
+<style>
+  :root {
+    --bg:#f4f5f7; --layer1:#fff; --layer2:#f1f2f4; --overlay:#fff;
+    --text:#1b1c1e; --text2:#6b7076; --text3:#8b9096;
+    --border1:#e7e8eb; --border2:#d8dade;
+    --brand:#4d6bfe; --ok:#16a34a; --warn:#d97706; --err:#dc2626; --idle:#9aa0a6;
+  }
+  body.dark {
+    --bg:#161719; --layer1:#1e2023; --layer2:#25272b; --overlay:#1f2124;
+    --text:#ecedef; --text2:#9ba1a8; --text3:#7c828a;
+    --border1:#2b2e33; --border2:#3a3e45;
+    --brand:#7c93ff; --ok:#4ade80; --warn:#fbbf24; --err:#f87171; --idle:#6b7280;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:26px;background:var(--bg);color:var(--text);
+    font:13px/1.55 -apple-system,"PingFang SC","Helvetica Neue",Arial,sans-serif}
+  #board{display:flex;gap:24px;align-items:flex-start;justify-content:center}
+  .frame{width:636px}
+  .label{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--text3);margin:0 0 9px 2px;font-weight:600}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+
+  /* ---- 会话舞台 + 抽屉 ---- */
+  .stage{position:relative;height:836px;border-radius:14px;border:1px solid var(--border1);
+    background:var(--layer1);overflow:hidden}
+  .chat{padding:16px;opacity:.42;filter:saturate(.55)}
+  .bubble{background:var(--layer2);border-radius:10px;padding:7px 11px;margin-bottom:7px;font-size:12px;color:var(--text2);width:76%}
+  .bubble.me{margin-left:auto;background:color-mix(in srgb,var(--brand) 12%,transparent);color:var(--text);width:60%}
+  .bubble.short{width:46%}
+
+  .drawer{position:absolute;inset:0 0 0 auto;width:438px;background:var(--overlay);
+    border-left:1px solid var(--border1);box-shadow:-16px 0 36px rgba(0,0,0,.10);
+    display:flex;flex-direction:column}
+  .dh{padding:13px 14px 0;border-bottom:1px solid var(--border1)}
+  .dh-row{display:flex;align-items:center;gap:8px}
+  .dh h2{margin:0;font-size:14px;font-weight:650;letter-spacing:.01em}
+  .count{font-size:11px;color:var(--text2);background:var(--layer2);border-radius:20px;padding:0 7px;line-height:18px}
+  .spacer{flex:1}
+  .icon{width:24px;height:24px;border:1px solid var(--border1);background:var(--layer1);
+    border-radius:7px;color:var(--text2);font-size:12px;line-height:1;cursor:pointer}
+  .seg{display:inline-flex;background:var(--layer2);border-radius:8px;padding:2px;margin:9px 0 11px}
+  .seg span{padding:3px 10px;font-size:12px;color:var(--text2);border-radius:6px;cursor:pointer}
+  .seg span.on{background:var(--layer1);color:var(--text);box-shadow:0 1px 2px rgba(0,0,0,.07)}
+  .dbody{overflow:auto;padding:11px;display:flex;flex-direction:column;gap:10px;flex:1}
+
+  /* ---- MR 卡 ---- */
+  .mr{border:1px solid var(--border1);border-radius:12px;background:var(--layer1);overflow:hidden}
+  .mr-h{padding:11px 12px 8px;display:flex;gap:8px;align-items:flex-start}
+  .mr-id{font-size:13px;font-weight:650;letter-spacing:.02em}
+  .mr-sub{font-size:11.5px;color:var(--text2);margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:250px}
+  .tags{margin-left:auto;display:flex;gap:5px;flex-shrink:0}
+  .tag{font-size:11px;padding:0 7px;line-height:18px;border-radius:20px;border:1px solid var(--border1);
+    color:var(--text2);background:var(--layer2);white-space:nowrap}
+  .tag.b{color:var(--brand);border-color:color-mix(in srgb,var(--brand) 32%,transparent);background:color-mix(in srgb,var(--brand) 10%,transparent)}
+  .tag.g{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 32%,transparent);background:color-mix(in srgb,var(--ok) 10%,transparent)}
+  .tag.r{color:var(--err);border-color:color-mix(in srgb,var(--err) 32%,transparent);background:color-mix(in srgb,var(--err) 10%,transparent)}
+
+  .gates{display:flex;gap:5px;flex-wrap:wrap;padding:0 12px 9px}
+  .gate{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;color:var(--text2);
+    background:var(--layer2);border-radius:7px;padding:2px 8px;white-space:nowrap}
+  .dot{width:6px;height:6px;border-radius:50%;background:var(--idle);flex:none}
+  .dot.g{background:var(--ok)}.dot.r{background:var(--err)}.dot.w{background:var(--warn)}
+
+  .merge{display:flex;align-items:center;gap:7px;margin:0 12px 10px;padding:7px 10px;border-radius:9px;
+    font-size:12px;background:color-mix(in srgb,var(--err) 8%,transparent);
+    border:1px solid color-mix(in srgb,var(--err) 20%,transparent)}
+  .merge.g{background:color-mix(in srgb,var(--ok) 8%,transparent);border-color:color-mix(in srgb,var(--ok) 20%,transparent)}
+  .merge .txt{flex:1;min-width:0}
+  .link{color:var(--brand);font-size:11.5px;white-space:nowrap;cursor:pointer}
+
+  /* ---- 问题行（三行式） ---- */
+  .issues{border-top:1px solid var(--border1)}
+  .issue{padding:9px 12px;border-bottom:1px solid var(--border1)}
+  .issue:last-child{border-bottom:0}
+  .i-top{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+  .fid{font-size:11px;color:var(--text2)}
+  .lv{font-size:10.5px;line-height:16px;padding:0 6px;border-radius:5px;background:var(--layer2);color:var(--text2);white-space:nowrap}
+  .lv.low{color:var(--brand)}.lv.mid{color:var(--warn)}.lv.high{color:var(--err)}
+  .st{font-size:10.5px;line-height:17px;padding:0 7px;border-radius:20px;white-space:nowrap;margin-left:auto}
+  .st.open{color:var(--warn);background:color-mix(in srgb,var(--warn) 13%,transparent)}
+  .st.fixed{color:var(--ok);background:color-mix(in srgb,var(--ok) 13%,transparent)}
+  .st.waived{color:var(--text3);background:var(--layer2)}
+  .file{font-size:10.5px;color:var(--text3);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .prob{font-size:12px;margin-top:3px}
+  .instr{margin-top:4px;font-size:11px;color:var(--text2);display:flex;gap:5px;align-items:baseline;flex-wrap:wrap}
+  .code{font-size:10.5px;background:var(--layer2);border-radius:4px;padding:1px 5px;max-width:250px;overflow:hidden;text-overflow:ellipsis;display:inline-block;vertical-align:bottom;white-space:nowrap}
+
+  .mr-f{padding:8px 12px;border-top:1px solid var(--border1);display:flex;align-items:center;gap:7px;
+    color:var(--text3);font-size:11px;background:var(--layer2)}
+  .btn{font-size:11.5px;padding:3px 9px;border-radius:6px;border:1px solid var(--border2);
+    background:var(--layer1);color:var(--text);cursor:pointer;white-space:nowrap}
+  .btn.p{background:var(--brand);border-color:var(--brand);color:#fff}
+  .btn.ghost{border-color:transparent;background:transparent;color:var(--text2)}
+
+  /* ---- 内联工具卡 ---- */
+  .card{border:1px solid var(--border1);border-radius:12px;background:var(--layer1);overflow:hidden}
+  .card-h{display:flex;align-items:center;gap:7px;padding:9px 12px;border-bottom:1px solid var(--border1);font-size:12px;color:var(--text2)}
+  .card-h b{color:var(--text);font-size:12.5px;font-weight:650}
+  .card-b{padding:10px 12px}
+  .kv{display:grid;grid-template-columns:44px 1fr;gap:5px 10px;font-size:12px}
+  .kv .k{color:var(--text3);font-size:11.5px}
+  .box{margin-top:9px;border:1px solid var(--border1);border-radius:9px;overflow:hidden}
+  .foot{margin-top:9px;padding-top:8px;border-top:1px dashed var(--border2);display:flex;gap:12px;font-size:11px;color:var(--text3)}
+  .foot b{color:var(--text2);font-weight:500}
+
+  /* ---- 会话头 chip ---- */
+  .bar{display:flex;align-items:center;gap:8px;border:1px solid var(--border1);border-radius:10px;
+    background:var(--layer1);padding:9px 11px;font-size:12.5px}
+  .bar .t{font-weight:600}
+</style>
+</head>
+<body>
+<div id="board">
+<!-- A -->
+<div class="frame">
+  <p class="label">A · 会话头 chip + MR 看板抽屉（推荐入口）</p>
+  <div class="stage">
+    <div class="chat">
+      <div class="bubble me">/mr https://git.htwisdom.cn/…/-/merge_requests/241</div>
+      <div class="bubble">已绑定 !241 · 第 1 轮 · 评审 ✅ 可直接合并 · 1 处待处置</div>
+      <div class="bubble short">派发修复…</div>
+      <div class="bubble short">已修复 aea50825a5，push 完成</div>
+    </div>
+    <div class="drawer">
+      <div class="dh">
+        <div class="dh-row">
+          <h2>MR 看板</h2><span class="count">2</span><span class="spacer"></span>
+          <button class="icon">↻</button><button class="icon">✕</button>
+        </div>
+        <div class="seg"><span class="on">本会话 2</span><span>全部会话</span><span>已合并</span></div>
+      </div>
+      <div class="dbody">
+        <!-- MR 1 -->
+        <div class="mr">
+          <div class="mr-h">
+            <div style="min-width:0">
+              <div class="mr-id">!241</div>
+              <div class="mr-sub">feat-V1.7.0.20261119-ly → feature-V1.7.0.20261119</div>
+            </div>
+            <div class="tags"><span class="tag b">第 1 轮</span><span class="tag r">差 1 项</span></div>
+          </div>
+          <div class="gates">
+            <span class="gate"><i class="dot g"></i>评审 · 可直接合并</span>
+            <span class="gate"><i class="dot g"></i>敏感 · 通过</span>
+            <span class="gate"><i class="dot"></i>必过 · 建议性</span>
+            <span class="gate"><i class="dot g"></i>流水线 #7298 ✓</span>
+          </div>
+          <div class="merge"><span>⛔</span><span class="txt">差 1 项：评审 1 处问题（本轮新增 1）</span><span class="link">打开 MR ↗</span></div>
+          <div class="issues">
+            <div class="issue">
+              <div class="i-top"><span class="fid mono">aea50825a5</span><span class="lv low">低 · 非阻塞建议</span><span class="st open">● 未处理</span></div>
+              <div class="file mono" title="src/pages/report-manage/components/ReportUploadModal/index.tsx:81">src/pages/report-manage/components/ReportUploadModal/index.tsx:81</div>
+              <div class="prob">回显加载态首帧未挂载字段，打开弹窗先闪一帧空表单</div>
+            </div>
+            <div class="issue">
+              <div class="i-top"><span class="fid mono">c3f0e7a1</span><span class="lv mid">中 · 阻塞</span><span class="st fixed">✓ 已修 · 第 2 轮</span></div>
+              <div class="file mono">src/pages/report-manage/utils/loadReportEcho.ts:44</div>
+              <div class="prob">allSettled 后未区分 rejected，失败时把空对象写进表单</div>
+            </div>
+            <div class="issue">
+              <div class="i-top"><span class="fid mono">b71c9d02</span><span class="lv low">低 · 非阻塞建议</span><span class="st waived">◌ 已豁免</span></div>
+              <div class="file mono">src/types/BaoGaoGuanLi.ts:12</div>
+              <div class="prob">类型字段与后端 DTO 命名不一致</div>
+              <div class="instr"><span>#ai-waive</span><span>reason=</span><span class="code">后端 DTO 已确认，本单不改</span><span>· 评论 #75200</span></div>
+            </div>
+          </div>
+          <div class="mr-f">
+            <span>sha 8a282d15 · 2 分钟前</span><span class="spacer"></span>
+            <button class="btn ghost">复制指令</button><button class="btn">详情</button>
+          </div>
+        </div>
+        <!-- MR 2 -->
+        <div class="mr">
+          <div class="mr-h">
+            <div style="min-width:0">
+              <div class="mr-id">!238</div>
+              <div class="mr-sub">fix-V1.7.0.20261119 → feature-V1.7.0.20261119</div>
+            </div>
+            <div class="tags"><span class="tag b">第 3 轮</span><span class="tag g">可合</span></div>
+          </div>
+          <div class="gates">
+            <span class="gate"><i class="dot g"></i>评审 · 发现 0</span>
+            <span class="gate"><i class="dot g"></i>敏感 · 通过</span>
+            <span class="gate"><i class="dot g"></i>合并 · 可合</span>
+          </div>
+          <div class="issues">
+            <div class="issue">
+              <div class="i-top"><span class="fid mono">d90a1b33</span><span class="lv low">低 · 非阻塞建议</span><span class="st waived">◌ 不适用</span></div>
+              <div class="file mono">src/apis/htrsfin-platform-server/types/DianWei.ts:2</div>
+              <div class="prob">新增代码包含 URL，需确认是否为内部地址</div>
+              <div class="instr"><span>#ai-skip</span><span>reason=</span><span class="code">该文件为后端生成类型，URL 来自接口定义</span><span>· 评论 #74980</span></div>
+            </div>
+          </div>
+          <div class="mr-f"><span>sha 3f1d9c02 · 1 小时前</span><span class="spacer"></span><button class="btn ghost">打开 MR ↗</button></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 右列 -->
+<div class="frame" style="width:520px">
+  <p class="label">B · 工具结果内联卡（同一数据，就地展开）</p>
+  <div class="card">
+    <div class="card-h"><b>mr_status</b><span>· !241</span><span class="spacer"></span><span class="tag r">差 1 项</span></div>
+    <div class="card-b">
+      <div class="kv">
+        <span class="k">轮次</span><span>第 1 轮 · <span class="mono">8a282d15</span> · 强绑定</span>
+        <span class="k">评审</span><span>✅ 可直接合并 · 发现 1（本轮新增 1）· 历史未收敛 0</span>
+        <span class="k">敏感</span><span>✅ 门禁通过 · 共 4 / 有效 4</span>
+        <span class="k">合并</span><span style="color:var(--err)">⛔ 差 1 项 · 流水线 #7298 success</span>
+      </div>
+      <div class="box">
+        <div class="issue">
+          <div class="i-top"><span class="fid mono">aea50825a5</span><span class="lv low">低 · 非阻塞建议</span><span class="st open">● 未处理</span></div>
+          <div class="file mono">ReportUploadModal/index.tsx:81</div>
+          <div class="prob">首帧空表单闪烁</div>
+        </div>
+      </div>
+      <div class="foot"><span><b>展开全部 1 条</b></span><span>复制豁免指令</span><span>打开 MR ↗</span></div>
+    </div>
+  </div>
+
+  <p class="label" style="margin-top:20px">C · 会话头 chip（常驻入口，点击打开 A）</p>
+  <div class="bar">
+    <span style="color:var(--text3)">◨</span><span class="t">财务服务平台 · 报告管理</span>
+    <span class="spacer"></span>
+    <span class="tag b">!241 · 第 1 轮</span><span class="tag r">1 待处理</span>
+    <span class="tag">!238 · 可合</span>
+    <button class="btn p">看板</button>
+  </div>
+  <p class="label" style="margin-top:20px">D · 空态 / 错误态</p>
+  <div class="card" style="padding:18px;text-align:center;color:var(--text3);font-size:12px">
+    <div style="font-size:15px;margin-bottom:6px">◨</div>
+    还没有绑定 MR<br>
+    <span class="mono" style="font-size:11px">/mr &lt;GitLab MR 链接&gt;</span>
+  </div>
+</div>
+</div>
+</body>
+</html>
