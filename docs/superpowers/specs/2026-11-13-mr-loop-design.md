@@ -93,11 +93,13 @@
 2. `GET /projects/:encoded/merge_requests/:iid` 取 `state` / `source_branch` / `target_branch` / `sha` / `web_url`。`state !== 'opened'` → `mr-not-open`。
 3. **repo 校验**：会话 cwd 必须是 git 仓库，`git remote get-url origin` 的 host + path 必须与 MR 项目路径一致 → 否则 `repo-mismatch`，提示换目录。`mr_bind({ repo })` 可显式指定仓库根（`/mr` 命令不支持该参数，需要时回退到工具调用）。
 4. 当前分支与 `source_branch` 不一致 → 绑定成功但报告里带 `branch-mismatch` 警告（worktree 场景合法）。
-5. 绑定写入账本，启动 watcher，返回首轮报告（当前 head sha 上的评审与门禁现状）。
+5. 绑定写入账本，启动 watcher，返回首轮报告（当前 head sha 上的评审与门禁现状）。重复绑定同一 MR 时若 head sha 未变，**不新增轮次**：复用账本最后一轮的轮次号并覆盖其快照（保留该轮 `observedAt` 基线）；只有 head sha 变化才开新一轮（§5.2）。
 
 一个会话只允许一个绑定；再次 `/mr` 会先停旧 watcher 再绑新的，并在返回里说明。同一 MR 已被另一个 live 会话绑定 → 允许只读查询，但**写操作（豁免）拒绝** `bound-elsewhere`，避免两个会话同时往同一 MR 回帖。
 
 ### 5.2 轮次与 SHA 绑定（本插件的核心）
+
+**轮次以 head sha 为界**：同一 sha 上重复绑定 / 重复观测都复用当前轮次，不新增；只有 head sha 变化才开启新一轮（`n + 1`）。重绑（无论 head 是否已前进）都会先把账本尾部连续同 sha 的段收敛为 `n` 最小的一条；尾部条目的 `n` 缺失 / 非正整数不复用。
 
 每轮记录 `{ n, sha, observedAt, baselineAt, notes: { review?, sensitive?, mandatory? } }`。`baselineAt` 是本轮的时间基线：优先取该 sha 的 `head_pipeline.created_at`（流水线只为当前 sha 跑，等价于 push 时间），取不到时退回 `observedAt`（本轮 sha 首次观测时间）。这样「绑定前评审就已存在」的 MR 也能被正确归属，而不是一律判 stale。
 
@@ -111,7 +113,7 @@ watcher 每 tick 拉 `notes?per_page=50&sort=desc`（过滤 `system: true`），
 | 无标记，`created_at < observedAt` | 丢弃 | `stale` |
 | 多条命中同一 sha | 取 `note.id` 最大的一条 | — |
 
-弱绑定在报告里显式标注「弱绑定（无 SHA 证明）」，并作为 `unknown` 参与门禁判定的一部分（§5.3 的 fail-closed 规则）。sha 标记是否真实存在由 S0 spike 核实；缺失时全轮次都会走弱绑定，功能仍可用，但报告会一直提示。
+弱绑定在报告里显式标注「弱绑定（无 SHA 证明）」，并在可合并判定里按 `unknown` 处理——**弱绑定的 `pass` 不能单独授权合并**（§5.3 的 fail-closed 规则）。sha 标记是否真实存在由 S0 spike 核实；缺失时全轮次都会走弱绑定，功能仍可用，但报告会一直提示。
 
 ### 5.3 门禁解析
 
@@ -212,7 +214,7 @@ idle ──bind──▶ watching(sha) ──head sha 变化──▶ awaiting(s
 2. 已完成绑定的那个 sha 的评审：`verdict === 'pass'`；且**每一条**列在「需要关注的问题 / 历史未收敛问题」里的阻塞项，要么已被本轮证明修复（不再出现），要么有 `waive` / `skip` / `wontfix` 处置记录。`verdict === 'changes'` 一律不可合并；
 3. 敏感门禁**本轮**（基线之后）`verdict === 'pass'`（`当前有效 0 条`）；该 sha 上还没有 → 还在 settle 窗口，不算可合并；
 4. 必过项是**建议性**的：只有存在基线之后的 note 才计入；没有则忽略并在报告里标「无本轮结论」，最终由 `detailed_merge_status` 兜底（该 notes 只在早期出现一次，若强制要求 pass 会让可合并永远判不出来）；
-5. `detailed_merge_status === 'mergeable'`（GitLab 15.6+）；字段不存在时降级为 `merge_status === 'can_be_merged'`，报告标注「降级判定」；
+5. GitLab 自己的合并态：有 `detailed_merge_status`（15.6+）时要求为 `'mergeable'`；14.9 实测**没有该字段**，降级为 `merge_status === 'can_be_merged'` + `blocking_discussions_resolved !== false` + **`head_pipeline.status === 'success'`**（14.9 的 `merge_status` 只反映冲突，不看 CI；没有流水线时视为「无 CI」放行），报告标注「降级判定」——在本实例上降级是**常态**，不是例外；
 6. `has_conflicts === false`。
 
 满足后：唤醒一次，附收尾报告（§6.4），停 watcher，账本写 `mergeableAt`。**插件不合并**。
@@ -221,10 +223,12 @@ idle ──bind──▶ watching(sha) ──head sha 变化──▶ awaiting(s
 
 **轮次不设上限**（`maxRounds: 0`，0 = 不限）：只要还在改善，就一直跟到「可合并、且没有待修问题」为止。防死循环不靠轮数，靠「有没有进展」——真正该停的是「没在改善」，不是「轮数多」。
 
+同 sha 重绑复用轮次号与 `observedAt` 基线，但守卫计时（`stallStreak` / `reverifyStreak` / `lastProgressAt` / `startedAt`）从重绑时刻重新开始——这些计数本来就不落账本。
+
 | 守卫 | 默认 | 判据 | 触发后 |
 |---|---|---|---|
-| `stallRounds` | 3 | 连续 3 轮的阻塞 FID 集合完全相同（说明推了但没修掉，或评审在复读） | `paused(stalled)` |
-| `reverifyStreak` | 3 | 同一 FID 的 `复验次数` 连续 3 轮递增（改了但没改对） | `paused(stalled)`，报告里点名该 FID |
+| `stallRounds` | 3 | 连续 3 **轮**（新 sha）的阻塞 FID 集合完全相同（说明推了但没修掉，或评审在复读）；同 sha 的轮询 tick 不计数 | `paused(stalled)` |
+| `reverifyStreak` | 3 | 同一 FID 的 `复验次数` 在连续 3 轮之间逐轮变大（改了但没改对）；同样只在轮次边界比较 | `paused(stalled)`，报告里点名该 FID |
 | `wallClockMs` | 12h | 从绑定起的墙钟时长 | `paused(budget)` |
 | `idleStopMs` | 30min | 无新 sha 也无门禁变化 | `paused(idle)` |
 
@@ -283,7 +287,7 @@ Finding = { fid, file, level, gateCategory, location, problem, suggestion, rever
 
 统一返回 `{ ok: boolean, code?: string, message: string, data?: object }`；`message` 为静态中文，不含 token、URL、上游原文。
 
-错误码（稳定，调用方按 `code` 分支）：`no-token`、`unauthorized`、`forbidden`、`not-found`、`rate-limited`、`network`、`timeout`、`bad-response`、`invalid-url`、`mr-not-open`、`repo-mismatch`、`not-bound`、`bound-elsewhere`、`stale-round`、`approval-required`、`draft-changed`、`invalid-waiver`。`branch-mismatch` 只出现在 `warnings[].code`，不中断绑定。
+错误码（稳定，调用方按 `code` 分支）：`no-token`、`unauthorized`、`forbidden`、`not-found`、`rate-limited`、`network`、`timeout`、`bad-response`、`invalid-url`、`mr-not-open`、`repo-mismatch`、`not-bound`、`bound-elsewhere`、`storage-failed`、`stale-round`、`approval-required`、`draft-changed`、`invalid-waiver`。`branch-mismatch` 只出现在 `warnings[].code`，不中断绑定。
 
 ### 6.4 报告模板（固定，每轮同一形状）
 
@@ -443,8 +447,8 @@ S0 不写产品代码；S1 起每期结束跑一次全量单测。
 
 | 风险 | 影响 | 对策 |
 |---|---|---|
-| `AI_REVIEW_SHA` 可能不存在 | 全轮次弱绑定，仍有 stale 误判可能 | S0 核实；缺标记时要求 `created_at >= observedAt` 且报告显式标注；必要时用「diff 规模 > 0」辅助 |
-| `detailed_merge_status` 取值与本 MR 的「合并被阻止」原因未必对应 | 可合并判定可能误判 | S0 抓红/绿两态；字段不可用时降级为 `merge_status` + 文本判定并标注 |
+| `AI_REVIEW_SHA` 可能不存在 | 全轮次弱绑定，仍有 stale 误判可能 | **已实测（MR !240）：存在**，每条评审 note 都带 `AI_REVIEW_SHA <40 位 sha>`；弱绑定只作为解析失败时的兜底 |
+| 实例是 GitLab 14.9，没有 `detailed_merge_status` | 可合并判定长期走降级路径 | 已实测：改用 `merge_status` + `blocking_discussions_resolved` + `head_pipeline.status` 组合，并在报告固定标注「⚠️ 降级判定」 |
 | 必过项检查只在早期出现一次 | 状态过期 | 报告标注 observedAt，不作为实时状态；最终以 `detailed_merge_status` 为准 |
 | 评审 bot 换代（模型/模板变化） | 解析 unknown | fail-closed + 唤醒带原文；标题与标记可配置 |
 | token 权限过大 | 误操作面 | 客户端只有 6 个固定方法和 2 个写端点，无 merge/approve 代码路径 |
