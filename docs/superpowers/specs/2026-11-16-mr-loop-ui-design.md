@@ -489,3 +489,40 @@ MR !243 已经合并（卡片标签已经是「已合并」「第 9 轮」），
   - `?demo=merged&round=3`：`mr-loop-ui-round-repeat-light.jpg`（第 3 轮 0 条新问题 + 历史未收敛 1）；
   - `?demo=settled&expand=1`：`mr-loop-ui-source-code-light.jpg`（路径 tag 完整 + 展开显示源码）；
   - `?demo=fallback`：`mr-loop-ui-waiting-light.jpg`（没流水线的那一笔不计轮次，单独「等待评审」）。
+
+## 十七、卡头补工作区名：编号跨仓库会重号（2026-11-17，v0.3.1）
+
+### 症状（用户实拍）
+
+看板卡片只写 `!243`、`!241`，光看编号认不出是哪个工作区的 MR：iid 是**仓库内自增**的，
+不同项目各自从 1 开始累积，同一个面板里出现 `!243` 时无法判断是哪条线在跟踪。
+用户口径：**在 MR 编号上面添加工作区名称**。
+
+### 根因
+
+`mrl-mr-id` 直接渲染 `"!" + mr.iid`；`projectPath` 虽然一直在 payload 里（还当 Map key 用），
+但从来没上过屏幕。面板隐含的假设是「一次只看一个仓库」——跨仓库同时跟踪时假设就不成立了。
+
+### 改法
+
+- `client.js` 新增 `workspaceNameOf(mr)`：取 `projectPath` 末段（项目名）；空值返回 `""`，
+  整行不渲染（不留一条空白，编号仍然贴顶）。
+  - **为什么是末段而不是完整路径**：面板里同一个 group 的项目居多，而整串 `group/project`
+    超过卡头可用宽度（≈290px）会被 `text-overflow:ellipsis` 吃掉**尾部**——尾部才是项目名，
+    截断后所有项目长得一模一样，正好吃掉最需要区分的信息。完整路径进 `title`。
+- 卡头顺序变成「工作区名（`.mrl-mr-ws`，11px 三级色）→ 编号 → 分支」，工作区名在编号**上面**。
+- chip 是同一份数据的第二个出口，可见文字刻意不变（会话头宽度紧张），只在 tooltip 补一层：
+  完整形态的 MR 标签 `title` 前缀工作区名（`credit-web：feat-x → feature-y`）；
+  紧凑态图标的 `title` 每条写成 `credit-web !241 第 2 轮`。
+  （紧凑态一格里可能列两条 MR，用项目名而不是完整路径，避免同一串路径在 tooltip 里重复两遍。）
+
+### 验收
+
+- 测试 **355/355**（新增 2 项：卡头工作区名的文本 / `title` / 文档顺序，以及没有 `projectPath`
+  时不渲染空行；改写 chip 的 2 处旧断言，补完整形态标签的 tooltip 断言）。
+- 视觉台（`scripts/ui-harness.html`，真实 client bundle + 假数据）：
+  - `?demo=all` 点「全部 4」：`specs/assets/mr-loop-ui-workspace-light.jpg` ——
+    `other`(!238) 与 `wisdom-financial-credit-platform-web`(!243) 同屏，工作区名在编号上一行；
+  - `?demo=all&theme=dark`：`specs/assets/mr-loop-ui-workspace-dark.jpg` —— 暗色下三级色仍可读。
+- DOM 级核对：4 张卡的 `.mrl-mr-ws` 依次为 `wisdom-financial-credit-platform-web ×3` + `other`，
+  每个节点的 `title` 是对应的完整 `projectPath`。

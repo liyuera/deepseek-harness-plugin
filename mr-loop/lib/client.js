@@ -48,6 +48,8 @@ window.__ModuleLoader__.load({
       ".mrl-body{padding:11px;display:flex;flex-direction:column;gap:10px;overflow:auto;flex:1}",
       ".mrl-mr{border:1px solid var(--mrl-line);border-radius:12px;background:var(--mrl-surface);overflow:hidden;flex:none}",
       ".mrl-mr-h{padding:11px 12px 8px;display:flex;gap:8px;align-items:flex-start}",
+      // 工作区名：卡头第一行，恒定用弱色（它是定位信息，不是结论），长名省略号，完整路径进 title。
+      ".mrl-mr-ws{font-size:11px;line-height:16px;margin-bottom:1px;max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--dsw-alias-label-tertiary)}",
       ".mrl-mr-id{font-size:13px;font-weight:650;letter-spacing:.02em;display:flex;align-items:center;gap:6px;color:var(--dsw-alias-label-primary)}",
       ".mrl-mr-sub{font-size:11.5px;color:var(--dsw-alias-label-secondary);margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:290px}",
       ".mrl-tags{margin-left:auto;display:flex;gap:5px;flex-shrink:0}",
@@ -261,6 +263,21 @@ window.__ModuleLoader__.load({
       if (problem.file !== undefined && problem.file !== null && String(problem.file) !== "") parts.push(String(problem.file));
       if (problem.line !== undefined && problem.line !== null) parts.push(String(problem.line));
       return parts.join(":");
+    }
+
+    /**
+     * 工作区（GitLab 项目）名：`group/project` 只取 project，完整路径留给 title。
+     *
+     * 为什么卡头要单独一行：iid 是**仓库内自增**的，不同项目都有 !243 / !1，
+     * 光看编号分不清是哪条线上在跟踪的 MR。所以工作区名放在编号上一行——先读「哪个仓库」，
+     * 再读「第几号 MR」。只取末段是因为面板里同一 group 的项目居多，且整串路径 > 290px
+     * 会被省略号吃掉尾部（尾部才是项目名），那样反而分不出来。
+     */
+    function workspaceNameOf(mr) {
+      var path = mr !== null && mr !== undefined && typeof mr.projectPath === "string" ? mr.projectPath.trim() : "";
+      if (path === "") return "";
+      var cut = path.lastIndexOf("/");
+      return cut === -1 ? path : path.slice(cut + 1);
     }
 
     /** 相对时间：<1h 显示「N 分钟前」，否则显示日期时间。 */
@@ -502,7 +519,12 @@ window.__ModuleLoader__.load({
         });
         var badgeTone = pending > 0 ? "warn" : (hasMergeable ? "ok" : "");
         var tips = ["MR 看板"];
-        scoped.slice(0, 2).forEach(function (mr) { tips.push("!" + mr.iid + " 第 " + (mr.round || 0) + " 轮"); });
+        // 紧凑形态下没有任何文字，tooltip 是唯一的信息出口：带上是哪个工作区，
+        // 光一个 `!243` 在不同仓库之间会重号，认不出是哪条线在跟踪（完整路径进看板卡头）。
+        scoped.slice(0, 2).forEach(function (mr) {
+          var where = workspaceNameOf(mr);
+          tips.push((where === "" ? "" : where + " ") + "!" + mr.iid + " 第 " + (mr.round || 0) + " 轮");
+        });
         if (scoped.length > 2) tips.push("+" + (scoped.length - 2));
         if (pending > 0) tips.push(pending + " 待处理");
         var tipsText = tips.join(" · ");
@@ -541,7 +563,8 @@ window.__ModuleLoader__.load({
           key: "mr-" + mr.iid,
           className: "mrl-chip-tag " + tone,
           type: "button",
-          title: mr.sourceBranch + " → " + mr.targetBranch,
+          // 完整形态的 chip 只有「!243 · 第 8 轮」，tooltip 补上工作区名才能区分同名 iid。
+          title: (workspaceNameOf(mr) === "" ? "" : workspaceNameOf(mr) + "：") + mr.sourceBranch + " → " + mr.targetBranch,
           onClick: openPanel,
         },
         h("span", { className: "mrl-dot " + tone }),
@@ -682,6 +705,7 @@ window.__ModuleLoader__.load({
             ? "（流水线 #" + merge.pipeline.id + " 还停在 " + String(merge.pipeline.sha).slice(0, 8) + "）"
             : "");
       var openMr = function () { if (mr.webUrl) window.open(mr.webUrl, "_blank", "noopener,noreferrer"); };
+      var workspaceName = workspaceNameOf(mr);
       var removeEscaped = function () { /* hooks not used here */ };
       void removeEscaped;
       var copyDraft = function () {
@@ -822,6 +846,11 @@ window.__ModuleLoader__.load({
       return h("div", { className: "mrl-mr" },
         h("div", { className: "mrl-mr-h" },
           h("div", { style: { minWidth: 0 } },
+            // 工作区名在编号上面：iid 按仓库自增，不同项目的 !243 必须能一眼区分。
+            // 没有 projectPath（理论不会），宁可不渲染这一行，也不留一条空白。
+            workspaceName === ""
+              ? null
+              : h("div", { className: "mrl-mr-ws", title: mr.projectPath }, workspaceName),
             h("div", { className: "mrl-mr-id" },
               "!" + mr.iid,
               h("span", {

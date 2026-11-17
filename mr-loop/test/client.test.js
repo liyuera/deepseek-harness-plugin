@@ -132,9 +132,9 @@ function textsOf(node) {
 
 const chipData = {
   mrs: [
-    { projectPath: 'g/p', iid: 241, round: 1, pending: 2, state: 'opened', live: true, session: { id: 's1' }, review: null, gates: {}, merge: null, problems: [], sourceBranch: 'a', targetBranch: 'b', sha: 'a' },
-    { projectPath: 'g/p', iid: 242, round: 2, pending: 5, state: 'opened', live: true, session: { id: 's2' }, review: null, gates: {}, merge: null, problems: [], sourceBranch: 'a', targetBranch: 'b', sha: 'b' },
-    { projectPath: 'g/p', iid: 243, round: 3, pending: 0, state: 'merged', live: false, session: { id: 's2' }, review: null, gates: {}, merge: null, problems: [], sourceBranch: 'a', targetBranch: 'b', sha: 'c' },
+    { projectPath: 'group/credit-web', iid: 241, round: 1, pending: 2, state: 'opened', live: true, session: { id: 's1' }, review: null, gates: {}, merge: null, problems: [], sourceBranch: 'a', targetBranch: 'b', sha: 'a' },
+    { projectPath: 'group/credit-web', iid: 242, round: 2, pending: 5, state: 'opened', live: true, session: { id: 's2' }, review: null, gates: {}, merge: null, problems: [], sourceBranch: 'a', targetBranch: 'b', sha: 'b' },
+    { projectPath: 'group/credit-web', iid: 243, round: 3, pending: 0, state: 'merged', live: false, session: { id: 's2' }, review: null, gates: {}, merge: null, problems: [], sourceBranch: 'a', targetBranch: 'b', sha: 'c' },
   ],
   counts: { total: 3, pending: 7, mergeable: 0, merged: 1 },
 }
@@ -241,6 +241,8 @@ test('chip：窄屏退化成一个 MR 图标按钮，点击仍能打开看板', 
   assert.equal(texts, '', '紧凑形态不渲染任何文字，只有图标')
   assert.equal(chip.props.className, 'mrl-chip-btn')
   assert.match(chip.props.title, /!241 第 1 轮/)
+  // 紧凑形态没有文字，tooltip 是唯一出口：带上是哪个工作区，才不会把两个仓库的 !241 混在一起。
+  assert.match(chip.props.title, /credit-web !241 第 1 轮/)
   assert.match(chip.props.title, /2 待处理/)
   assert.equal(chip.props['aria-label'], chip.props.title)
 
@@ -266,6 +268,26 @@ test('chip：窄屏退化成一个 MR 图标按钮，点击仍能打开看板', 
   const drawer = drawerOf(loaded)()
   assert.equal(drawer.props.className, 'mrl-dialog')
 })
+
+test('chip：完整形态的 MR 标签把工作区名放进 tooltip（编号会跨仓库重号）', async () => {
+  const loaded = loadBundle({ fetchData: chipData })
+  // 不设 innerWidth → 首帧按窗口宽度兜底判定为「放得下」，走完整形态。
+  loaded.sandbox.__moduleExports.apply(loaded.ctx)
+  renderChip(loaded)
+  await settle()
+
+  const chip = renderChip(loaded)
+  const tags = []
+  walkTree(chip, (item) => {
+    if (typeof item !== 'object' || item === null || item.props === undefined) return
+    if (typeof item.props.className === 'string' && item.props.className.startsWith('mrl-chip-tag')) tags.push(item)
+  })
+  // 两张 MR 标签 + 「看板」按钮。
+  assert.equal(tags.length, 3)
+  assert.match(tags[0].props.title, /^credit-web：/, 'tooltip 前缀是工作区名')
+  assert.match(tags[0].props.title, /a → b$/, '分支箭头串保持原样')
+  assert.equal(textOfTree(tags[0]).join(''), '!241 · 第 1 轮', '可见文字不变，不挤占会话头')
+});
 
 test('chipShrinkMode：放得下就用完整形态，放不下才收成图标，且判定与当前形态无关（不抖）', () => {
   const { sandbox } = loadBundle()
@@ -376,6 +398,33 @@ test('看板：唯一问题索引（共 N 条）+ 等待评审提示，没流水
   // 轮次条只有第 5、6 轮：没有流水线的 b30c43b3 不占轮次号（也就没有「第 7 轮」）。
   const chips = nodesByClass(panel, 'mrl-round')
   assert.deepEqual(chips.map((node) => textOfTree(node)[0]), ['第5轮', '第6轮'])
+});
+
+test('看板：卡头第一行是工作区名，同 iid 不同项目靠它区分；没有 projectPath 不留空行', async () => {
+  // iid 是仓库内自增的：两个项目都有 !243，只靠编号认不出是哪条线在跟踪。
+  const credit = { ...fallbackMr, projectPath: 'wisdom-financial-service-platform/wisdom-financial-credit-platform-web' }
+  const { panel } = await renderPanel(credit)
+
+  const [workspace] = nodesByClass(panel, 'mrl-mr-ws')
+  assert.ok(workspace, '卡头应有工作区名一行')
+  assert.equal(textOfTree(workspace).join(''), 'wisdom-financial-credit-platform-web', '只显示项目名，不带 group')
+  assert.equal(workspace.props.title, credit.projectPath, '完整 projectPath 进 title，长名被省略时仍可查')
+
+  // 位置：工作区名在编号上面（文档顺序 ws → id）。
+  const order = []
+  walkTree(panel, (item) => {
+    if (typeof item !== 'object' || item === null || item.props === undefined) return
+    if (item.props.className === 'mrl-mr-ws' || item.props.className === 'mrl-mr-id') order.push(item.props.className)
+  })
+  assert.deepEqual(order, ['mrl-mr-ws', 'mrl-mr-id'])
+
+  // 同一个 iid 换一个项目：工作区名跟着变（这就是「不能光靠编号判断」的落点）。
+  const other = await renderPanel({ ...fallbackMr, projectPath: 'other-group/financial-crm-web' })
+  assert.equal(textOfTree(nodesByClass(other.panel, 'mrl-mr-ws')[0]).join(''), 'financial-crm-web')
+
+  // 拿不到 projectPath 时整行不渲染（不占一行空白，编号仍然贴顶）。
+  const bare = await renderPanel({ ...fallbackMr, projectPath: '' })
+  assert.deepEqual(nodesByClass(bare.panel, 'mrl-mr-ws'), [])
 });
 
 test('看板：路径用 tag 完整展示、展开后显示源码；没有源码就不显示源码行', async () => {
