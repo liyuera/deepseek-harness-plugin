@@ -99,20 +99,20 @@
     problemsRound: { n: 6, sha: '081bb374144f8151345d8dd1a337e500b79a351f', current: false },
     rounds: [
       { n: 1, verdict: 'pass', total: 0, open: 0, fixed: 0, current: false, problems: [] },
-      { n: 2, verdict: 'pass', total: 2, open: 2, fixed: 0, current: false, problems: [
-        { fid: '2870c3e6c9', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/components/ReportUploadModal/index.tsx', line: 302, problem: '同一份 vectorErrorMsg 在两个地方渲染，弹窗里的报错条缺少换行控制，长无空格串会横向溢出。', status: 'open' },
-        { fid: 'da97a49527', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/components/ReportInfoPanel.tsx', line: 41, problem: '两处报错渲染的条件口径不一致：详情面板按 reportStatus 门禁，弹窗只看字段是否存在。', status: 'open' },
+      { n: 2, verdict: 'pass', total: 2, open: 0, fixed: 0, current: false, problems: [
+        { fid: '2870c3e6c9', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/components/ReportUploadModal/index.tsx', line: 302, problem: '同一份 vectorErrorMsg 在两个地方渲染，弹窗里的报错条缺少换行控制，长无空格串会横向溢出。', status: 'fixed', fixedAtRound: 3 },
+        { fid: 'da97a49527', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/components/ReportInfoPanel.tsx', line: 41, problem: '两处报错渲染的条件口径不一致：详情面板按 reportStatus 门禁，弹窗只看字段是否存在。', status: 'fixed', fixedAtRound: 4 },
       ] },
-      { n: 3, verdict: 'pass', total: 1, open: 1, fixed: 1, current: false, problems: [
-        { fid: 'da97a49527', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/components/ReportInfoPanel.tsx', line: 41, problem: '两处报错渲染的条件口径不一致：详情面板按 reportStatus 门禁，弹窗只看字段是否存在。', status: 'open' },
+      { n: 3, verdict: 'pass', total: 1, open: 0, fixed: 1, current: false, problems: [
+        { fid: 'da97a49527', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/components/ReportInfoPanel.tsx', line: 41, problem: '两处报错渲染的条件口径不一致：详情面板按 reportStatus 门禁，弹窗只看字段是否存在。', status: 'fixed', fixedAtRound: 4 },
         { fid: '2870c3e6c9', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/components/ReportUploadModal/index.tsx', line: 302, problem: '弹窗内新增的报错条缺少换行控制，长无空格串会横向溢出。', status: 'fixed', fixedAtRound: 3 },
       ] },
-      { n: 4, verdict: 'pass', total: 1, open: 1, fixed: 1, current: false, problems: [
-        { fid: '3b3b7b9b20', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/utils/loadReportEcho.ts', line: 130, problem: 'reportStatus 只对 null/undefined 兜底，详情接口返回空串时不会回落到列表行的状态。', status: 'open' },
+      { n: 4, verdict: 'pass', total: 1, open: 0, fixed: 1, current: false, problems: [
+        { fid: '3b3b7b9b20', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/utils/loadReportEcho.ts', line: 130, problem: 'reportStatus 只对 null/undefined 兜底，详情接口返回空串时不会回落到列表行的状态。', status: 'fixed', fixedAtRound: 5 },
         { fid: 'da97a49527', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/components/ReportInfoPanel.tsx', line: 41, problem: '两处报错渲染的条件口径不一致。', status: 'fixed', fixedAtRound: 4 },
       ] },
-      { n: 5, verdict: 'pass', total: 1, open: 1, fixed: 1, current: false, problems: [
-        { fid: 'e462d18b0d', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/utils/reportStatus.tsx', line: 78, problem: 'isVectorFailed 的 String() 兜底并未生效：后端返回数字状态时依旧是 false。', status: 'open' },
+      { n: 5, verdict: 'pass', total: 1, open: 0, fixed: 1, current: false, problems: [
+        { fid: 'e462d18b0d', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/utils/reportStatus.tsx', line: 78, problem: 'isVectorFailed 的 String() 兜底并未生效：后端返回数字状态时依旧是 false。', status: 'fixed', fixedAtRound: 6 },
         { fid: '3b3b7b9b20', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/utils/loadReportEcho.ts', line: 130, problem: 'reportStatus 空串未兜底。', status: 'fixed', fixedAtRound: 5 },
       ] },
       { n: 6, verdict: 'pass', total: 1, open: 1, fixed: 1, current: false, problems: [
@@ -218,15 +218,16 @@
     merge: { mergeable: false, missing: [], terminal: 'merged', pipeline: { id: 7364, status: 'success', sha: 'aa11bb2233cc' } },
     problemsRound: { n: 9, sha: 'aa11bb2233cc', current: true },
     rounds: [
-      { n: 2, verdict: 'pass', total: 2, open: 2, fixed: 0, current: false, problems: [
-        { fid: 'b1c2d3e4f5', level: '低', type: '非阻塞建议', file: 'src/pages/delivery/utils/rate.ts', line: 42, problem: '交付率口径在列表与详情两处各算一遍，四舍五入方式不一致。', status: 'open' },
-        { fid: 'c2d3e4f5a6', level: '中', type: '逻辑错误', file: 'src/pages/delivery/utils/rate.ts', line: 88, problem: '分母为 0 时直接除，NaN 会写进报表。', status: 'open' },
+      { n: 2, verdict: 'pass', total: 1, open: 0, fixed: 0, current: false, problems: [
+        { fid: 'b1c2d3e4f5', level: '低', type: '非阻塞建议', file: 'src/pages/delivery/utils/rate.ts', line: 42, problem: '交付率口径在列表与详情两处各算一遍，四舍五入方式不一致。', status: 'fixed', fixedAtRound: 8 },
       ] },
-      { n: 8, verdict: 'pass', total: 1, open: 1, fixed: 1, current: false, problems: [
-        { fid: 'fd56004d1a', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/utils/loadReportEcho.ts', line: 41, problem: '注释仍把两处共用的状态门禁描述为 reportStatus === FAILED，但实际门禁是 isVectorFailed（内部先把 reportStatus 与常量都归一成字符串再比）。同文件的 reportStatus.tsx 注释已明确说明「不归一成字符串时，下发数字的 reportStatus 会让 === FAILED 恒为 false」，注释与实现口径不一致。', status: 'open' },
+      { n: 8, verdict: 'pass', total: 1, open: 0, fixed: 1, current: false, problems: [
+        { fid: 'fd56004d1a', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/utils/loadReportEcho.ts', line: 41, problem: '注释口径与实际门禁不一致：注释写 reportStatus === FAILED，实际门禁是 isVectorFailed。', status: 'fixed', fixedAtRound: 9 },
         { fid: 'b1c2d3e4f5', level: '低', type: '非阻塞建议', file: 'src/pages/delivery/utils/rate.ts', line: 42, problem: '交付率口径两处各算一遍。', status: 'fixed', fixedAtRound: 8 },
       ] },
-      { n: 9, verdict: 'pass', total: 0, open: 0, fixed: 1, current: true, problems: [] },
+      { n: 9, verdict: 'pass', total: 0, open: 0, fixed: 1, current: true, problems: [
+        { fid: 'fd56004d1a', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/utils/loadReportEcho.ts', line: 41, problem: '注释口径与实际门禁不一致：注释写 reportStatus === FAILED，实际门禁是 isVectorFailed。', status: 'fixed', fixedAtRound: 9 },
+      ] },
     ],
     pending: 0, problems: [],
   }

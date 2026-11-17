@@ -72,7 +72,7 @@ test('bind 成功：报告可合、账本落盘、轮次 1', async () => {
   assert.equal(state.mergeability.mergeable, true)
   const saved = await service.ledger.load({ projectPath: 'g/p', iid: 240 })
   assert.equal(saved.rounds.length, 1)
-  await rm(dir, { recursive: true, force: true })
+  await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
 })
 
 test('错误码：invalid-url / mr-not-open / repo-mismatch', async () => {
@@ -85,7 +85,7 @@ test('错误码：invalid-url / mr-not-open / repo-mismatch', async () => {
   await assert.rejects(mkService({ mrImpl: async () => mr({ state: 'merged' }) }).bind({ sessionId: 's', url, repoRoot: '/r' }), (e) => e.code === 'mr-not-open')
   await assert.rejects(mkService({ repoImpl: async () => ({ root: '/r', host: 'git.x.com', projectPath: 'other/repo', branch: 'x' }) }).bind({ sessionId: 's', url, repoRoot: '/r' }), (e) => e.code === 'repo-mismatch')
   await assert.rejects(mkService({ repoImpl: async () => { throw new Error('nope') } }).bind({ sessionId: 's', url, repoRoot: '/r' }), (e) => e.code === 'repo-mismatch')
-  await rm(dir, { recursive: true, force: true })
+  await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
 })
 
 test('origin host 与 baseUrl 不一致 → repo-mismatch', async () => {
@@ -101,7 +101,7 @@ test('origin host 与 baseUrl 不一致 → repo-mismatch', async () => {
     service.bind({ sessionId: 's', url: 'https://git.x.com/g/p/-/merge_requests/240', repoRoot: '/r' }),
     (e) => e instanceof ServiceError && e.code === 'repo-mismatch',
   )
-  await rm(dir, { recursive: true, force: true })
+  await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
 })
 
 test('status 重新拉取；review 返回当前轮与处置', async () => {
@@ -120,7 +120,7 @@ test('status 重新拉取；review 返回当前轮与处置', async () => {
   // status 内部 applySnapshot 的落盘是 fire-and-forget；stop 的 await persist 排在队列后面，
   // 等它完成即可排空写队列，避免 rm 与在途写竞争（ENOTEMPTY 抖动）。
   await service.stop({ sessionId: 's' })
-  await rm(dir, { recursive: true, force: true })
+  await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
 })
 
 test('applySnapshot：同 sha 只刷新，新 sha 开新一轮，评审到达可识别', async () => {
@@ -152,7 +152,7 @@ test('applySnapshot：同 sha 只刷新，新 sha 开新一轮，评审到达可
   assert.equal(arrived.newRound, false)
   assert.equal(arrived.reviewArrived, true)
   await service.stop({ sessionId: 's' })
-  await rm(dir, { recursive: true, force: true })
+  await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
 })
 
 test('同 sha 门禁翻面：gatesChanged 触发一次唤醒，报告带敏感行', async () => {
@@ -202,7 +202,7 @@ test('同 sha 门禁翻面：gatesChanged 触发一次唤醒，报告带敏感�
   assert.equal(notified.length, 1)
   assert.match(notified[0], /敏感 {3}⛔ 阻止合并/)
   await service.stop({ sessionId: 's' })
-  await rm(dir, { recursive: true, force: true })
+  await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
 })
 
 test('新 sha 门禁先到、评审未出：gatesChanged 为真也不唤醒', async () => {
@@ -248,7 +248,7 @@ test('新 sha 门禁先到、评审未出：gatesChanged 为真也不唤醒', as
   assert.equal(snapshot.gatesChanged, true)
   assert.equal(notified.length, 0)
   await service.stop({ sessionId: 's' })
-  await rm(dir, { recursive: true, force: true })
+  await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
 })
 
 test('未绑定 → not-bound；同 sha 重复绑定复用轮次，不新增', async () => {
@@ -270,7 +270,7 @@ test('未绑定 → not-bound；同 sha 重复绑定复用轮次，不新增', a
   const saved = await service.ledger.load({ projectPath: 'g/p', iid: 240 })
   assert.deepEqual(saved.rounds.map((item) => item.n), [1])
   assert.equal(saved.rounds[0].sha, SHA)
-  await rm(dir, { recursive: true, force: true })
+  await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
 })
 
 test('MR 换 sha 后再 bind：轮次 +1、账本追加', async () => {
@@ -297,7 +297,7 @@ test('MR 换 sha 后再 bind：轮次 +1、账本追加', async () => {
   const saved = await service.ledger.load({ projectPath: 'g/p', iid: 240 })
   assert.deepEqual(saved.rounds.map((item) => item.n), [1, 2])
   assert.equal(saved.rounds[1].sha, SHA2)
-  await rm(dir, { recursive: true, force: true })
+  await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
 })
 
 test('同 sha 重复绑定保留上一轮 observedAt 基线，不往后推', async () => {
@@ -323,7 +323,7 @@ test('同 sha 重复绑定保留上一轮 observedAt 基线，不往后推', asy
   assert.equal(state.round.observedAt, firstObservedAt)
   const saved = await service.ledger.load({ projectPath: 'g/p', iid: 240 })
   assert.equal(saved.rounds[saved.rounds.length - 1].observedAt, firstObservedAt)
-  await rm(dir, { recursive: true, force: true })
+  await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
 })
 
 test('mr.sha 缺失或空串时不误复用已有轮次', async () => {
@@ -346,7 +346,7 @@ test('mr.sha 缺失或空串时不误复用已有轮次', async () => {
     const state = service.getState('s')
     assert.equal(state.round.n, 8, `sha=${String(sha)} 时不应复用轮次号`)
     assert.deepEqual(state.rounds.map((item) => item.n), [7, 8])
-    await rm(dir, { recursive: true, force: true })
+    await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
   }
 })
 
@@ -375,7 +375,7 @@ test('同 sha 重绑收敛账本尾部连续重复轮次：保留最小 n 与首
   assert.equal(state.rounds[0].sha, SHA)
   const saved = await service.ledger.load({ projectPath: 'g/p', iid: 240 })
   assert.deepEqual(saved.rounds.map((item) => item.n), [1])
-  await rm(dir, { recursive: true, force: true })
+  await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
 })
 
 test('同 sha 重绑只收敛尾部连续段，前面不同 sha 的轮次原样保留', async () => {
@@ -405,7 +405,7 @@ test('同 sha 重绑只收敛尾部连续段，前面不同 sha 的轮次原样�
   assert.equal(state.round.observedAt, firstObservedAt + 1000)
   assert.deepEqual(state.rounds.map((item) => item.n), [1, 2])
   assert.deepEqual(state.rounds.map((item) => item.sha), [SHA, SHA2])
-  await rm(dir, { recursive: true, force: true })
+  await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
 })
 
 test('同 sha 脏账本尾段含坏 n 时收敛为最小合法 n，不先涨后回退', async () => {
@@ -433,7 +433,7 @@ test('同 sha 脏账本尾段含坏 n 时收敛为最小合法 n，不先涨后�
   assert.deepEqual(state.rounds.map((item) => item.n), [5])
   const saved = await service.ledger.load({ projectPath: 'g/p', iid: 240 })
   assert.deepEqual(saved.rounds.map((item) => item.n), [5])
-  await rm(dir, { recursive: true, force: true })
+  await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
 })
 
 test('脏账本尾段同 sha + 新 sha 重绑：先收敛再新增，n 不虚高', async () => {
@@ -458,7 +458,7 @@ test('脏账本尾段同 sha + 新 sha 重绑：先收敛再新增，n 不虚高
   assert.equal(state.round.n, 2)
   assert.deepEqual(state.rounds.map((item) => item.n), [1, 2])
   assert.deepEqual(state.rounds.map((item) => item.sha), [SHA, SHA2])
-  await rm(dir, { recursive: true, force: true })
+  await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
 })
 
 test('账本最后一条 n=0 不复用，走新增路径', async () => {
@@ -480,7 +480,7 @@ test('账本最后一条 n=0 不复用，走新增路径', async () => {
   const state = service.getState('s')
   assert.equal(state.round.n, 1)
   assert.deepEqual(state.rounds.map((item) => item.n), [0, 1])
-  await rm(dir, { recursive: true, force: true })
+  await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
 })
 
 test('账本最后一条 n 为负数时也不复用', async () => {
@@ -502,7 +502,7 @@ test('账本最后一条 n 为负数时也不复用', async () => {
   const state = service.getState('s')
   assert.equal(state.round.n, 1)
   assert.deepEqual(state.rounds.map((item) => item.n), [-3, 1])
-  await rm(dir, { recursive: true, force: true })
+  await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
 })
 
 test('锚条缺 observedAt 时基线取段内最早有效时间，不退回 now()', async () => {
@@ -529,7 +529,7 @@ test('锚条缺 observedAt 时基线取段内最早有效时间，不退回 now(
   assert.equal(state.round.n, 1)
   assert.equal(state.round.observedAt, segmentObservedAt)
   assert.deepEqual(state.rounds.map((item) => item.n), [1])
-  await rm(dir, { recursive: true, force: true })
+  await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
 })
 
 test('同 sha 重绑只覆盖尾部最后一条，不收敛更早的不同 sha 轮次', async () => {
@@ -558,7 +558,7 @@ test('同 sha 重绑只覆盖尾部最后一条，不收敛更早的不同 sha �
   assert.equal(state.round.observedAt, firstObservedAt + 1000)
   assert.deepEqual(state.rounds.map((item) => item.n), [1, 2])
   assert.deepEqual(state.rounds.map((item) => item.sha), [SHA, SHA2])
-  await rm(dir, { recursive: true, force: true })
+  await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
 })
 
 test('同 sha 重绑继承 mergeableAt，新 sha 轮次不继承', async () => {
@@ -592,7 +592,7 @@ test('同 sha 重绑继承 mergeableAt，新 sha 轮次不继承', async () => {
   assert.equal(service.getState('s').mergeableAt, undefined)
   const resaved = await service.ledger.load({ projectPath: 'g/p', iid: 240 })
   assert.equal(resaved.mergeableAt, null)
-  await rm(dir, { recursive: true, force: true })
+  await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
 })
 
 test('账本裁剪后轮次号仍单调：取已有最大 n + 1', async () => {
@@ -613,7 +613,7 @@ test('账本裁剪后轮次号仍单调：取已有最大 n + 1', async () => {
   await service.bind({ sessionId: 's', url: 'https://git.x.com/g/p/-/merge_requests/240', repoRoot: '/r' })
   assert.equal(service.getState('s').round.n, 52)
   assert.deepEqual(service.getState('s').rounds.map((item) => item.n), [50, 51, 52])
-  await rm(dir, { recursive: true, force: true })
+  await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
 })
 
 test('账本写入失败 → storage-failed，且不留半绑定', async () => {
@@ -631,7 +631,7 @@ test('账本写入失败 → storage-failed，且不留半绑定', async () => {
     { name: 'ServiceError', code: 'storage-failed', message: /账本写入失败/ },
   )
   assert.equal(service.getState('s'), null)
-  await rm(dir, { recursive: true, force: true })
+  await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
 })
 
 test('并发绑定同一会话：串行执行、轮次连续、只留一个 state', async () => {
@@ -657,7 +657,7 @@ test('并发绑定同一会话：串行执行、轮次连续、只留一个 stat
   assert.equal(service.getState('s').round.n, 2)
   const saved = await service.ledger.load({ projectPath: 'g/p', iid: 240 })
   assert.deepEqual(saved.rounds.map((item) => item.n), [1, 2])
-  await rm(dir, { recursive: true, force: true })
+  await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
 })
 
 test('forget 删除账本失败 → storage-failed 且保留绑定', async () => {
@@ -677,7 +677,7 @@ test('forget 删除账本失败 → storage-failed 且保留绑定', async () =>
   )
   assert.ok(service.getState('s') !== null)
   assert.equal(service.getState('s').binding.iid, 240)
-  await rm(dir, { recursive: true, force: true })
+  await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
 })
 
 test('守卫计数按轮次：5 次同 sha 快照不累计 stallStreak', async () => {
@@ -703,7 +703,7 @@ test('守卫计数按轮次：5 次同 sha 快照不累计 stallStreak', async (
   assert.equal(service.getState('s').reverifyStreak, 0)
   assert.equal(service.getState('s').stallKey, 'aa')
   await service.stop({ sessionId: 's' })
-  await rm(dir, { recursive: true, force: true })
+  await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
 })
 
 test('守卫计数按轮次：连续 3 个新 sha 阻塞集合相同 → stallStreak 3', async () => {
@@ -725,7 +725,7 @@ test('守卫计数按轮次：连续 3 个新 sha 阻塞集合相同 → stallSt
   // 绑定轮是基线；之后连续 3 轮同集合才到阈值（stallRounds 默认 3）。
   assert.equal(service.getState('s').stallStreak, 3)
   await service.stop({ sessionId: 's' })
-  await rm(dir, { recursive: true, force: true })
+  await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
 })
 
 test('守卫计数按轮次：新 sha 的阻塞集合变小即清零', async () => {
@@ -749,7 +749,7 @@ test('守卫计数按轮次：新 sha 的阻塞集合变小即清零', async () 
   assert.equal(service.getState('s').stallStreak, 0)
   assert.equal(service.getState('s').stallKey, 'aa')
   await service.stop({ sessionId: 's' })
-  await rm(dir, { recursive: true, force: true })
+  await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
 })
 
 test('守卫计数：阻塞集合比较忽略顺序与重复', async () => {
@@ -769,7 +769,7 @@ test('守卫计数：阻塞集合比较忽略顺序与重复', async () => {
   service.applySnapshot({ sessionId: 's', mr: mr({ sha: 'c'.repeat(40) }), notes: blockingNotes(['bb', 'aa', 'bb']) })
   assert.equal(service.getState('s').stallStreak, 2)
   await service.stop({ sessionId: 's' })
-  await rm(dir, { recursive: true, force: true })
+  await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
 })
 
 test('resume 清零守卫计数并落盘：下一个 tick 不再暂停', async () => {
@@ -819,7 +819,7 @@ test('resume 清零守卫计数并落盘：下一个 tick 不再暂停', async (
   await watcher.tick('s')
   assert.equal(service.getState('s').paused, null)
   await service.stop({ sessionId: 's' })
-  await rm(dir, { recursive: true, force: true })
+  await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
 })
 
 test('resume 落盘失败 → storage-failed，但内存状态不留在 paused', async () => {
@@ -847,7 +847,7 @@ test('resume 落盘失败 → storage-failed，但内存状态不留在 paused',
   assert.equal(service.getState('s').paused, null)
   assert.equal(service.getState('s').stallStreak, 0)
   await service.stop({ sessionId: 's' })
-  await rm(dir, { recursive: true, force: true })
+  await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
 })
 
 // ---------------------------------------------------------------------------
@@ -887,7 +887,7 @@ async function boundService({ notesImpl, postNoteImpl, listNotesImpl, now } = {}
 
 async function cleanup({ dir, service }) {
   await service.stop({ sessionId: 's' })
-  await rm(dir, { recursive: true, force: true })
+  await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
 }
 
 const MR_LABEL = 'MR !240 · g/p'
@@ -1413,7 +1413,7 @@ test('markTerminal：terminal 落账本、state.mr 更新，findings 旁路照�
   const saved = await service.ledger.load({ projectPath: 'g/p', iid: 240 })
   assert.equal(saved.terminal, 'merged')
   assert.equal(recorded.length, 2, 'bind 与 markTerminal 各 record 一次')
-  await rm(dir, { recursive: true, force: true })
+  await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
 })
 
 // ---------------------------------------------------------------------------
@@ -1452,7 +1452,7 @@ test('restore：从账本恢复绑定（sessionId 落账本，MR 快照不落账
     assert.match(report, /MR !240/)
     assert.match(report, /可合/)
   } finally {
-    await rm(dir, { recursive: true, force: true })
+    await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
   }
 })
 
@@ -1484,7 +1484,7 @@ test('restore：没有 sessionId / 已终态 / 空轮次 / 同会话已绑定 �
     assert.ok(service.restore({ record: recordOf() }) !== null)
     assert.equal(service.restore({ record: recordOf() }), null)
   } finally {
-    await rm(dir, { recursive: true, force: true })
+    await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
   }
 })
 
@@ -1502,6 +1502,6 @@ test('stop（不 forget）抹掉账本里的 sessionId：显式停止的 MR 不�
     assert.equal(record.binding.sessionId, null)
     assert.equal(record.binding.iid, 240, '账本本身要保留（看板还要看历史）')
   } finally {
-    await rm(dir, { recursive: true, force: true })
+    await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
   }
 })

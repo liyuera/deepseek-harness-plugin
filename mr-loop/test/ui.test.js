@@ -283,9 +283,10 @@ test('面板：当前轮评审未出时回落到上一轮结论，rounds 给出�
   // 待处理计数与可合判定仍只认当前轮：回落只改展示。
   assert.equal(mr.pending, 0)
   assert.deepEqual(
+    // 第 1 轮提 1 条（后来被第 2 轮确认已修）→ total 1、open 0；第 2 轮 fixed 1。
     mr.rounds.map((round) => [round.n, round.verdict, round.total, round.open, round.fixed, round.current]),
     [
-      [1, 'changes', 1, 1, 0, false],
+      [1, 'changes', 1, 0, 0, false],
       [2, 'pass', 0, 0, 1, false],
       [3, null, 0, 0, 0, true],
     ],
@@ -333,15 +334,20 @@ test('面板：每轮摘要都带自己的问题正文（历史轮点开即可�
   ])
   // 轮次摘要里每一轮都有自己的正文，客户端点开历史轮直接渲染，不需要再请求。
   const [r1, r2, r3] = mr.rounds
-  assert.deepEqual(r1.problems.map((problem) => [problem.fid, problem.status]), [['old0000001', 'open']])
+  // 历史轮的状态按最新一次已落地评审收敛：第 1 轮那条在第 2 轮被确认已修，
+  // 不能在第 1 轮视图里还显示「未处理」（同一个 FID 两个视图状态必须一致）。
+  assert.deepEqual(r1.problems.map((problem) => [problem.fid, problem.status, problem.fixedAtRound]), [
+    ['old0000001', 'fixed', 2],
+  ])
   assert.deepEqual(r2.problems.map((problem) => [problem.fid, problem.status]), [
     ['new0000002', 'open'],
     ['old0000001', 'fixed'],
   ])
   assert.equal(r2.fixed, 1)
   assert.deepEqual(r3.problems, [])
-  // 历史轮的问题不标 unverified（那是「当前视图」的语义）。
+  // 当前轮（第 3 轮）评审还没出：两个视图里的未处理都只能说「待复验」。
   assert.equal('unverified' in r1.problems[0], false)
+  assert.equal(r2.problems[0].unverified, true)
 })
 
 // ---------------------------------------------------------------------------

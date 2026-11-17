@@ -12,7 +12,7 @@ import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { collectFindings, createFindingsStore, displayRoundIndex, settledRoundIndex } from '../src/host/findings.js'
+import { collectFindings, createFindingsStore, displayRoundIndex, resolveFindings, settledRoundIndex } from '../src/host/findings.js'
 import { resolveConfig } from '../src/host/config.js'
 import { createLedger } from '../src/host/ledger.js'
 import { createService } from '../src/host/service.js'
@@ -632,4 +632,31 @@ test('collectFindings：roundIndex 指定看哪一轮；回落只改展示，不
   // 一条评审都没落地 → -1（面板显示空，而不是假装有结论）。
   assert.equal(displayRoundIndex(stateOf({ rounds: [pending] })), -1)
   assert.equal(settledRoundIndex(stateOf({ rounds: [pending] })), -1)
+})
+
+test('resolveFindings：历史轮里后来被修好的 FID 改判 fixed（带确认轮），仍在最新评审里的保持 open', () => {
+  const first = roundOf({ n: 1, blocking: [finding({ fid: 'AAAA' })] })
+  const second = roundOf({ sha: SHA_B, n: 2, blocking: [] })
+  const third = roundOf({ sha: 'c'.repeat(40), n: 3, blocking: [finding({ fid: 'CCCC' })], verdict: 'pass' })
+  const record = stateOf({ rounds: [first, second, third] })
+
+  // 第 1 轮视角：AAAA 在第 2 轮消失 → fixed@2。
+  const firstView = resolveFindings(collectFindings(record, { roundIndex: 0 }), record, 0)
+  assert.deepEqual(firstView.map((item) => [item.fid, item.status, item.fixedAtRound]), [['AAAA', 'fixed', 2]])
+
+  // 看最新一轮：后面没有已落地评审，原样返回（open 保持 open）。
+  const lastView = resolveFindings(collectFindings(record, { roundIndex: 2 }), record, 2)
+  assert.deepEqual(lastView.map((item) => [item.fid, item.status]), [['CCCC', 'open']])
+
+  // 中间轮（第 2 轮）视图：本轮没提新问题，但「第 1 轮那条被本轮确认修好」→ fixed@2。
+  assert.deepEqual(
+    resolveFindings(collectFindings(record, { roundIndex: 1 }), record, 1).map((item) => [item.fid, item.status, item.fixedAtRound]),
+    [['AAAA', 'fixed', 2]],
+  )
+
+  // 在最新评审里还在的 FID 不能被历史轮视图误判成已修。
+  const stillOpen = { ...record }
+  stillOpen.rounds = [first, second, roundOf({ sha: 'c'.repeat(40), n: 3, blocking: [finding({ fid: 'AAAA' })], verdict: 'pass' })]
+  const view = resolveFindings(collectFindings(stillOpen, { roundIndex: 0 }), stillOpen, 0)
+  assert.deepEqual(view.map((item) => [item.fid, item.status]), [['AAAA', 'open']])
 })

@@ -12,7 +12,7 @@ import { readdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { expandHome } from './ledger.js'
 import { evaluateMergeable, reviewTodo } from './mergeable.js'
-import { collectFindings, displayRoundIndex } from './findings.js'
+import { collectFindings, displayRoundIndex, resolveFindings, settledRoundIndex } from './findings.js'
 
 const MAX_COMMENTS = 5
 /** 面板最多回放多少轮历史（账本最多保留 50 轮，全给前端只会让 payload 变大）。 */
@@ -88,25 +88,35 @@ function isoOf(value) {
 function roundSummaryOf(record, index) {
   const rounds = Array.isArray(record?.rounds) ? record.rounds : []
   const round = rounds[index] ?? null
-  const findings = index < 0 ? [] : collectFindings(record, { roundIndex: index })
-  const open = findings.filter((finding) => finding.status === 'open').length
-  const fixed = findings.filter((finding) => finding.status === 'fixed').length
-  // 该轮评审自己的 finding = open + 已处置（skip / wontfix / waive）；fixed 是上一轮的。
-  const waived = findings.filter((finding) => finding.status !== 'open' && finding.status !== 'fixed').length
+  // 当前轮评审还没落地时，任何视图里的「未处理」都只是上一轮结论 → 显示「待复验」。
+  const unverifiedOpen = settledRoundIndex(record) !== rounds.length - 1
+  // 历史轮里当时未处理、但后续已落地评审确认消失的 FID 要改判已修，否则同一个 FID
+  // 在第 8 轮显示未处理、第 9 轮显示已修，自相矛盾。
+  const findings = index < 0 ? [] : resolveFindings(collectFindings(record, { roundIndex: index }), record, index)
+  // total 是「这一轮自己提了几条」，与后续修没修无关；状态计数按收敛后的结果算。
+  const own = [
+    ...(Array.isArray(round?.review?.blocking) ? round.review.blocking : []),
+    ...(Array.isArray(round?.review?.nonBlocking) ? round.review.nonBlocking : []),
+  ]
+  const ownKeys = new Set(own.map((item) => String(item?.fid ?? '').toLowerCase()))
+  const open = findings.filter((finding) => ownKeys.has(String(finding.fid ?? '').toLowerCase()) && finding.status === 'open').length
+  // fixed 仍是「这一轮确认修好的上一轮问题」（旧口径），不是「这一轮自己提的后来被修了」。
+  const fixed = findings.filter((finding) => finding.status === 'fixed' && ownKeys.has(String(finding.fid ?? '').toLowerCase()) === false).length
+  const waived = findings.filter((finding) => ownKeys.has(String(finding.fid ?? '').toLowerCase()) && finding.status !== 'open' && finding.status !== 'fixed').length
   return {
     n: Number.isSafeInteger(round?.n) ? round.n : index + 1,
     sha: typeof round?.sha === 'string' ? round.sha : '',
     verdict: round?.review?.verdict ?? null,
     binding: round?.binding ?? null,
     at: isoOf(round?.observedAt),
-    total: open + waived,
+    total: own.length,
     open,
     fixed,
     waived,
     current: index === rounds.length - 1,
-    // 历史轮点开时显示的问题列表（与当前轮同口径；unverified 只标给「当前视图」）。
+    // 历史轮点开时显示的问题列表（状态已按最新一次已落地评审收敛）。
     problems: findings.map((finding) => {
-      const problem = uiProblemOf(finding)
+      const problem = uiProblemOf(finding, unverifiedOpen)
       const noteId = problem.instruction?.noteId
       const comment = noteId === undefined ? undefined : commentMapOf(round).get(noteId)
       if (comment !== undefined) problem.comment = comment
@@ -171,8 +181,9 @@ function resultOf(record, live, config) {
   const currentIndex = rounds.length - 1
   const displayIndex = displayRoundIndex(record)
   const displayRound = displayIndex < 0 ? null : rounds[displayIndex]
-  // 有回落时「未处理」只代表上一轮的结论：面板显示为「待复验」，不能当成还没修。
-  const unverified = displayIndex >= 0 && displayIndex !== currentIndex
+  // 当前轮评审还没落地时，「未处理」只代表最近一次落地评审的结论（面板显示「待复验」）。
+  // 这一口径对所有视图一致（顶层列表与历史轮列表不会互相矛盾）。
+  const unverified = settledRoundIndex(record) !== currentIndex
   const binding = record?.binding ?? {}
   const decisions = record?.decisions !== null && typeof record.decisions === 'object' ? record.decisions : {}
   const todo = reviewTodo(round, decisions)
@@ -244,7 +255,9 @@ function resultOf(record, live, config) {
       .slice(roundStart)
       .map((_, offset) => roundSummaryOf(record, roundStart + offset)),
     // #9：问题状态与落盘共用 collectFindings，避免面板和 findings 各写一套判定。
-    problems: (displayIndex < 0 ? [] : collectFindings(record, { roundIndex: displayIndex })).map((finding) => {
+    problems: (displayIndex < 0
+      ? []
+      : resolveFindings(collectFindings(record, { roundIndex: displayIndex }), record, displayIndex)).map((finding) => {
       const problem = uiProblemOf(finding, unverified)
       const noteId = problem.instruction?.noteId
       const comment = noteId === undefined ? undefined : commentMapOf(displayRound).get(noteId)

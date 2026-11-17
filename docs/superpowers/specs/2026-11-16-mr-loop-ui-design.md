@@ -375,3 +375,36 @@ MR !243 已经合并（卡片标签已经是「已合并」「第 9 轮」），
   还有 live 快照时有），pending 0，合并条绿色「已合并（sha c0cfe45f）」，不再出现
   「差 1 项：MR 状态是 merged」。终态账本不会被 rehydrate 恢复成「监视中」：重载后卡片
   标「历史账本」+「已合并」，属于预期。
+
+## 十五、历史轮的状态按「最新一次已落地评审」收敛（2026-11-17，v0.2.8）
+
+### 症状（用户实拍）
+
+同一个 FID `fd56004d1a`：点第 8 轮显示「● 未处理」，点第 9 轮显示「✓ 已修」——
+第 8 轮提的问题在第 9 轮被验证修好了，但第 8 轮的视图还停在「当时没处理」。
+用户原话：「第八轮和第九轮的 FID 是同一个，但是状态却不一样」。
+
+### 根因
+
+`collectFindings(record, { roundIndex })` 只比较**相邻两轮**：它给第 N 轮算「第 N 轮的问题 +
+第 N 轮确认修好的第 N-1 轮问题」。所以第 8 轮那一条要等到看第 9 轮视图时才会变成「已修」，
+历史轮自己的视图永远是当时的快照。
+
+### 改法
+
+- `findings.js` 新增 `resolveFindings(findings, record, roundIndex)`：把某轮视图里仍是 open 的
+  finding 拿到后续「已落地评审」（verdict = pass / changes）里对账——
+  - 最新一次已落地评审里还有它 → 仍然是 open（没修好）；
+  - 消失了 → 改判 `fixed`，`fixedAtRound` = 第一次不再出现的那一轮。
+  - 看的就是最新一轮（后面没有已落地评审）时原样返回，所以当前轮 / 回落视图的判定完全不变。
+- `ui.js`：`rounds[].problems` 与顶层 `problems` 都过一遍 `resolveFindings`；
+  `unverified`（待复验）改成全局口径「当前轮评审还没落地」，所有视图一致。
+  轮次摘要的 `total` 改为「这一轮自己提了几条」（与后续修没修无关），`open/fixed/waived` 用收敛后的状态。
+- `client.js`：`fixed` 状态带轮次：在别的轮视图里显示 **「✓ 第 9 轮已修」**，本轮视图里仍是「✓ 已修」。
+
+### 验收
+
+- 测试 **339/339**（新增 `resolveFindings` 1 项、UI 历史轮收敛断言、客户端「第 N 轮已修」渲染 1 项）。
+- 视觉台：`?demo=merged&round=8`（同一个 FID 在两个轮视图里都是已修，且标明是第 9 轮验证的）；
+  截图 `specs/assets/mr-loop-ui-round-status-light.jpg`。
+- 真实数据：!243 第 8 轮视图里 `fd56004d1a` 从 `open` 变成 `fixed / fixedAtRound 9`。

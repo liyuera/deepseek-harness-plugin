@@ -490,3 +490,37 @@ test('看板：已合并 / 已关闭的 MR 不显示「差 N 项」，复制指�
   assert.match(closedTexts, /MR 已关闭（未合并）/)
   assert.doesNotMatch(closedTexts, /差 [0-9]+ 项/)
 })
+
+test('看板：历史轮里后来被修好的问题显示「第 N 轮已修」，同一个 FID 不再两轮状态打架', async () => {
+  const problem = {
+    fid: 'fd56004d1a', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/utils/loadReportEcho.ts', line: 41,
+    problem: '注释口径与实际门禁不一致', status: 'fixed', fixedAtRound: 9,
+  }
+  const data = {
+    ...fallbackMr,
+    state: 'merged',
+    round: 9,
+    sha: 'c0cfe45f12345678',
+    review: { verdict: 'pass', historicalUnresolved: 0, verifiedFixed: 1, newThisRound: 0 },
+    merge: { mergeable: false, missing: [], terminal: 'merged', pipeline: null },
+    problemsRound: { n: 9, sha: 'c0cfe45f12345678', current: true },
+    rounds: [
+      { n: 8, verdict: 'pass', total: 1, open: 0, fixed: 0, current: false, problems: [problem] },
+      { n: 9, verdict: 'pass', total: 0, open: 0, fixed: 1, current: true, problems: [problem] },
+    ],
+    // 默认视图（第 9 轮）= 本轮新问题 + 本轮确认修好的上一轮问题。
+    problems: [problem],
+  }
+  const { loaded, panel } = await renderPanel(data)
+  // 默认（第 9 轮）：本轮验证修复，显示「✓ 已修」。
+  assert.match(textOfTree(panel).join(' | '), /已修/)
+
+  // 点第 8 轮：同一个 FID 必须也是已修，并写出是第 9 轮验证的。
+  const round8 = nodesByClass(panel, 'mrl-round').find((node) => textOfTree(node)[0] === '第8轮')
+  assert.equal(typeof round8.props.onClick, 'function')
+  round8.props.onClick()
+  const browsing = drawerOf(loaded)()
+  const texts = textOfTree(browsing).join(' | ')
+  assert.match(texts, /第 9 轮已修/)
+  assert.doesNotMatch(texts, /未处理/)
+})

@@ -205,8 +205,15 @@ window.__ModuleLoader__.load({
       return "建议性";
     }
 
-    function problemStatusLabel(problem) {
-      if (problem.status === "fixed") return { text: "✓ 已修", tone: "fixed" };
+    function problemStatusLabel(problem, roundN) {
+      // fixed 是「哪一轮验证的」；翻历史轮时把轮次写出来（同一个 FID 在第 8 轮视图里
+      // 也要显示「第 9 轮已修」，不能还是「未处理」）。
+      if (problem.status === "fixed") {
+        if (Number.isSafeInteger(problem.fixedAtRound) && Number.isSafeInteger(roundN) && problem.fixedAtRound !== roundN) {
+          return { text: "✓ 第 " + problem.fixedAtRound + " 轮已修", tone: "fixed" };
+        }
+        return { text: "✓ 已修", tone: "fixed" };
+      }
       if (problem.status === "waived") {
         var kind = problem.instruction && problem.instruction.kind;
         if (kind === "skip") return { text: "◌ 不适用", tone: "waived" };
@@ -522,7 +529,7 @@ window.__ModuleLoader__.load({
       var state = useStore();
       var key = String(problem.fid);
       var open = state.expanded[key] === true;
-      var status = problemStatusLabel(problem);
+      var status = problemStatusLabel(problem, props.roundN);
       var level = problem.level || "—";
       var instruction = problem.instruction;
       var detail = null;
@@ -693,7 +700,7 @@ window.__ModuleLoader__.load({
       var issues = shownProblems.length > 0
         ? h("div", { className: "mrl-issues" },
             shownProblems.map(function (problem) {
-              return h(ProblemRow, { key: String(problem.fid), problem: problem });
+              return h(ProblemRow, { key: String(problem.fid), problem: problem, roundN: shownN });
             }))
         : null;
       var historyHead = issuesHead !== null || issues !== null

@@ -98,6 +98,49 @@ const findingsOf = (round) => {
   return [...blocking, ...nonBlocking]
 }
 
+/** 某一轮评审自己的 finding 里有没有这个 FID（大小写不敏感）。 */
+const roundHasFid = (round, key) => findingsOf(round).some((item) => String(item?.fid ?? '').toLowerCase() === key)
+
+/**
+ * 把「按轮快照」的判定升级成「按最新一次已落地评审」的最终状态。
+ *
+ * `collectFindings(record, { roundIndex })` 只比较相邻两轮：历史轮里当时还没修的 FID 会一直显示
+ * 未处理，于是同一个 FID 在第 8 轮显示「未处理」、第 9 轮显示「已修」——用户看到的是自相矛盾。
+ * 这里补一步：某轮的 open finding 如果在后续已落地评审里消失了，就改判 fixed，并记下确认轮
+ * `fixedAtRound`；如果它在最新一次已落地评审里还在，就仍是 open。
+ *
+ * 缺省行为不变：看的是最新一轮（后面没有已落地评审）时原样返回。
+ *
+ * @param {Array<object>} findings collectFindings 的结果
+ * @param {object} record service 状态 / 账本记录
+ * @param {number} roundIndex 这批 findings 对应的轮次下标
+ * @returns {Array<object>}
+ */
+export function resolveFindings(findings, record, roundIndex) {
+  const rounds = roundsOf(record)
+  const later = []
+  for (let index = roundIndex + 1; index < rounds.length; index += 1) {
+    if (isSettled(rounds[index])) later.push(index)
+  }
+  if (later.length === 0) return findings
+  const latest = later[later.length - 1]
+  return findings.map((finding) => {
+    if (finding.status !== 'open') return finding
+    const key = String(finding.fid ?? '').toLowerCase()
+    // 最新一次已落地评审里还有 → 现在仍未处理，不动。
+    if (roundHasFid(rounds[latest], key)) return finding
+    // 消失了：第一次「不再出现」的已落地评审就是修复确认轮。
+    const confirmed = later.find((index) => roundHasFid(rounds[index], key) === false)
+    if (confirmed === undefined) return finding
+    const fixedAtRound = rounds[confirmed]?.n
+    return {
+      ...finding,
+      status: 'fixed',
+      fixedAtRound: Number.isSafeInteger(fixedAtRound) ? fixedAtRound : undefined,
+    }
+  })
+}
+
 /** 行号：优先 finding.line；评审模板只给 `位置: src/a.js:3` 时从中取（纯提取，不做分析）。 */
 function lineOf(item) {
   if (Number.isSafeInteger(item?.line) && item.line > 0) return item.line
