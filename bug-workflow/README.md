@@ -1,10 +1,20 @@
 # @liyuera/dsh-bug-workflow
 
-DeepSeek Harness（DSH）的 Bug 工作流看板，**P5 真交付版本 0.0.1**。右栏打开「Bug 看板」tab，即可把一张工单从 `inbox` 一路驱动到 `done`：状态机、storageDomain 持久化、工作区设置、同源 HTTP 路由与安全守卫都是真实实现；P2 起工单可来自星瞰河山一体化平台（token 凭据、我的工单同步、按编号导入、字典筛选）；P3 起「开始分析」由**真实只读分析子代理**读取工作区代码并产出结构化修复方案，审核通过后进入 `fixing`；P4 起「开始修复」由**真实写权限修复子代理**在独立 git worktree 中按已批准方案改代码，回填 `changedFiles`/`diffStat`/`fixes`，人工测试通过后进入 `submitting`；P5 起「提交并创建 MR」按设置先跑 lint/test，再在 worktree 里用团队模板 commit、推送个人分支、创建 GitLab MR，之后每 60s 轮询 `AI Code Review`，`需要修改` 自动起 Review 修复子代理并重新提交（最多 3 轮），`可直接合并` 进入 `mergeable`，检测到 MR `state=merged` 后自动归档为 `done`。插件**绝不**自动合并/关闭/approve/resolve/force push；合并由人工在 GitLab 完成。平台状态写回（「进行中/已修复」）留给 P6。
+DeepSeek Harness（DSH）的 Bug 工作流看板，内部私有 `0.0.1`。右栏打开「Bug 看板」tab，即可把一张工单从 `inbox` 一路驱动到 `done`：状态机、storageDomain 持久化、工作区设置、同源 HTTP 路由与安全守卫都是真实实现；P2 起工单可来自星瞰河山一体化平台（token 凭据、我的工单同步、按编号导入、字典筛选）；P3 起「开始分析」由**真实只读分析子代理**读取工作区代码并产出结构化修复方案，审核通过后进入 `fixing`；P4 起「开始修复」由**真实写权限修复子代理**在独立 git worktree 中按已批准方案改代码，回填 `changedFiles`/`diffStat`/`fixes`；P7 人工测试通过后工单**直接归档 `done`**（从看板移除）。
+
+> **2026-11-17 变更：P5 的 GitLab 交付链路已下线。** 看板不再接入/不再显示「提交并创建 MR」、GitLab 地址/token/项目路径/Reviewer、lint/test 门禁与 AI Review 轮询/合并归档（相应状态 `submitting→mr_open→fixing_review→mergeable→merged` 只可能出现在历史工单上，用「标记完成」收尾）。**实现代码与测试仍保留在仓库**（`src/host/gitlab.js`、`delivery-service.js`、`review-service.js`、`review-parser.js` 及对应测试与脚本，只是不再接线），完整可运行版本见分支 [`archive/gitlab-delivery`](https://github.com/liyuera/deepseek-harness-plugin/tree/archive/gitlab-delivery)。详见「变更记录：GitLab 交付链路下线」。
 
 > 当前为 `private` 包，尚未发布 npm。P5 验收记录见 [`docs/superpowers/spikes/2026-11-07-p5-findings.md`](../docs/superpowers/spikes/2026-11-07-p5-findings.md)，P4 见 [`docs/superpowers/spikes/2026-11-07-p4-findings.md`](../docs/superpowers/spikes/2026-11-07-p4-findings.md)，P3 见 [`docs/superpowers/spikes/2026-11-07-p3-findings.md`](../docs/superpowers/spikes/2026-11-07-p3-findings.md)，P2 见 [`docs/superpowers/spikes/2026-11-07-p2-findings.md`](../docs/superpowers/spikes/2026-11-07-p2-findings.md)，P1 见 [`docs/superpowers/spikes/2026-11-07-p1-findings.md`](../docs/superpowers/spikes/2026-11-07-p1-findings.md)。
 >
-> P2 的 live 证据全部来自**本地 mock 平台**。P3 的分析与 P4 的修复都是**真子代理**（真实模型、真实 git worktree；本机样本分别约 7 分钟与 5 分 45 秒），但本机验收工作区都是插件仓库本身、不是工单所属业务仓库。P5 的完整链路由**隔离 E2E**（临时 git 仓库 + 本地 bare origin + loopback mock GitLab + 真 store/delivery/review 服务）证明，live 只做了**只读验收**（卸装热重载、snapshot/health、`/api/deliver` 未配置时的 503/404 等），**没有**用真实 GitLab token 推送或创建 MR。真实 GitLab token/TLS/MR、真实业务仓库交付、真实人工合并、平台状态写回、GUI 目视与 Windows 仍是用户的最终验收项（见「P5 真交付」「已知限制」）。
+> P2 的 live 证据全部来自**本地 mock 平台**。P3 的分析与 P4 的修复都是**真子代理**（真实模型、真实 git worktree；本机样本分别约 7 分钟与 5 分 45 秒），但本机验收工作区都是插件仓库本身、不是工单所属业务仓库。P5 交付链路**已下线**（下文 P5 章节保留为历史实现说明，代码在仓库内但未接线）；平台状态写回、GUI 目视与 Windows 仍未实现。历史 P5 live 验收只做了**只读验收**，没有用真实 GitLab token 推送或创建 MR。
+
+## 变更记录：GitLab 交付链路下线（2026-11-17）
+
+- **下线范围**：看板设置里的 GitLab 连接（地址/token/项目路径/Reviewer）与交付字段（Lint 命令/测试命令/启动命令/预览地址）不再显示；`submitting` 详情页不再有「提交并创建 MR」；不再创建/推送个人分支与 MR，不再轮询 AI Code Review，不再自动 `mergeable`/`merged`/`dismiss`；`POST /api/deliver` 与 `POST /api/gitlab-token` 不再接线（返回 503）。人工测试通过后工单直接归档为 `done`。
+- **保留部分（不再接线）**：`src/host/gitlab.js`、`delivery-service.js`、`review-service.js`、`review-parser.js`、`credentials.js` 的 GitLab token ref、`src/host/routes.js` 的 delivery/token 处理器、`store.js` 的 delivery/review meta 命名空间、`domain-spec.js` 的 `mr`/`reviewRounds` schema、相关测试（`gitlab`/`delivery-service`/`review-service`/`review-parser`/`credentials`/`routes`）与 `scripts/e2e-delivery.mjs`、`scripts/probe-gitlab.mjs` 等脚本都保留，便于随时恢复。
+- **快照与数据**：snapshot 仍带 `gitlab:{tokenPresent:false}`、空的 `delivery:{running:[],errors:{}}` 与 `review:{running:[],errors:{}}`（客户端兼容用）；历史工单的 `mr`/`reviewRounds`/`delivery.*` metadata 原样保留，但新流程不再写入；GitLab token 不再读取/校验，历史 credentials ref `BUG_WORKFLOW_GITLAB_TOKEN` 不会被删。
+- **回滚/恢复**：完整可运行的上一版在分支 `archive/gitlab-delivery`（已推送 origin），必要时 `git checkout archive/gitlab-delivery` 或 cherry-pick 回 `index.js` 的接线与 `client.js` 的 UI。
+- **历史遗留工单**：仓库现存数据里没有 `submitting`/`mr_open`/`fixing_review`/`mergeable`/`merged` 状态的工单；如果别处有，这几条状态仍会显示在「待收尾」泳道，详情页提供「标记完成」。
 
 ## 安装
 
@@ -35,11 +45,11 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 | 能力 | 说明 |
 | --- | --- |
 | 看板列表 | 工作区名/绑定状态、状态与类型筛选、同步/刷新、3 秒轮询；`done` 工单从进行中列表隐藏 |
-| 工单详情 | 工单字段；方案卡（摘要/根因/方案/改动文件/风险/测试建议，通过/驳回）；修复与测试区；MR/Review 卡（轮次、阻塞项、结论）；最近 20 条时间线 |
+| 工单详情 | 工单字段；方案卡（摘要/根因/方案/改动文件/风险/测试建议，通过/驳回）；修复与测试区；分支与工作树卡；最近 20 条时间线 |
 | 动作按钮 | 由 client 内 `ACTION_BY_STATE` 字面量按 `workflow` 渲染（**不是**由宿主 `canApply` 派生）；全部二次确认（`window.confirm`，缺失时用内联确认）；POST 带唯一 `actionId`，宿主幂等重放 |
 | 状态机 | 12 个状态、16 个动作（含 `block`/`retry`/`reject_plan`）；review 变更轮次上限 3 轮，第 4 次请求由宿主转为 `blocked` |
 | 持久化 | storageDomain domain `bug_workflow` v2（兼容 v1）：`tickets` / `settings` / `meta` 三表；写前用真 zod schema 校验；`meta` 是 actionId 幂等账本（最多 500 条）；所有写方法经 store 内单进程写队列串行化，平台同步 upsert 不会覆盖并发落地的本地动作 |
-| 设置面板 | 同页面 overlay，12 个字段（P2 增加平台连接，P5 增加 GitLab 地址/token 卡），按工作区 cwd 保存；`Esc` 关闭、焦点返回、未保存修改丢弃；「保存 token」会先持久化同一面板里未保存的设置草稿，再保存 token |
+| 设置面板 | 同页面 overlay，按工作区 cwd 保存；现行面板 =「平台连接」区（平台地址/项目编码/登录/token/写回开关）+「修复与测试」区（个人分支后缀/提交信息前缀）；GitLab 与交付字段已下线不显示。`Esc` 关闭、焦点返回、未保存修改丢弃；「保存 token」会先持久化同一面板里未保存的设置草稿，再保存 token |
 | 安全守卫 | 仅本机回环 socket + `Host` 白名单；POST 仅 `application/json`；`Origin` 必须同源；64 KiB / 10 s 限制；错误消息裁剪 |
 | 测试（P1+P2） | `node --test bug-workflow/test/*.test.js`，P2 收尾时 197 个用例全绿 |
 
@@ -103,15 +113,15 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 | 写范围（**prompt-only**） | prompt 把工单/方案放进 nonce 数据块，声明：只改 worktree、不得改主工作区、不得 commit/push/checkout/reset/merge/rebase、不得读凭据/`~/.dsh`、不得联网。**宿主没有工具白名单或权限收窄**，子代理继承父 Agent 工具权限——与 P3 只读约束同级，是提示词约束，不是强制沙箱 |
 | 分支规则 | 开发分支（你本地检出、用来测试和提 MR 的分支）`feat-<versionName>-<branchUser>`，故障工单 `hot-<versionName>-<branchUser>`；目标分支 `feature-<versionName>` / `hotfix-<versionName>`。AI 修复永远跑在**工单级临时分支** `feat-<X>-<user>-<工单号>`（如 `feat-V1.6.1.20261109-ly-648`）的独立工作树里，开发分支不参与修复。`versionName` 取 `platform.versionName ?? version`，只保留 `[A-Za-z0-9._-]`；`branchUser` 来自工作区设置（默认 `ly`）。目标分支由开发分支名推导 |
 | 人工终结 | 详情页底部固定一个「标记完成」入口（任意非终态，含 `blocked`）：弹出确认气泡、可填原因，确认后执行状态机动作 `terminate`（`任意非终态 → done`），原因写入时间线（`人工终结：<原因>`），工单归档、不再出现在看板。用于流程无法自动继续、需要人工收尾（重复单、已在别处处理、AI 修复不可用等）的场景 |
-| 人工测试（P7） | `fix_done` 详情页新增「开始测试 / 测试通过 / 测试不通过」：<br>① 开始测试 = `POST /api/test-start`：先在工作树里提交 AI 改动，再把临时分支合并进**主工作树的开发分支**（要求主工作树干净、在开发分支、且开发分支不领先 `origin/<目标>`），合并记录写 `meta['test.merge:<code>']`；<br>② 测试不通过 = `POST /api/test-revert`：仅当开发分支 HEAD 仍是那次合并结果时 `reset --hard` 回合并前，工作树改动保留，可点「重新修复」（`fix_done -> fixing`）；<br>③ 测试通过 = `POST /api/test-pass`：校验合并仍在，删除工作树 + 临时分支，然后 `mark_test_passed` 进入 `submitting`；<br>④ 交付时 MR 源分支是开发分支（feat→feature），预览 `snapshot.test.merged` 显示「已合并到 feat，测试中」 |
+| 人工测试（P7） | `fix_done` 详情页新增「开始测试 / 测试通过 / 测试不通过」：<br>① 开始测试 = `POST /api/test-start`：先在工作树里提交 AI 改动，再把临时分支合并进**主工作树的开发分支**（要求主工作树干净、在开发分支、且开发分支不领先 `origin/<目标>`），合并记录写 `meta['test.merge:<code>']`；<br>② 测试不通过 = `POST /api/test-revert`：仅当开发分支 HEAD 仍是那次合并结果时 `reset --hard` 回合并前，工作树改动保留，可点「重新修复」（`fix_done -> fixing`）；<br>③ 测试通过 = `POST /api/test-pass`：校验合并仍在，删除工作树 + 临时分支，然后 `mark_test_passed` **直接归档 `done`**（GitLab 交付链路已下线）；<br>④ `snapshot.test.merged` 仍显示「已合并到 feat，测试中」；push/MR 由人工按团队流程完成 |
 | 基线与 baseSource | 依次尝试 `origin/<目标分支>`（`branch.baseSource:'origin'`）→ 本地 `<目标分支>`（`'target'`）→ `HEAD`（`'HEAD'`，本地/演示仓库；本机没有集成分支时走这一档），并写入 `branch.baseSource` |
-| 工作树 | `<repo>/.dsh-worktrees/<code>`（`git.worktreePath` 只接受 `[A-Za-z0-9._-]{1,120}` 的 code）；本仓库已把 `.dsh-worktrees/` 加入 `.gitignore`。P4 **不 commit、不 push**，改动以未提交状态留在 worktree，供人工测试与 P5 提交 |
+| 工作树 | `<repo>/.dsh-worktrees/<code>`（`git.worktreePath` 只接受 `[A-Za-z0-9._-]{1,120}` 的 code）；本仓库已把 `.dsh-worktrees/` 加入 `.gitignore`。AI 修复**不 commit、不 push**，改动以未提交状态留在 worktree，供人工测试（测试通过/不通过由 P7 服务处理） |
 | 结果回填 | 子代理只输出一个 JSON；宿主以 `git status --porcelain`（含 `??` 未跟踪文件）为准收集 `changedFiles`，`diffStat`/`diff` 来自 git（`diff` 只持久化最多 4,000 字符的摘要），连同 summary/testResult/耗时写入 `fixes`，再以 `expectedWorkflow:'fixing'` 条件写 `fix_done`。成功 status 但 **0 改动** → 不进入 `fix_done`，改为 `blocked`（`fix-no-changes`） |
 | 失败/重试 | 子代理失败/超时/坏输出/无 live Agent → `blocked`（`blockedFrom:'fixing'`）+ 静态原因 `fix-timeout`/`fix-bad-output`/`no-live-agent`/`fix-failed`；看板显示静态文案 +「重新修复」，再次 POST `/api/fix` 由宿主自动 `retry`（客户端不需要先发 `/action retry`） |
 | 取消/重启 | `dispose()`（插件卸载/app 退出）先标 `cancelled` 再 abort：**不写** `block`/错误 meta，工单保持 `fixing`；下次加载按孤儿路径重启并复用已有 worktree/分支。`blocked(fixing)` 重启时先完成 git 准备再 `retry`；准备失败保持原 `blocked` 状态，只把新原因写入 `meta['fix.error:<code>']` |
 | 并发 | 同仓库同一时间只允许 1 个修复（`fix-service` 进程内锁）：第二张工单 `fix-busy` 409，且在任何状态写之前拒绝；个人分支已被本插件记录的其它工单工作树占用 → `fix-branch-busy` 409。不同仓库可并行 |
-| 工单归属工作区 | 分析开始时把会话工作区写入 `meta['ticket.workspace:<code>']`；之后从**任意**工作区点「开始修复」「提交并创建 MR」，宿主优先用这个工作区解析仓库、设置、工作树与 Review 上下文，避免在错误仓库里建 worktree、白跑一次修复。记录缺失/失效（目录或 git 仓库不可读）时回退到当前会话工作区；修复启动成功后也会补写该记录 |
-| 人工测试 | `fix_done` 详情展示 branch/target/worktree、`changedFiles`、`diffStat`、summary、`testResult` 与修复记录；人工测试后点「标记测试通过」→ `mark_test_passed` → `submitting`。真实人工测试由用户完成；P4 live 验收中的该点击是模拟动作 |
+| 工单归属工作区 | 分析开始时把会话工作区写入 `meta['ticket.workspace:<code>']`；之后从**任意**工作区点「开始修复」「开始测试 / 测试通过」，宿主优先用这个工作区解析仓库、设置与工作树，避免在错误仓库里建 worktree、白跑一次修复。记录缺失/失效（目录或 git 仓库不可读）时回退到当前会话工作区；修复启动成功后也会补写该记录 |
+| 人工测试 | `fix_done` 详情展示 branch/target/worktree、`changedFiles`、`diffStat`、summary、`testResult` 与修复记录；人工测试后点「测试通过」→ `mark_test_passed` → `done`（归档）。真实人工测试由用户完成；P4 live 验收中的该点击是模拟动作 |
 | 客户端 UX | `fixing` 且从未启动（无 `branch.worktree`、无 `fixes`、无错误）→「开始修复」；有 branch/修复记录/错误但无运行任务 →「上次修复已中断，可重新修复」；运行中 →「AI 修复中…（最长约 15 分钟）」+ 本地计时（计时行 `aria-live=off`）；blocked(fixing) → 静态原因 +「重新修复」；`fix_done` → 修复记录卡（摘要/改动文件/`diffStat`/耗时）+ 测试卡（`testResult`）+「标记测试通过」。所有按钮二次确认，demo「修复完成」按钮隐藏 |
 | 超时/成本 | 单次修复预算 **15 分钟**（`DEFAULT_FIX_TIMEOUT_MS=900000`，代码级默认，无 host setting）；真子代理消耗模型 token 与真实时间 |
 | 测试 | **352 个用例**（P3 基线 263；P4 新增/扩充：`branch` 14、`git` 13、`fix-service` 38、`agent-access` +8、`store` +8、`routes` +8） |
@@ -139,9 +149,11 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 
 > **动作映射的维护约束（每期必读）**：按钮只来自 `bug-workflow/client.js` 的 `ACTION_BY_STATE` 字面量（按 `workflow` 的静态列表）；宿主 `canApply` 是转移的权威，但两者是**两份独立数据**。`test/client-action-map.test.js` 只做单向校验（map → host：每个映射动作在该状态必须被 `canApply` 接受），**不校验 host → map**，所以新增宿主动作不会自动出现按钮。每加/改一个动作，必须同步更新该映射并运行 `node --test bug-workflow/test/*.test.js`。已知一处偏差：宿主支持 `block`（任意非终态可执行），但看板没有「阻塞」按钮。review 轮次上限已由映射处理，不再是偏差：`review_requests_changes` 声明 `maxRounds: 3`，`mr.rounds = 3` 时该按钮在界面上禁用并显示「轮次已耗尽」提示，不会发出必然被拒的请求；宿主仍是权威（绕过 UI 直接 POST 仍返回 409 `review-rounds-exhausted`，工单进入 `blocked`）。P3 的两个分析入口都不经过 `/api/action`，但来源不同：「**开始分析**」的按钮来自 `ACTION_BY_STATE.start_analysis`（`inbox` 的按钮来源，映射里保留），只有它的**执行**绕过映射、直接 POST `/api/analyze`；「**重新分析**」是**看板临时动作**（`client.js` 的 `ANALYSIS_RETRY_DESCRIPTOR`，复用 `action:'start_analysis'` 但不属于 `ACTION_BY_STATE`），只在 `analyzing` 已无运行任务、或 `blockedFrom='analyzing'` 时由详情页按上下文追加，因此它连按钮来源也不在映射里。P4 的「开始修复」「重新修复」同理：`FIX_START_DESCRIPTOR`/`FIX_RETRY_DESCRIPTOR` 是看板临时动作，直接 POST `/api/fix`，不属于 `ACTION_BY_STATE`；demo「修复完成」按钮对**所有** `fixing` 工单隐藏（真实 `fix_done` 由宿主在修复成功后写入）。
 
-### P5 真交付（GitLab MR + AI Review 轮询 + 合并归档）
+### P5 真交付（**已下线**：GitLab MR + AI Review 轮询 + 合并归档）
 
-流程：`fix_done` → 人工测试通过（`mark_test_passed`）→ `submitting` →「提交并创建 MR」→ 跑 lint/test → 团队模板 commit → push 个人分支 → 创建/复用 GitLab MR → `mr_open` → 每 60s 拉取 MR 最新一条 `AI Code Review` 结论 → `需要修改` 起 Review 修复子代理并在宿主 commit+push（最多 3 轮）→ `可直接合并` 进入 `mergeable` → 人工在 GitLab 合并 → 轮询到 `state=merged` → `merged` → 下一 tick 自动 `dismiss(system)` → `done`（从看板移除）。
+> **已下线（2026-11-17）**：本节描述的是**保留在仓库里但不再接线**的历史实现。看板没有「提交并创建 MR」入口、GitLab 设置/token 卡、MR/Review 面板，也不会创建 MR 或轮询 Review；人工测试通过后工单直接归档 `done`。代码与测试保留，完整可运行版本见分支 `archive/gitlab-delivery`。下文保留原始行为说明，供恢复/维护参考。
+
+流程（历史）：`fix_done` → 人工测试通过（`mark_test_passed`）→ `submitting` →「提交并创建 MR」→ 跑 lint/test → 团队模板 commit → push 个人分支 → 创建/复用 GitLab MR → `mr_open` → 每 60s 拉取 MR 最新一条 `AI Code Review` 结论 → `需要修改` 起 Review 修复子代理并在宿主 commit+push（最多 3 轮）→ `可直接合并` 进入 `mergeable` → 人工在 GitLab 合并 → 轮询到 `state=merged` → `merged` → 下一 tick 自动 `dismiss(system)` → `done`（从看板移除）。
 
 | 能力 | 说明 |
 | --- | --- |
@@ -155,8 +167,8 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 | Review 修复轮 | 子代理只在 worktree 改代码；宿主以 `git status --porcelain` 收集 `changedFiles`、`diffStat`/`diff` 回填 `fixes[]`/`reviewRounds[]`，再 commit+push，最后 `review_fix_done` 回到 `mr_open`。最多 3 轮（`MAX_REVIEW_ROUNDS`），第 4 次 `block('review-rounds-exhausted')`；轮次记录按 `mr.rounds`/note id 绑定，上一轮残留的 pending-commit 记录不会重放到下一轮 |
 | 合并检测/归档 | `mergeable` + MR `state=merged` → `mr_merged` → `merged`；下一 tick `dismiss(system)` → `done` 并离开看板。若在 `mr_open`/`fixing_review` 就被人工合并 → `block('review-merged-manually')`，不伪造 review pass。**插件从不调用 merge/close/approve/resolve**，合并必须由人在 GitLab 完成 |
 | 取消/恢复 | delivery/review-fix 的 `dispose()` 只取消并排水，**不写** block/错误；`fixing_review` 无运行任务时下一 tick 按持久化 findings 恢复（重启子代理 / 重推 pending commit / 不可恢复则 `block('review-recovery-unavailable')`）。迟到结果只写静态 `delivery.error`/`review.error`，绝不回退已推进的工单 |
-| 客户端 UX | `submitting` 显示「提交并创建 MR」+ 运行横幅 + 静态错误映射；`mr_open`/`fixing_review` 显示 MR 卡（!iid/URL/source→target/轮次 n/3/最近结论/轮询提示）；`fixing_review` 运行中显示「AI 正在修复 Review 问题…」（计时 `aria-live=off`）；`mergeable` 显示「等待人工在 GitLab 合并（插件不会自动合并）」；`merged` 显示「已合并，即将从看板移除」；`done` 不再出现在看板 |
-| 测试 | **638 个用例**（P4 基线 352，P5 新增/扩充 218、UI v2 新增 4、P6 平台登录/同步/分析证据新增 39：`review-parser` 45、`credentials` 16、`gitlab` 27、`git` 20、`store` 42、`delivery-service` 41、`review-service` 45、`agent-access` 51、`analysis` 30、`sync` 31、`routes` 115、`attachments` 6、`platform-login` 14、`client-action-map` 14、`client-stage-map` 4、`client-platform-login` 4 等；另有隔离 E2E 脚本 29 条断言） |
+| 客户端 UX（历史） | `submitting` 显示「提交并创建 MR」+ 运行横幅 + 静态错误映射；`mr_open`/`fixing_review` 显示 MR 卡（!iid/URL/source→target/轮次 n/3/最近结论/轮询提示）；`fixing_review` 运行中显示「AI 正在修复 Review 问题…」（计时 `aria-live=off`）；`mergeable` 显示「等待人工在 GitLab 合并（插件不会自动合并）」；`merged` 显示「已合并，即将从看板移除」；`done` 不再出现在看板。**以上 UI 已随交付链路下线**，现行看板对这几条历史状态只显示「待收尾」泳道 + 「标记完成」 |
+| 测试 | **640 个用例**（P4 基线 352，P5 历史新增/扩充 218、UI v2 新增 4、P6 平台登录/同步/分析证据新增 39，下线改造 +2：`review-parser` 45、`credentials` 16、`gitlab` 27、`git` 20、`store` 42、`delivery-service` 41、`review-service` 45、`agent-access` 51、`analysis` 30、`sync` 31、`routes` 115、`attachments` 6、`platform-login` 14、`client-action-map` 15、`client-stage-map` 6、`client-platform-login` 4 等；另有隔离 E2E 脚本 29 条断言） |
 
 **P5 交付成功的前置条件（缺一不可）**
 
@@ -166,9 +178,11 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 4. **同一仓库单飞**：delivery 与 review-fix 共用一把仓库锁；同仓库已有任务时 409 `delivery-busy`，不会重叠写 git。
 5. **Review 轮询依赖 delivery 持久化的上下文**：`delivery.context:<code>` 保存 `{sessionId, cwd, gitlabBaseUrl, gitlabProjectPath, commitType}`（**不含 token**）；P4 遗留、没有该上下文的工单需要在 P5 重新交付一次，或人工检查（`review-recovery-unavailable`/静态提示）。
 
-**GitLab / 交付配置（看板「设置」）**
+**GitLab / 交付配置（历史，已下线）**
 
-`gitlabBaseUrl` 与 GitLab token 在「设置 → GitLab 连接」区；其余为同面板的交付/提交字段。
+> 以下字段仍是 settings 契约的一部分（旧数据可读、`settingsPayload` 原样回写），但看板**不再显示或校验**它们；只有 `branchUser` 与 `commitType` 仍在「设置 → 修复与测试」区可见（分别用于修复分支命名与测试合并提交）。
+
+`gitlabBaseUrl` 与 GitLab token 原来在「设置 → GitLab 连接」区；其余为同面板的交付/提交字段。
 
 | 字段 | 默认 | 说明 |
 | --- | --- | --- |
@@ -202,8 +216,8 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 
 | workflow | 看板/宿主行为 |
 | --- | --- |
-| `fix_done` | 显示「标记测试通过」；人工测试通过后 → `submitting` |
-| `submitting` | 显示「提交并创建 MR」（`DELIVER_DESCRIPTOR`，board-only，直接 POST `/api/deliver`）；运行中横幅 + `snapshot.delivery.running`；失败静态映射 + `snapshot.delivery.errors` |
+| `fix_done` | 显示「开始测试 / 测试通过 / 测试不通过」；人工测试通过后 → `done`（归档；原流程进入 `submitting`，交付链路已下线） |
+| `submitting` | **历史**：曾显示「提交并创建 MR」（`DELIVER_DESCRIPTOR`，直接 POST `/api/deliver`）；交付链路下线后不再显示，历史工单归入「待收尾」泳道，用「标记完成」收尾 |
 | `mr_open` | MR 卡（!iid/URL/source→target/rounds/verdict/最近结论/60s 轮询提示）；无写按钮 |
 | `fixing_review` | 「AI 正在修复 Review 问题…」计时；运行任务来自 `snapshot.review.running`；无 job 时提示宿主下次轮询恢复 |
 | `mergeable` | 「AI Review 通过，等待人工在 GitLab 合并（插件不会自动合并）」；可显示 `snapshot.review.errors` |
@@ -218,10 +232,10 @@ dsh plugin --profile desktop add @liyuera/dsh-bug-workflow
 看板列表从「平铺列表」改为**流程泳道**（样式方案 B，见 [设计说明](../docs/superpowers/design/2026-11-07-bug-workflow-ui-redesign.md) / [轻量规格](../docs/superpowers/design/2026-11-07-b-ui-spec.md)）：
 
 - **同一份数据两种布局**：容器宽 `<720px` → 垂直阶段分组卡片流（右栏默认）；`≥720px` → 横向泳道（每泳道一列，横向滚动）。用 `ResizeObserver` 监听容器宽度，纯前端本地状态。
-- **阶段映射唯一数据源**：`STAGE_LANES`（`client.js` 的 `<client-stage-map>` 字面量）把 12 个 workflow 状态映射为 9 条展示泳道（`inbox→草稿`、`analyzing→分析中`、`plan_review→方案待审`、`fixing→修复中`、`fix_done→待人工测试`、`submitting→交付中`、`mr_open/fixing_review→Review 中`、`mergeable/merged→等你合并`、`blocked→需要处理`；`done` 归档不展示）。`test/client-stage-map.test.js` 锁定「每个非终态恰好出现一次、blocked 最后、泳道顺序」。
+- **阶段映射唯一数据源**：`STAGE_LANES`（`client.js` 的 `<client-stage-map>` 字面量）把 12 个 workflow 状态映射为展示泳道：现行流程 `inbox→草稿`、`analyzing→分析中`、`plan_review→方案待审`、`fixing→修复中`、`fix_done→待人工测试`、`blocked→需要处理`；已下线的 P5 状态 `submitting`、`mr_open/fixing_review`、`mergeable/merged` 归入 3 条带 `retired:true` 的「待收尾」泳道（只在历史工单存在时出现，不进入详情流程条）。`done` 归档不展示。`test/client-stage-map.test.js` 锁定「每个非终态恰好出现一次、blocked 最后、retired 泳道不进入详情流程条」。
 - **卡片直答四件事**：卡在哪（左侧阶段色条/泳道）、等谁（`下一步` chip：等你审核/等你测试/AI 修复中/等你合并…）、等了多久（人工态 `等了 2 小时`，AI 态 `已运行`，来自 `updatedAt` 与 `snapshot.*.running`）、有问题吗（阻塞卡直接显示原因）。卡片是纯展示按钮，**不会**直接触发动作（动作仍在详情页走宿主校验）。
 - **阶段概览条**：每条泳道计数 chip，点选=筛选该阶段（与状态/类型筛选叠加，单一数据源），再点取消；「全部」清除阶段筛选。
-- **详情流程条**：详情顶部新增 9 步进度（草稿→分析→方案→修复→测试→交付→Review→合并），当前步高亮，阻塞时按 `blockedFrom` 标红。
+- **详情流程条**：详情顶部 5 步进度（草稿→分析→方案→修复→测试；交付/Review/合并已下线并从流程条移除），当前步高亮，阻塞时按 `blockedFrom` 标红。
 - **可访问性**：卡片/概览是原生 button，保留 `aria-current`/`aria-pressed`，运行态不只靠颜色（有文字「运行中」）。
 - 已完成的真实渲染预览（由真实 `client.js` + 假 React 离屏渲染，非 mock 静态页）：窄栏列表、宽屏泳道、详情流程条见 [设计目录](../docs/superpowers/design/2026-11-07-ui-styles/)（`real-lane-narrow.jpg` / `real-lane-wide.jpg` / `real-lane-detail.jpg`）。
 - **未做（P6/后续）**：拖拽推进、AI 副驾、泳道折叠/WIP 上限、真实 GUI 视觉与明暗主题验收（需要刷新页面后人工确认）。
@@ -320,7 +334,7 @@ P2 **未对真实平台执行**同步/导入（无真实 token，用户不在场
 1. 登录平台，复制 `app/access-token`，在设置里保存；平台地址保持官方域名，项目编码填实际项目。
 2. 点「同步」，确认新工单数量与平台「我的工单」一致；检查类型/状态/负责人/版本/描述与平台页面一致。
 3. 点开一张工单，确认「在平台打开」外链可跳转；用错误 token 验证 401 提示与恢复。
-4. **写回平台状态默认关闭**（`writebackStatus:false`），P2–P5 只保存开关、不向平台写；写回推迟到 P6。
+4. **写回平台状态默认关闭**（`writebackStatus:false`），P2 起只保存开关、不向平台写；写回仍未实现。
 5. 真实 token / 网关 / WAF / 分页字段类型与 P0 契约的差异，以这次联调为准；发现偏差请记录在 findings 并修 adapter。
 
 ## P2–P6 待办
@@ -330,23 +344,25 @@ P2 **未对真实平台执行**同步/导入（无真实 token，用户不在场
 | P2 | 平台接入：token、我的工单同步、详情、按编号导入、字典筛选 | **已完成（mock 验收；真实平台待用户联调）** |
 | P3 | 分析子代理 + 真实方案审核/驳回重跑 | **已完成（live 真子代理验收；真实业务仓库与 GUI 待用户验收）** |
 | P4 | 修复子代理 + worktree、diff/fixes 回填、人工测试 | **已完成（live 真修复验收；真实业务仓库、GUI、真机测试待用户验收）** |
-| P5 | GitLab 交付：提交前 lint/test、commit/push、MR 创建/复用、AI Review 轮询、回修、合并检测、完成归档 | **已完成（隔离 E2E + live 只读验收；真实 GitLab token/TLS/MR、真实业务仓库与 GUI 待用户验收）** |
-| P6 | **已完成：插件内平台登录（账号+密码+图形验证码）**；进行中：平台状态写回（进行中/已修复）、Review 修复轮 lint/test、MR discussions、closed MR 处理、客户端行为测试与 GUI 截图 | 进行中 |
+| P5 | GitLab 交付：提交前 lint/test、commit/push、MR 创建/复用、AI Review 轮询、回修、合并检测、完成归档 | **已下线（2026-11-17）**：代码/测试保留但不再接线，完整版本见分支 `archive/gitlab-delivery`；人工测试通过直接归档 `done` |
+| P6 | **已完成：插件内平台登录（账号+密码+图形验证码）**；待办：平台状态写回（进行中/已修复）、客户端行为测试与 GUI 截图（原 Review/MR 相关待办随 P5 下线） | 进行中 |
 
 ## 打包与交接（P6 前仍需处理）
+
+> P5 GitLab 交付链路已下线：本节中 delivery/review/MR 相关条目保留为历史记录（相关代码仍在仓库里、只是未接线）；恢复时请同时恢复 `index.js` 的接线、`client.js` 的 UI 与 `POST /api/deliver`、`/api/gitlab-token` 的端到端校验。
 
 - **打包**：`package.json` 的 peerDependencies（`@deepseek-ai/dsh-storage-domain`、`zod`）仍是 `"*"`，且**没有 `license` 字段**（`private: true`）。发布前必须把 peer 收窄到实际验证过的范围、补 `license`，并按 `files` 清单做一次 `npm pack --dry-run` 检查（`locale/*.json` 目录尚未创建，导出仍写在那里）。
 - **`review_fix_done` 的 `verdict`**：只把 `workflow` 推回 `mr_open`，`mr.verdict` 保持 `changes`，直到 `review_pass` 才变 `pass`。P5 已用 `reviewRounds[]`（每轮 round/noteId/verdict/status/changedFiles）记录逐轮结果，客户端以「最新一轮 + `mr.verdict`」呈现；**不要**用 `verdict==='changes'` 推断「修复失败」，真正的失败看 `reviewRounds[].status`/`blockedReason`。
 - **`fixes` / `branch` 宿主校验（P4 已补）**：`domain-spec.js` 的 `fixRunSchema` 与 `branchSchema` 现在由 `store.patchTicket` 在写队列内整体校验（runId/时间/status/changedFiles/diffStat/summary/testResult；`baseSource` 枚举、`worktree`/`createdAt` 上限），元素形状不再是 P1 客户端约定。**但 domain 仍是 v2**：若历史数据里有不符合新 schema 的 `fixes` 条目，domain open 会失败；本机 live 验收前 `fixes` 为 0 条，风险未实际发生。P5 的 `mr`/`reviewRounds` 也走同一 `patchTicket` 校验，domain 仍未升版本。
 - **设置「必填」**：`branchUser` / `commitType` 的必填校验只在 `client.js`（`validateSettings`）；宿主 `settingsSchema` 为 `z.string().default(...)`，`POST /api/settings` 会接受空串（修复服务对 `branchUser` 有 `|| 'ly'` 兜底，delivery 的 `commitType` 也有默认）。P6 若要求服务端保证，需在 host 补校验与测试。
-- **lint/test 已接但只在 delivery**：`lintCommand` / `testCommand` 在 P5 delivery 的 commit 前执行（失败 block，不 commit/push）；**Review 修复轮不重跑 lint/test**，也不做视觉留证（`devCommand`/`previewUrl` 仍未使用）。P6 若要给 Review 修复轮加门禁，需在 review-service 的宿主 commit 前复用同一 `execCommand` 路径。
+- **lint/test（历史）**：`lintCommand` / `testCommand` 原来只在 P5 delivery 的 commit 前执行；交付链路下线后这两个设置不再生效/显示，`devCommand`/`previewUrl` 未被使用。代码保留在 `delivery-service.js`，恢复交付链路时需重新接上。
 - **宿主级权限仍未强制**：P3 分析只读、P4 修复写范围、P5 Review 修复写范围都只是 prompt 约束，子代理继承父 Agent 工具；P5 未补 preset/工具 allowlist（或等价沙箱）测试，不能把「prompt 说了」当执行保证。
 - **子代理契约**：P0 已确认 `ctx.subagents.startActivation({ provider:'spawn', label, delivery:'caller', signal, request:{ prompt, parent, cwd } })`；父 Agent 用 `ctx.agents.roots()`（live Agent），不要依赖 `agent/created`。P3 分析、P4 修复（`runFix`，cwd = worktree）和 P5 Review 修复（`runReviewFix`，cwd = worktree）都用该 seam；Review 修复仍依赖 `delivery.context.sessionId` 解析父 Agent，会话销毁/非 live 时按 `resolveParent()` 语义回退到最后一个 live root（见「已知限制」）。
-- **demo 动作已收口**：`submit_mr` / `mr_created` / `review_requests_changes` / `review_fix_done` / `review_pass` / `mr_merged` / `dismiss` 已从 `ACTION_BY_STATE` 删除（真实服务写这些动作的路径保留）；`analysis_done` / `fix_done` 仍保留在 `ACTION_BY_STATE` 字面量，但看板对所有 `analyzing`/`fixing` 工单隐藏按钮，且宿主在对应真实任务运行期间对裸 `POST /api/action` 返回 409 `service-job-running`。`test/client-action-map.test.js` 已同步映射。
+- **demo 动作已收口**：`submit_mr` / `mr_created` / `review_requests_changes` / `review_fix_done` / `review_pass` / `mr_merged` / `dismiss` 已从 `ACTION_BY_STATE` 删除（P5 下线前由真实服务写这些动作，现在没有服务再写；历史工单用「标记完成」收尾）；`analysis_done` / `fix_done` 仍保留在 `ACTION_BY_STATE` 字面量，但看板对所有 `analyzing`/`fixing` 工单隐藏按钮，且宿主在对应真实任务运行期间对裸 `POST /api/action` 返回 409 `service-job-running`。`test/client-action-map.test.js` 已同步映射。
 - **沿用条件写**：P4 的 `fix_done`/`block`、P5 的 `mr_created`/`review_requests_changes`/`review_fix_done`/`review_pass`/`mr_merged`/`dismiss` 都用 `expectedWorkflow` 在 store 写队列内复核；迟到结果不会回退已推进的工单。
 - **取消语义**：P4 修复、P5 delivery/review-fix 的 dispose 都先标 `cancelled` 再 abort，**不写** `block`/错误 meta；工单保持原状态供下次启动恢复。P5 的 60s timer 在 dispose 时清 interval。
-- **review issue 形状**：P5 的 `mr.blockingIssues`/`nonBlockingIssues` 已是 parser 的 `{file,fid,level,gateCategory,location,problem,suggestion}` 形状，客户端 `IssueList` 按 `file/level/problem` 渲染；P1 遗留的原始 `{id,severity,body}` 工单若仍存在，会显示空标题，需要重新 walk 一次 Review 或人工清理（本机当前 `mr` 为 null，不受影响）。
-- **P4 live E2E 工作树仍保留（P5 live 只读，未提交）**：`.dsh-worktrees/YGFNXDJRFWDJSYJJYY-648`（分支 `feat-V1.2.0-ly`，4 个已修改 + 3 个未跟踪文件，未提交）；live 工单 648 仍为 `submitting`，P5 只做了只读验收（未保存 token、未推送）。该目录已被 `.gitignore` 忽略，不要在主工作树提交这些改动；清理命令（**只在真实交付/验收完成后执行**，会丢弃未提交改动）：
+- **review issue 形状（历史）**：P5 的 `mr.blockingIssues`/`nonBlockingIssues` 曾是 parser 的 `{file,fid,level,gateCategory,location,problem,suggestion}` 形状；交付下线后看板不再渲染 Review 列表，历史 `mr` 数据只原样保留。
+- **P4 live E2E 工作树仍保留（P5 live 只读，未提交）**：`.dsh-worktrees/YGFNXDJRFWDJSYJJYY-648`（分支 `feat-V1.2.0-ly`，4 个已修改 + 3 个未跟踪文件，未提交）；live 工单 648 仍为 `submitting`（交付链路下线后属于「待收尾」，可在看板点「标记完成」归档），P5 只做了只读验收（未保存 token、未推送）。该目录已被 `.gitignore` 忽略，不要在主工作树提交这些改动；清理命令（**只在真实交付/验收完成后执行**，会丢弃未提交改动）：
 
   ```sh
   git worktree remove --force .dsh-worktrees/YGFNXDJRFWDJSYJJYY-648 && git branch -D feat-V1.2.0-ly
@@ -360,18 +376,18 @@ P2 **未对真实平台执行**同步/导入（无真实 token，用户不在场
 | --- | --- | --- | --- |
 | `platformBaseUrl` | 平台地址 | `https://ecard.htwisdom.cn` | P2 平台 API 根地址；仅 `http(s)`，允许 localhost（mock） |
 | `platformProjectCode` | 平台项目编码 | 空 | P2 同步过滤前缀，如 `YGFNXDJRFWDJSYJJYY`；空 = 全部 |
-| `gitlabBaseUrl` | GitLab 地址 | `https://git.htwisdom.cn` | P5 GitLab API 根地址；仅 `http(s)`、不能内嵌账号密码/query；loose 兼容旧 settings 行（缺键读默认） |
-| `gitlabProjectPath` | GitLab 项目路径 | 空 | `group/project`（允许子组），P5 delivery 创建/复用 MR 用；留空表示未配置 |
-| `branchUser` | 个人分支后缀 | `ly` | 必填；P4 修复的个人分支后缀（`feat-<版本>-<branchUser>` / `hot-…`） |
-| `gitlabReviewer` | GitLab Reviewer | 空 | **P5 未使用**：不发送 reviewer_ids，字段仅为 P6 预留 |
-| `commitType` | 提交信息前缀 | `fix` | 必填；提交信息 `<commitType>: 【jira单号】…`；delivery 与 Review 修复共用 |
-| `lintCommand` | Lint 命令 | 空 | **P5 delivery 提交前执行**（失败 block，不 commit/push）；Review 修复轮不执行；空 = 跳过 |
-| `testCommand` | 测试命令 | 空 | **P5 delivery 提交前执行**（失败 block，不 commit/push）；Review 修复轮不执行；空 = 跳过 |
-| `devCommand` | 启动命令 | 空 | P5 未使用（预览/视觉留证仍未实现） |
-| `previewUrl` | 预览地址 | 空 | P5 未使用（预览/视觉留证仍未实现） |
-| `writebackStatus` | 写回平台状态（界面仍标注「P5 使用」） | `false` | 布尔开关；P2–P5 只保存，不向平台写回；写回推迟到 P6 |
+| `gitlabBaseUrl` | ~~GitLab 地址~~（已下线，不再显示） | `https://git.htwisdom.cn` | 历史字段仍可读，P5 delivery 用它创建/复用 MR；现在不再展示/校验 |
+| `gitlabProjectPath` | ~~GitLab 项目路径~~（已下线，不再显示） | 空 | 历史字段：`group/project`；现在不再展示/校验 |
+| `branchUser` | 个人分支后缀 | `ly` | 必填；P4 修复的个人分支后缀（`feat-<版本>-<branchUser>` / `hot-…`），设置面板「修复与测试」区 |
+| `gitlabReviewer` | ~~GitLab Reviewer~~（已下线，不再显示） | 空 | 历史字段：P5 从未使用；现在不再展示/校验 |
+| `commitType` | 提交信息前缀 | `fix` | 必填；P7 测试合并提交用 `<commitType>: 【jira单号】…`（原 delivery/Review 修复也共用），设置面板「修复与测试」区 |
+| `lintCommand` | ~~Lint 命令~~（已下线，不再显示） | 空 | 历史字段：原 P5 delivery 提交前执行；现在不再展示/校验 |
+| `testCommand` | ~~测试命令~~（已下线，不再显示） | 空 | 历史字段：原 P5 delivery 提交前执行；现在不再展示/校验 |
+| `devCommand` | ~~启动命令~~（已下线，不再显示） | 空 | 历史字段：P5 未使用（预览/视觉留证未实现）；现在不再展示/校验 |
+| `previewUrl` | ~~预览地址~~（已下线，不再显示） | 空 | 历史字段：P5 未使用；现在不再展示/校验 |
+| `writebackStatus` | 写回平台状态 | `false` | 布尔开关；只保存，不向平台写回（界面提示已改为「目前只保存该开关」） |
 
-> P1 live 验收时把本仓库工作区的 `gitlabProjectPath` 填成了 `wisdom-financial-service-platform/wisdom-financial-credit-platform-web`，只是**演示配置**，不代表真实项目绑定；`branchUser=ly`、`commitType=fix` 为默认值。P2 收尾已把平台地址/项目编码/token 恢复为默认，`gitlabProjectPath` 保留该演示值；P5 live 只读验收没有保存 GitLab token。
+> P1 live 验收时把本仓库工作区的 `gitlabProjectPath` 填成了 `wisdom-financial-service-platform/wisdom-financial-credit-platform-web`，只是**演示配置**，不代表真实项目绑定；`branchUser=ly`、`commitType=fix` 为默认值。P2 收尾已把平台地址/项目编码/token 恢复为默认；该 `gitlabProjectPath` 仍留在历史 settings 里但已不在界面显示。P5 live 只读验收没有保存 GitLab token。
 
 ## HTTP 接口
 
@@ -380,38 +396,38 @@ P2 **未对真实平台执行**同步/导入（无真实 token，用户不在场
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/bug-workflow/api/health` | `{ ok, domainOpenedAt, tickets }`；存储不可用时 500/503 带 `stage` |
-| GET | `/bug-workflow/api/snapshot?sessionId=` | `{ ok, workspace, settings, platform:{tokenPresent,lastSyncAt,lastSyncError}, gitlab:{tokenPresent}, dicts:{status,type,priority}, analysis:{running,errors}, fix:{running,errors}, delivery:{running,errors}, review:{running,errors}, tickets, serverTime }` |
+| GET | `/bug-workflow/api/snapshot?sessionId=` | `{ ok, workspace, settings, platform:{tokenPresent,lastSyncAt,lastSyncError}, gitlab:{tokenPresent:false}, dicts:{status,type,priority}, analysis:{running,errors}, fix:{running,errors}, delivery:{running:[],errors:{}}, review:{running:[],errors:{}}, test:{merged}, tickets, serverTime }`（`gitlab`/`delivery`/`review` 为兼容保留，恒为空） |
 | POST | `/bug-workflow/api/action` | `{ sessionId, actionId, code, action, payload? }` → `{ ok, ticket }` 或 `{ ok:false, code, message }`；`action:'create'` + `payload.code` 走平台按编号导入；`analysis_done`/`fix_done` 在对应真实任务运行期间返回 409 `service-job-running` |
 | POST | `/bug-workflow/api/analyze` | `{ sessionId, code }` → `{ ok:true, workflow:'analyzing', running:true }` 或 `{ ok:false, code, message }`；启动真分析子代理（重复点击返回 `running:true`，不重复起子代理） |
 | POST | `/bug-workflow/api/fix` | `{ sessionId, code }` → `{ ok:true, workflow:'fixing', running:true }` 或 `{ ok:false, code, message }`；创建/复用 worktree 与个人分支后启动真修复子代理（重复点击返回 `running:true`；`blocked(fixing)` 自动 retry，`fixing` 孤儿自动重启） |
-| POST | `/bug-workflow/api/deliver` | `{ sessionId, code }` → `{ ok:true, workflow:'submitting', running:true }` 或 `{ ok:false, code, message }`；校验 `submitting`/设置/token/分支/worktree 后后台跑 lint/test → commit → push → MR；重复点击同仓库 `delivery-busy` 409 |
-| GET | `/bug-workflow/api/deliver` | 405（只允许 POST） |
+| POST | `/bug-workflow/api/deliver` | **已下线（不再接线）**：现在返回 503 `delivery-unavailable`；历史实现为校验 `submitting`/设置/token/分支/worktree 后后台跑 lint/test → commit → push → MR |
+| GET | `/bug-workflow/api/deliver` | 405（只允许 POST；路由仍挂载） |
 | POST | `/bug-workflow/api/settings` | `{ sessionId, settings }` → `{ ok, settings }` |
 | POST | `/bug-workflow/api/platform-token` | `{ sessionId, token }` 保存；`{ token:null }` 清除 → `{ ok, tokenPresent }`；无 token 回显（降级路径） |
 | POST | `/bug-workflow/api/platform-login/captcha` | `{ sessionId }` → `{ ok, key, image }`（`image` 为 `data:image/...;base64`；宿主代理平台验证码接口） |
 | POST | `/bug-workflow/api/platform-login` | `{ sessionId, username, password, code, captchaKey, tenantId? }` → `{ ok, tokenPresent, username }`，token 只写凭据、不回显；失败 400/401/502/504/503 |
-| POST | `/bug-workflow/api/gitlab-token` | `{ sessionId, token }` 保存；`{ token:null }` 清除 → `{ ok, tokenPresent }`；独立 credentials ref；无 token 回显；`GET` → 405 |
+| POST | `/bug-workflow/api/gitlab-token` | **已下线（不再接线）**：现在返回 503（凭据服务不可用语义）；历史实现为独立 credentials ref 的只写 token |
 | POST | `/bug-workflow/api/sync` | `{ sessionId }` → `{ ok, synced, created, updated, total, filtered, lastSyncAt }` 或 `{ ok:false, code, message }` |
 
-**snapshot 的 P5 增量**：
+**snapshot 的 P5 增量（历史，已下线）**：
 
-- `gitlab:{tokenPresent}`：只暴露布尔值；token 只存 credentials（`BUG_WORKFLOW_GITLAB_TOKEN`），永不回显。
-- `delivery:{running:string[], errors:Record<code,string>}`：运行中的工单号 + 从 `meta['delivery.error:<code>']` 读出的静态错误；**与 `fix.errors` 平行、互不清空**。
-- `review:{running:string[], errors:Record<code,string>}`：Review 修复后台任务 + 从 `meta['review.error:<code>']` 读出的静态错误。
-- `settings` 新增 `gitlabBaseUrl`（旧 settings 行缺键读默认，不升 domain）。
+- `gitlab:{tokenPresent}`：恒为 `false`（不再读取 GitLab token）；历史实现只暴露布尔值，token 只存 credentials（`BUG_WORKFLOW_GITLAB_TOKEN`）。
+- `delivery:{running:string[], errors:Record<code,string>}`：恒为空（服务未接线）；历史实现为运行中的工单号 + `meta['delivery.error:<code>']`。
+- `review:{running:string[], errors:Record<code,string>}`：恒为空（服务未接线）；历史实现为 Review 修复后台任务 + `meta['review.error:<code>']`。
+- `settings` 保留 `gitlabBaseUrl` 等历史字段（旧 settings 行缺键读默认，不升 domain），但界面不显示。
 
-> **错误命名空间（P5 必读）**：delivery 的错误只写 `delivery.error:<code>`（snapshot `delivery.errors`），Review 的错误只写 `review.error:<code>`（snapshot `review.errors`）；两者都**不写** P4 的 `fix.error:<code>`。下一次成功启动/轮询会清本命名空间的旧错误，不会互相清空。
+> **错误命名空间（历史）**：delivery 的错误只写 `delivery.error:<code>`，Review 的错误只写 `review.error:<code>`；两者都**不写** P4 的 `fix.error:<code>`。当前没有服务再写这两个命名空间，旧值只作为历史工单的静态展示来源。
 
-错误映射：参数/设置/配置 400，`action-id-reused` / `invalid-transition` / `duplicate-code` / review 轮次耗尽 / `service-job-running` 409，工单不存在 404，上游 401 映射 401，网络/上游异常 502，内部错误 500。`review_requests_changes` 第 4 次返回 409 `review-rounds-exhausted`，同时工单进入 `blocked`，`retry` 回到 `mr_open`。`/analyze` 额外：分析服务未接线、或 `runner.available()` 为 false（缺 `subagents`/`agents` 服务）→ 同步 503 `analysis-unavailable`，工单不改；**无 live 会话 Agent 不是 503**——路由照常回 200 受理并落 `start_analysis`，后台失败后工单被 `block`，原因 `no-live-agent`；工单状态不能分析 → 409 `invalid-state`；未绑定工作区/空 `code`/缺 `sessionId` → 400；GET → 405。`/fix` 额外：`ticket-not-found` 404；`invalid-state`/`plan-not-approved`/`fix-busy`/`fix-branch-busy`/`worktree-conflict` 409；分支/工作树参数错误 400；`fix-unavailable`/`git-timeout` 503；`git-failed`/`internal` 500；GET → 405（完整映射见「P4 真修复」）。`/deliver` 额外：`ticket-not-found` 404；`not-submitting`/`delivery-busy`/`protected-branch`/`worktree-conflict` 409；`worktree-missing`/`invalid-gitlab-settings`/`invalid-branch`/`invalid-code`/`invalid-input`/`unknown-workspace` 400；`missing-gitlab-token`/`delivery-unavailable` 503；`git-failed`/`push-failed`/`mr-failed`/`internal` 500。**`delivery-no-changes` 不是同步 409**：它是 commit 阶段在 200 之后的后台失败（`failDelivery('delivery-no-changes')`，工单 `block`），路由只为防御性保留该 code 的 409 映射。**lint/test/commit/push/MR 失败发生在 200 之后**：路由同步错误映射覆盖不到它们，工单会被 `block` 并把静态原因/输出尾部写进 `snapshot.delivery.errors`。`/gitlab-token` 与 `/platform-token` 同契约：非 JSON 415、缺 session 400、token 非字符串且非 null 400、凭据不可用 503、`GET` 405。
+错误映射：参数/设置/配置 400，`action-id-reused` / `invalid-transition` / `duplicate-code` / review 轮次耗尽 / `service-job-running` 409，工单不存在 404，上游 401 映射 401，网络/上游异常 502，内部错误 500。`review_requests_changes` 第 4 次返回 409 `review-rounds-exhausted`，同时工单进入 `blocked`，`retry` 回到 `mr_open`。`/analyze` 额外：分析服务未接线、或 `runner.available()` 为 false（缺 `subagents`/`agents` 服务）→ 同步 503 `analysis-unavailable`，工单不改；**无 live 会话 Agent 不是 503**——路由照常回 200 受理并落 `start_analysis`，后台失败后工单被 `block`，原因 `no-live-agent`；工单状态不能分析 → 409 `invalid-state`；未绑定工作区/空 `code`/缺 `sessionId` → 400；GET → 405。`/fix` 额外：`ticket-not-found` 404；`invalid-state`/`plan-not-approved`/`fix-busy`/`fix-branch-busy`/`worktree-conflict` 409；分支/工作树参数错误 400；`fix-unavailable`/`git-timeout` 503；`git-failed`/`internal` 500；GET → 405（完整映射见「P4 真修复」）。`/deliver`（已下线；服务未接线时统一 503）额外：`ticket-not-found` 404；`not-submitting`/`delivery-busy`/`protected-branch`/`worktree-conflict` 409；`worktree-missing`/`invalid-gitlab-settings`/`invalid-branch`/`invalid-code`/`invalid-input`/`unknown-workspace` 400；`missing-gitlab-token`/`delivery-unavailable` 503；`git-failed`/`push-failed`/`mr-failed`/`internal` 500。**`delivery-no-changes` 不是同步 409**：它是 commit 阶段在 200 之后的后台失败（`failDelivery('delivery-no-changes')`，工单 `block`），路由只为防御性保留该 code 的 409 映射。**lint/test/commit/push/MR 失败发生在 200 之后**：路由同步错误映射覆盖不到它们，工单会被 `block` 并把静态原因/输出尾部写进 `snapshot.delivery.errors`。`/gitlab-token`（已下线，服务未接线时 503）与 `/platform-token` 的同契约（历史）：非 JSON 415、缺 session 400、token 非字符串且非 null 400、凭据不可用 503、`GET` 405。
 
 ## 数据位置
 
 - `~/.dsh/storages/bug_workflow.json`（storageDomain 的 JSON 后端，domain `bug_workflow` v2；`compatibleVersions:[1]` 兼容 P1 文件，open 时归一化并写回 v2 形状）。
-- `tickets`：**profile 全局**工单（P2–P5 仍未按工作区隔离）；`settings`：按工作区 cwd 为 key；`meta`：domain 标记、`migration:tickets-v2`、`platform.dicts`、`platform.lastSyncAt`、`platform.lastSyncError`、`analysis.error:<code>`（分析失败的静态文案，成功/下次启动时清空）、`fix.error:<code>`（修复启动/执行失败的静态文案，下一次 `/api/fix` 启动成功或修复成功时清空）、**`delivery.commit:<code>`**（push 前的待重试 commit 记录：sha/worktree/branch/message；交付成功后清 null）、**`delivery.context:<code>`**（Review 轮询所需的 `{sessionId,cwd,gitlabBaseUrl,gitlabProjectPath,commitType}`，**不含 token**；成功交付后写）、**`delivery.error:<code>`**（交付失败的静态文案/输出尾部；成功交付或下次成功启动清空）、**`review.last-note:<code>`**（已处理 note 的 `{id,verdict,at}` 去重账本）、**`review.fix-commit:<code>`**（Review 修复的 pending commit 记录，含 round/noteId 绑定）、**`review.error:<code>`**（Review 轮询/修复失败的静态文案）、`action:<actionId>` 幂等账本（最多 500 条）。
-- **工单内的交付/Review 元数据**：P4 的 `branch:{name,target,baseSource,worktree,createdAt}` 与 `fixes[]`（每次真实修复/Review 修复一条；含 runId/childId/开始完成时间/status/changedFiles/diffStat/summary/testResult；`diff` 只保存最多 4,000 字符的摘要）；P5 新增 `mr:{iid,url,sourceBranch,targetBranch,state,verdict,blockingIssues,nonBlockingIssues,rounds}`（`verdict` 在 `review_pass` 前保持 `changes`,逐轮结果看 `reviewRounds`）与 `reviewRounds:[{round,noteId,verdict,startedAt,finishedAt,childId?,changedFiles,status}]`。P5 成功交付后代码在远端个人分支 + open MR 里；Review 修复后宿主会再次 commit/push。**在首次成功 delivery 之前，worktree 仍是改动唯一副本**（如 live 遗留的 648）。
+- `tickets`：**profile 全局**工单（P2–P5 仍未按工作区隔离）；`settings`：按工作区 cwd 为 key；`meta`：domain 标记、`migration:tickets-v2`、`platform.dicts`、`platform.lastSyncAt`、`platform.lastSyncError`、`analysis.error:<code>`（分析失败的静态文案，成功/下次启动时清空）、`fix.error:<code>`（修复启动/执行失败的静态文案，下一次 `/api/fix` 启动成功或修复成功时清空）、`delivery.commit:<code>` / `delivery.context:<code>` / `delivery.error:<code>` / `review.last-note:<code>` / `review.fix-commit:<code>` / `review.error:<code>`（P5 历史命名空间：交付/Review metadata 的旧记录仍可读，但**当前没有服务再写入/清理**）、`action:<actionId>` 幂等账本（最多 500 条）。
+- **工单内的修复/交付元数据**：P4 的 `branch:{name,target,baseSource,worktree,createdAt}` 与 `fixes[]`（每次真实修复一条；含 runId/childId/开始完成时间/status/changedFiles/diffStat/summary/testResult；`diff` 只保存最多 4,000 字符的摘要）；P5 历史字段 `mr:{...}`/`reviewRounds:[...]` 仍可读（schema 保留），但交付链路下线后不再写入。当前 AI 修复成功后、人工测试前，**worktree 是改动唯一副本**（如 live 遗留的 648）。
 - 平台 token：`~/.dsh/.credentials.yaml` 的 ref `BUG_WORKFLOW_PLATFORM_TOKEN`；GitLab token：同一文件的 ref **`BUG_WORKFLOW_GITLAB_TOKEN`**（由 `ctx.credentials` 管理，文件 0600）；都不写入 storage/settings/snapshot（snapshot 只有 `platform.tokenPresent`/`gitlab.tokenPresent`）。
 - 删除 storage 文件会清空工单/设置/幂等账本；P2–P5 没有 UI 归档或删除入口（`done` 仅是看板隐藏），卸载插件不会删数据。
-- **遗留 demo 数据**：`YGFNXDJRFWDJSYJJYY-647`、`-648`、`HTSMART-12` 三张 mock 平台工单仍在 live storage，`platform.url` 指向已停止的 mock。P3 live E2E 把 **648 从 `inbox` 推进到 `fixing`**；P4 live E2E 用真修复子代理把它推进到 `fix_done` →（模拟人工测试）`submitting`，并留下分支 `feat-V1.2.0-ly` 与工作树 `.dsh-worktrees/YGFNXDJRFWDJSYJJYY-648`；P5 live 只做只读验收（未保存 token、未推送、未交付），648 **仍是 `submitting`**，该工作树**仍保留**、**不要删除**；647 / HTSMART-12 与 P1 手动创建的 `DEMO-1` 仍是先前遗留的 `analyzing`（`DEMO-1` 是 manual 工单，清理脚本按设计拒绝，只删 platform + loopback）。保留/清理的取舍见 findings。清理脚本（只在 DSH 完全退出后、且只接受 platform + loopback URL 的工单；示例**故意不含 648**）：
+- **遗留 demo 数据**：`YGFNXDJRFWDJSYJJYY-647`、`-648`、`HTSMART-12` 三张 mock 平台工单仍在 live storage，`platform.url` 指向已停止的 mock。P3 live E2E 把 **648 从 `inbox` 推进到 `fixing`**；P4 live E2E 用真修复子代理把它推进到 `fix_done` →（模拟人工测试）`submitting`，并留下分支 `feat-V1.2.0-ly` 与工作树 `.dsh-worktrees/YGFNXDJRFWDJSYJJYY-648`；P5 live 只做只读验收（未保存 token、未推送、未交付），648 **仍是 `submitting`**（现属「待收尾」，用「标记完成」归档即可），该工作树**仍保留**、**不要删除**；647 / HTSMART-12 与 P1 手动创建的 `DEMO-1` 仍是先前遗留的 `analyzing`（`DEMO-1` 是 manual 工单，清理脚本按设计拒绝，只删 platform + loopback）。保留/清理的取舍见 findings。清理脚本（只在 DSH 完全退出后、且只接受 platform + loopback URL 的工单；示例**故意不含 648**）：
 
   ```sh
   # 先 dry-run（不改文件）；确认后退出 DSH，再执行 --write
@@ -451,7 +467,9 @@ P2 **未对真实平台执行**同步/导入（无真实 token，用户不在场
 
 ## 已知限制
 
-**P5 重点（用户验收时优先看）**
+> **P5 已下线（2026-11-17）**：下面「P5 重点」整节是历史实现/验收记录，保留供恢复时参考；当前看板没有 GitLab 交付流程，这些限制不再影响日常使用。P4/P7 的修复与人工测试限制仍然适用。
+
+**P5 重点（历史：用户验收时优先看）**
 
 - **真实 GitLab 未 live 验证**：P5 live 只做了只读验收（卸装热重载、snapshot/health、`/api/deliver` 的 404/503/405、token 端点 415/400/405），**没有**保存真实 token、没有真实 TLS/网关/WAF、没有真实 push 或 MR 创建/复用/合并。真实 GitLab token 权限、项目路径、目标集成分支是否存在、MR 创建字段与真实 API 的差异，都是用户验收项；隔离 E2E 的 loopback mock 只证明协议与编排。
 - **真实业务仓库交付未验证**：E2E 用临时仓库；live 遗留工单 648 来自平台但其 plan/修复是在**插件仓库**上做的（P4 findings §6）。真实业务仓库的 lint/test 命令、提交信息、目标分支与 MR 结果未验证。
@@ -465,7 +483,7 @@ P2 **未对真实平台执行**同步/导入（无真实 token，用户不在场
 - **lint/test 只在 delivery 执行**：Review 修复轮的宿主 commit/push **不重跑** lint/test；如果 Review 修复引入 lint/test 回归，只能靠下一轮 delivery（或人工）发现。P6 待补。
 - **Review 修复有宿主硬门禁（P5 终审 I1 已修）**：review-fix 在启动子代理或任何 git 写之前，宿主校验 `branch.worktree` 的 realpath **严格位于**仓库内（仓库根/主工作树、`..`/symlink 逃逸一律拒绝）、`branch.name` 可通过 `assertPushableBranch`（受保护分支拒绝）、`mr.sourceBranch` 非空时必须等于 `branch.name`；不满足直接 `block('review-fix-failed')`，不跑子代理、不 `git add -A`/commit/push，`review.fix-commit` 的恢复/重放走同一门。这是 prompt 之外的第二道宿主门，但仍不替代子代理工具沙箱（见「P4/P3 重点」第一条）。
 - **工作树已提交时交付不再死锁（原 M1 residual）**：commit 已落地但 `meta['delivery.commit:<code>']` 没写成（宿主崩溃/`dispose`），或用户在评审后自己在工作树里手提交，重试时会得到 `sha:null`。现在交付会把个人分支 HEAD 与交付基线（`origin/<target>`，其次本地 `<target>`）对比：HEAD 已经领先就按该 sha 继续 push + 建 MR，只有分支确实还在基线上才 `block('delivery-no-changes')`。
-- **旧工单没有 delivery context 会卡住**：P4 遗留的 `submitting` 工单没有 `delivery.context:<code>`；Review 轮询会写静态 `review.error` 提示「缺少交付上下文，需人工检查（P4/P5 交接）」，不会自动伪造上下文。需要在 P5 重新交付一次，或人工检查/补数据。
+- **旧 `submitting` 工单（历史）**：P4 遗留的 `submitting` 工单现在没有自动出口（交付链路已下线），看板把它放在「待收尾」泳道，用「标记完成」归档即可。
 - **`fixes`/`reviewRounds` 历史不修剪**：每次修复最多存 4,000 字符 diff 摘要与最多 2,000 个 `changedFiles`；成功交付/Review 轮次会持续追加，snapshot 轮询成本随历史增长（客户端只渲染最近 10 条 `fixes`）；没有分页/detail 端点或归档。
 - **无提交级 client 行为测试**：仓库内仍只有 `client-action-map.test.js` 的静态映射/源码守卫；P5 的 delivery/review UI 渲染与交互没有提交的 DOM/行为测试（渲染 smoke 只在未提交的 `/tmp` fake-React harness 里做过）。
 - **平台状态写回仍未实现**：`writebackStatus` 只是布尔设置，P2–P5 都不向平台写「进行中/已修复」；状态写回是 P6 backlog。
@@ -512,7 +530,7 @@ P2 **未对真实平台执行**同步/导入（无真实 token，用户不在场
 无构建步骤：host 是纯 ESM JavaScript，client 是自包含 React bundle（只 `require('react')`，由宿主 module table 提供）。
 
 ```sh
-# 全部单元/集成测试（在仓库根目录执行）——597/597
+# 全部单元/集成测试（在仓库根目录执行）——640/640
 node --test bug-workflow/test/*.test.js
 
 # P5 隔离 E2E（临时 git 仓库 + 本地 bare origin + loopback mock GitLab；
@@ -566,16 +584,11 @@ curl -s -X POST http://127.0.0.1:49192/bug-workflow/api/fix \
   -H 'Content-Type: application/json' \
   -d '{"sessionId":"<live-session-id>","code":"<ticket-code>"}'
 
-# 真交付（会跑 lint/test、commit、push、创建/复用 GitLab MR；需要真实
-# GitLab token 与可用的个人分支/worktree；按需手动执行）
-curl -s -X POST http://127.0.0.1:49192/bug-workflow/api/deliver \
-  -H 'Content-Type: application/json' \
-  -d '{"sessionId":"<live-session-id>","code":"<ticket-code>"}'
-
-# 清除 GitLab token（写 null；不会回显 token）
-curl -s -X POST http://127.0.0.1:49192/bug-workflow/api/gitlab-token \
-  -H 'Content-Type: application/json' \
-  -d '{"sessionId":"<live-session-id>","token":null}'
+# P5 交付接口已下线：/api/deliver 与 /api/gitlab-token 现在返回 503
+# （delivery-unavailable / credentials-unavailable 语义），保留路由仅为兼容。
+# 恢复交付链路后，原来的 curl 示例：
+#   POST /bug-workflow/api/deliver       {sessionId, code}
+#   POST /bug-workflow/api/gitlab-token  {sessionId, token|null}
 
 # 清理 P4 live 工作树（只在真实交付/验收完成后执行；会丢弃未提交改动）
 git worktree remove --force .dsh-worktrees/YGFNXDJRFWDJSYJJYY-648 \
@@ -584,7 +597,7 @@ git worktree remove --force .dsh-worktrees/YGFNXDJRFWDJSYJJYY-648 \
 
 | 文件 | 作用 |
 | --- | --- |
-| `index.js` | 宿主入口：fallback 路由 → 打开 domain/store → 组装 token store/sync/分析/修复/delivery/review 服务 → 挂真实路由；fiber 释放时按 review → analysis → fix → delivery 顺序 dispose 再关 domain |
+| `index.js` | 宿主入口：fallback 路由 → 打开 domain/store → 组装 token store/sync/分析/修复/测试服务（delivery/review **已下线、不再组装**）→ 挂真实路由；fiber 释放时按 analysis → fix 顺序 dispose 再关 domain |
 | `src/host/protocol.js` | 状态、动作、上限常量 |
 | `src/host/state-machine.js` | 纯状态机 `initialTicket/canApply/apply`，无 I/O |
 | `src/host/domain.js` | zod schema、`bug_workflow` domain 声明与打开/关闭、v1→v2 归一化 |
@@ -596,22 +609,22 @@ git worktree remove --force .dsh-worktrees/YGFNXDJRFWDJSYJJYY-648 \
 | `src/host/sync.js` | 同步引擎与按编号导入（分页、项目过滤、映射、upsert、lastSync 元数据） |
 | `src/host/branch.js` | 纯分支推导：`versionName` + 工单类型 + `branchUser` → 个人分支/目标分支（`feat-*`/`hot-*` → `feature-*`/`hotfix-*`）；非法输入抛静态 `BranchError`，不触 git/文件系统 |
 | `src/host/git.js` | 注入式 git 执行器：`repoRoot/refExists/worktreePath/worktreeAdd/listWorktrees/probeWorktree/status/diffStat/diff/worktreeRemove/revParse/commitAll/pushBranch` + `assertPushableBranch`；只经 `execFile('git', argv)`、30 s（push 60 s）超时、静态错误、无 force |
-| `src/host/review-parser.js` | P0 review parser 的 canonical 迁移：`parseReview`/`isReviewBody`，裁剪隐藏统计段、门禁分类/阻塞项拆分；脚本 `scripts/review-parser.mjs` 复导出 |
-| `src/host/gitlab.js` | 注入 fetch 的只读 + 创建 MR 客户端（5 个端点、`PRIVATE-TOKEN`、`redirect:'error'`、15 s 超时、1 MiB 上限、静态错误、不 merge/close/approve） |
-| `src/host/agent-access.js` | 分析 + 修复 + Review 修复 runner：活 Agent 解析/回退、`startActivation`、nonce 数据块、输出解析/校验、10/15 分钟超时、取消（零依赖依赖注入；写范围 prompt-only） |
+| `src/host/review-parser.js` | **P5 历史（保留未接线）**：P0 review parser 的 canonical 迁移：`parseReview`/`isReviewBody`，裁剪隐藏统计段、门禁分类/阻塞项拆分；脚本 `scripts/review-parser.mjs` 复导出 |
+| `src/host/gitlab.js` | **P5 历史（保留未接线）**：注入 fetch 的只读 + 创建 MR 客户端（5 个端点、`PRIVATE-TOKEN`、`redirect:'error'`、15 s 超时、1 MiB 上限、静态错误、不 merge/close/approve） |
+| `src/host/agent-access.js` | 分析 + 修复（+ P5 历史 Review 修复）runner：活 Agent 解析/回退、`startActivation`、nonce 数据块、输出解析/校验、10/15 分钟超时、取消（零依赖依赖注入；写范围 prompt-only） |
 | `src/host/analysis-service.js` | 分析编排：`running` 占位、后台任务、`analysis_done`/条件 `block` 落盘、失败 meta、重启语义、dispose 取消（不写假失败） |
 | `src/host/fix-service.js` | 修复编排：算分支 → 建 worktree（origin/target/HEAD）→ 启动 `runFix` → 收集 diff/changedFiles → 写 `fixes` + 条件 `fix_done`；同仓库单飞、失败/取消/孤儿/blocked 重启、错误静态化 |
-| `src/host/delivery-service.js` | P5 交付编排：lint/test 门禁 → 团队 commit → 校验 sha → push → 复用/创建 MR → 条件写 `submit_mr`/`mr_created`/`reviewRounds` + `delivery.context`；失败只写 `delivery.error`，不碰 `fix.error` |
-| `src/host/review-service.js` | P5 Review 轮询/修复/合并归档：60s tick、最新 AI note + note id 去重、3 轮上限、`runReviewFix` → 宿主 commit/push → `review_fix_done`、pending-commit 恢复（round/note 绑定）、merge→merged→dismiss、dispose 排水 |
-| `src/host/routes.js` | 十个路由（`health/snapshot/action/analyze/fix/deliver/settings/platform-token/gitlab-token/sync`）、安全守卫、错误映射、`service-job-running` 守卫 |
+| `src/host/delivery-service.js` | **P5 历史（保留未接线）**：lint/test 门禁 → 团队 commit → 校验 sha → push → 复用/创建 MR → 条件写 `submit_mr`/`mr_created`/`reviewRounds` + `delivery.context`；失败只写 `delivery.error` |
+| `src/host/review-service.js` | **P5 历史（保留未接线）**：Review 轮询/修复/合并归档：60s tick、最新 AI note + note id 去重、3 轮上限、`runReviewFix` → 宿主 commit/push、merge→merged→dismiss |
+| `src/host/routes.js` | 十个路由（`health/snapshot/action/analyze/fix/deliver/settings/platform-token/gitlab-token/sync`）、安全守卫、错误映射、`service-job-running` 守卫；`/deliver` 与 `/gitlab-token` 现在因服务未接线返回 503 |
 | `src/host/workspace.js` | sessionId → 工作区 cwd |
-| `client.js` | 右栏 tab/guide 注册与看板 UI（列表/详情/动作/设置/平台同步/GitLab token 卡/真分析/P4 修复/P5 交付与 Review 面板） |
+| `client.js` | 右栏 tab/guide 注册与看板 UI（列表/详情/动作/设置/平台同步/真分析/P4 修复/P7 人工测试；P5 交付与 Review 面板已下线） |
 | `scripts/mock-platform.mjs` | 本地 mock 平台（fixtures、随机端口、token 校验） |
-| `scripts/e2e-delivery.mjs` | P5 隔离 E2E：临时 repo + bare origin + loopback mock GitLab + 真 store/git/delivery/review + fake runner；跑通全链路并断言硬边界，退出码 0/1 |
+| `scripts/e2e-delivery.mjs` | **P5 历史（保留）**：隔离 E2E：临时 repo + bare origin + loopback mock GitLab + 真 store/git/delivery/review + fake runner；跑通原交付全链路并断言硬边界，退出码 0/1 |
 | `scripts/fixtures/platform/` | mock 工单/详情/字典/评论/附件 fixtures |
 | `scripts/cleanup-demo-tickets.mjs` | 安全清理 mock 遗留工单（dry-run 默认、0600 备份、原子写） |
 | `scripts/verify-domain-v2.mjs` | 用安装版 zod/domain 验证 v2 契约（Electron-as-node） |
-| `test/` | `node:test` 单元/集成测试（P5 新增/扩充：`review-parser`、`gitlab`、`delivery-service`、`review-service`、`credentials`、`git`、`store`、`routes`、`client-action-map`、`agent-access`；UI v2：`client-stage-map`；P6：`platform-login`、`client-platform-login`、`attachments`；总计 **614**） |
+| `test/` | `node:test` 单元/集成测试（含 P5 历史用例：`review-parser`、`gitlab`、`delivery-service`、`review-service`、`credentials`；`store`、`routes`、`client-action-map`、`agent-access`、`client-stage-map`，P6：`platform-login`、`client-platform-login`、`attachments`；总计 **640**） |
 
 ## 许可
 

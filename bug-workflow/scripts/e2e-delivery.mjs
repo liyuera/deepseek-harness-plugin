@@ -4,10 +4,12 @@
  *
  *   node bug-workflow/scripts/e2e-delivery.mjs
  *
- * One plain-Node run drives the whole P5 chain over REAL local resources and
- * a loopback-only mock GitLab:
+ * P5 is retired from the board, but its modules and this isolated acceptance
+ * script are kept for recovery. One plain-Node run drives the whole archived P5
+ * chain over REAL local resources and a loopback-only mock GitLab:
  *
- *   fix_done -> mark_test_passed -> submitting -> /api/deliver equivalent
+ *   submitting (seeded directly; the board no longer reaches this state)
+ *   -> /api/deliver equivalent
  *   (lint/test -> team commit -> push to a bare `origin` -> MR create)
  *   -> mr_open -> review tick #1 (`需要修改`) -> fixing_review
  *   -> review-fix child (fake runner, real host commit/push) -> mr_open round 1
@@ -884,7 +886,7 @@ function gitPushCalls(harness) {
 }
 
 // ---------------------------------------------------------------------------
-// Main chain: fix_done -> submitting -> delivery/MR -> review rounds -> done
+// Main chain: submitting -> delivery/MR -> review rounds -> done
 // ---------------------------------------------------------------------------
 
 async function runMainChain() {
@@ -893,22 +895,20 @@ async function runMainChain() {
   const h = await createHarness({
     code: MAIN_CODE,
     dirty: true,
-    workflow: 'fix_done',
+    // The GitLab delivery flow is retired from the board, so the archived chain
+    // starts at `submitting` directly. (`mark_test_passed` now archives
+    // fix_done -> done, which would bypass delivery.)
+    workflow: 'submitting',
     seedContext: false,
     settings: { lintCommand: 'npm run lint', testCommand: 'npm test' },
   });
 
-  // 1. Seeded at fix_done, then the simulated human test pass.
+  // 1. Seeded at the archived entry state.
   let ticket = h.store.get(MAIN_CODE);
-  assert.equal(ticket.workflow, 'fix_done');
+  assert.equal(ticket.workflow, 'submitting');
   assert.equal(ticket.branch.name, MAIN_BRANCH);
   assert.equal(ticket.branch.target, TARGET_BRANCH);
-  pass('ticket seeded at fix_done', `code=${MAIN_CODE} name="${ticket.title}" worktree=${displayPath(h.fixture.root, h.fixture.worktree)}`);
-
-  const marked = await h.store.applyAction(MAIN_CODE, 'mark_test_passed', { actor: 'user' });
-  assert.equal(marked.ok, true);
-  assert.equal(marked.ticket.workflow, 'submitting');
-  pass('mark_test_passed', 'workflow fix_done -> submitting');
+  pass('ticket seeded at submitting', `code=${MAIN_CODE} name="${ticket.title}" worktree=${displayPath(h.fixture.root, h.fixture.worktree)}`);
 
   // 2. Delivery (lint/test -> commit -> push -> MR).
   const started = await h.delivery.start(SESSION_ID, h.fixture.repo, MAIN_CODE);

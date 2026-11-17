@@ -66,8 +66,8 @@
  *     the host advances it itself after the real run. `FixCard` renders the
  *     host's run shape (`startedAt`/`finishedAt`/`status`/`changedFiles`/
  *     `diffStat`/`summary`/`error`/`elapsedMs`, legacy `at`/`evidence`
- *     tolerated) and `MrCard` shows the branch base (`baseSource`) and
- *     worktree when the host recorded them.
+ *     tolerated); `BranchCard` shows the retained branch base (`baseSource`)
+ *     and worktree for the fix/test step.
  *   - status/type filters prefer the platform dictionaries in `snapshot.dicts`
  *     (label = `value`, stable key = `key`, optional colour dot) and fall back
  *     to the values observed on tickets. Rows carry a 平台/手动 source badge.
@@ -82,11 +82,13 @@
  * The client never re-implements the state machine: action buttons are derived
  * from the declarative `ACTION_BY_STATE` map (extracted and cross-checked
  * against `src/host/state-machine.js` by `test/client-action-map.test.js`).
- * P5 removed the demo delivery/review write-back actions (`submit_mr`,
- * `mr_created`, `review_requests_changes`, `review_pass`, `review_fix_done`,
- * `mr_merged`, `dismiss`) from that literal; the host services own those
- * transitions, and the raw `analysis_done`/`fix_done` demo actions are refused
- * by the host while the matching real job is running.
+ * The P5 GitLab delivery flow is retired: the board has no delivery button,
+ * no GitLab token/settings section and no AI Review/merge panels (the
+ * host modules are kept, the full wiring is on `archive/gitlab-delivery`). Its
+ * demo write-back actions (`submit_mr`, `mr_created`, `review_*`, `mr_merged`,
+ * `dismiss`) stay absent from that literal, while the host state machine still
+ * accepts them for legacy records. The raw `analysis_done`/`fix_done` demo
+ * actions are refused by the host while the matching real job is running.
  * `actionUnavailableHint` applies the map's declarative `maxRounds` cap so a
  * button the host would reject (409 + block) is disabled with a hint instead.
  * The host remains the authority on transitions (an illegal one comes back as a
@@ -100,7 +102,7 @@ window.__ModuleLoader__.load({
     const h = React.createElement;
     const ID = '@liyuera/dsh-bug-workflow';
     /** Visible build tag so the running UI can be verified after a reload. */
-    const CLIENT_BUILD = 'p7-test.2026-11-09.3';
+    const CLIENT_BUILD = 'p8-no-gitlab.2026-11-17.1';
 
     /** Snapshot/action endpoints (same origin as the Harness Web page). */
     const API = Object.freeze({
@@ -108,7 +110,6 @@ window.__ModuleLoader__.load({
       action: '/bug-workflow/api/action',
       analyze: '/bug-workflow/api/analyze',
       fix: '/bug-workflow/api/fix',
-      deliver: '/bug-workflow/api/deliver',
       testStart: '/bug-workflow/api/test-start',
       testRevert: '/bug-workflow/api/test-revert',
       testPass: '/bug-workflow/api/test-pass',
@@ -116,7 +117,6 @@ window.__ModuleLoader__.load({
       platformToken: '/bug-workflow/api/platform-token',
       platformCaptcha: '/bug-workflow/api/platform-login/captcha',
       platformLogin: '/bug-workflow/api/platform-login',
-      gitlabToken: '/bug-workflow/api/gitlab-token',
       sync: '/bug-workflow/api/sync',
     });
 
@@ -189,8 +189,6 @@ window.__ModuleLoader__.load({
     });
 
     const ACTOR_LABELS = Object.freeze({ user: '用户', agent: '代理', system: '系统' });
-    const VERDICT_LABELS = Object.freeze({ pass: '通过', changes: '需修改' });
-    const MR_STATE_LABELS = Object.freeze({ open: '进行中', merged: '已合并', closed: '已关闭' });
 
     /** Review round budget mirrored from the host state machine. */
     const MAX_REVIEW_ROUNDS = 3;
@@ -270,11 +268,11 @@ window.__ModuleLoader__.load({
       // pass + cleanup): the detail view renders `TestNotice` instead of a
       // state-machine button so a pass can never skip the merge+cleanup.
       fix_done: [],
-      // P5 delivery/review are service-owned: the board renders the real
-      // board-only 「提交并创建 MR」 descriptor (POST /api/deliver) and the
-      // review/merge status banners instead of demo write-back buttons. The
-      // host state machine still accepts submit_mr/mr_created/review_*/dismiss
-      // for its services; they are deliberately absent from this literal.
+      // The P5 delivery/review flow is retired: no board action exists for
+      // these legacy states (a legacy ticket is finished with the generic
+      // 「标记完成」). The host state machine still accepts
+      // submit_mr/mr_created/review_*/dismiss; they stay absent from this
+      // literal so they can never become a demo button.
       submitting: [],
       mr_open: [],
       fixing_review: [],
@@ -343,26 +341,33 @@ window.__ModuleLoader__.load({
         hint: '修复完成，等你验证改动',
         states: ['fix_done'],
       },
+      // Retired P5 GitLab delivery states. The board no longer offers the flow
+      // (no entry point, no detail step), but a legacy ticket persisted in one
+      // of these states must stay visible and terminable, so the lanes are kept
+      // with `retired: true` and `StageSteps` skips them.
       {
         id: 'delivery',
-        label: '交付中',
-        tone: 'info',
-        hint: '正在按团队模板提交并创建 MR，可继续其他操作',
+        label: '待收尾（原交付中）',
+        tone: 'warn',
+        hint: '交付流程已下线；这类历史工单可人工标记完成',
         states: ['submitting'],
+        retired: true,
       },
       {
         id: 'review',
-        label: 'Review 中',
-        tone: 'info',
-        hint: '每 60 秒检查 AI Review 结论，需要修改会自动回修',
+        label: '待收尾（原 Review）',
+        tone: 'warn',
+        hint: 'Review 流程已下线；这类历史工单可人工标记完成',
         states: ['mr_open', 'fixing_review'],
+        retired: true,
       },
       {
         id: 'mergeable',
-        label: '等你合并',
-        tone: 'success',
-        hint: 'AI Review 已通过；请在 GitLab 人工合并（插件不会自动合并）',
+        label: '待收尾（原待合并）',
+        tone: 'warn',
+        hint: '交付流程已下线；这类历史工单可人工标记完成',
         states: ['mergeable', 'merged'],
+        retired: true,
       },
       {
         id: 'blocked',
@@ -610,16 +615,15 @@ window.__ModuleLoader__.load({
     }
 
     // ---------------------------------------------------------------------
-    // P5 delivery (POST /api/deliver + snapshot.delivery feedback)
+    // Retired P5 delivery copy (GitLab flow removed; modules kept)
     // ---------------------------------------------------------------------
 
     /**
-     * Static copy for the delivery failure reasons persisted by the host
-     * (`DELIVERY_REASON_MESSAGES` in `src/host/delivery-service.js`). A blocked
-     * ticket only keeps the reason code, so the board attaches the Chinese hint
-     * and never renders a raw code. The start-validation codes are included
-     * too: a 503/409 route error may also be persisted as a block reason by a
-     * future flow, and `blockedReasonText` must stay total.
+     * Static copy for the delivery failure reasons persisted by the retained
+     * host module (`DELIVERY_REASON_MESSAGES` in
+     * `src/host/delivery-service.js`). The board no longer starts a delivery,
+     * but a legacy ticket blocked by that retired flow still needs static copy
+     * (`blockedReasonText` must stay total, never a raw reason code).
      */
     const DELIVERY_REASON_LABELS = Object.freeze(Object.assign(Object.create(null), {
       'missing-gitlab-token': '未配置 GitLab token，请先在设置中保存 GitLab token',
@@ -639,11 +643,10 @@ window.__ModuleLoader__.load({
       'not-submitting': '工单尚未通过人工测试，不能提交 MR',
     }));
 
-    /** Live progress copy for a running delivery job (elapsed appended locally). */
-    const DELIVERY_RUNNING_HINT = '正在提交并创建 MR…（先运行 lint/test，再提交、推送并创建 MR）';
-
-    /** Normal `submitting` copy when no delivery job is running. */
-    const DELIVERY_READY_HINT = '人工测试已通过，可以提交并创建 MR';
+    /** Persisted delivery block reason -> static client copy (never a raw code). */
+    function deliveryReasonLabel(reason) {
+      return ownServiceValue(DELIVERY_REASON_LABELS, reason);
+    }
 
     /** Board-only test-step descriptors (POST /api/test-*). */
     const TEST_START_DESCRIPTOR = Object.freeze({
@@ -655,7 +658,7 @@ window.__ModuleLoader__.load({
     const TEST_PASS_DESCRIPTOR = Object.freeze({
       action: 'test_pass',
       label: '测试通过',
-      confirm: '确认测试通过？将清理工作树并进入「提交并创建 MR」。',
+      confirm: '确认测试通过？将清理工作树并把工单归档完成。',
       tone: 'primary',
     });
     /**
@@ -679,93 +682,16 @@ window.__ModuleLoader__.load({
       tone: 'danger',
     });
 
-    /**
-     * Board-only delivery descriptor. It is NOT part of `ACTION_BY_STATE` (that
-     * literal is the state-machine contract checked by
-     * `test/client-action-map.test.js`); `executeAction` routes it to
-     * `POST /api/deliver` instead of `/action`, because the host owns the
-     * submit_mr/mr_created transitions after the real job succeeds.
-     */
-    const DELIVER_DESCRIPTOR = Object.freeze({
-      action: 'start_deliver',
-      label: '提交并创建 MR',
-      confirm: '确认提交并创建 MR？（先运行配置的 lint/test，再提交、推送个人分支并创建 GitLab MR）',
-      tone: 'primary',
-    });
-
-    /**
-     * `POST /api/deliver` failure code -> actionable Chinese hint. Covers every
-     * code the route's `DELIVERY_ERROR_STATUS` map can return (the status
-     * fallback still covers a future/host-side code this board does not know
-     * yet). `invalid-input`/`internal` are the route-level 400/500 buckets and
-     * intentionally share the same copy as the status fallback.
-     */
-    const DELIVERY_ERROR_HINTS = Object.freeze(Object.assign(Object.create(null), {
-      'ticket-not-found': '工单不存在',
-      'not-found': '工单不存在',
-      'not-submitting': '工单尚未通过人工测试，不能提交 MR',
-      'missing-gitlab-token': '未配置 GitLab token，请先在设置中保存 GitLab token',
-      'invalid-gitlab-settings': 'GitLab 配置无效，请检查 GitLab 地址与项目路径',
-      'protected-branch': '个人分支受保护，禁止推送',
-      'delivery-busy': '当前工作区已有交付任务在执行，请稍后重试',
-      'delivery-no-changes': '没有可提交的改动，请确认修复已保存',
-      'worktree-missing': '未找到可提交的工作树，请先执行修复',
-      'worktree-conflict': '工作树当前分支与个人分支不一致，请重新执行修复',
-      'invalid-branch': '个人分支或目标分支不合法，无法提交 MR',
-      'invalid-code': '工单编号/工作区无效',
-      'invalid-input': '工单/工作树或 GitLab 配置无效',
-      'unknown-workspace': '工单编号/工作区无效',
-      'delivery-unavailable': '交付服务不可用，请稍后重试',
-      'git-failed': '无法解析工作区仓库，无法提交 MR',
-      'push-failed': '推送个人分支失败，请检查远程仓库后重试',
-      'mr-failed': '创建 GitLab MR 失败，请稍后重试',
-      'internal': '交付启动失败，请稍后重试',
-      'missing-session': '缺少会话上下文，无法提交 MR',
-    }));
-
-    /** Product-status fallback for `POST /api/deliver` (400/404/409/500/503). */
-    const DELIVERY_STATUS_HINTS = Object.freeze(Object.assign(Object.create(null), {
-      400: '工单/工作树或 GitLab 配置无效',
-      404: '工单不存在',
-      409: '当前状态不能提交（可能尚未通过人工测试，或已有交付在执行）',
-      500: '提交并创建 MR 失败，请稍后重试',
-      503: '交付服务不可用，请稍后重试',
-    }));
-
-    /** Persisted delivery block reason -> static client copy (never a raw code). */
-    function deliveryReasonLabel(reason) {
-      return ownServiceValue(DELIVERY_REASON_LABELS, reason);
-    }
-
-    /**
-     * `POST /api/deliver` failure copy: 404 missing ticket, 409 stale state /
-     * not test-passed / busy, 503 missing GitLab token or unwired service, 400
-     * invalid worktree/branch/GitLab configuration, 500 unexpected git/push/MR
-     * failure. The hint replaces the host message so the banner always tells the
-     * user what to do; the server code/status stay for diagnosis.
-     */
-    function deliverErrorView(result) {
-      const view = toErrorView(result);
-      const hint = ownServiceValue(DELIVERY_ERROR_HINTS, view.code)
-        ?? (view.status === null ? undefined : ownServiceValue(DELIVERY_STATUS_HINTS, view.status))
-        ?? null;
-      return {
-        ...view,
-        title: '提交并创建 MR 失败',
-        message: hint === null ? view.message : hint,
-      };
-    }
-
     // ---------------------------------------------------------------------
-    // P5 AI Review polling / merge detection (snapshot.review only, no route)
+    // Retired P5 AI Review copy (GitLab flow removed; modules kept)
     // ---------------------------------------------------------------------
 
     /**
-     * Static copy for the review failure reasons persisted by the host
-     * (`REVIEW_REASON_MESSAGES` in `src/host/review-service.js` plus the
-     * runner-failure reasons the review fix maps). A blocked ticket only keeps
-     * the code, so the board attaches the Chinese hint; raw codes are never
-     * rendered.
+     * Static copy for the review failure reasons persisted by the retained host
+     * module (`REVIEW_REASON_MESSAGES` in `src/host/review-service.js` plus the
+     * runner-failure reasons it maps). The board no longer polls Review, but a
+     * legacy ticket blocked by the retired flow still renders its mapped reason
+     * through `blockedReasonText`.
      */
     const REVIEW_REASON_LABELS = Object.freeze(Object.assign(Object.create(null), {
       'review-parse-failed': 'AI Review 结论解析失败，请人工检查 MR 评论',
@@ -781,57 +707,9 @@ window.__ModuleLoader__.load({
       'review-fix-branch-busy': '个人分支已被其它工单占用，请先清理后再试',
     }));
 
-    /** Polling hint rendered for every Review-owned state. */
-    const REVIEW_POLL_HINT = '每 60 秒自动检查 AI Code Review 结论';
-
-    /**
-     * The review timer no-ops without a GitLab token, but the board keeps
-     * promising the next poll; this warning makes the paused poller visible.
-     */
-    const REVIEW_TOKEN_MISSING_HINT = '未配置 GitLab token，Review 轮询已暂停';
-
-    /** Live progress copy while the review-fix job runs (elapsed appended). */
-    const REVIEW_RUNNING_HINT = 'AI 正在修复 Review 问题…（最长约 15 分钟，可继续其他操作）';
-
-    /** `fixing_review` with no live job: the host recovers on its next poll. */
-    const REVIEW_NOT_RUNNING_HINT = 'Review 修复未在运行，宿主会在下次轮询自动恢复';
-
-    /** `mergeable`: the plugin never merges; a human must do it in GitLab. */
-    const REVIEW_MERGEABLE_HINT = 'AI Review 已通过，等待人工在 GitLab 合并（插件不会自动合并）';
-
-    /** `merged`: the next host poll archives the ticket out of the board. */
-    const REVIEW_MERGED_HINT = '已合并，工单即将自动从看板移除';
-
-    /** Blocking issues rendered inline by the MR/Review status panel. */
-    const MAX_RENDERED_REVIEW_ISSUES = 5;
-
-    /** `reviewRounds[].status` -> short Chinese label. */
-    const REVIEW_ROUND_STATUS_LABELS = Object.freeze(Object.assign(Object.create(null), {
-      succeeded: '已完成',
-      failed: '失败',
-      cancelled: '已取消',
-      running: '进行中',
-    }));
-
     /** Persisted review block reason -> static client copy (never a raw code). */
     function reviewReasonLabel(reason) {
       return ownServiceValue(REVIEW_REASON_LABELS, reason);
-    }
-
-    /** Newest `reviewRounds` entry, or null (defensive against partial data). */
-    function latestReviewRound(ticket) {
-      if (ticket === null || typeof ticket !== 'object' || !Array.isArray(ticket.reviewRounds)) return null;
-      for (let index = ticket.reviewRounds.length - 1; index >= 0; index -= 1) {
-        const entry = ticket.reviewRounds[index];
-        if (entry !== null && typeof entry === 'object') return entry;
-      }
-      return null;
-    }
-
-    /** `reviewRounds[].status` display copy; unknown values stay clipped. */
-    function reviewRoundStatusLabel(status) {
-      if (typeof status !== 'string' || status === '') return '';
-      return ownServiceValue(REVIEW_ROUND_STATUS_LABELS, status) ?? clip(status, 40);
     }
 
     // ---------------------------------------------------------------------
@@ -841,12 +719,17 @@ window.__ModuleLoader__.load({
     /**
      * Settings contract defaults. The host store owns these fields;
      * `platformBaseUrl`/`platformProjectCode` configure the platform client and
-     * `writebackStatus` is the P5 write-back switch (P2 only persists it).
+     * `writebackStatus` is the platform write-back switch (only persisted today).
+     *
+     * The retired P5 GitLab/delivery keys stay in the contract on purpose: the
+     * host store/schema owns them, `settingsPayload` round-trips them unchanged,
+     * and dropping them would be a settings-data migration for a flow whose
+     * implementation is kept on branch `archive/gitlab-delivery`.
      */
     const SETTINGS_DEFAULTS = Object.freeze({
       platformBaseUrl: 'https://ecard.htwisdom.cn',
       platformProjectCode: '',
-      // P5 GitLab API root (host default; the token is write-only below).
+      // Retired P5 GitLab/delivery fields: not rendered/validated any more.
       gitlabBaseUrl: 'https://git.htwisdom.cn',
       gitlabProjectPath: '',
       branchUser: 'ly',
@@ -863,68 +746,35 @@ window.__ModuleLoader__.load({
     const SETTINGS_KEYS = Object.freeze(Object.keys(SETTINGS_DEFAULTS));
 
     /**
-     * The GitLab/tooling settings fields, Chinese label + one-line help.
-     * `required` marks
-     * the fields the board refuses to submit empty (the host would still accept
-     * them, but P2 uses them for branch/commit generation). The platform base
-     * URL, project code and write-back switch live in the 「平台连接」 section.
+     * The fix/test settings rows, Chinese label + one-line help.
+     *
+     * The GitLab delivery fields (`gitlabProjectPath`, `gitlabReviewer`,
+     * `lintCommand`, `testCommand`, `devCommand`, `previewUrl`) are retired with
+     * the P5 delivery chain: the host store/schema keeps them (code retained on
+     * branch `archive/gitlab-delivery`), the board no longer shows or validates
+     * them. `branchUser` and `commitType` stay because the retained fix branch
+     * naming and the P7 test-merge commit still use them.
      */
     const SETTINGS_FIELDS = Object.freeze([
       {
-        key: 'gitlabProjectPath',
-        label: 'GitLab 项目路径',
-        hint: 'GitLab 项目路径 group/project；留空表示未配置',
-        placeholder: 'group/project',
-      },
-      {
         key: 'branchUser',
         label: '个人分支后缀',
-        hint: '个人分支后缀，如 ly',
+        hint: '个人分支后缀，如 ly（修复分支与测试提交使用）',
         placeholder: 'ly',
         required: true,
       },
       {
-        key: 'gitlabReviewer',
-        label: 'GitLab Reviewer',
-        hint: 'Reviewer 用户名，如 zhangsan，可留空',
-        placeholder: 'zhangsan',
-      },
-      {
         key: 'commitType',
         label: '提交信息前缀',
-        hint: '提交信息前缀，默认 fix',
+        hint: '测试通过时合并提交的前缀，默认 fix',
         placeholder: 'fix',
         required: true,
-      },
-      {
-        key: 'lintCommand',
-        label: 'Lint 命令',
-        hint: 'Lint 命令，可留空',
-        placeholder: 'pnpm lint',
-      },
-      {
-        key: 'testCommand',
-        label: '测试命令',
-        hint: '测试命令，可留空',
-        placeholder: 'pnpm test',
-      },
-      {
-        key: 'devCommand',
-        label: '启动命令',
-        hint: '启动命令，可留空',
-        placeholder: 'pnpm dev',
-      },
-      {
-        key: 'previewUrl',
-        label: '预览地址',
-        hint: '预览地址，可留空',
-        placeholder: 'http://127.0.0.1:5173',
       },
     ]);
 
     /**
-     * The platform base URL row. Rendered inside the 「平台连接」 section rather
-     * than among the GitLab rows, but still part of the settings payload.
+     * The platform base URL row. Rendered inside the 「平台连接」 section; it is
+     * part of the settings payload like every other field.
      */
     const PLATFORM_BASE_URL_FIELD = Object.freeze({
       key: 'platformBaseUrl',
@@ -945,22 +795,6 @@ window.__ModuleLoader__.load({
       placeholder: 'YGFNXDJRFWDJSYJJYY',
     });
 
-    /**
-     * The GitLab API root row. Same validation as `platformBaseUrl`: an
-     * absolute http(s) URL without embedded credentials. Rendered inside the
-     * 「GitLab 连接」 section together with the write-only token card.
-     */
-    const GITLAB_BASE_URL_FIELD = Object.freeze({
-      key: 'gitlabBaseUrl',
-      label: 'GitLab 地址',
-      hint: 'GitLab 根地址，必须是 http(s) URL，且不能内嵌账号密码',
-      placeholder: 'https://git.htwisdom.cn',
-      required: true,
-    });
-
-    /** `group/project`, two non-empty segments without whitespace. */
-    const GITLAB_PROJECT_PATH_RE = /^[^/\s]+\/[^/\s]+$/;
-
     const SETTINGS_SAVE_HINT = '设置按工作区保存，未保存的修改会在关闭面板后丢弃';
     const SETTINGS_UNBOUND_HINT = '当前会话未绑定工作区，设置无法保存：请先在会话工作区打开「Bug 看板」后再保存。';
     const SETTINGS_LOADING_HINT = '正在读取工作区信息，读取完成前无法保存设置。';
@@ -971,23 +805,12 @@ window.__ModuleLoader__.load({
     const PLATFORM_TOKEN_PRESENT = 'token 已配置';
     const PLATFORM_TOKEN_ABSENT = 'token 未配置';
 
-    const GITLAB_SECTION_HINT = '用于提交个人分支并创建 GitLab MR。token 只写入宿主凭据服务，看板与接口都不会回显。';
-    const GITLAB_TOKEN_HINT = 'GitLab Personal Access Token（需要 api 权限）';
-    const GITLAB_TOKEN_PRESENT = 'GitLab token 已配置';
-    const GITLAB_TOKEN_ABSENT = 'GitLab token 未配置';
-
-    /** Flash/validation copy for the two shared token-card flows. */
+    /** Flash/validation copy for the platform token-card flow. */
     const PLATFORM_TOKEN_UI = Object.freeze({
       empty: '请输入平台 token',
       saved: 'token 已保存',
       combined: '设置与 token 已保存',
       cleared: 'token 已清除',
-    });
-    const GITLAB_TOKEN_UI = Object.freeze({
-      empty: '请输入 GitLab token',
-      saved: 'GitLab token 已保存',
-      combined: '设置与 GitLab token 已保存',
-      cleared: 'GitLab token 已清除',
     });
     /** P6 in-board login copy (captcha + account, token is write-only). */
     const PLATFORM_LOGIN_HINT = '用平台账号登录后自动保存 token；密码只用于这一次登录请求，不保存、不回显。';
@@ -1026,8 +849,8 @@ window.__ModuleLoader__.load({
       }
     }
 
-    const PLATFORM_WRITEBACK_LABEL = '写回平台状态（P5 使用）';
-    const PLATFORM_WRITEBACK_HINT = 'P2 只保存该开关，不会向平台写回状态；P5 接入写回后生效。';
+    const PLATFORM_WRITEBACK_LABEL = '写回平台状态';
+    const PLATFORM_WRITEBACK_HINT = '目前只保存该开关，不会向平台写回状态。';
     const PLATFORM_IMPORT_HINT = '将从平台导入该编号的工单；重复编号会提示已存在';
 
     // ---------------------------------------------------------------------
@@ -1262,9 +1085,13 @@ window.__ModuleLoader__.load({
       return Math.max(0, Date.now() - time);
     }
 
-    /** True when the state is explicitly waiting for a human decision. */
+    /**
+     * True when the state is explicitly waiting for a human decision. The
+     * retired P5 `mergeable` state is excluded: its lane is a legacy bucket, not
+     * a "waiting for you" flow, and its only exit is manual termination.
+     */
     function laneWaitsForHuman(workflow) {
-      return workflow === 'plan_review' || workflow === 'fix_done' || workflow === 'mergeable';
+      return workflow === 'plan_review' || workflow === 'fix_done';
     }
 
     /** True when a background host job should be running for this workflow. */
@@ -1294,11 +1121,13 @@ window.__ModuleLoader__.load({
         case 'plan_review': return '等你审核方案';
         case 'fixing': return running ? 'AI 修复中' : '修复未运行 · 可重新修复';
         case 'fix_done': return '等你人工测试';
-        case 'submitting': return running ? '正在提交 MR' : '待提交 MR';
-        case 'mr_open': return '等 AI Review 结论';
-        case 'fixing_review': return running ? 'AI 回修中' : '等待恢复回修';
-        case 'mergeable': return '等你到 GitLab 合并';
-        case 'merged': return '即将自动移除';
+        // Retired P5 states only appear on legacy records: the flow is gone, so
+        // the card points at the always-available manual termination.
+        case 'submitting': return '交付流程已下线 · 可标记完成';
+        case 'mr_open': return 'Review 流程已下线 · 可标记完成';
+        case 'fixing_review': return 'Review 流程已下线 · 可标记完成';
+        case 'mergeable': return '交付流程已下线 · 可标记完成';
+        case 'merged': return '可标记完成归档';
         case 'blocked': return `原因：${clip(blockedReasonText(ticket), 26)}`;
         case 'done': return '已完成';
         default: return workflowLabel(workflow);
@@ -1327,14 +1156,6 @@ window.__ModuleLoader__.load({
 
     function actorLabel(actor) {
       return ACTOR_LABELS[actor] ?? (typeof actor === 'string' && actor !== '' ? actor : '系统');
-    }
-
-    function verdictLabel(verdict) {
-      return VERDICT_LABELS[verdict] ?? (typeof verdict === 'string' && verdict !== '' ? verdict : '未评审');
-    }
-
-    function mrStateLabel(state) {
-      return MR_STATE_LABELS[state] ?? (typeof state === 'string' && state !== '' ? state : '未知');
     }
 
     function dimensionValue(value) {
@@ -1500,19 +1321,6 @@ window.__ModuleLoader__.load({
      */
     function deliveryErrorFor(snapshot, code) {
       return serviceErrorFor(snapshot, 'delivery', code);
-    }
-
-    /**
-     * The persisted static review error for one code, or `null`.
-     *
-     * Same staleness rule as `analysisErrorFor`: `review.error:<code>` can
-     * survive on a ticket that moved on, so the review panel only renders it
-     * for the states that consume review writes — `mr_open`, `fixing_review`,
-     * and `mergeable`/`merged` (where a failed merge/archival write leaves the
-     * host-recorded cause visible instead of only the success copy).
-     */
-    function reviewErrorFor(snapshot, code) {
-      return serviceErrorFor(snapshot, 'review', code);
     }
 
     /** Shared `snapshot.<service>.errors[code]` lookup. */
@@ -1870,25 +1678,18 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Field errors for a settings draft. Empty `gitlabProjectPath` means "not
-     * configured" and is valid; `branchUser` and `commitType` must not be empty;
-     * command/preview fields may be empty. Both base URLs
-     * (`platformBaseUrl`/`gitlabBaseUrl`, P5) must be absolute http(s) URLs
-     * without embedded credentials.
+     * Field errors for a settings draft. Only the visible fields are validated:
+     * `platformBaseUrl` must be an absolute http(s) URL without embedded
+     * credentials, and `branchUser`/`commitType` must not be empty (the fix
+     * branch naming and the test-merge commit still use them). The retired
+     * GitLab fields are neither shown nor validated, so a legacy stored value
+     * can never block saving.
      */
     function validateSettings(draft) {
       const value = draft !== null && typeof draft === 'object' ? draft : {};
       const errors = {};
       const platformBaseUrlError = validatePlatformBaseUrl(value.platformBaseUrl);
       if (platformBaseUrlError !== null) errors.platformBaseUrl = platformBaseUrlError;
-      const gitlabBaseUrlError = validateGitlabBaseUrl(value.gitlabBaseUrl);
-      if (gitlabBaseUrlError !== null) errors.gitlabBaseUrl = gitlabBaseUrlError;
-      const projectPath = typeof value.gitlabProjectPath === 'string'
-        ? value.gitlabProjectPath.trim()
-        : '';
-      if (projectPath !== '' && !GITLAB_PROJECT_PATH_RE.test(projectPath)) {
-        errors.gitlabProjectPath = '格式应为 group/project（两段、不含空格）；留空表示未配置';
-      }
       if (typeof value.branchUser !== 'string' || value.branchUser.trim() === '') {
         errors.branchUser = '个人分支后缀不能为空';
       }
@@ -1924,11 +1725,6 @@ window.__ModuleLoader__.load({
 
     function validatePlatformBaseUrl(value) {
       return validateBaseUrl(value, '平台地址');
-    }
-
-    /** P5 `gitlabBaseUrl` rule (same shape as the platform base URL). */
-    function validateGitlabBaseUrl(value) {
-      return validateBaseUrl(value, 'GitLab 地址');
     }
 
     function errorCodeText(error) {
@@ -2845,18 +2641,15 @@ window.__ModuleLoader__.load({
     const TOKEN_MUTATION_BUSY_HINT = '正在保存 token，请稍候';
 
     /**
-     * Write-only token card shared by the platform and GitLab connection
-     * sections (P5 extracts it so both flow exactly the same way).
+     * Write-only platform token card (the GitLab token card is retired with the
+     * P5 flow).
      *
      * The input is `type=password`, starts empty on every open, and is cleared
      * by the board after a successful save; the status dot follows the polled
-     * `snapshot.<service>.tokenPresent`, never a client copy of the value.
+     * `snapshot.platform.tokenPresent`, never a client copy of the value.
      * Save/clear are disabled while the session has no bound workspace (the
      * host token routes are profile-global, but the panel keeps the same gate
-     * as every other write) and while another request is in flight. The shared
-     * board mutation gate means a save/clear on the OTHER card (or a settings
-     * save) would silently no-op here, so `otherTokenBusy` disables this card's
-     * buttons too and names the reason in their title.
+     * as every other write) and while another request is in flight.
      */
     /** Map a platform-login failure to actionable static copy (never raw codes). */
     function platformLoginErrorView(result) {
@@ -2904,15 +2697,13 @@ window.__ModuleLoader__.load({
       disabled,
       canSave,
       tokenBusy,
-      otherTokenBusy,
       onUsernameChange,
       onPasswordChange,
       onCodeChange,
       onRefreshCaptcha,
       onSubmit,
     }) {
-      const locked = disabled === true || busy === true || canSave !== true
-        || tokenBusy === true || otherTokenBusy === true;
+      const locked = disabled === true || busy === true || canSave !== true || tokenBusy === true;
       const image = captcha !== null && typeof captcha === 'object' && typeof captcha.image === 'string'
         ? captcha.image
         : null;
@@ -3071,7 +2862,6 @@ window.__ModuleLoader__.load({
       ariaLabel,
       tokenDraft,
       tokenBusy,
-      otherTokenBusy,
       tokenPresent,
       disabled,
       canSave,
@@ -3080,10 +2870,8 @@ window.__ModuleLoader__.load({
       onClearToken,
     }) {
       const tokenLocked = disabled === true || tokenBusy === true || canSave !== true;
-      const otherBusy = otherTokenBusy === true;
-      const actionLocked = tokenLocked || otherBusy;
-      const saveTokenDisabled = actionLocked || tokenDraft.trim() === '';
-      const clearTokenDisabled = actionLocked || tokenPresent !== true;
+      const saveTokenDisabled = tokenLocked || tokenDraft.trim() === '';
+      const clearTokenDisabled = tokenLocked || tokenPresent !== true;
       const gateHint = canSave === true ? readyHint : SETTINGS_UNBOUND_HINT;
       const dotColor = tokenPresent === true ? C.success : C.textTertiary;
 
@@ -3152,20 +2940,16 @@ window.__ModuleLoader__.load({
             onClick: onSaveToken,
             disabled: saveTokenDisabled,
             'aria-busy': tokenBusy === true || undefined,
-            title: otherBusy
-              ? TOKEN_MUTATION_BUSY_HINT
-              : (canSave !== true
-                ? SETTINGS_UNBOUND_HINT
-                : (tokenDraft.trim() === '' ? '请先粘贴 token' : '保存 token')),
+            title: canSave !== true
+              ? SETTINGS_UNBOUND_HINT
+              : (tokenDraft.trim() === '' ? '请先粘贴 token' : '保存 token'),
             style: primaryButtonStyle(saveTokenDisabled),
           }, tokenBusy === true ? '保存中…' : '保存 token'),
           h('button', {
             type: 'button',
             onClick: onClearToken,
             disabled: clearTokenDisabled,
-            title: otherBusy
-              ? TOKEN_MUTATION_BUSY_HINT
-              : (tokenPresent === true ? '清除已保存的 token' : '当前没有已保存的 token'),
+            title: tokenPresent === true ? '清除已保存的 token' : '当前没有已保存的 token',
             style: smallButtonStyle(clearTokenDisabled),
           }, '清除'),
           h('span', {
@@ -3184,7 +2968,6 @@ window.__ModuleLoader__.load({
       canSave,
       tokenDraft,
       tokenBusy,
-      otherTokenBusy,
       tokenPresent,
       loginUsername,
       loginPassword,
@@ -3261,7 +3044,6 @@ window.__ModuleLoader__.load({
           disabled: disabled === true,
           canSave,
           tokenBusy,
-          otherTokenBusy,
           onUsernameChange: onLoginUsernameChange,
           onPasswordChange: onLoginPasswordChange,
           onCodeChange: onLoginCodeChange,
@@ -3293,7 +3075,6 @@ window.__ModuleLoader__.load({
               ariaLabel: '平台 token',
               tokenDraft,
               tokenBusy,
-              otherTokenBusy,
               tokenPresent,
               disabled,
               canSave,
@@ -3308,80 +3089,6 @@ window.__ModuleLoader__.load({
           checked: draft.writebackStatus === true,
           disabled: disabled === true,
           onChange: (next) => onFieldChange('writebackStatus', next),
-        }));
-    }
-
-    /**
-     * 「GitLab 连接」 section: GitLab API root and the write-only GitLab token
-     * card (P5). The token is saved through `POST /api/gitlab-token` with the
-     * same contract as the platform token: string saves, `null` clears, and the
-     * value is never echoed back.
-     */
-    function GitlabConnectionSection({
-      draft,
-      errors,
-      disabled,
-      canSave,
-      tokenDraft,
-      tokenBusy,
-      otherTokenBusy,
-      tokenPresent,
-      onFieldChange,
-      onTokenChange,
-      onSaveToken,
-      onClearToken,
-    }) {
-      return h('section', {
-        'data-bug-gitlab-connection': 'section',
-        style: {
-          display: 'flex',
-          flexDirection: 'column',
-          gap: 8,
-          paddingBottom: 10,
-          borderBottom: `0.5px solid ${C.border}`,
-          minWidth: 0,
-        },
-      },
-        h('div', {
-          style: { display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap', minWidth: 0 },
-        },
-          h('h3', {
-            style: {
-              margin: 0,
-              fontSize: 12.5,
-              fontWeight: 600,
-              lineHeight: '18px',
-              color: C.text,
-            },
-          }, 'GitLab 连接'),
-          h('span', {
-            style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary, minWidth: 0 },
-          }, '登录后 token 仅保存在宿主凭据服务')),
-        h('div', {
-          style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary, wordBreak: 'break-word' },
-        }, GITLAB_SECTION_HINT),
-        h(SettingsField, {
-          field: GITLAB_BASE_URL_FIELD,
-          value: draft.gitlabBaseUrl,
-          error: errors.gitlabBaseUrl,
-          disabled: disabled === true,
-          onChange: onFieldChange,
-        }),
-        h(TokenCard, {
-          scope: 'gitlab',
-          statusText: tokenPresent === true ? GITLAB_TOKEN_PRESENT : GITLAB_TOKEN_ABSENT,
-          readyHint: GITLAB_TOKEN_HINT,
-          placeholder: '粘贴 GitLab Personal Access Token',
-          ariaLabel: 'GitLab token',
-          tokenDraft,
-          tokenBusy,
-          otherTokenBusy,
-          tokenPresent,
-          disabled,
-          canSave,
-          onTokenChange,
-          onSaveToken,
-          onClearToken,
         }));
     }
 
@@ -3405,9 +3112,6 @@ window.__ModuleLoader__.load({
       tokenDraft,
       tokenBusy,
       tokenPresent,
-      gitlabTokenDraft,
-      gitlabTokenBusy,
-      gitlabTokenPresent,
       loginUsername,
       loginPassword,
       loginCode,
@@ -3418,9 +3122,6 @@ window.__ModuleLoader__.load({
       onTokenChange,
       onSaveToken,
       onClearToken,
-      onGitlabTokenChange,
-      onSaveGitlabToken,
-      onClearGitlabToken,
       onLoginUsernameChange,
       onLoginPasswordChange,
       onLoginCodeChange,
@@ -3432,10 +3133,10 @@ window.__ModuleLoader__.load({
       const panelRef = React.useRef(null);
       const firstInputRef = React.useRef(null);
       const canSave = sessionMissing !== true && configured === true;
-      // One shared mutation gate: while either token card saves/clears, the
-      // panel's own 「保存」 button would silently no-op too. Keep it disabled
-      // and name the reason instead of dropping the click.
-      const tokenMutationBusy = tokenBusy === true || gitlabTokenBusy === true;
+      // Shared mutation gate: while the token card saves/clears, the panel's own
+      // 「保存」 button would silently no-op too. Keep it disabled and name the
+      // reason instead of dropping the click.
+      const tokenMutationBusy = tokenBusy === true;
       const settingsSaveDisabled = saving === true || tokenMutationBusy || !canSave;
 
       React.useEffect(() => {
@@ -3596,9 +3297,6 @@ window.__ModuleLoader__.load({
             canSave,
             tokenDraft,
             tokenBusy,
-            // The shared board mutation gate also blocks this card while the
-            // GitLab card is saving/clearing.
-            otherTokenBusy: gitlabTokenBusy === true,
             tokenPresent,
             loginUsername,
             loginPassword,
@@ -3617,28 +3315,45 @@ window.__ModuleLoader__.load({
             onRefreshCaptcha,
             onLoginSubmit,
           }),
-          h(GitlabConnectionSection, {
-            draft,
-            errors,
-            disabled: saving === true,
-            canSave,
-            tokenDraft: gitlabTokenDraft,
-            tokenBusy: gitlabTokenBusy,
-            otherTokenBusy: tokenBusy === true,
-            tokenPresent: gitlabTokenPresent,
-            onFieldChange: onChange,
-            onTokenChange: onGitlabTokenChange,
-            onSaveToken: onSaveGitlabToken,
-            onClearToken: onClearGitlabToken,
-          }),
-          SETTINGS_FIELDS.map((field) => h(SettingsField, {
-            key: field.key,
-            field,
-            value: draft[field.key],
-            error: errors[field.key],
-            disabled: saving === true,
-            onChange,
-          }))),
+          // Fix/test settings only: the GitLab delivery settings (address,
+          // token, project path, reviewer, lint/test/dev commands) are retired
+          // with the P5 flow, so they are neither rendered nor validated.
+          h('section', {
+            'data-bug-fix-test-settings': 'section',
+            style: {
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 8,
+              paddingTop: 2,
+              minWidth: 0,
+            },
+          },
+            h('div', {
+              style: { display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap', minWidth: 0 },
+            },
+              h('h3', {
+                style: {
+                  margin: 0,
+                  fontSize: 12.5,
+                  fontWeight: 600,
+                  lineHeight: '18px',
+                  color: C.text,
+                },
+              }, '修复与测试'),
+              h('span', {
+                style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary, minWidth: 0 },
+              }, 'GitLab 交付设置已下线')),
+            h('div', {
+              style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary, wordBreak: 'break-word' },
+            }, 'AI 修复分支命名、测试合并提交会用到下面两项；其余交付相关字段已从看板移除。'),
+            SETTINGS_FIELDS.map((field) => h(SettingsField, {
+              key: field.key,
+              field,
+              value: draft[field.key],
+              error: errors[field.key],
+              disabled: saving === true,
+              onChange,
+            })))),
         h('div', {
           style: {
             flex: '0 0 auto',
@@ -4312,7 +4027,7 @@ window.__ModuleLoader__.load({
         role: 'list',
         'aria-label': '流程进度',
         style: { display: 'flex', flexWrap: 'wrap', gap: 4, minWidth: 0 },
-      }, STAGE_LANES.filter((lane) => lane.id !== 'blocked').map((lane, index) => {
+      }, STAGE_LANES.filter((lane) => lane.id !== 'blocked' && lane.retired !== true).map((lane, index) => {
         const isCurrent = index === currentIndex && !doneLane;
         const isDone = doneLane ? index <= currentIndex : index < currentIndex;
         const palette = isCurrent && isBlocked ? TONES.danger : lanePalette(lane.tone);
@@ -4720,236 +4435,55 @@ window.__ModuleLoader__.load({
           : h(ListField, { label: '视觉/运行证据', values: evidence }));
     }
 
-    function MrCard({ ticket }) {
-      const mr = ticket.mr !== null && typeof ticket.mr === 'object' ? ticket.mr : null;
+    /**
+     * Branch / worktree card for the retained P4 fix + P7 manual-test flow.
+     *
+     * The P5 delivery chain (GitLab MR, AI Review) is retired, so the MR half of
+     * the old MrCard is gone; the local branch metadata still matters because it
+     * is where the AI fix lives and where 「开始测试」 merges from.
+     */
+    function BranchCard({ ticket }) {
       const branch = ticket.branch !== null && typeof ticket.branch === 'object' ? ticket.branch : null;
-      if (mr === null && branch === null) {
-        return h(Card, { title: 'MR 与分支' }, h('p', { style: emptyTextStyle }, '暂无分支或 MR，流程进入「待提交」后创建。'));
-      }
-      const source = mr !== null && typeof mr.sourceBranch === 'string'
-        ? mr.sourceBranch
-        : (branch !== null && typeof branch.name === 'string' ? branch.name : '—');
-      const target = mr !== null && typeof mr.targetBranch === 'string'
-        ? mr.targetBranch
-        : (branch !== null && typeof branch.target === 'string' ? branch.target : '—');
-      const baseSource = branch === null || typeof branch.baseSource !== 'string'
-        ? ''
-        : branchBaseSourceLabel(branch.baseSource);
-      const worktree = branch === null || typeof branch.worktree !== 'string' || branch.worktree.trim() === ''
-        ? null
-        : branch.worktree;
-      const url = mr === null ? null : safeHttpUrl(mr.url);
-      const iid = mr === null ? null : textOf(mr.iid);
-      return h(Card, { title: 'MR 与分支', aside: iid === null || iid === '' ? undefined : `!${iid}` },
-        h('div', { style: { display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 } },
-          h('div', { style: fieldLabelStyle }, '分支'),
-          h('div', { style: { ...fieldValueStyle, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace', fontSize: 11.5 } },
-            `${source} → ${target}`)),
-        baseSource === ''
-          ? null
-          : h('div', { style: { fontSize: 11.5, lineHeight: '18px', color: C.textSecondary } },
-            `基线：${baseSource}`),
-        worktree === null
-          ? null
-          : h('div', { style: { display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 } },
-            h('div', { style: fieldLabelStyle }, '工作树'),
-            h('div', {
-              style: {
-                ...fieldValueStyle,
-                fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
-                fontSize: 11.5,
-                wordBreak: 'break-all',
-              },
-            }, worktree)),
-        mr === null
-          ? null
-          : h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '4px 12px', fontSize: 11.5, lineHeight: '18px', color: C.textSecondary } },
-            h('span', null, `状态：${mrStateLabel(mr.state)}`),
-            h('span', null, `结论：${verdictLabel(mr.verdict)}`),
-            h('span', null, `Review 轮次：${mr.rounds === undefined || mr.rounds === null ? 0 : mr.rounds} / ${MAX_REVIEW_ROUNDS}`)),
-        url === null
-          ? null
-          : h('a', {
-            href: url,
-            target: '_blank',
-            rel: 'noreferrer noopener',
-            style: { fontSize: 12, color: C.link, wordBreak: 'break-all' },
-          }, '打开 MR'));
-    }
-
-    /**
-     * Bounded issue list used by the Review card and the inline `mr_open`
-     * panel.
-     *
-     * `bounded` is opt-in and only the P5 inline panel sets it: the P4
-     * `ReviewCard` keeps its pre-P5 rendering verbatim (full file/level/problem
-     * text), so the P5 clipping never changes an existing card. When
-     * `bounded:true`, every field is clipped because issue text is AI-generated
-     * (and passed through an untrusted note), so an oversized value must not
-     * blow up the sidebar layout. `limit` caps the number of rendered issues
-     * without touching the stored array.
-     */
-    function IssueList({ issues, title, limit, bounded }) {
-      const isBounded = bounded === true;
-      if (!Array.isArray(issues) || issues.length === 0) return null;
-      const list = typeof limit === 'number' && Number.isFinite(limit) && limit > 0
-        ? issues.slice(0, limit)
-        : issues;
-      return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 } },
-        h('div', { style: fieldLabelStyle }, title),
-        h('ul', {
-          style: { listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: 5 },
-        }, list.map((issue, index) => {
-          const value = issue && typeof issue === 'object' ? issue : { problem: issue };
-          const heading = isBounded
-            ? [clip(textOf(value.file), 120), clip(textOf(value.level), 40)]
-              .filter((part) => part !== '').join(' · ')
-            : [textOf(value.file), textOf(value.level)].filter((part) => part !== '').join(' · ');
-          return h('li', {
-            key: `issue-${index}`,
-            style: {
-              border: `0.5px solid ${C.border}`,
-              borderRadius: 6,
-              background: C.surfaceAlt,
-              padding: '5px 8px',
-              display: 'flex',
-              flexDirection: 'column',
-              gap: 2,
-              minWidth: 0,
-            },
-          },
-            heading === '' ? null : h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textSecondary, wordBreak: 'break-all' } }, heading),
-            isBounded && typeof value.location === 'string' && value.location !== ''
-              ? h('div', { style: { fontSize: 10.5, lineHeight: '15px', color: C.textTertiary, wordBreak: 'break-all' } }, clip(value.location, 160))
-              : null,
-            h('div', {
-              style: isBounded
-                ? { ...fieldValueStyle, fontSize: 12, wordBreak: 'break-word' }
-                : { ...fieldValueStyle, fontSize: 12 },
-            }, isBounded ? clip(textOf(value.problem, '—'), 400) : textOf(value.problem, '—')),
-            typeof value.suggestion === 'string' && value.suggestion !== ''
-              ? h('div', {
-                style: isBounded
-                  ? { fontSize: 11, lineHeight: '16px', color: C.textTertiary, wordBreak: 'break-word' }
-                  : { fontSize: 11, lineHeight: '16px', color: C.textTertiary },
-              }, `建议：${clip(value.suggestion, 300)}`)
-              : null);
-        })));
-    }
-
-    function ReviewCard({ mr }) {
-      const value = mr !== null && typeof mr === 'object' ? mr : null;
-      if (value === null) {
-        return h(Card, { title: 'Review' }, h('p', { style: emptyTextStyle }, '暂无 Review 记录。'));
-      }
-      const rounds = value.rounds === undefined || value.rounds === null ? 0 : value.rounds;
-      return h(Card, { title: 'Review', aside: `轮次 ${rounds} / ${MAX_REVIEW_ROUNDS}` },
-        h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: '4px 12px', fontSize: 12, lineHeight: '18px' } },
-          h('span', null, `结论：${verdictLabel(value.verdict)}`),
-          h('span', { style: { color: C.textTertiary } }, `状态：${mrStateLabel(value.state)}`)),
-        h(IssueList, { issues: value.blockingIssues, title: '阻塞问题' }),
-        h(IssueList, { issues: value.nonBlockingIssues, title: '非阻塞问题' }),        !Array.isArray(value.blockingIssues) || value.blockingIssues.length === 0
-          ? h('p', { style: emptyTextStyle }, '当前没有阻塞问题。')
-          : null);
-    }
-
-    /**
-     * P5 delivery status panel for a `submitting` ticket.
-     *
-     * The delivery flow is service-owned: 200 from `POST /api/deliver` only
-     * means the job was accepted, and the host advances `submit_mr`/
-     * `mr_created` itself after lint/test, commit, push and MR creation. The
-     * board therefore never renders demo submit_mr/mr_created buttons:
-     *   - `snapshot.delivery.running` contains the code: live progress copy plus
-     *     a local elapsed timer (kept out of the polite live region);
-     *   - otherwise: the real 「提交并创建 MR」 button plus the last static
-     *     delivery error (`snapshot.delivery.errors[code]`, the delivery-only
-     *     meta namespace) and a token-config hint.
-     */
-    function DeliveryNotice({ ticket, snapshot, busyAction, locked, onAction }) {
-      const isSubmitting = ticket.workflow === 'submitting';
-      const running = isSubmitting && deliveryRunningFor(snapshot, ticket.code);
-      const elapsed = useElapsedSeconds(running, ticket.code);
-      if (!isSubmitting) return null;
-
-      const busy = busyAction === DELIVER_DESCRIPTOR.action;
-      const disabled = busy || locked === true;
-      const serverError = deliveryErrorFor(snapshot, ticket.code);
-      const gitlabReady = snapshot !== null
-        && snapshot.gitlab !== null
-        && typeof snapshot.gitlab === 'object'
-        && snapshot.gitlab.tokenPresent === true;
-      const start = h('button', {
-        key: 'deliver-start',
-        type: 'button',
-        disabled,
-        'aria-busy': busy || undefined,
-        title: locked === true ? UNBOUND_WORKSPACE_HINT : DELIVER_DESCRIPTOR.confirm,
-        onClick: (event) => {
-          if (disabled) return;
-          // The event is what anchors the confirm bubble under this button.
-          if (typeof onAction === 'function') onAction(DELIVER_DESCRIPTOR, event);
-        },
-        style: primaryButtonStyle(disabled),
-      }, busy ? '处理中…' : DELIVER_DESCRIPTOR.label);
-
-      if (running) {
-        return h('div', {
-          role: 'status',
-          'aria-live': 'polite',
-          'data-bug-delivery': 'running',
-          style: {
-            border: `0.5px solid ${TONES.info.border}`,
-            background: TONES.info.background,
-            borderRadius: 8,
-            padding: '8px 10px',
-            display: 'flex',
-            flexDirection: 'column',
-            gap: 3,
-            minWidth: 0,
-          },
-        },
-          h('div', { style: { fontSize: 12, fontWeight: 600, color: TONES.info.color, lineHeight: '18px' } },
-            DELIVERY_RUNNING_HINT),
-          // The elapsed counter updates every second; keep it out of the polite
-          // live region so screen readers announce acceptance/completion, not
-          // one message per tick.
-          h('div', {
-            'aria-live': 'off',
-            style: { fontSize: 11, lineHeight: '16px', color: C.textSecondary },
-          }, `已运行 ${formatElapsed(elapsed)}`),
-          h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary } },
-            '交付在后台进行，可继续其他操作；完成后工单会进入「Review 中」。'));
-      }
-
-      return h('div', {
-        role: 'status',
-        'data-bug-delivery': 'ready',
-        style: {
-          border: `0.5px solid ${TONES.warn.border}`,
-          background: TONES.warn.background,
-          borderRadius: 8,
-          padding: '8px 10px',
-          display: 'flex',
-          flexDirection: 'column',
-          gap: 4,
-          minWidth: 0,
-        },
-      },
-        h('div', { style: { fontSize: 12, fontWeight: 600, color: TONES.warn.color, lineHeight: '18px' } },
-          DELIVERY_READY_HINT),
-        gitlabReady
-          ? null
-          : h('div', { style: { fontSize: 11, lineHeight: '16px', color: TONES.warn.color, wordBreak: 'break-word' } },
-            '未配置 GitLab token，提交会失败；请先在「设置 → GitLab 连接」保存 token。'),
-        serverError === null
-          ? null
-          : h('div', {
-            style: { fontSize: 11, lineHeight: '16px', color: C.textSecondary, wordBreak: 'break-word' },
-          }, `上次交付记录：${clip(serverError, 300)}`),
-        h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary } },
-          '提交前会先运行配置的 lint/test，再提交、推送个人分支并创建 GitLab MR；最长约 15 分钟。'),
-        h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' } }, start));
+      if (branch === null) return null;
+      const source = typeof branch.name === 'string' && branch.name !== '' ? branch.name : null;
+      const target = typeof branch.target === 'string' && branch.target !== '' ? branch.target : null;
+      const devBranch = typeof branch.devBranch === 'string' && branch.devBranch !== '' ? branch.devBranch : null;
+      const baseSource = typeof branch.baseSource === 'string' && branch.baseSource !== ''
+        ? branchBaseSourceLabel(branch.baseSource)
+        : '';
+      const worktree = typeof branch.worktree === 'string' && branch.worktree.trim() !== ''
+        ? branch.worktree
+        : null;
+      return h(Card, { title: '分支与工作树' },
+        source === null && target === null && worktree === null && devBranch === null
+          ? h('p', { style: emptyTextStyle }, '暂无分支记录。')
+          : h('div', { style: { display: 'flex', flexDirection: 'column', gap: 6, minWidth: 0 } },
+            source === null && target === null
+              ? null
+              : h('div', { style: { display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 } },
+                h('div', { style: fieldLabelStyle }, '修复分支'),
+                h('div', { style: { ...fieldValueStyle, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace', fontSize: 11.5 } },
+                  `${source ?? '—'} → ${target ?? '—'}`)),
+            devBranch === null
+              ? null
+              : h('div', { style: { fontSize: 11.5, lineHeight: '18px', color: C.textSecondary } },
+                `开发分支：${devBranch}`),
+            baseSource === ''
+              ? null
+              : h('div', { style: { fontSize: 11.5, lineHeight: '18px', color: C.textSecondary } },
+                `基线：${baseSource}`),
+            worktree === null
+              ? null
+              : h('div', { style: { display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 } },
+                h('div', { style: fieldLabelStyle }, '工作树'),
+                h('div', {
+                  style: {
+                    ...fieldValueStyle,
+                    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+                    fontSize: 11.5,
+                    wordBreak: 'break-all',
+                  },
+                }, worktree))));
     }
 
     /**
@@ -5074,157 +4608,11 @@ window.__ModuleLoader__.load({
         }, isMerged ? `已合并到 ${devBranch}，等待人工测试` : 'AI 修复已完成，等待人工测试'),
         h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textSecondary, wordBreak: 'break-word' } },
           isMerged
-            ? '在开发目录里验证改动；测试通过会清理工作树并进入提交 MR，测试不通过会回滚 feat 上的合并（工作树改动保留）。'
+            ? '在开发目录里验证改动；测试通过会清理工作树并归档完成（done），测试不通过会回滚 feat 上的合并（工作树改动保留）。'
             : `点「开始测试」会把工作树的改动提交并合并到 ${devBranch}，之后在开发目录里验证。`),
         h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' } },
           isMerged ? makeButton(TEST_PASS_DESCRIPTOR, 'primary') : makeButton(TEST_START_DESCRIPTOR, 'primary'),
           isMerged ? makeButton(TEST_REVERT_DESCRIPTOR, 'danger') : retry));
-    }
-
-    /**
-     * P5 AI Review / merge status panel for the states the timer-driven review
-     * service owns. It renders static, never-interactive copy except the
-     * existing MR card:
-     *   - `mr_open`: polling hint + the newest blocking issues (max 5, clipped)
-     *     + the live review error meta (`snapshot.review.errors[code]`; this is
-     *     the review namespace, never fix/delivery);
-     *   - `fixing_review`: a running banner with elapsed timer only while
-     *     `snapshot.review.running` contains the code; otherwise the static
-     *     "host recovers on the next poll" hint (the host owns the restart) and
-     *     the latest review round;
-     *   - `mergeable`: the human must merge in GitLab (the plugin never merges);
-     *   - `merged`: the next poll archives the ticket out of the board.
-     *
-     * The demo review_requests_changes/review_pass/review_fix_done/mr_merged/
-     * dismiss buttons are absent from `ACTION_BY_STATE`, so these states show
-     * no board actions at all.
-     */
-    function ReviewNotice({ ticket, snapshot }) {
-      const workflow = ticket.workflow;
-      const reviewState = workflow === 'mr_open'
-        || workflow === 'fixing_review'
-        || workflow === 'mergeable'
-        || workflow === 'merged';
-      const running = workflow === 'fixing_review' && reviewRunningFor(snapshot, ticket.code);
-      const elapsed = useElapsedSeconds(running, ticket.code);
-      if (!reviewState) return null;
-
-      const mr = ticket.mr !== null && typeof ticket.mr === 'object' ? ticket.mr : null;
-      const rounds = mr !== null && typeof mr.rounds === 'number' && Number.isFinite(mr.rounds)
-        ? Math.max(0, Math.trunc(mr.rounds))
-        : 0;
-      const round = latestReviewRound(ticket);
-      const reviewError = reviewErrorFor(snapshot, ticket.code);
-      // Strict `=== false`: a partial snapshot without the gitlab block must not
-      // claim the token is missing.
-      const gitlabTokenMissing = snapshot !== null
-        && typeof snapshot === 'object'
-        && snapshot.gitlab !== null
-        && typeof snapshot.gitlab === 'object'
-        && snapshot.gitlab.tokenPresent === false;
-      const tokenWarning = gitlabTokenMissing
-        ? h('div', {
-          style: { fontSize: 11, lineHeight: '16px', color: TONES.warn.color, wordBreak: 'break-word' },
-        }, `${REVIEW_TOKEN_MISSING_HINT}；请在「设置 → GitLab 连接」保存 token。`)
-        : null;
-      const styleFor = (tone) => ({
-        border: `0.5px solid ${tone.border}`,
-        background: tone.background,
-        borderRadius: 8,
-        padding: '8px 10px',
-        display: 'flex',
-        flexDirection: 'column',
-        gap: 3,
-        minWidth: 0,
-      });
-      const roundParts = [];
-      if (rounds > 0) roundParts.push(`Review 轮次：${Math.min(rounds, MAX_REVIEW_ROUNDS)} / ${MAX_REVIEW_ROUNDS}`);
-      if (round !== null) {
-        const status = reviewRoundStatusLabel(round.status);
-        if (status !== '') roundParts.push(`最近一轮：${status}`);
-        if (Array.isArray(round.changedFiles)) roundParts.push(`改动 ${round.changedFiles.length} 个文件`);
-        if (typeof round.finishedAt === 'string' && round.finishedAt !== '') {
-          roundParts.push(`完成于 ${formatTime(round.finishedAt)}`);
-        }
-      }
-      const roundInfo = roundParts.length === 0
-        ? null
-        : h('div', {
-          style: { fontSize: 11, lineHeight: '16px', color: C.textSecondary, wordBreak: 'break-word' },
-        }, roundParts.join(' · '));
-      const errorLine = reviewError === null
-        ? null
-        : h('div', {
-          style: { fontSize: 11, lineHeight: '16px', color: C.textSecondary, wordBreak: 'break-word' },
-        }, `宿主记录：${clip(reviewError, 300)}`);
-
-      if (workflow === 'merged') {
-        return h('div', { role: 'status', 'data-bug-review': 'merged', style: styleFor(TONES.success) },
-          h('div', { style: { fontSize: 12, fontWeight: 600, color: TONES.success.color, lineHeight: '18px' } },
-            REVIEW_MERGED_HINT),
-          h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary } },
-            '宿主会在下一次 60 秒轮询自动归档，看板无需手动操作。'),
-          errorLine);
-      }
-
-      if (workflow === 'mergeable') {
-        return h('div', { role: 'status', 'data-bug-review': 'mergeable', style: styleFor(TONES.success) },
-          h('div', { style: { fontSize: 12, fontWeight: 600, color: TONES.success.color, lineHeight: '18px' } },
-            REVIEW_MERGEABLE_HINT),
-          h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary } },
-            REVIEW_POLL_HINT),
-          errorLine,
-          roundInfo);
-      }
-
-      if (workflow === 'fixing_review' && running) {
-        return h('div', {
-          role: 'status',
-          'aria-live': 'polite',
-          'data-bug-review': 'running',
-          style: styleFor(TONES.info),
-        },
-          h('div', { style: { fontSize: 12, fontWeight: 600, color: TONES.info.color, lineHeight: '18px' } },
-            REVIEW_RUNNING_HINT),
-          // The counter ticks every second; keep it out of the polite region.
-          h('div', {
-            'aria-live': 'off',
-            style: { fontSize: 11, lineHeight: '16px', color: C.textSecondary },
-          }, `已运行 ${formatElapsed(elapsed)}`),
-          h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary } },
-            '修复完成后宿主会自动提交并推送，然后重新请求 AI Review。'),
-          tokenWarning,
-          roundInfo);
-      }
-
-      if (workflow === 'fixing_review') {
-        return h('div', { role: 'status', 'data-bug-review': 'not-running', style: styleFor(TONES.warn) },
-          h('div', { style: { fontSize: 12, fontWeight: 600, color: TONES.warn.color, lineHeight: '18px' } },
-            REVIEW_NOT_RUNNING_HINT),
-          h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textTertiary } },
-            '无需手动操作；若长时间未恢复，请人工检查宿主日志与 GitLab MR。'),
-          tokenWarning,
-          roundInfo,
-          errorLine);
-      }
-
-      // `mr_open`: waiting for the next AI Review note.
-      const blocking = mr !== null && Array.isArray(mr.blockingIssues) ? mr.blockingIssues : [];
-      return h('div', { role: 'status', 'data-bug-review': 'waiting', style: styleFor(TONES.info) },
-        h('div', { style: { fontSize: 12, fontWeight: 600, color: TONES.info.color, lineHeight: '18px' } },
-          '等待 AI Code Review 结论'),
-        h('div', { style: { fontSize: 11, lineHeight: '16px', color: C.textSecondary } },
-          REVIEW_POLL_HINT),
-        tokenWarning,
-        h(IssueList, {
-          issues: blocking,
-          title: blocking.length > MAX_RENDERED_REVIEW_ISSUES
-            ? `最近阻塞问题（共 ${blocking.length} 条，仅显示 ${MAX_RENDERED_REVIEW_ISSUES} 条）`
-            : '最近阻塞问题',
-          limit: MAX_RENDERED_REVIEW_ISSUES,
-          bounded: true,
-        }),
-        errorLine);
     }
 
     function Timeline({ events }) {
@@ -5294,9 +4682,9 @@ window.__ModuleLoader__.load({
             : (isFixBlock(ticket)
               ? '这是 AI 修复失败导致的阻塞：点击「重新修复」会自动解除阻塞并重新开始修复。'
               : (isDeliveryBlock(ticket)
-                ? '这是提交/交付失败导致的阻塞：处理后点击「重试」回到「待提交」，再重新提交并创建 MR。'
+                ? '这是已下线的交付流程遗留的阻塞：交付链路已移除，可点击「标记完成」人工归档。'
                 : (isReviewBlock(ticket)
-                  ? '这是 AI Review/合并流程导致的阻塞：处理后点击「重试」回到阻塞前状态；若仍无法恢复，请人工检查 GitLab MR。'
+                  ? '这是已下线的 AI Review 流程遗留的阻塞：Review 链路已移除，可点击「标记完成」人工归档。'
                   : '处理完成后可点击「重试」回到阻塞前状态。')))));
     }
 
@@ -5643,11 +5031,8 @@ window.__ModuleLoader__.load({
         // P7: merge-to-feat / revert / pass (cleanup) of the manual test step.
         h(TestNotice, { ticket, snapshot, busyAction, locked, onAction }),
         h(TerminateNotice, { ticket, busyAction, locked, onAction }),
-        // P5: submission progress (board-only 「提交并创建 MR」) and the
-        // service-owned Review/merge status banners. Both are static after 200;
-        // no demo submit_mr/mr_created/review_*/dismiss button exists any more.
-        h(DeliveryNotice, { ticket, snapshot, busyAction, locked, onAction }),
-        h(ReviewNotice, { ticket, snapshot }),
+        // The P5 delivery/Review panels are retired; a legacy ticket in one of
+        // those states stops here and uses the always-available 「标记完成」.
         // FixNotice already reports the blocked-fix cause and the restart
         // action (role="alert"); the generic blocked banner would repeat the
         // same reason. Keep it for every other block (analysis, plan review…).
@@ -5663,8 +5048,7 @@ window.__ModuleLoader__.load({
         }),
         h(FixCard, { fixes: ticket.fixes }),
         h(TestCard, { fixes: ticket.fixes, workflow: ticket.workflow }),
-        h(MrCard, { ticket }),
-        h(ReviewCard, { mr: ticket.mr }),
+        h(BranchCard, { ticket }),
         h(Timeline, { events: ticket.timeline }));
     }
 
@@ -5734,22 +5118,18 @@ window.__ModuleLoader__.load({
         fastWhen: (data) => data !== null && (
           (Array.isArray(data.analysis.running) && data.analysis.running.length > 0)
           || (Array.isArray(data.fix.running) && data.fix.running.length > 0)
-          || (Array.isArray(data.delivery.running) && data.delivery.running.length > 0)
-          || (Array.isArray(data.review.running) && data.review.running.length > 0)
         ),
       });
 
       // Background job completion notice: the session panel shows the child,
       // but the board should say when a job moved the ticket.
-      const previousRunningRef = React.useRef({ analysis: [], fix: [], delivery: [], review: [] });
+      const previousRunningRef = React.useRef({ analysis: [], fix: [] });
       React.useEffect(() => {
         const data = polling.data;
         if (data === null) return;
         const kinds = [
           ['analysis', 'AI 分析'],
           ['fix', 'AI 修复'],
-          ['delivery', '交付'],
-          ['review', 'Review 修复'],
         ];
         const previous = previousRunningRef.current;
         const next = {};
@@ -5782,8 +5162,6 @@ window.__ModuleLoader__.load({
       const [settingsSaving, setSettingsSaving] = React.useState(false);
       const [tokenDraft, setTokenDraft] = React.useState('');
       const [tokenBusy, setTokenBusy] = React.useState(false);
-      const [gitlabTokenDraft, setGitlabTokenDraft] = React.useState('');
-      const [gitlabTokenBusy, setGitlabTokenBusy] = React.useState(false);
       // P6 in-board platform login (account + password + image captcha).
       const [loginUsername, setLoginUsername] = React.useState(() => readRememberedUsername());
       const [loginPassword, setLoginPassword] = React.useState('');
@@ -5798,7 +5176,6 @@ window.__ModuleLoader__.load({
       const settingsButtonRef = React.useRef(null);
       const settingsSavingRef = React.useRef(false);
       const tokenBusyRef = React.useRef(false);
-      const gitlabTokenBusyRef = React.useRef(false);
       const loginBusyRef = React.useRef(false);
       const syncingRef = React.useRef(false);
       const pendingSelectRef = React.useRef(null);
@@ -5812,7 +5189,6 @@ window.__ModuleLoader__.load({
       const laneMode = laneWidth >= LANE_WIDE_MIN_WIDTH ? 'wide' : 'narrow';
       const configured = snapshot !== null && snapshot.workspace.configured === true;
       const tokenPresent = snapshot !== null && snapshot.platform.tokenPresent === true;
-      const gitlabTokenPresent = snapshot !== null && snapshot.gitlab.tokenPresent === true;
       const canWrite = sessionId !== null && configured;
       const settingsBaseline = React.useMemo(() => settingsFromSnapshot(snapshot), [snapshot]);
       const settingsDirty = settingsOpen === true && !settingsEqual(settingsDraft, settingsBaseline);
@@ -5902,13 +5278,12 @@ window.__ModuleLoader__.load({
       }, []);
 
       const closeSettings = React.useCallback(() => {
-        if (settingsSavingRef.current || tokenBusyRef.current || gitlabTokenBusyRef.current) return;
+        if (settingsSavingRef.current || tokenBusyRef.current) return;
         settingsTouchedRef.current = false;
         setSettingsOpen(false);
         setSettingsErrors({});
         // Tokens typed but not saved must not outlive the panel.
         setTokenDraft('');
-        setGitlabTokenDraft('');
         // The platform password/captcha are one-shot values: never keep them.
         setLoginPassword('');
         setLoginCode('');
@@ -5918,9 +5293,7 @@ window.__ModuleLoader__.load({
       }, [focusSettingsButton]);
 
       const openSettings = React.useCallback(() => {
-        if (busyRef.current || settingsSavingRef.current || tokenBusyRef.current || gitlabTokenBusyRef.current) {
-          return;
-        }
+        if (busyRef.current || settingsSavingRef.current || tokenBusyRef.current) return;
         const initial = settingsFromSnapshot(snapshot);
         settingsDraftRef.current = initial;
         settingsTouchedRef.current = false;
@@ -5928,7 +5301,6 @@ window.__ModuleLoader__.load({
         setSettingsDraft(initial);
         setSettingsErrors({});
         setTokenDraft('');
-        setGitlabTokenDraft('');
         setLoginUsername(readRememberedUsername());
         setLoginPassword('');
         setLoginCode('');
@@ -6198,25 +5570,6 @@ window.__ModuleLoader__.load({
         cleared: PLATFORM_TOKEN_UI.cleared,
       }), [clearToken]);
 
-      /** Save the GitLab token through the shared card flow. */
-      const saveGitlabToken = React.useCallback(() => saveToken({
-        path: API.gitlabToken,
-        token: gitlabTokenDraft,
-        tokenBusyRef: gitlabTokenBusyRef,
-        setTokenBusy: setGitlabTokenBusy,
-        setTokenDraft: setGitlabTokenDraft,
-        labels: GITLAB_TOKEN_UI,
-      }), [gitlabTokenDraft, saveToken]);
-
-      /** Clear the GitLab token (`{token:null}`). */
-      const clearGitlabToken = React.useCallback(() => clearToken({
-        path: API.gitlabToken,
-        tokenBusyRef: gitlabTokenBusyRef,
-        setTokenBusy: setGitlabTokenBusy,
-        setTokenDraft: setGitlabTokenDraft,
-        cleared: GITLAB_TOKEN_UI.cleared,
-      }), [clearToken]);
-
       // -------------------------------------------------------------------
       // P6 in-board platform login (account + password + image captcha)
       // -------------------------------------------------------------------
@@ -6382,21 +5735,19 @@ window.__ModuleLoader__.load({
         if (!descriptor || !ticket || busyRef.current || typeof ticket.code !== 'string') return;
         if (sessionId === null || configured !== true) return;
 
-        // P3/P4/P5: `start_analysis`, the board-only `start_fix` and the
-        // board-only `start_deliver` descriptors bypass `/action` and go to
-        // their real routes. The host handles the approved start, the
-        // orphaned-`analyzing`/`fixing` restart, the blocked-from-analysis/fix
-        // retry and the whole delivery job through those routes, so the client
-        // never sends a separate submit_mr/mr_created demo action.
+        // P3/P4/P7: `start_analysis`, the board-only `start_fix` and the three
+        // test-step descriptors bypass `/action` and go to their real routes.
+        // The host handles the approved start, the orphaned restarts, the
+        // blocked-from-analysis/fix retry and the test merge/revert/pass
+        // through those routes. The retired P5 delivery action no longer exists.
         const isAnalyze = descriptor.action === 'start_analysis';
         const isFix = descriptor.action === 'start_fix';
-        const isDeliver = descriptor.action === 'start_deliver';
         const isTestStart = descriptor.action === 'test_start';
         const isTestRevert = descriptor.action === 'test_revert';
         const isTestPass = descriptor.action === 'test_pass';
         const isTest = isTestStart || isTestRevert || isTestPass;
         let payload = {};
-        if (!isAnalyze && !isFix && !isDeliver && !isTest) {
+        if (!isAnalyze && !isFix && !isTest) {
           payload = descriptor.payload === undefined || descriptor.payload === null ? {} : descriptor.payload;
           if (descriptor.input === 'reason') {
             const trimmed = typeof reason === 'string' ? reason.trim() : '';
@@ -6421,8 +5772,6 @@ window.__ModuleLoader__.load({
             result = await postMutation(API.analyze, { sessionId, code: ticket.code });
           } else if (isFix) {
             result = await postMutation(API.fix, { sessionId, code: ticket.code });
-          } else if (isDeliver) {
-            result = await postMutation(API.deliver, { sessionId, code: ticket.code });
           } else if (isTestStart) {
             result = await postMutation(API.testStart, { sessionId, code: ticket.code });
           } else if (isTestRevert) {
@@ -6452,17 +5801,12 @@ window.__ModuleLoader__.load({
               // start, not that the work is done. Progress comes only from
               // `snapshot.fix.running` / the ticket's workflow.
               setFlash(`工单 ${ticket.code} 修复请求已受理，正在刷新…`);
-            } else if (isDeliver) {
-              // 200 only means the delivery job was accepted; lint/test,
-              // commit, push and MR creation run in the background and surface
-              // through `snapshot.delivery.running` / `snapshot.delivery.errors`.
-              setFlash(`工单 ${ticket.code} 提交请求已受理，正在创建 MR…`);
             } else if (isTestStart) {
               setFlash(`工单 ${ticket.code} 已合并到开发分支，可以在开发目录里测试了`);
             } else if (isTestRevert) {
               setFlash(`工单 ${ticket.code} 已回滚开发分支上的合并，工作树改动保留`);
             } else if (isTestPass) {
-              setFlash(`工单 ${ticket.code} 测试通过，工作树已清理，进入提交 MR`);
+              setFlash(`工单 ${ticket.code} 测试通过，工作树已清理，工单已完成`);
             } else {
               const next = result.data && typeof result.data === 'object' ? result.data.ticket : null;
               const nextWorkflow = next && typeof next.workflow === 'string' ? next.workflow : null;
@@ -6474,8 +5818,6 @@ window.__ModuleLoader__.load({
             setActionError(analyzeErrorView(result));
           } else if (isFix) {
             setActionError(fixErrorView(result));
-          } else if (isDeliver) {
-            setActionError(deliverErrorView(result));
           } else if (isTest) {
             setActionError({ ...toErrorView(result), title: '测试操作失败' });
           } else {
@@ -6982,9 +6324,6 @@ window.__ModuleLoader__.load({
               tokenDraft,
               tokenBusy,
               tokenPresent,
-              gitlabTokenDraft,
-              gitlabTokenBusy,
-              gitlabTokenPresent,
               loginUsername,
               loginPassword,
               loginCode,
@@ -6995,9 +6334,6 @@ window.__ModuleLoader__.load({
               onTokenChange: setTokenDraft,
               onSaveToken: savePlatformToken,
               onClearToken: clearPlatformToken,
-              onGitlabTokenChange: setGitlabTokenDraft,
-              onSaveGitlabToken: saveGitlabToken,
-              onClearGitlabToken: clearGitlabToken,
               onLoginUsernameChange: setLoginUsername,
               onLoginPasswordChange: setLoginPassword,
               onLoginCodeChange: setLoginCode,

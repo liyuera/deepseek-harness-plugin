@@ -101,26 +101,15 @@ test('initialTicket() 生成 inbox 工单，timeline 只有一条 created', () =
 });
 
 test('合法链从 inbox 一路走到 done，每一步只追加一条 timeline 事件', () => {
+  // The GitLab delivery chain (submitting -> MR -> AI Review -> merged) is
+  // retired; a passed manual test archives the ticket directly. Its retained
+  // transitions are covered by the separate delivery-chain test below.
   const steps = [
     ['start_analysis', {}, 'analyzing'],
     ['analysis_done', { plan: PLAN }, 'plan_review'],
     ['approve_plan', {}, 'fixing'],
     ['fix_done', {}, 'fix_done'],
-    ['mark_test_passed', {}, 'submitting'],
-    ['submit_mr', {}, 'submitting'],
-    ['mr_created', {
-      mr: {
-        iid: 17,
-        url: 'https://gitlab.example.com/group/app/-/merge_requests/17',
-        sourceBranch: 'feat-BUG-001-ly',
-        targetBranch: 'develop',
-      },
-    }, 'mr_open'],
-    ['review_requests_changes', {}, 'fixing_review'],
-    ['review_fix_done', {}, 'mr_open'],
-    ['review_pass', {}, 'mergeable'],
-    ['mr_merged', {}, 'merged'],
-    ['dismiss', {}, 'done'],
+    ['mark_test_passed', {}, 'done'],
   ];
 
   let ticket = inbox();
@@ -144,6 +133,47 @@ test('合法链从 inbox 一路走到 done，每一步只追加一条 timeline �
   assert.equal(ticket.workflow, 'done');
   assert.equal(ticket.plan.approvedAt, AT);
   assert.equal(ticket.plan.rejectedReason, null);
+  assert.equal(ticket.timeline.at(-1).kind, 'mark_test_passed');
+  assert.equal(ticket.timeline.at(-1).message, '人工测试通过，工单完成');
+});
+
+test('retired delivery chain still applies from a legacy submitting ticket', () => {
+  // The host state machine and its modules are kept even though the board no
+  // longer wires the GitLab delivery flow: each transition must still work on
+  // a legacy ticket that already sits at `submitting`.
+  const steps = [
+    ['submit_mr', {}, 'submitting'],
+    ['mr_created', {
+      mr: {
+        iid: 17,
+        url: 'https://gitlab.example.com/group/app/-/merge_requests/17',
+        sourceBranch: 'feat-BUG-001-ly',
+        targetBranch: 'develop',
+      },
+    }, 'mr_open'],
+    ['review_requests_changes', {}, 'fixing_review'],
+    ['review_fix_done', {}, 'mr_open'],
+    ['review_pass', {}, 'mergeable'],
+    ['mr_merged', {}, 'merged'],
+    ['dismiss', {}, 'done'],
+  ];
+
+  let ticket = ticketAt('submitting');
+  let expectedTimelineLength = ticket.timeline.length;
+  for (const [action, payload, expectedWorkflow] of steps) {
+    assert.deepEqual(
+      canApply(ticket, action),
+      { ok: true },
+      `canApply(${ticket.workflow}, ${action}) 应为 true`,
+    );
+    ticket = apply(ticket, action, payload, AT);
+    assert.equal(ticket.workflow, expectedWorkflow, `${action} 后的状态`);
+    expectedTimelineLength += 1;
+    assert.equal(ticket.timeline.length, expectedTimelineLength);
+  }
+
+  assert.equal(ticket.workflow, 'done');
+  assert.equal(ticket.mr.iid, 17);
   assert.equal(ticket.mr.verdict, 'pass');
   assert.equal(ticket.mr.state, 'merged');
   assert.equal(ticket.mr.rounds, 1);

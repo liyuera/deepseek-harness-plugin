@@ -76,7 +76,11 @@ const TRANSITIONS = Object.freeze({
   approve_plan: { from: ['plan_review'], to: 'fixing', actor: 'user' },
   reject_plan: { from: ['plan_review'], to: 'blocked', actor: 'user' },
   fix_done: { from: ['fixing'], to: 'fix_done', actor: 'agent' },
-  mark_test_passed: { from: ['fix_done'], to: 'submitting', actor: 'user' },
+  // The GitLab delivery chain (deliver -> MR -> AI Review -> merge) is retired:
+  // a passed manual test archives the ticket directly. The submit_mr/mr_*
+  // transitions below are kept for the retained delivery/review modules and
+  // their tests, but no board flow reaches them any more.
+  mark_test_passed: { from: ['fix_done'], to: 'done', actor: 'user' },
   // Re-open a finished fix (manual test failed / the user wants another AI
   // round). The test service reverts the dev-branch merge before this is legal;
   // fix-service refuses while a merge record still exists.
@@ -102,7 +106,7 @@ const ACTION_MESSAGES = Object.freeze({
   approve_plan: '方案已通过，开始修复',
   reject_plan: '方案已驳回',
   fix_done: '修复完成，等待人工测试',
-  mark_test_passed: '人工测试通过，准备提交 MR',
+  mark_test_passed: '人工测试通过，工单完成',
   submit_mr: '已发起 MR 提交',
   mr_created: 'MR 已创建',
   review_fix_done: 'review 问题修复完成，已重新提交',

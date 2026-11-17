@@ -85,6 +85,29 @@ test('STAGE_LANES is a well-formed literal with unique ids and known tones', () 
   }
 });
 
+test('retired P5 lanes stay out of the detail step bar', () => {
+  const lanes = readLanes();
+  const retired = lanes.filter((lane) => lane.retired === true);
+  assert.ok(retired.length >= 3, 'the retired P5 states must be marked retired');
+  assert.deepEqual(
+    Array.from(retired, (lane) => lane.id),
+    ['delivery', 'review', 'mergeable'],
+    'only the P5 delivery/review lanes are retired',
+  );
+  for (const lane of retired) {
+    assert.ok(
+      ['submitting', 'mr_open', 'fixing_review', 'mergeable', 'merged'].every(
+        (state) => !lane.states.includes(state) || typeof lane.hint === 'string',
+      ),
+    );
+  }
+  const source = readFileSync(CLIENT_URL, 'utf8');
+  assert.ok(
+    source.includes("lane.retired !== true"),
+    'StageSteps must skip retired lanes so the detail step bar shows only the retained flow',
+  );
+});
+
 test('STAGE_LANES covers every non-terminal host state exactly once', () => {
   const lanes = readLanes();
   const covered = new Map();
@@ -144,12 +167,15 @@ test('destructive actions use the in-board Popconfirm, never a native dialog', (
   assert.ok(source.includes('function ActionPopConfirm'), 'the anchored confirm bubble must exist');
   assert.ok(source.includes("'data-bug-popconfirm'"), 'the bubble must expose a verification marker');
   assert.ok(source.includes('anchorRectFromEvent'), 'the bubble must anchor to the clicked button');
-  // Regression: the delivery button forgot to forward its click event, so the
-  // bubble fell back to the viewport corner instead of the button.
-  assert.ok(
-    source.includes('onAction(DELIVER_DESCRIPTOR, event)'),
-    'every confirm action must forward the click event to the anchor',
-  );
+  // Regression: a confirm button once forgot to forward its click event, so the
+  // bubble fell back to the viewport corner instead of the button. Every
+  // board-only descriptor still has to forward the event.
+  for (const forwarded of [
+    'onAction(ANALYSIS_RETRY_DESCRIPTOR, event)',
+    'onAction(FIX_RETRY_DESCRIPTOR, event)',
+  ]) {
+    assert.ok(source.includes(forwarded), `every confirm action must forward the click event (${forwarded})`);
+  }
   assert.ok(
     source.includes('function anchorRectFromRequest'),
     'the bubble must re-measure the stored anchor when it renders',

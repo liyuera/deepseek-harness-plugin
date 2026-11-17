@@ -240,15 +240,15 @@ test('revert() refuses when the dev branch moved after the merge', async () => {
   assert.equal(git.calls.resetHard.length, 0);
 });
 
-test('pass() cleans the worktree and advances fix_done -> submitting', async () => {
+test('pass() cleans the worktree and archives fix_done -> done', async () => {
   const { domain, store, git, service } = setup();
   await seedFixDone(domain);
   await service.start('session-1', CWD, CODE);
 
   const result = await service.pass('session-1', CWD, CODE);
   assert.equal(result.ok, true);
-  assert.equal(result.ticket.workflow, 'submitting');
-  assert.equal(store.get(CODE).workflow, 'submitting');
+  assert.equal(result.ticket.workflow, 'done');
+  assert.equal(store.get(CODE).workflow, 'done');
   assert.deepEqual(git.calls.deleteBranch, [SCRATCH]);
   assert.equal(git.calls.worktreeRemove.length, 1);
   assert.equal(git.calls.worktreeRemove[0].path, WORKTREE);

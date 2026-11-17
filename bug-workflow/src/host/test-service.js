@@ -10,7 +10,9 @@
  *   revert : hard-reset the dev branch back to the recorded pre-merge commit
  *            (the scratch branch keeps its commits for another AI round);
  *   pass   : verify the merge is still intact, remove the worktree + scratch
- *            branch, then apply `mark_test_passed` (fix_done -> submitting).
+ *            branch, then apply `mark_test_passed` (fix_done -> done).
+ *            The GitLab delivery chain is retired, so a passed test archives
+ *            the ticket directly instead of entering `submitting`.
  *
  * Every git failure is a static Chinese message; a rejected request writes
  * nothing. `start`/`pass` are synchronous git work (no background job): a merge
@@ -157,7 +159,8 @@ export function createTestService({ store, git, clock } = {}) {
 
   /**
    * Test passed: verify the merge, clean the worktree/scratch branch, then
-   * advance `fix_done -> submitting`.
+   * archive the ticket (`fix_done -> done`; the GitLab delivery chain that
+   * used to follow is retired).
    */
   async function pass(sessionId, cwd, code) {
     void sessionId;
