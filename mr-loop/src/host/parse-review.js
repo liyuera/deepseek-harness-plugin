@@ -16,7 +16,8 @@
  *      the JSON inside that hidden block never reaches the returned issues.
  *   3. `结论: 可直接合并` -> pass, `结论: 需要修改` -> changes.
  *   4. Items are read from `需要关注的问题` and `历史未收敛问题`: `文件`, `FID`,
- *      `复验次数`, `级别`, `门禁分类`, `位置`, `问题`, `建议` (other fields are ignored).
+ *      `复验次数`, `级别`, `门禁分类`, `位置`, `源码`, `问题`, `建议` (other fields are
+ *      ignored). `源码` 是可选的取证片段（单行或缩进续行），面板只在有它时显示源码行。
  *   5. `门禁分类 = 非阻塞建议` or `级别 = 低` -> nonBlocking, everything else -> blocking.
  *      This grouping is presentation-only: mergeability treats every undisposed
  *      finding in either group as blocking (see `mergeable.js`).
@@ -60,9 +61,13 @@ const FIELD_KEY = {
   级别: 'level',
   门禁分类: 'gateCategory',
   位置: 'location',
+  源码: 'snippet',
   问题: 'problem',
   建议: 'suggestion',
 };
+
+/** 允许跨行累积的字段：问题 / 建议是散文，源码可能是多行片段。 */
+const MULTILINE_KEYS = new Set(['problem', 'suggestion', 'snippet']);
 
 function unknownResult() {
   return { verdict: 'unknown', blocking: [], nonBlocking: [] };
@@ -207,6 +212,9 @@ function parseSection(lines) {
       level: (current.level ?? '').trim(),
       gateCategory: (current.gateCategory ?? '').trim(),
       location: (current.location ?? '').trim(),
+      // 源码是可选的取证片段（模板里常写作 `源码: \`<表达式>\``）：没有就不给这个字段，
+      // 面板据此决定「不显示源码行」，不拿空串冒充源码。
+      snippet: (current.snippet ?? '').trim(),
       problem: (current.problem ?? '').trim(),
       suggestion: (current.suggestion ?? '').trim(),
       // 0 是合法值（'还没复验过'），不能与缺失混为一谈；|| null 会把 0 吃掉。
@@ -245,8 +253,11 @@ function parseSection(lines) {
         currentField = null;
         continue;
       }
-      const prose = key === 'problem' || key === 'suggestion';
-      current[key] = appendValue(current[key], fieldMatch[2], prose);
+      const prose = MULTILINE_KEYS.has(key);
+      // 源码是代码片段：去掉包裹反引号，但不折行/压空格——续行原样保留。
+      current[key] = key === 'snippet'
+        ? appendValue(current[key], stripOuterBackticks(fieldMatch[2].trim()), true)
+        : appendValue(current[key], fieldMatch[2], prose);
       currentField = key;
       continue;
     }
@@ -259,7 +270,7 @@ function parseSection(lines) {
       }
       continue;
     }
-    const prose = currentField === 'problem' || currentField === 'suggestion';
+    const prose = MULTILINE_KEYS.has(currentField);
     current[currentField] = appendValue(current[currentField], trimmed, prose);
   }
 

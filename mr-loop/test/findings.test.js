@@ -12,7 +12,7 @@ import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { collectFindings, createFindingsStore, displayRoundIndex, resolveFindings, settledRoundIndex } from '../src/host/findings.js'
+import { collectFindings, collectFindingsIndex, createFindingsStore, displayRoundIndex, resolveFindings, settledRoundIndex } from '../src/host/findings.js'
 import { resolveConfig } from '../src/host/config.js'
 import { createLedger } from '../src/host/ledger.js'
 import { createService } from '../src/host/service.js'
@@ -659,4 +659,86 @@ test('resolveFindings：历史轮里后来被修好的 FID 改判 fixed（带确
   stillOpen.rounds = [first, second, roundOf({ sha: 'c'.repeat(40), n: 3, blocking: [finding({ fid: 'AAAA' })], verdict: 'pass' })]
   const view = resolveFindings(collectFindings(stillOpen, { roundIndex: 0 }), stillOpen, 0)
   assert.deepEqual(view.map((item) => [item.fid, item.status]), [['AAAA', 'open']])
+})
+
+// ---------------------------------------------------------------------------
+// collectFindingsIndex：按 FID 唯一索引（0.3.0 用户口径）
+// ---------------------------------------------------------------------------
+
+test('collectFindingsIndex：同一个 FID 只算一个问题，记录首见轮次 / 出现轮次 / 次数', () => {
+  const first = roundOf({ n: 1, blocking: [finding({ fid: 'AAAA' })] })
+  const second = roundOf({ sha: SHA_B, n: 2, blocking: [finding({ fid: 'AAAA', problem: '第二次描述' }), finding({ fid: 'BBBB' })] })
+  const third = roundOf({ sha: 'c'.repeat(40), n: 3, blocking: [finding({ fid: 'BBBB' })], verdict: 'pass' })
+  const list = collectFindingsIndex(stateOf({ rounds: [first, second, third] }))
+
+  assert.deepEqual(list.map((item) => [item.fid, item.firstRound, item.rounds, item.count, item.status]), [
+    // AAAA 首见第 1 轮、在第 2 轮重复出现 → 只算一条，次数 2；第 3 轮起消失 → 第 3 轮验证已修。
+    ['AAAA', 1, [1, 2], 2, 'fixed'],
+    ['BBBB', 2, [2, 3], 2, 'open'],
+  ])
+  // 描述取首见那一轮的原文，不被后续复述覆盖。
+  assert.equal(list[0].problem, '问题')
+  // 仍出现在最新一次评审里的 FID 不能判已修。
+  assert.equal(list[1].fixedAtRound, undefined)
+  // 修复轮次是「最后一次出现之后、第一个没有它的已落地评审」。
+  assert.equal(list[0].fixedAtRound, 3)
+})
+
+test('collectFindingsIndex：修复判定只看已落地评审，unknown / 评审未出都不算修好', () => {
+  const fixedRound = roundOf({ n: 1, blocking: [finding({ fid: 'AAAA' })] })
+  // 第 2 轮评审解析失败（unknown）：FID 消失不能当成已修。
+  const unknown = { ...roundOf({ sha: SHA_B, n: 2 }), review: { ...roundOf().review, verdict: 'unknown', blocking: [] } }
+  const list = collectFindingsIndex(stateOf({ rounds: [fixedRound, unknown] }))
+  assert.equal(list[0].status, 'open')
+  assert.equal(list[0].fixedAtRound, undefined)
+
+  // 第 3 轮评审已落地且没有它 → 第 3 轮验证已修。
+  const settledEmpty = roundOf({ sha: 'c'.repeat(40), n: 3, blocking: [], verdict: 'pass' })
+  const after = collectFindingsIndex(stateOf({ rounds: [fixedRound, unknown, settledEmpty] }))
+  assert.equal(after[0].status, 'fixed')
+  assert.equal(after[0].fixedAtRound, 3)
+})
+
+test('collectFindingsIndex：修复后再次出现 → 仍是未处理，出现轮次与次数合并统计', () => {
+  const r1 = roundOf({ n: 1, blocking: [finding({ fid: 'AAAA' })] })
+  const r2 = roundOf({ sha: SHA_B, n: 2, blocking: [], verdict: 'pass' })
+  const r3 = roundOf({ sha: 'c'.repeat(40), n: 3, blocking: [finding({ fid: 'AAAA' })], verdict: 'changes' })
+  const [item] = collectFindingsIndex(stateOf({ rounds: [r1, r2, r3] }))
+  assert.equal(item.status, 'open')
+  assert.deepEqual(item.rounds, [1, 3])
+  assert.equal(item.count, 2)
+  assert.equal(item.fixedAtRound, undefined)
+})
+
+test('collectFindingsIndex：处置沿用「账本 decisions 优先、其次最近一轮指令」，已处置的不判 fixed', () => {
+  const r1 = roundOf({ n: 1, blocking: [finding({ fid: 'AAAA' })] })
+  const r2 = roundOf({
+    sha: SHA_B, n: 2, blocking: [], verdict: 'pass',
+    directives: [{ kind: 'waive', fid: 'AAAA', reason: '已评估', noteId: 700 }],
+  })
+  const [waived] = collectFindingsIndex(stateOf({ rounds: [r1, r2] }))
+  assert.equal(waived.status, 'waived')
+  assert.deepEqual(waived.instruction, { kind: 'waive', reason: '已评估', noteId: 700 })
+
+  const [fromLedger] = collectFindingsIndex(stateOf({
+    rounds: [r1, r2],
+    decisions: { AAAA: { kind: 'skip', reason: '不适用', noteId: 31 } },
+  }))
+  assert.equal(fromLedger.status, 'skip')
+  assert.deepEqual(fromLedger.instruction, { kind: 'skip', reason: '不适用', noteId: 31 })
+})
+
+test('collectFindingsIndex：伪轮次（没评审、没流水线）被过滤并重编号，首见轮次跟着前移', () => {
+  const r1 = roundOf({ n: 1, blocking: [finding({ fid: 'AAAA' })] })
+  // 第 2 轮：push 了但没有流水线、也没有评审 → 伪轮次，不计轮次。
+  const phantom = {
+    sha: SHA_B, n: 2, binding: null, observedAt: NOW, review: null, pipelineForHead: false,
+    sensitive: null, mandatory: null, directives: { directives: [], directiveNotes: [], invalid: { count: 0, samples: [] }, truncated: {} },
+  }
+  const r3 = roundOf({ sha: 'c'.repeat(40), n: 3, blocking: [finding({ fid: 'BBBB' })], verdict: 'pass' })
+  const list = collectFindingsIndex(stateOf({ rounds: [r1, phantom, r3] }))
+  assert.deepEqual(list.map((item) => [item.fid, item.firstRound, item.status, item.fixedAtRound]), [
+    ['AAAA', 1, 'fixed', 2], // 真实第 3 轮重编号后是第 2 轮
+    ['BBBB', 2, 'open', undefined],
+  ])
 })

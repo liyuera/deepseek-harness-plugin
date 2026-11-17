@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { baselineOf, classifyReviewNote, reviewShaOf, buildRound } from '../src/host/rounds.js'
+import { baselineOf, classifyReviewNote, isPhantomRound, normalizeRounds, pipelineForHead, reviewShaOf, buildRound } from '../src/host/rounds.js'
 import { resolveConfig } from '../src/host/config.js'
 
 const cfg = resolveConfig({})
@@ -370,4 +370,46 @@ test('M1：围栏 / 引用 / 标题里展示指令示例的评论仍出现在 co
   assert.match(excerptOf.get(30), /#ai-waive a1b2c3d4 reason=代码块里的示例/)
   assert.match(excerptOf.get(31), /引用别人的豁免/)
   assert.match(excerptOf.get(32), /标题/)
+})
+
+// ---------------------------------------------------------------------------
+// 轮次计数：push 了但流水线没跑起来的那一笔不算一轮（0.3.0 用户口径）
+// ---------------------------------------------------------------------------
+
+test('pipelineForHead：head_pipeline 的 sha 与当前 sha 一致才算「这笔有流水线」', () => {
+  assert.equal(pipelineForHead({ sha: SHA, head_pipeline: { id: 1, status: 'running', sha: SHA } }), true)
+  // 新 push 之后 head_pipeline 可能还停在上一笔提交：已知没有本提交的流水线。
+  assert.equal(pipelineForHead({ sha: SHA, head_pipeline: { id: 1, status: 'success', sha: OTHER } }), false)
+  assert.equal(pipelineForHead({ sha: SHA, head_pipeline: null }), false)
+  assert.equal(pipelineForHead({ sha: SHA }), false)
+  // 实例没给 sha / 当前 sha 缺失时无法证明，按「未知 = 有」处理，绝不误报。
+  assert.equal(pipelineForHead({ sha: SHA, head_pipeline: { id: 1, status: 'success' } }), true)
+  assert.equal(pipelineForHead({ sha: '', head_pipeline: { id: 1, status: 'success', sha: OTHER } }), true)
+})
+
+test('isPhantomRound：没评审、没本提交流水线的轮次是伪轮次；有评审或有流水线都算真轮次', () => {
+  const review = { verdict: 'pass', blocking: [], nonBlocking: [] }
+  assert.equal(isPhantomRound({ review: null, pipelineForHead: false }), true)
+  assert.equal(isPhantomRound({ review: null, pipelineForHead: true }), false, '流水线在跑，只是评审还没出')
+  assert.equal(isPhantomRound({ review, pipelineForHead: false }), false, '有评审就是真轮次')
+  // 老账本没有证据字段：末轮保留；非末轮只有 binding 明确为 null（确实没评审）才算伪轮次。
+  assert.equal(isPhantomRound({ review: null, binding: 'strong' }, { last: false }), false)
+  assert.equal(isPhantomRound({ review: null, binding: null }, { last: false }), true)
+  assert.equal(isPhantomRound({ review: null, binding: null }, { last: true }), false)
+})
+
+test('normalizeRounds：去掉伪轮次并连续重编号，保留账本裁剪后的起始编号', () => {
+  const real = (n, sha) => ({ n, sha, binding: 'strong', review: { verdict: 'pass', blocking: [], nonBlocking: [] }, pipelineForHead: true })
+  const phantom = (n, sha) => ({ n, sha, binding: null, review: null, pipelineForHead: false })
+
+  const list = [real(1, SHA), phantom(2, OTHER), real(3, 'c'.repeat(40))]
+  assert.deepEqual(normalizeRounds(list).map((item) => [item.n, item.sha]), [[1, SHA], [2, 'c'.repeat(40)]])
+
+  // 没有伪轮次时原样返回（不想把裁剪后的「第 5 轮」改成第 1 轮）。
+  const trimmed = [real(5, SHA), real(6, OTHER)]
+  assert.equal(normalizeRounds(trimmed), trimmed)
+
+  // 中间夹伪轮次时以首个保留轮次为基准往后排。
+  const trimmedWithPhantom = [real(5, SHA), phantom(6, OTHER), real(7, 'c'.repeat(40))]
+  assert.deepEqual(normalizeRounds(trimmedWithPhantom).map((item) => item.n), [5, 6])
 })

@@ -319,11 +319,22 @@ function nodesByClass(node, className) {
   return out
 }
 
-/** 回落态 MR：当前轮（第 7 轮）评审还没出，problems 来自第 6 轮。 */
+/** 一条问题的唯一索引形状（0.3.0）：首见轮次 / 出现过的轮次 / 出现次数。 */
+const problemOf = (over = {}) => ({
+  fid: 'aea50825a5', level: '低', type: '非阻塞建议', file: 'src/report/Index.tsx', line: 81,
+  problem: '首帧会闪一帧空表单', suggestion: '把加载态与数据就绪度绑定', status: 'open',
+  firstRound: 6, lastRound: 6, rounds: [6], count: 1,
+  ...over,
+})
+
+/**
+ * 等待评审的 MR（0.3.0）：新提交 b30c43b3 没有流水线（head_pipeline 还停在 081bb374），
+ * 所以它**不算一轮**——轮次停在 6，等待单独标出。
+ */
 const fallbackMr = {
-  projectPath: 'g/p', iid: 243, round: 7, pending: 0, state: 'opened', live: true,
+  projectPath: 'g/p', iid: 243, round: 6, pending: 0, state: 'opened', live: true,
   session: { id: 's1' }, sourceBranch: 'feat-x', targetBranch: 'feature-y', sha: 'b30c43b3d962',
-  review: null,
+  review: { verdict: 'pass', historicalUnresolved: 0, verifiedFixed: 1, newThisRound: 1 },
   gates: { sensitive: null, mandatory: null },
   merge: {
     mergeable: false,
@@ -331,16 +342,14 @@ const fallbackMr = {
     // head_pipeline 还停在上一笔提交：这笔 push 没触发流水线。
     pipeline: { id: 7358, status: 'success', sha: '081bb37414f8' },
   },
-  problemsRound: { n: 6, sha: '081bb37414f8', current: false },
+  problemsRound: { n: 6, sha: '081bb37414f8', current: true },
+  waiting: { sha: 'b30c43b3d962', since: '2026-11-17T07:03:08.000Z' },
+  summary: { total: 1, open: 1, fixed: 0, waived: 0 },
   rounds: [
-    { n: 1, verdict: 'pass', total: 0, open: 0, fixed: 0, current: false },
-    { n: 6, verdict: 'pass', total: 1, open: 1, fixed: 1, current: false },
-    { n: 7, verdict: null, total: 0, open: 0, fixed: 0, current: true },
+    { n: 5, verdict: 'pass', newCount: 0, repeatCount: 0, total: 0, current: false, repeats: [], problems: [] },
+    { n: 6, verdict: 'pass', newCount: 1, repeatCount: 0, total: 1, current: true, repeats: [], problems: [problemOf()] },
   ],
-  problems: [{
-    fid: 'aea50825a5', level: '低', type: '非阻塞建议', file: 'src/report/Index.tsx', line: 81,
-    problem: '首帧会闪一帧空表单', suggestion: '把加载态与数据就绪度绑定', status: 'open', unverified: true,
-  }],
+  problems: [problemOf()],
 }
 
 /** 打开看板并渲染一次（chip 紧凑态点一下即可）。 */
@@ -354,99 +363,137 @@ const renderPanel = async (data) => {
   return { loaded, panel: drawerOf(loaded)() }
 }
 
-test('看板：当前轮评审没出时显示上一轮结论、标「待复验」，并提示流水线还停在上一笔提交', async () => {
+test('看板：唯一问题索引（共 N 条）+ 等待评审提示，没流水线的那一笔不计轮次', async () => {
   const { panel } = await renderPanel(fallbackMr)
   const texts = textOfTree(panel).join(' | ')
 
-  // 段落头说清是哪一轮 + 为什么不是本轮。
-  assert.match(texts, /第 6 轮问题/)
-  assert.match(texts, /第 7 轮评审未出/)
-  // 上一轮的「未处理」不能写成现在还没修。
-  assert.match(texts, /待复验/)
-  assert.doesNotMatch(texts, /未处理/)
-  // 评审未知的真因：这笔提交没有流水线（不是插件解析失败）。
-  assert.match(texts, /流水线 #7358 还停在 081bb374/)
-  assert.match(texts, /这笔提交没有流水线/)
-
-  // 轮次条：第 6 轮被选中（正在显示），第 7 轮是等待评审。
+  // 默认视图 = 全部唯一问题，标题直接给总数与状态汇总。
+  assert.match(texts, /问题/)
+  assert.match(texts, /共 1 条/)
+  assert.match(texts, /● 未处理/)
+  // 等待提示：说清哪一笔在等 + 流水线停在上一笔（不是插件解析失败）。
+  assert.match(texts, /已推送 b30c43b3，等待流水线 \/ 评审（流水线 #7358 还停在 081bb374）/)
+  // 轮次条只有第 5、6 轮：没有流水线的 b30c43b3 不占轮次号（也就没有「第 7 轮」）。
   const chips = nodesByClass(panel, 'mrl-round')
-  const selected = chips.filter((node) => node.props['data-sel'] === '1')
-  assert.equal(selected.length, 1)
-  assert.equal(textOfTree(selected[0])[0], '第6轮')
-  const waiting = chips.filter((node) => node.props['data-wait'] === '1')
-  assert.equal(waiting.length, 1)
-  assert.equal(textOfTree(waiting[0])[0], '第7轮')
-  assert.match(waiting[0].props.title, /等待评审/)
-})
+  assert.deepEqual(chips.map((node) => textOfTree(node)[0]), ['第5轮', '第6轮'])
+});
 
-test('看板：当前轮评审已落地时标「第 N 轮问题」，问题仍是未处理、不出现回落提示', async () => {
-  const currentMr = {
+test('看板：路径用 tag 完整展示、展开后显示源码；没有源码就不显示源码行', async () => {
+  const longPath = 'src/pages/report-manage/components/ReportUploadModal/index.tsx'
+  const withSnippet = problemOf({ file: longPath, snippet: 'if (isEdit && row.fileList) {' })
+  const data = {
     ...fallbackMr,
-    round: 6,
-    sha: '081bb37414f8',
-    review: { verdict: 'pass', historicalUnresolved: 0, verifiedFixed: 1, newThisRound: 1 },
-    merge: { mergeable: false, missing: ['评审有 1 处需要关注的问题：FID aea50825a5（低）'], pipeline: { id: 7358, status: 'success', sha: '081bb37414f8' } },
-    problemsRound: { n: 6, sha: '081bb37414f8', current: true },
-    rounds: [
-      { n: 5, verdict: 'pass', total: 1, open: 1, fixed: 0, current: false },
-      { n: 6, verdict: 'pass', total: 1, open: 1, fixed: 1, current: true },
-    ],
-    problems: [{ ...fallbackMr.problems[0], unverified: undefined }],
-  }
-  const { panel } = await renderPanel(currentMr)
-  const texts = textOfTree(panel).join(' | ')
-  assert.match(texts, /第 6 轮问题/)
-  assert.match(texts, /未处理/)
-  assert.doesNotMatch(texts, /待复验/)
-  assert.doesNotMatch(texts, /评审未出/)
-  assert.doesNotMatch(texts, /没有流水线/)
-})
-
-test('看板：点轮次条翻看历史轮的问题正文，并能回到默认轮（复制指令同时禁用）', async () => {
-  // 第 1 轮给一条历史问题：点开第 1 轮应显示它，而不是默认第 6 轮的问题。
-  const data = JSON.parse(JSON.stringify(fallbackMr))
-  data.rounds[0] = {
-    ...data.rounds[0], total: 1,
-    problems: [{
-      fid: 'oldold0001', level: '低', type: '非阻塞建议', file: 'src/old.ts', line: 3,
-      problem: '第 1 轮提出的历史问题', status: 'open',
-    }],
+    waiting: null,
+    rounds: [{ n: 6, verdict: 'pass', newCount: 1, repeatCount: 0, total: 1, current: true, repeats: [], problems: [withSnippet] }],
+    problems: [withSnippet],
   }
   const { loaded, panel } = await renderPanel(data)
+  const issue = nodesByClass(panel, 'mrl-issue')[0]
+  const path = nodesByClass(issue, 'mrl-path')[0]
+  assert.equal(textOfTree(path).join(''), longPath + ':81', '路径 tag 必须完整，不省略')
+  // 展开：源码行出现。
+  nodesByClass(panel, 'mrl-chev')[0].props.onClick()
+  const expanded = drawerOf(loaded)()
+  assert.match(textOfTree(expanded).join(' | '), /源码/)
+  assert.match(textOfTree(expanded).join(' | '), /if \(isEdit && row\.fileList\)/)
 
-  // 默认视图 = 第 6 轮（最近一次落地的评审）。
-  const chips = nodesByClass(panel, 'mrl-round')
-  const selected = chips.filter((node) => node.props['data-sel'] === '1')
-  assert.equal(selected.length, 1)
-  assert.equal(textOfTree(selected[0])[0], '第6轮')
-  assert.match(textOfTree(panel).join(' | '), /第 6 轮问题/)
+  // 没有源码的同一问题：展开后不出现「源码」行。
+  const plain = problemOf({ file: longPath })
+  const data2 = { ...data, rounds: [{ ...data.rounds[0], problems: [plain] }], problems: [plain] }
+  const second = await renderPanel(data2)
+  nodesByClass(second.panel, 'mrl-chev')[0].props.onClick()
+  const expanded2 = drawerOf(second.loaded)()
+  assert.doesNotMatch(textOfTree(expanded2).join(' | '), /源码/)
+})
 
-  // 点第 1 轮：段落头切过去，正文换成那一轮的问题。
-  const round1 = chips.find((node) => textOfTree(node)[0] === '第1轮')
-  assert.equal(typeof round1.props.onClick, 'function')
-  round1.props.onClick()
+test('看板：点轮次只看该轮新出现的问题；没有新问题的轮次不显示「本轮已修」', async () => {
+  const old = problemOf({ fid: 'old0000001', firstRound: 5, lastRound: 6, rounds: [5, 6], count: 2, problem: '第 5 轮提出的历史问题' })
+  const data = {
+    ...fallbackMr,
+    waiting: null,
+    summary: { total: 1, open: 1, fixed: 0, waived: 0 },
+    problemsRound: { n: 5, sha: '081bb37414f8', current: true },
+    rounds: [
+      { n: 5, verdict: 'pass', newCount: 1, repeatCount: 0, total: 1, current: false, repeats: [], problems: [old] },
+      { n: 6, verdict: 'pass', newCount: 0, repeatCount: 1, total: 1, current: true, repeats: [{ fid: 'old0000001', firstRound: 5, count: 2 }], problems: [] },
+    ],
+    problems: [old],
+  }
+  const { loaded, panel } = await renderPanel(data)
+  // 默认视图：唯一问题只出现一次，并标出首见轮次与出现次数。
+  const defaultTexts = textOfTree(panel).join(' | ')
+  assert.match(defaultTexts, /首见 第 5 轮 · 出现 2 次（第5轮、第6轮）/)
+  assert.equal(nodesByClass(panel, 'mrl-issue').length, 1)
+
+  // 点第 6 轮：这轮没有新问题 → 不展示已修清单，只说明重复出现的条数与首见轮次。
+  const round6 = nodesByClass(panel, 'mrl-round').find((node) => textOfTree(node)[0] === '第6轮')
+  round6.props.onClick()
   const browsing = drawerOf(loaded)()
   const browsingTexts = textOfTree(browsing).join(' | ')
-  assert.match(browsingTexts, /第 1 轮问题/)
-  assert.match(browsingTexts, /第 1 轮提出的历史问题/)
-  assert.doesNotMatch(browsingTexts, /第 6 轮问题/)
-  // 翻历史轮时「复制指令」必须禁用：那可能是早就修好的 FID。
-  const footerButtons = nodesByClass(browsing, 'mrl-btn').filter((node) => textOfTree(node)[0] === '复制指令')
-  assert.equal(footerButtons.length, 1)
-  assert.equal(footerButtons[0].props.disabled, true)
-
-  // 「回到第 6 轮」回到默认视图。
-  const reset = nodesByClass(browsing, 'mrl-link').find((node) => textOfTree(node).join('').includes('回到第 6 轮'))
+  assert.match(browsingTexts, /第 6 轮新问题/)
+  assert.match(browsingTexts, /历史未收敛 1/)
+  assert.match(browsingTexts, /本轮没有新问题；重复出现 1 条历史问题：old0000001（首见第5轮 · 共2次）/)
+  assert.doesNotMatch(browsingTexts, /已修/)
+  // 回到全部。
+  const reset = nodesByClass(browsing, 'mrl-link').find((node) => textOfTree(node).join('').includes('回到全部'))
   assert.ok(reset !== undefined)
   reset.props.onClick()
-  const back = drawerOf(loaded)()
-  const backTexts = textOfTree(back).join(' | ')
-  assert.match(backTexts, /第 6 轮问题/)
-  assert.doesNotMatch(backTexts, /第 1 轮问题/)
+  assert.equal(nodesByClass(drawerOf(loaded)(), 'mrl-issue').length, 1)
+})
+
+test('看板：轮次条展示完整轮次（不再截断成 8 条）', async () => {
+  const rounds = []
+  for (let n = 1; n <= 12; n += 1) {
+    rounds.push({ n, verdict: 'pass', newCount: 0, repeatCount: 0, total: 0, current: n === 12, repeats: [], problems: [] })
+  }
+  const data = { ...fallbackMr, round: 12, waiting: null, rounds, problems: [], summary: { total: 0, open: 0, fixed: 0, waived: 0 } }
+  const { panel } = await renderPanel(data)
+  assert.equal(nodesByClass(panel, 'mrl-round').length, 12)
+})
+
+test('看板：已修问题只在首见轮次展示，状态写清第 N 轮验证（同一个 FID 不再两轮状态打架）', async () => {
+  const fixed = problemOf({ fid: 'fd56004d1a', status: 'fixed', fixedAtRound: 9, firstRound: 8, lastRound: 8, rounds: [8], count: 1 })
+  const data = {
+    ...fallbackMr,
+    state: 'merged',
+    round: 9,
+    sha: 'c0cfe45f12345678',
+    review: { verdict: 'pass', historicalUnresolved: 0, verifiedFixed: 1, newThisRound: 0 },
+    merge: { mergeable: false, missing: [], terminal: 'merged', pipeline: null },
+    waiting: null,
+    problemsRound: { n: 9, sha: 'c0cfe45f12345678', current: true },
+    summary: { total: 1, open: 0, fixed: 1, waived: 0 },
+    rounds: [
+      { n: 8, verdict: 'pass', newCount: 1, repeatCount: 0, total: 1, current: false, repeats: [], problems: [fixed] },
+      { n: 9, verdict: 'pass', newCount: 0, repeatCount: 0, total: 0, current: true, repeats: [], problems: [] },
+    ],
+    problems: [fixed],
+  }
+  const { loaded, panel } = await renderPanel(data)
+  assert.match(textOfTree(panel).join(' | '), /✓ 第 9 轮已修/)
+  // 点第 8 轮：同一个 FID 仍是「第 9 轮已修」，不会显示成未处理。
+  nodesByClass(panel, 'mrl-round').find((node) => textOfTree(node)[0] === '第8轮').props.onClick()
+  const round8Texts = textOfTree(drawerOf(loaded)()).join(' | ')
+  assert.match(round8Texts, /✓ 第 9 轮已修/)
+  assert.doesNotMatch(round8Texts, /未处理/)
+  // 点第 9 轮：本轮没有新问题 → 不重复展示已修条目。
+  nodesByClass(drawerOf(loaded)(), 'mrl-round').find((node) => textOfTree(node)[0] === '第9轮').props.onClick()
+  const round9Texts = textOfTree(drawerOf(loaded)()).join(' | ')
+  assert.match(round9Texts, /本轮没有新问题/)
+  assert.doesNotMatch(round9Texts, /已修/)
 })
 
 test('看板：重载后刚恢复的活绑定（还没拉到 MR 快照）不能说成「历史账本」', async () => {
-  const restored = { ...fallbackMr, merge: null, review: null, problemsRound: null, problems: [] }
+  const restored = {
+    ...fallbackMr,
+    merge: null,
+    review: null,
+    waiting: null,
+    problemsRound: null,
+    problems: [],
+    summary: { total: 0, open: 0, fixed: 0, waived: 0 },
+    rounds: [],
+  }
   const { panel } = await renderPanel(restored)
   const texts = textOfTree(panel).join(' | ')
   assert.match(texts, /刚恢复监视，正在拉取 MR 状态/)
@@ -463,10 +510,12 @@ test('看板：已合并 / 已关闭的 MR 不显示「差 N 项」，复制指�
     gates: { sensitive: null, mandatory: null },
     merge: { mergeable: false, missing: [], terminal: 'merged', pipeline: { id: 7364, status: 'success', sha: 'c0cfe45f12345678' } },
     pending: 0,
+    waiting: null,
     problemsRound: { n: 9, sha: 'c0cfe45f12345678', current: true },
+    summary: { total: 0, open: 0, fixed: 0, waived: 0 },
     rounds: [
-      { n: 8, verdict: 'pass', total: 1, open: 1, fixed: 0, current: false, problems: fallbackMr.rounds[1].problems },
-      { n: 9, verdict: 'pass', total: 0, open: 0, fixed: 1, current: true, problems: [] },
+      { n: 8, verdict: 'pass', newCount: 0, repeatCount: 0, total: 0, current: false, repeats: [], problems: [] },
+      { n: 9, verdict: 'pass', newCount: 0, repeatCount: 0, total: 0, current: true, repeats: [], problems: [] },
     ],
     problems: [],
   }
@@ -489,38 +538,4 @@ test('看板：已合并 / 已关闭的 MR 不显示「差 N 项」，复制指�
   const closedTexts = textOfTree(second.panel).join(' | ')
   assert.match(closedTexts, /MR 已关闭（未合并）/)
   assert.doesNotMatch(closedTexts, /差 [0-9]+ 项/)
-})
-
-test('看板：历史轮里后来被修好的问题显示「第 N 轮已修」，同一个 FID 不再两轮状态打架', async () => {
-  const problem = {
-    fid: 'fd56004d1a', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/utils/loadReportEcho.ts', line: 41,
-    problem: '注释口径与实际门禁不一致', status: 'fixed', fixedAtRound: 9,
-  }
-  const data = {
-    ...fallbackMr,
-    state: 'merged',
-    round: 9,
-    sha: 'c0cfe45f12345678',
-    review: { verdict: 'pass', historicalUnresolved: 0, verifiedFixed: 1, newThisRound: 0 },
-    merge: { mergeable: false, missing: [], terminal: 'merged', pipeline: null },
-    problemsRound: { n: 9, sha: 'c0cfe45f12345678', current: true },
-    rounds: [
-      { n: 8, verdict: 'pass', total: 1, open: 0, fixed: 0, current: false, problems: [problem] },
-      { n: 9, verdict: 'pass', total: 0, open: 0, fixed: 1, current: true, problems: [problem] },
-    ],
-    // 默认视图（第 9 轮）= 本轮新问题 + 本轮确认修好的上一轮问题。
-    problems: [problem],
-  }
-  const { loaded, panel } = await renderPanel(data)
-  // 默认（第 9 轮）：本轮验证修复，显示「✓ 已修」。
-  assert.match(textOfTree(panel).join(' | '), /已修/)
-
-  // 点第 8 轮：同一个 FID 必须也是已修，并写出是第 9 轮验证的。
-  const round8 = nodesByClass(panel, 'mrl-round').find((node) => textOfTree(node)[0] === '第8轮')
-  assert.equal(typeof round8.props.onClick, 'function')
-  round8.props.onClick()
-  const browsing = drawerOf(loaded)()
-  const texts = textOfTree(browsing).join(' | ')
-  assert.match(texts, /第 9 轮已修/)
-  assert.doesNotMatch(texts, /未处理/)
 })

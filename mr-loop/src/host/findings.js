@@ -15,6 +15,7 @@ import { appendFile, mkdir, readFile, rename, rm, stat } from 'node:fs/promises'
 import { basename, join } from 'node:path'
 import { expandHome } from './ledger.js'
 import { decisionFor, directiveFor, isDisposed, isDisposedFinding } from './mergeable.js'
+import { normalizeRounds } from './rounds.js'
 
 export const FINDINGS_VERSION = 1
 export const DEFAULT_MAX_BYTES = 5 * 1024 * 1024
@@ -139,6 +140,114 @@ export function resolveFindings(findings, record, roundIndex) {
       fixedAtRound: Number.isSafeInteger(fixedAtRound) ? fixedAtRound : undefined,
     }
   })
+}
+
+/**
+ * 全 MR 的**唯一问题索引**（用户口径 0.3.0）：同一个 FID 只算一个问题。
+ *
+ * - 按 FID 建立唯一索引：重复出现的 FID 不新增条目，只记录出现过的轮次与次数；
+ * - 展示归属：条目只归到**首次出现的轮次**（面板据此只在那一轮展示，后续轮不再重复计数）；
+ * - 修复判定：最后一次出现之后，第一个「已落地评审」（pass / changes）里没有这个 FID，
+ *   就表示它已被修复，记下验证轮次 `fixedAtRound`；仍出现在最近一次评审里则是未处理。
+ * - 处置（waived / skip / wontfix）沿用账本 decisions + MR 指令，任一命中即算已处置。
+ *
+ * 只看有评审 note 的轮次（`review != null`）；伪轮次（没评审、没流水线）已由
+ * `normalizeRounds` 过滤，所以这里的 `firstRound` / `rounds` 与面板轮次条编号一致。
+ *
+ * @param {object} record service 状态或账本记录（只读 binding / rounds / decisions）
+ * @returns {Array<{fid:string,file:string|undefined,line:number|undefined,level:string,
+ *   type:string|null,gateCategory:string|null,problem:string,suggestion:string|undefined,
+ *   snippet:string|undefined,reverifyCount:number|null,
+ *   status:'open'|'waived'|'skip'|'wontfix'|'fixed',
+ *   instruction:{kind:string,reason:string|null,noteId:number|null}|null,
+ *   firstRound:number,firstSha:string,lastRound:number,rounds:number[],count:number,
+ *   fixedAtRound?:number}>}
+ */
+export function collectFindingsIndex(record) {
+  const rounds = normalizeRounds(roundsOf(record))
+  const decisions = record?.decisions !== null && typeof record.decisions === 'object' ? record.decisions : {}
+  /** @type {Map<string, object>} 小写 FID → 唯一问题（Map 保持首次出现顺序） */
+  const index = new Map()
+
+  const addAppearance = (round, item) => {
+    const fid = sanitizeId(item?.fid) ?? '?'
+    const key = fid.toLowerCase()
+    const n = Number.isSafeInteger(round?.n) ? round.n : 0
+    const existing = index.get(key)
+    if (existing !== undefined) {
+      existing.rounds.push(n)
+      existing.count += 1
+      existing.lastRound = n
+      // 描述取首次出现那一轮的原文；后面的复验次数 / 源码片段有值就补上（首次缺失时）。
+      const reverify = reverifyOf(item)
+      if (reverify !== null) existing.reverifyCount = reverify
+      if (existing.snippet === undefined) existing.snippet = text(item?.snippet ?? item?.sourceSnippet, SNIPPET_LIMIT)
+      return
+    }
+    index.set(key, {
+      fid,
+      file: text(item?.file, FILE_LIMIT),
+      line: lineOf(item),
+      level: text(item?.level, LEVEL_LIMIT) ?? '',
+      type: text(item?.type, TYPE_LIMIT) ?? null,
+      gateCategory: text(item?.gateCategory, TYPE_LIMIT) ?? null,
+      problem: text(item?.problem, PROBLEM_LIMIT) ?? '',
+      suggestion: text(item?.suggestion, SUGGESTION_LIMIT),
+      snippet: text(item?.snippet ?? item?.sourceSnippet, SNIPPET_LIMIT),
+      reverifyCount: reverifyOf(item),
+      firstRound: n,
+      firstSha: typeof round?.sha === 'string' ? round.sha : '',
+      lastRound: n,
+      rounds: [n],
+      count: 1,
+      status: 'open',
+      instruction: null,
+    })
+  }
+
+  rounds.forEach((round) => {
+    if (round?.review === null || round?.review === undefined) return
+    for (const item of findingsOf(round)) addAppearance(round, item)
+  })
+
+  const lastAppearanceIndex = new Map()
+  rounds.forEach((round, index2) => {
+    for (const item of findingsOf(round)) {
+      const key = String(item?.fid ?? '').toLowerCase()
+      if (key !== '') lastAppearanceIndex.set(key, index2)
+    }
+  })
+
+  for (const finding of index.values()) {
+    const key = finding.fid.toLowerCase()
+    // 处置：账本 decisions 优先，其次取**最近一轮** MR 指令（同一 FID 早期豁免过、后期还提到，以最近为准）。
+    const decision = decisionFor(decisions, finding.fid)
+    const fromLedger = isDisposed(decision) ? decision.kind : null
+    let directive = null
+    for (let index2 = rounds.length - 1; index2 >= 0; index2 -= 1) {
+      const found = directiveFor(rounds[index2], finding.fid)
+      if (found !== null) {
+        directive = found
+        break
+      }
+    }
+    const kind = fromLedger ?? directive?.kind ?? null
+    finding.status = kind === null ? 'open' : statusOf(kind)
+    finding.instruction = kind === null ? null : instructionOf(fromLedger !== null ? decision : directive)
+    if (finding.status !== 'open') continue
+
+    // 修复确认只看「最后一次出现之后」的已落地评审：第一次不再出现的那一轮就是验证轮。
+    const from = lastAppearanceIndex.get(key) ?? -1
+    for (let index2 = from + 1; index2 < rounds.length; index2 += 1) {
+      const round = rounds[index2]
+      if (isSettled(round) === false) continue
+      if (roundHasFid(round, key)) break
+      finding.status = 'fixed'
+      finding.fixedAtRound = Number.isSafeInteger(round?.n) ? round.n : undefined
+      break
+    }
+  }
+  return [...index.values()]
 }
 
 /** 行号：优先 finding.line；评审模板只给 `位置: src/a.js:3` 时从中取（纯提取，不做分析）。 */

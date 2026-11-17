@@ -67,6 +67,8 @@ window.__ModuleLoader__.load({
       ".mrl-sec{display:flex;align-items:center;gap:6px;padding:8px 12px 6px;font-size:11px;color:var(--dsw-alias-label-secondary);border-top:1px solid var(--mrl-line-soft)}",
       ".mrl-sec b{font-weight:600;color:var(--dsw-alias-label-primary)}",
       ".mrl-sec-warn{color:var(--dsw-alias-state-warn-primary)}",
+      ".mrl-sec-ok{color:var(--dsw-alias-state-success-primary)}",
+      ".mrl-sec-note{font-size:10.5px;color:var(--dsw-alias-label-tertiary)}",
       ".mrl-merge-sub{font-size:10.5px;color:var(--dsw-alias-label-secondary);margin-top:2px;line-height:1.5}",
       ".mrl-rounds{display:flex;align-items:center;gap:5px;flex-wrap:wrap;padding:7px 12px;border-top:1px solid var(--mrl-line-soft);font-size:10.5px;color:var(--dsw-alias-label-secondary)}",
       ".mrl-rounds .lbl{color:var(--dsw-alias-label-tertiary);flex:none;padding-right:1px}",
@@ -74,6 +76,9 @@ window.__ModuleLoader__.load({
       ".mrl-round:hover{background:var(--mrl-fill-2)}",
       ".mrl-round[data-wait]{color:var(--dsw-alias-state-warn-primary);background:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 13%,transparent)}",
       ".mrl-round[data-sel]{box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--dsw-alias-label-primary) 22%,transparent);color:var(--dsw-alias-label-primary)}",
+      ".mrl-round .num{color:var(--dsw-alias-label-tertiary)}",
+      ".mrl-rep{font-style:normal;color:var(--dsw-alias-label-tertiary)}",
+      ".mrl-wait-chip{display:inline-flex;align-items:center;gap:4px;padding:0 7px;line-height:18px;border-radius:20px;border:0;background:transparent;color:var(--dsw-alias-state-warn-primary);font-family:inherit;font-size:10.5px;white-space:nowrap;cursor:default}",
       ".mrl-issue{padding:9px 12px;border-bottom:1px solid var(--mrl-line-soft)}",
       ".mrl-issue:last-child{border-bottom:0}",
       ".mrl-issue[data-open]{background:var(--mrl-fill)}",
@@ -89,7 +94,10 @@ window.__ModuleLoader__.load({
       ".mrl-st[data-st=fixed]{color:var(--dsw-alias-state-success-primary);background:color-mix(in srgb,var(--dsw-alias-state-success-primary) 14%,transparent)}",
       ".mrl-st[data-st=waived]{color:var(--dsw-alias-label-tertiary);background:var(--mrl-fill)}",
       ".mrl-chev{font-size:10.5px;color:var(--dsw-alias-label-secondary);cursor:pointer;background:none;border:0;padding:0;margin-left:6px}",
-      ".mrl-file{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;color:var(--dsw-alias-label-secondary);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+      // 代码路径 tag：完整展示，不省略（长路径换行，不做省略号截断）。
+      ".mrl-path-row{margin-top:4px;min-width:0}",
+      ".mrl-path{display:inline-block;max-width:100%;padding:0 6px;border-radius:5px;border:1px solid var(--mrl-line-soft);background:var(--mrl-fill);color:var(--dsw-alias-label-secondary);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;line-height:18px;white-space:normal;word-break:break-all}",
+      ".mrl-meta{margin-top:3px;font-size:10.5px;line-height:1.5;color:var(--dsw-alias-label-tertiary)}",
       ".mrl-prob{font-size:12px;margin-top:3px;color:var(--dsw-alias-label-primary)}",
       ".mrl-instr{margin-top:4px;font-size:11px;color:var(--dsw-alias-label-secondary);display:flex;gap:5px;align-items:baseline;flex-wrap:wrap}",
       ".mrl-code{font-size:10.5px;background:var(--mrl-fill-2);border-radius:4px;padding:1px 5px;max-width:250px;overflow:hidden;text-overflow:ellipsis;display:inline-block;vertical-align:bottom;white-space:nowrap}",
@@ -99,7 +107,8 @@ window.__ModuleLoader__.load({
       ".mrl-d-v{color:var(--dsw-alias-label-secondary);min-width:0;white-space:pre-wrap;word-break:break-word}",
       ".mrl-quote{border-left:2px solid var(--mrl-line);padding-left:8px;white-space:pre-wrap;word-break:break-word}",
       ".mrl-meta2{display:block;color:var(--dsw-alias-label-tertiary);font-size:10.5px;margin-top:2px}",
-      ".mrl-snippet{display:block;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;line-height:1.7;background:var(--mrl-surface);border:1px solid var(--mrl-line-soft);border-radius:6px;padding:6px 8px;color:var(--dsw-alias-label-primary);white-space:pre-wrap;word-break:break-word}",
+      ".mrl-snippet{display:block;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;line-height:1.7;background:var(--mrl-surface);border:1px solid var(--mrl-line-soft);border-radius:6px;padding:6px 8px;color:var(--dsw-alias-label-primary);white-space:pre-wrap;word-break:break-word;max-height:220px;overflow:auto}",
+      ".mrl-hint{padding:10px 12px;font-size:11px;color:var(--dsw-alias-label-tertiary);line-height:1.6}",
       ".mrl-f{padding:8px 12px;border-top:1px solid var(--mrl-line);display:flex;align-items:center;gap:7px;color:var(--dsw-alias-label-secondary);font-size:11px;background:var(--mrl-fill)}",
       ".mrl-btn{font-size:11.5px;padding:3px 9px;border-radius:7px;border:1px solid var(--mrl-line);background:var(--mrl-surface);color:var(--dsw-alias-label-primary);cursor:pointer;white-space:nowrap}",
       ".mrl-btn:hover:enabled{background:var(--mrl-fill)}",
@@ -205,11 +214,11 @@ window.__ModuleLoader__.load({
       return "建议性";
     }
 
-    function problemStatusLabel(problem, roundN) {
-      // fixed 是「哪一轮验证的」；翻历史轮时把轮次写出来（同一个 FID 在第 8 轮视图里
-      // 也要显示「第 9 轮已修」，不能还是「未处理」）。
+    function problemStatusLabel(problem) {
+      // fixed 一律写出「第几轮验证修的」：同一个 FID 只会出现在首次出现的那一轮，
+      // 状态必须自带验证轮次，否则翻那一轮时看不出它其实早就修了。
       if (problem.status === "fixed") {
-        if (Number.isSafeInteger(problem.fixedAtRound) && Number.isSafeInteger(roundN) && problem.fixedAtRound !== roundN) {
+        if (Number.isSafeInteger(problem.fixedAtRound)) {
           return { text: "✓ 第 " + problem.fixedAtRound + " 轮已修", tone: "fixed" };
         }
         return { text: "✓ 已修", tone: "fixed" };
@@ -223,6 +232,35 @@ window.__ModuleLoader__.load({
       // 当前轮评审还没出时，上一轮的「未处理」不能断言现在还没修，只能算待复验。
       if (problem.unverified === true) return { text: "◔ 待复验", tone: "pending" };
       return { text: "● 未处理", tone: "open" };
+    }
+
+    /**
+     * 唯一问题索引的溯源文案：首见轮次 + 出现次数（>1 时列出现轮次）。
+     * 只在首次出现的轮次里展示问题，这行文案让读者知道它后面又被提到过几次。
+     */
+    function problemMeta(problem) {
+      var parts = [];
+      if (Number.isSafeInteger(problem.firstRound) && problem.firstRound > 0) {
+        parts.push("首见 第 " + problem.firstRound + " 轮");
+      }
+      var rounds = Array.isArray(problem.rounds) ? problem.rounds : [];
+      var count = Number.isSafeInteger(problem.count) ? problem.count : rounds.length;
+      if (count > 1) {
+        var countText = "出现 " + count + " 次";
+        if (rounds.length > 1) {
+          countText += "（" + rounds.map(function (n) { return "第" + n + "轮"; }).join("、") + "）";
+        }
+        parts.push(countText);
+      }
+      return parts.join(" · ");
+    }
+
+    /** 路径完整展示（不省略）：file:line 作为一个 tag，长路径换行而不是截断。 */
+    function pathOf(problem) {
+      var parts = [];
+      if (problem.file !== undefined && problem.file !== null && String(problem.file) !== "") parts.push(String(problem.file));
+      if (problem.line !== undefined && problem.line !== null) parts.push(String(problem.line));
+      return parts.join(":");
     }
 
     /** 相对时间：<1h 显示「N 分钟前」，否则显示日期时间。 */
@@ -507,7 +545,7 @@ window.__ModuleLoader__.load({
           onClick: openPanel,
         },
         h("span", { className: "mrl-dot " + tone }),
-        h("span", null, label + " · 第 " + (mr.round || 0) + " 轮"));
+        h("span", null, label + (mr.round > 0 ? " · 第 " + mr.round + " 轮" : " · 等待评审")));
       });
       var more = scoped.length > shown.length
         ? h("span", { className: "mrl-tag" }, "+" + (scoped.length - shown.length))
@@ -529,9 +567,11 @@ window.__ModuleLoader__.load({
       var state = useStore();
       var key = String(problem.fid);
       var open = state.expanded[key] === true;
-      var status = problemStatusLabel(problem, props.roundN);
+      var status = problemStatusLabel(problem);
       var level = problem.level || "—";
       var instruction = problem.instruction;
+      var path = pathOf(problem);
+      var meta = problemMeta(problem);
       var detail = null;
       if (open) {
         var rows = [];
@@ -540,9 +580,10 @@ window.__ModuleLoader__.load({
             h("span", { className: "mrl-d-k" }, "建议"),
             h("span", { className: "mrl-d-v" }, problem.suggestion)));
         }
+        // 只在评审给出源码片段时显示「源码」行；没有源码就不留空行（用户口径）。
         if (problem.snippet) {
           rows.push(h("div", { className: "mrl-d-row", key: "snippet" },
-            h("span", { className: "mrl-d-k" }, "代码"),
+            h("span", { className: "mrl-d-k" }, "源码"),
             h("span", { className: "mrl-d-v" }, h("code", { className: "mrl-snippet" }, problem.snippet))));
         }
         if (problem.comment && problem.comment.body) {
@@ -576,8 +617,13 @@ window.__ModuleLoader__.load({
               setStore({ expanded: next });
             },
           }, open ? "收起 ▴" : "展开 ▾")),
-        h("div", { className: "mrl-file", title: [problem.file, problem.line].filter(Boolean).join(":") },
-          [problem.file, problem.line].filter(function (part) { return part !== undefined && part !== null; }).join(":")),
+        // FID 下面是代码路径：tag 完整展示，不做省略号截断。
+        path
+          ? h("div", { className: "mrl-path-row" },
+              h("span", { className: "mrl-path", title: path }, path))
+          : null,
+        // 首见轮次 + 出现次数（重复出现时给出具体轮次）。
+        meta ? h("div", { className: "mrl-meta" }, meta) : null,
         h("div", { className: "mrl-prob" }, problem.problem || "（无描述）"),
         instruction && instruction.reason
           ? h("div", { className: "mrl-instr" },
@@ -593,8 +639,11 @@ window.__ModuleLoader__.load({
     function MrCard(props) {
       var mr = props.mr;
       var state = useStore();
+      // 唯一问题索引：每个 FID 只出现一次（重复出现只累加出现轮次 / 次数），面板不再按轮重复铺开。
       var problems = Array.isArray(mr.problems) ? mr.problems : [];
-      var pending = mr.pending || 0;
+      var summary = mr.summary || { total: problems.length, open: 0, fixed: 0, waived: 0 };
+      // 新提交已 push、评审还没出（可能是流水线没跑）：只提示，不算一轮。
+      var waiting = mr.waiting || null;
       var merge = mr.merge;
       // 已结束（merged / closed）的 MR 不再显示「差 N 项」：合并完成反而报「差 1 项：MR 状态是 merged」
       // 自相矛盾，也误导用户以为还要做什么。
@@ -621,13 +670,17 @@ window.__ModuleLoader__.load({
       var gates = mr.gates || {};
       var review = mr.review;
       var rounds = Array.isArray(mr.rounds) ? mr.rounds : [];
-      // 当前轮评审还没出时，problems 来自上一轮：面板要标清是哪一轮，别把旧结论当本轮。
-      var shownRound = mr.problemsRound || null;
-      var fallback = shownRound !== null && shownRound.current === false;
       // head_pipeline 还停在上一笔提交：这笔 push 没触发流水线，评审不会自己冒出来。
       var pipelineStale = merge !== null && merge.pipeline !== null && merge.pipeline !== undefined &&
         typeof merge.pipeline.sha === "string" && merge.pipeline.sha !== "" &&
         typeof mr.sha === "string" && mr.sha !== "" && merge.pipeline.sha !== mr.sha;
+      // 等待评审的提示：写清「哪一笔在等」+ 流水线是不是还停在上一笔（否则用户会以为插件漏解析了）。
+      var waitingText = waiting === null
+        ? null
+        : "已推送 " + String(waiting.sha || mr.sha || "").slice(0, 8) + "，等待流水线 / 评审"
+          + (pipelineStale && merge !== null && merge.pipeline !== null && merge.pipeline !== undefined
+            ? "（流水线 #" + merge.pipeline.id + " 还停在 " + String(merge.pipeline.sha).slice(0, 8) + "）"
+            : "");
       var openMr = function () { if (mr.webUrl) window.open(mr.webUrl, "_blank", "noopener,noreferrer"); };
       var removeEscaped = function () { /* hooks not used here */ };
       void removeEscaped;
@@ -648,11 +701,11 @@ window.__ModuleLoader__.load({
                   ? null
                   : h("span", { className: "mrl-tag err", key: "state" }, "差 " + (merge.missing ? merge.missing.length : 0) + " 项"));
       var tags = [
-        h("span", { className: "mrl-tag brand", key: "round" }, "第 " + (mr.round || 0) + " 轮"),
+        h("span", { className: "mrl-tag brand", key: "round" }, mr.round > 0 ? "第 " + mr.round + " 轮" : "等待评审"),
         statusTag,
       ];
 
-      // 默认看「最近一次落地的评审」；用户点轮次条可以翻看任意一轮（历史轮的问题正文随 payload 下发）。
+      // 默认视图 = 全部唯一问题（每条只出现一次）；点轮次条 = 只看「首次出现在那一轮」的问题。
       var roundKey = String(mr.projectPath || "") + "#" + String(mr.iid || 0);
       var picked = state.roundSel !== null && state.roundSel !== undefined && Number.isSafeInteger(state.roundSel[roundKey])
         ? state.roundSel[roundKey]
@@ -661,9 +714,7 @@ window.__ModuleLoader__.load({
       if (picked !== null) {
         pickedRound = rounds.filter(function (item) { return item.n === picked; })[0] || null;
       }
-      // browsing = 正在看一轮「不是默认那一轮」的历史轮：段落头要说明并给回退入口。
-      var browsing = pickedRound !== null && (shownRound === null || pickedRound.n !== shownRound.n);
-      var shownN = browsing ? pickedRound.n : (shownRound === null ? null : shownRound.n);
+      var browsing = pickedRound !== null;
       var shownProblems = browsing
         ? (Array.isArray(pickedRound.problems) ? pickedRound.problems : [])
         : problems;
@@ -679,66 +730,92 @@ window.__ModuleLoader__.load({
         setStore({ roundSel: next });
       };
 
-      // 问题段落头：写清「这是第几轮的问题」；回落时标注第 N 轮评审未出，翻历史轮时给「回到最新」。
-      var issuesHead = shownN === null
-        ? null
-        : h("div", { className: "mrl-sec" },
-            h("b", null, "第 " + shownN + " 轮问题"),
-            h("span", null, browsing && (pickedRound.verdict === null || pickedRound.verdict === undefined)
-              ? "· 等待评审"
-              : "· " + shownProblems.length + " 条"),
-            h("span", { className: "mrl-sp" }),
-            browsing
-              ? h("button", {
-                  className: "mrl-link",
-                  type: "button",
-                  onClick: function () { pickRound(null); },
-                }, shownRound === null ? "回到最新" : "回到第 " + shownRound.n + " 轮")
-              : fallback
-                ? h("span", { className: "mrl-sec-warn" }, "第 " + (mr.round || 0) + " 轮评审未出")
-                : null);
-      var issues = shownProblems.length > 0
-        ? h("div", { className: "mrl-issues" },
-            shownProblems.map(function (problem) {
-              return h(ProblemRow, { key: String(problem.fid), problem: problem, roundN: shownN });
-            }))
-        : null;
-      var historyHead = issuesHead !== null || issues !== null
-        ? h("div", null, issuesHead, issues)
-        : null;
+      // 段落头：默认视图写「共 N 条」+ 已修 / 未处理汇总；进入某轮写「该轮新问题 N 条」+ 历史未收敛条数。
+      var issuesHead;
+      if (browsing) {
+        issuesHead = h("div", { className: "mrl-sec" },
+          h("b", null, "第 " + pickedRound.n + " 轮新问题"),
+          h("span", null, "· " + shownProblems.length + " 条"),
+          pickedRound.repeatCount > 0
+            ? h("span", { className: "mrl-sec-warn" }, "· 历史未收敛 " + pickedRound.repeatCount)
+            : null,
+          h("span", { className: "mrl-sp" }),
+          h("button", {
+            className: "mrl-link",
+            type: "button",
+            onClick: function () { pickRound(null); },
+          }, "回到全部"));
+      } else {
+        issuesHead = h("div", { className: "mrl-sec" },
+          h("b", null, "问题"),
+          h("span", null, "· 共 " + (summary.total || 0) + " 条"),
+          summary.fixed > 0 ? h("span", { className: "mrl-sec-ok" }, "· 已修 " + summary.fixed) : null,
+          summary.waived > 0 ? h("span", null, "· 已豁免 " + summary.waived) : null,
+          summary.open > 0 ? h("span", { className: "mrl-sec-warn" }, "· 未处理 " + summary.open) : null,
+          h("span", { className: "mrl-sp" }),
+          waiting !== null ? h("span", { className: "mrl-sec-warn" }, "等待评审") : null);
+      }
+      var issues;
+      if (shownProblems.length > 0) {
+        issues = h("div", { className: "mrl-issues" },
+          shownProblems.map(function (problem) {
+            return h(ProblemRow, { key: String(problem.fid), problem: problem });
+          }));
+      } else if (browsing) {
+        // 没有新问题的轮次不显示「本轮修复的问题」（用户口径）：修复状态挂在首次出现的那条上。
+        // 该轮重复提到的历史问题只给一行摘要，不重复铺开问题卡片。
+        var repeats = Array.isArray(pickedRound.repeats) ? pickedRound.repeats : [];
+        issues = h("div", { className: "mrl-hint" },
+          repeats.length === 0
+            ? "本轮没有新问题"
+            : "本轮没有新问题；重复出现 " + repeats.length + " 条历史问题："
+              + repeats.map(function (item) {
+                  return item.fid + "（首见第" + item.firstRound + "轮 · 共" + item.count + "次）";
+                }).join("、"));
+      } else {
+        issues = h("div", { className: "mrl-hint" }, "还没有评审问题");
+      }
+      var historyHead = h("div", null, issuesHead, issues);
 
-      // 轮次条：一眼看到每轮的结论与条数；点一轮就看那一轮的问题（默认看最近一次落地的评审）。
+      // 轮次条：展示**完整轮次**（不截断）。徽标数字 = 该轮新出现的问题数；
+      // ↻N = 该轮重复提到的历史未收敛问题数（不计入新问题数，避免同一个 FID 被反复计数）。
       var roundStrip = null;
-      if (rounds.length > 1) {
-        var shown = rounds.slice(-8);
-        var chips = [];
-        if (rounds.length > shown.length) {
-          chips.push(h("span", { className: "mrl-round", key: "more", title: "更早的 " + (rounds.length - shown.length) + " 轮已省略" },
-            "+" + (rounds.length - shown.length)));
-        }
-        shown.forEach(function (item) {
-          var waiting = item.verdict === null || item.verdict === undefined;
-          var selected = shownN !== null && shownN === item.n;
-          var label = waiting ? "等待评审" : (item.verdict === "pass" ? "通过" : item.verdict === "changes" ? "需修改" : "未解析");
-          var tip = "第 " + item.n + " 轮 · " + label;
-          if (!waiting) tip += " · " + (item.total || 0) + " 条";
-          if (item.fixed > 0) tip += "，已修 " + item.fixed;
+      if (rounds.length > 0) {
+        var chips = rounds.map(function (item) {
+          var awaiting = item.verdict === null || item.verdict === undefined;
+          var selected = browsing && pickedRound.n === item.n;
+          var label = awaiting ? "等待评审" : (item.verdict === "pass" ? "通过" : item.verdict === "changes" ? "需修改" : "未解析");
+          var tip = "第 " + item.n + " 轮 · " + label + " · 新问题 " + (item.newCount || 0) + " 条";
+          if (item.repeatCount > 0) tip += " · 历史未收敛 " + item.repeatCount + " 条";
           if (item.at) tip += " · " + String(item.at).replace("T", " ").slice(0, 16);
-          chips.push(h("button", {
+          tip += " · 点击查看这一轮新出现的问题";
+          return h("button", {
             className: "mrl-round",
             key: "r" + item.n,
             type: "button",
-            title: tip + " · 点击查看这一轮的问题",
+            title: tip,
             "data-sel": selected ? "1" : undefined,
-            "data-wait": waiting ? "1" : undefined,
+            "data-wait": awaiting ? "1" : undefined,
             onClick: function () { pickRound(item.n); },
           },
             "第" + item.n + "轮",
-            waiting
-              ? null
-              : h("i", { className: "mrl-dot " + (item.verdict === "pass" ? "ok" : item.verdict === "changes" ? "err" : "warn") }),
-            waiting ? null : String(item.total || 0)));
+            awaiting ? null : h("i", { className: "mrl-dot " + (item.verdict === "pass" ? "ok" : item.verdict === "changes" ? "err" : "warn") }),
+            awaiting
+              ? h("span", { className: "num" }, "等待评审")
+              : h("span", { className: "num", title: "新问题 " + (item.newCount || 0) + " 条" }, String(item.newCount || 0)),
+            item.repeatCount > 0
+              ? h("i", { className: "mrl-rep", title: "另有 " + item.repeatCount + " 条历史未收敛问题在本轮重复出现" }, "↻" + item.repeatCount)
+              : null);
         });
+        if (waiting !== null) {
+          chips.push(h("span", {
+            className: "mrl-wait-chip",
+            key: "wait",
+            title: "已推送 " + String(waiting.sha || "").slice(0, 8)
+              + (waiting.since ? "（" + String(waiting.since).replace("T", " ").slice(0, 16) + " 起）" : "")
+              + "，等待流水线 / 评审；这一笔还没有评审结论，不计轮次",
+          }, "⏳ 等待评审"));
+        }
         roundStrip = h("div", { className: "mrl-rounds" }, h("span", { className: "lbl" }, "轮次"), chips);
       }
 
@@ -776,11 +853,10 @@ window.__ModuleLoader__.load({
           h("span", { className: "mrl-merge-icon" }, mergeIcon),
           h("span", { className: "txt" },
             mergeText,
-            // 只看 missing 文字会以为「评审解析失败」；其实是这笔提交根本没跑流水线。
-            pipelineStale && review === null
-              ? h("div", { className: "mrl-merge-sub" },
-                  "流水线 #" + merge.pipeline.id + " 还停在 " + String(merge.pipeline.sha).slice(0, 8) +
-                  "，这笔提交没有流水线")
+            // 新提交已 push、评审还没出：直接说「哪一笔在等 + 流水线是不是还没跑」，
+            // 否则用户会以为是插件没解析出评审，或者把等待当成新一轮已经开始了。
+            waitingText !== null
+              ? h("div", { className: "mrl-merge-sub" }, waitingText)
               : null),
           h("button", { className: "mrl-link", type: "button", onClick: openMr }, "打开 MR ↗")),
         historyHead,

@@ -4,7 +4,7 @@
  */
 import { parseMrUrl } from './url.js'
 import { readRepoState } from './repo.js'
-import { buildRound } from './rounds.js'
+import { buildRound, isPhantomRound, normalizeRounds, pipelineForHead } from './rounds.js'
 import { evaluateMergeable, isDisposed, isDisposedFinding, directiveFor, decisionFor, reviewFindings } from './mergeable.js'
 import { clipText, FID_RE, parseDirectives, REASON_LIMIT } from './parse-directives.js'
 import { GitlabError } from './gitlab.js'
@@ -177,7 +177,7 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
     const previous = await ledger.load({ projectPath: parsed.project, iid: parsed.iid })
     // 轮次 = 一个 head sha 上的「评审 → 处置」周期：同 sha 的重绑复用轮次，sha 变化才新增。
     // 新增时用「已有最大轮次 + 1」而不是数组长度：账本裁剪后长度会回退，轮次号不能重复。
-    const previousRounds = Array.isArray(previous?.rounds) ? previous.rounds : []
+    const previousRounds = normalizeRounds(Array.isArray(previous?.rounds) ? previous.rounds : [])
     const shaKnown = typeof mr.sha === 'string' && mr.sha !== ''
     // 先收敛账本尾部连续同 sha 的段，再判定复用 / 新增：旧版本可能堆了
     // [1(S),2(S),3(S),4(S)]，无论 head 是否已前进，都不能把虚高的 n 带进后续轮次。
@@ -198,18 +198,26 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
         rounds = [...previousRounds.slice(0, segmentStart), anchor]
       }
     }
+    // 末尾是伪轮次（没评审、没流水线）：同 sha 重绑要复用，换 sha 就直接丢掉，不让它占轮次号。
+    if (rounds.length > 0
+      && isPhantomRound(rounds[rounds.length - 1], { last: false })
+      && rounds[rounds.length - 1]?.sha !== mr.sha) {
+      rounds = rounds.slice(0, -1)
+    }
     const lastRound = rounds[rounds.length - 1]
     // sha 缺失（undefined / 空串）不能算「同 sha」；n 必须是正整数，否则 0 / 负数
     // 会复用出「第 0 轮」或倒序轮次。
     const reuse = shaKnown && Number.isSafeInteger(lastRound?.n) && lastRound.n > 0 && lastRound.sha === mr.sha
     let round
     let nextRounds
+    // pipelineForHead：这笔提交通知有没有流水线（评审能不能自己来）。仅作展示 / 轮次计数证据。
+    const pipelineOnHead = pipelineForHead(mr)
     if (reuse) {
-      round = { ...buildRound({ mr, notes, cfg: config, observedAt: baselineObservedAt }), n: lastRound.n }
+      round = { ...buildRound({ mr, notes, cfg: config, observedAt: baselineObservedAt }), n: lastRound.n, pipelineForHead: pipelineOnHead }
       nextRounds = [...rounds.slice(0, -1), round]
     } else {
       const n = rounds.reduce((max, item) => (Number.isSafeInteger(item?.n) && item.n > max ? item.n : max), 0) + 1
-      round = { ...buildRound({ mr, notes, cfg: config, observedAt }), n }
+      round = { ...buildRound({ mr, notes, cfg: config, observedAt }), n, pipelineForHead: pipelineOnHead }
       nextRounds = [...rounds, round]
     }
 
@@ -277,7 +285,7 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
     if (bindings.has(sessionId)) return null
     // 终态是永久的：账本留给看板，不再恢复监视。
     if (typeof record.terminal === 'string' && record.terminal !== '') return null
-    const rounds = Array.isArray(record.rounds) ? record.rounds : []
+    const rounds = normalizeRounds(Array.isArray(record.rounds) ? record.rounds : [])
     const round = rounds.length === 0 ? null : rounds[rounds.length - 1]
     if (round === null || typeof round !== 'object') return null
     const observedAt = now()
@@ -334,7 +342,15 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
       newRound = true
       const previousRound = state.round
       const observedAt = now()
-      const round = { ...buildRound({ mr, notes, cfg: config, observedAt }), n: (state.round?.n ?? 0) + 1 }
+      // 伪轮次（push 了但没流水线、也没评审）不占轮次号：新 sha 到来时直接替换它，
+      // 这样「提交了但流水线没工作」不会让面板轮次 +1（用户口径 0.3.0）。
+      const baseRounds = isPhantomRound(previousRound, { last: false }) ? state.rounds.slice(0, -1) : state.rounds
+      const n = baseRounds.reduce((max, item) => (Number.isSafeInteger(item?.n) && item.n > max ? item.n : max), 0) + 1
+      const round = {
+        ...buildRound({ mr, notes, cfg: config, observedAt }),
+        n,
+        pipelineForHead: pipelineForHead(mr),
+      }
       // 守卫计数按「轮」推进：只有新 sha 开新一轮时才比较上一轮。
       // 同 sha 的快照（watcher 每 tick、/mr status）不碰 streak / stallKey。
       const key = blockingKey(round)
@@ -342,10 +358,16 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
       state.stallKey = key
       state.reverifyStreak = reverifyIncreased(previousRound, round) ? state.reverifyStreak + 1 : 0
       state.round = round
-      state.rounds = [...state.rounds, round].slice(-config.ledgerKeepRounds)
+      state.rounds = [...baseRounds, round].slice(-config.ledgerKeepRounds)
       state.lastProgressAt = observedAt
     } else if (Array.isArray(notes)) {
-      state.round = { ...buildRound({ mr, notes, cfg: config, observedAt: state.round.observedAt }), n: state.round.n }
+      // 同 sha 重建本轮：流水线可能在 push 之后才出现（head_pipeline 一度还停在上一笔提交），
+      // 每次快照都刷新这个证据，面板才知道「这笔提交到底算不算一轮」。
+      state.round = {
+        ...buildRound({ mr, notes, cfg: config, observedAt: state.round.observedAt }),
+        n: state.round.n,
+        pipelineForHead: pipelineForHead(mr),
+      }
       state.rounds = [...state.rounds.slice(0, -1), state.round]
     }
 

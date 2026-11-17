@@ -12,11 +12,8 @@ import { readdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { expandHome } from './ledger.js'
 import { evaluateMergeable, reviewTodo } from './mergeable.js'
-import { collectFindings, displayRoundIndex, resolveFindings, settledRoundIndex } from './findings.js'
-
-const MAX_COMMENTS = 5
-/** 面板最多回放多少轮历史（账本最多保留 50 轮，全给前端只会让 payload 变大）。 */
-const UI_ROUNDS = 12
+import { collectFindingsIndex, settledRoundIndex } from './findings.js'
+import { normalizeRounds } from './rounds.js'
 
 /**
  * 账本目录里每个文件即一个 MR。读坏的文件按「没有」处理（与 ledger.load 同口径）。
@@ -42,17 +39,18 @@ async function readLedgerFiles(dir) {
   return records
 }
 
-const roundOf = (record) => {
-  const rounds = Array.isArray(record?.rounds) ? record.rounds : []
-  return rounds.length === 0 ? null : rounds[rounds.length - 1]
-}
+const roundsOf = (record) => (Array.isArray(record?.rounds) ? record.rounds : [])
 
 /**
- * 共享 findings 判定（findings.js）→ UI 展示形状：面板只有 open / waived / fixed 三态，
- * skip / wontfix 都显示为 waived；真正的处置方式保留在 instruction.kind。
+ * 唯一问题索引（findings.js 的 collectFindingsIndex）→ 面板展示形状：
+ * 面板只有 open / waived / fixed 三态，skip / wontfix 都显示为 waived；
+ * 真正的处置方式保留在 instruction.kind。
  *
- * `unverified`：这条问题来自更早的一轮（当前轮评审还没出），所以「未处理」只代表
- * 上一轮结论里没处置，不能断言现在还没修——面板据此显示成「待复验」。
+ * `firstRound` / `rounds` / `count`：这个问题首次出现在第几轮、都在哪几轮出现过、一共出现几次。
+ * 面板据此「只在首次出现的轮次里展示，并标出首见轮次与次数」。
+ *
+ * `unverified`：当前轮评审还没落地，所以「未处理」只代表最近一次已落地评审的结论，
+ * 不能断言现在还没修——面板据此显示成「待复验」。
  */
 function uiProblemOf(finding, unverified = false) {
   const status = finding.status === 'open' || finding.status === 'fixed' ? finding.status : 'waived'
@@ -67,6 +65,10 @@ function uiProblemOf(finding, unverified = false) {
     snippet: finding.snippet,
     status,
     instruction: finding.instruction === null ? undefined : finding.instruction,
+    firstRound: finding.firstRound,
+    lastRound: finding.lastRound,
+    rounds: finding.rounds,
+    count: finding.count,
   }
   if (unverified === true && status === 'open') problem.unverified = true
   if (finding.fixedAtRound !== undefined) problem.fixedAtRound = finding.fixedAtRound
@@ -80,48 +82,38 @@ function isoOf(value) {
 }
 
 /**
- * 单轮摘要（面板的轮次条 + 历史轮详情）：计数、结论与**该轮的问题正文**。
- * `total` 是该轮评审自己的 finding 数；`fixed` 是上一轮遗留、本轮评审里已消失的条数。
- * 「看哪一轮」的口径与当前轮列表同一套（collectFindings），所以历史轮点开看到的是
- * 「第 N 轮时的清单」：本轮问题 + 本轮确认为已修的上一轮问题。
+ * 单轮摘要（面板的轮次条 + 进入该轮的问题列表）。
+ *
+ * 轮次计数只看**首次出现**在那一轮的问题（`newCount`）；同一 FID 在后续轮次再被提到
+ * 不再重复计数，只记 `repeatCount`（历史未收敛），面板轮次条上单独标一个 ↻ 数。
+ * 这样「243 一共 6 个问题」在轮次条上的和就是 6，不会因为重复出现被放大成十几个。
+ *
+ * 「本轮修复的问题」不再进任何一轮的列表（用户口径）：问题只在首次出现的那一轮展示，
+ * 修复状态挂在原条目上（✓ 第 N 轮已修），没有问题的轮次因此不会凭空多出一串已修项。
  */
-function roundSummaryOf(record, index) {
-  const rounds = Array.isArray(record?.rounds) ? record.rounds : []
-  const round = rounds[index] ?? null
-  // 当前轮评审还没落地时，任何视图里的「未处理」都只是上一轮结论 → 显示「待复验」。
-  const unverifiedOpen = settledRoundIndex(record) !== rounds.length - 1
-  // 历史轮里当时未处理、但后续已落地评审确认消失的 FID 要改判已修，否则同一个 FID
-  // 在第 8 轮显示未处理、第 9 轮显示已修，自相矛盾。
-  const findings = index < 0 ? [] : resolveFindings(collectFindings(record, { roundIndex: index }), record, index)
-  // total 是「这一轮自己提了几条」，与后续修没修无关；状态计数按收敛后的结果算。
-  const own = [
-    ...(Array.isArray(round?.review?.blocking) ? round.review.blocking : []),
-    ...(Array.isArray(round?.review?.nonBlocking) ? round.review.nonBlocking : []),
-  ]
-  const ownKeys = new Set(own.map((item) => String(item?.fid ?? '').toLowerCase()))
-  const open = findings.filter((finding) => ownKeys.has(String(finding.fid ?? '').toLowerCase()) && finding.status === 'open').length
-  // fixed 仍是「这一轮确认修好的上一轮问题」（旧口径），不是「这一轮自己提的后来被修了」。
-  const fixed = findings.filter((finding) => finding.status === 'fixed' && ownKeys.has(String(finding.fid ?? '').toLowerCase()) === false).length
-  const waived = findings.filter((finding) => ownKeys.has(String(finding.fid ?? '').toLowerCase()) && finding.status !== 'open' && finding.status !== 'fixed').length
+function roundSummaryOf(round, index, { problems, repeats, unverified, current, comments }) {
+  const n = Number.isSafeInteger(round?.n) ? round.n : index + 1
+  const withComment = (finding) => {
+    const problem = uiProblemOf(finding, unverified)
+    const noteId = problem.instruction?.noteId
+    const comment = noteId === undefined ? undefined : comments.get(noteId)
+    if (comment !== undefined) problem.comment = comment
+    return problem
+  }
   return {
-    n: Number.isSafeInteger(round?.n) ? round.n : index + 1,
+    n,
     sha: typeof round?.sha === 'string' ? round.sha : '',
     verdict: round?.review?.verdict ?? null,
     binding: round?.binding ?? null,
     at: isoOf(round?.observedAt),
-    total: own.length,
-    open,
-    fixed,
-    waived,
-    current: index === rounds.length - 1,
-    // 历史轮点开时显示的问题列表（状态已按最新一次已落地评审收敛）。
-    problems: findings.map((finding) => {
-      const problem = uiProblemOf(finding, unverifiedOpen)
-      const noteId = problem.instruction?.noteId
-      const comment = noteId === undefined ? undefined : commentMapOf(round).get(noteId)
-      if (comment !== undefined) problem.comment = comment
-      return problem
-    }),
+    // 该轮评审一共报了几条：新出现的 + 历史未收敛（重复出现）。
+    total: problems.length + repeats.length,
+    newCount: problems.length,
+    repeatCount: repeats.length,
+    current,
+    // 只在轮次条 tooltip / 轮次详情里用的摘要，不带问题正文。
+    repeats: repeats.map((finding) => ({ fid: finding.fid, firstRound: finding.firstRound, count: finding.count })),
+    problems: problems.map(withComment),
   }
 }
 
@@ -150,57 +142,92 @@ function webUrlOf(config, binding) {
   return `${base.origin}${basePath}/${project}/-/merge_requests/${iid}`
 }
 
-/** 指令评论原文：directiveNotes 只有 noteId/body，作者与时间从 directives 里捞（同一 noteId）。 */
-function commentMapOf(round) {
-  const notes = Array.isArray(round?.directiveNotes) ? round.directiveNotes : []
-  const directives = Array.isArray(round?.directives?.directives) ? round.directives.directives : []
+/**
+ * 指令评论原文：directiveNotes 只有 noteId/body，作者与时间从 directives 里捞（同一 noteId）。
+ * 跨全部轮次合并：唯一问题索引里的处置可能来自更晚的一轮（早期轮次找不到原文）。
+ */
+function commentsOf(rounds) {
   const meta = new Map()
-  for (const directive of directives) {
-    if (Number.isSafeInteger(directive?.noteId) && !meta.has(directive.noteId)) {
-      meta.set(directive.noteId, { author: directive.author ?? null, createdAt: directive.createdAt ?? null })
+  const map = new Map()
+  for (const round of Array.isArray(rounds) ? rounds : []) {
+    for (const directive of Array.isArray(round?.directives?.directives) ? round.directives.directives : []) {
+      if (Number.isSafeInteger(directive?.noteId) && !meta.has(directive.noteId)) {
+        meta.set(directive.noteId, { author: directive.author ?? null, createdAt: directive.createdAt ?? null })
+      }
     }
   }
-  const map = new Map()
-  for (const note of notes) {
-    if (!Number.isSafeInteger(note?.noteId)) continue
-    const extra = meta.get(note.noteId) ?? { author: null, createdAt: null }
-    map.set(note.noteId, {
-      noteId: note.noteId,
-      body: note.body ?? '',
-      author: extra.author,
-      createdAt: extra.createdAt,
-    })
+  for (const round of Array.isArray(rounds) ? rounds : []) {
+    for (const note of Array.isArray(round?.directiveNotes) ? round.directiveNotes : []) {
+      if (!Number.isSafeInteger(note?.noteId) || map.has(note.noteId)) continue
+      const extra = meta.get(note.noteId) ?? { author: null, createdAt: null }
+      map.set(note.noteId, {
+        noteId: note.noteId,
+        body: note.body ?? '',
+        author: extra.author,
+        createdAt: extra.createdAt,
+      })
+    }
   }
   return map
 }
 
 function resultOf(record, live, config) {
-  const rounds = Array.isArray(record?.rounds) ? record.rounds : []
-  // 判定口径一律用当前轮（最后一轮）；问题列表允许回落到上一轮，两者分开算。
-  const round = roundOf(record)
-  const currentIndex = rounds.length - 1
-  const displayIndex = displayRoundIndex(record)
-  const displayRound = displayIndex < 0 ? null : rounds[displayIndex]
+  const rawRounds = roundsOf(record)
+  // 轮次条 / 问题归属只认「真实轮次」：push 了但没有流水线、也没有评审的那一轮会被去掉并重编号，
+  // 所以「提交了但流水线没工作」不会让面板的轮次 +1（用户口径 0.3.0）。
+  const rounds = normalizeRounds(rawRounds)
+  // 判定口径仍用当前轮（原始最后一轮，可能是等待评审的伪轮次）；展示口径用最后一个真实轮次。
+  const currentRound = rawRounds.length === 0 ? null : rawRounds[rawRounds.length - 1]
+  const displayRound = rounds.length === 0 ? null : rounds[rounds.length - 1]
   // 当前轮评审还没落地时，「未处理」只代表最近一次落地评审的结论（面板显示「待复验」）。
   // 这一口径对所有视图一致（顶层列表与历史轮列表不会互相矛盾）。
-  const unverified = settledRoundIndex(record) !== currentIndex
+  const unverified = settledRoundIndex(record) !== rawRounds.length - 1
   const binding = record?.binding ?? {}
   const decisions = record?.decisions !== null && typeof record.decisions === 'object' ? record.decisions : {}
-  const todo = reviewTodo(round, decisions)
+  const todo = reviewTodo(currentRound, decisions)
+  const currentReview = reviewTodo(displayRound, decisions)
   const mr = live?.state?.mr
   // M1：live 的 MR 快照必须与当前轮同 sha 才参与合并判定——不一致说明快照还没并进这一轮，
   // 拿它算会得到错配的「可合 / 差 N 项」。
-  const roundSha = typeof round?.sha === 'string' ? round.sha : ''
+  const roundSha = typeof currentRound?.sha === 'string' ? currentRound.sha : ''
   const mrSha = typeof mr?.sha === 'string' ? mr.sha : ''
   const mergeability = mr === undefined || roundSha === '' || mrSha !== roundSha
     ? null
-    : evaluateMergeable({ mr, round, decisions })
+    : evaluateMergeable({ mr, round: currentRound, decisions })
   // 终态（merged / closed）：账本 terminal 是永久的；live 时也可以从 MR 快照看出来。
   // 已经结束的 MR 不再算「差几项」——之前会把「MR 状态是 merged」当成缺口显示成「差 1 项」。
   const terminalState = typeof record?.terminal === 'string' && record.terminal !== ''
     ? record.terminal
     : (mr?.state === 'merged' || mr?.state === 'closed' ? mr.state : null)
-  const roundStart = Math.max(0, rounds.length - UI_ROUNDS)
+  // 唯一问题索引：243 这类 MR 一共只有 6 个 FID，面板就只显示 6 条（重复出现只累加次数）。
+  const indexFindings = collectFindingsIndex(record)
+  const comments = commentsOf(rounds)
+  const problems = indexFindings.map((finding) => {
+    const problem = uiProblemOf(finding, unverified)
+    const noteId = problem.instruction?.noteId
+    const comment = noteId === undefined ? undefined : comments.get(noteId)
+    if (comment !== undefined) problem.comment = comment
+    return problem
+  })
+  const roundSummaries = rounds.map((round, index) => {
+    const n = Number.isSafeInteger(round?.n) ? round.n : index + 1
+    const first = indexFindings.filter((finding) => finding.firstRound === n)
+    const repeats = indexFindings.filter((finding) => finding.firstRound !== n
+      && Array.isArray(finding.rounds) && finding.rounds.includes(n))
+    return roundSummaryOf(round, index, {
+      problems: first,
+      repeats,
+      unverified,
+      current: index === rounds.length - 1,
+      comments,
+    })
+  })
+  // 新提交已 push、本轮评审还没落地（含「没有流水线、评审不会自己来」）：面板给出等待提示。
+  const waiting = terminalState === null && currentRound !== null
+    && (currentRound.review === null || currentRound.review === undefined)
+    ? { sha: typeof currentRound.sha === 'string' ? currentRound.sha : '', since: isoOf(currentRound.observedAt) }
+    : null
+  const countOfStatus = (status) => problems.filter((problem) => problem.status === status).length
   return {
     projectPath: binding.projectPath ?? '',
     iid: binding.iid ?? 0,
@@ -209,23 +236,24 @@ function resultOf(record, live, config) {
     targetBranch: binding.targetBranch ?? '',
     // I1：终态以账本记录为准（merged/closed 是永久的）；live 还没落账本时回落实时 mr。
     state: record?.terminal ?? mr?.state ?? 'unknown',
-    sha: round?.sha ?? '',
-    round: round?.n ?? 0,
+    // sha 给当前 head（新提交等待评审时也要看得到是哪一笔）。
+    sha: mrSha !== '' ? mrSha : (typeof currentRound?.sha === 'string' ? currentRound.sha : ''),
+    round: displayRound === null ? 0 : (Number.isSafeInteger(displayRound.n) ? displayRound.n : rounds.length),
     updatedAt: record?.updatedAt ?? binding.boundAt ?? null,
     live: live !== undefined,
     session: live === undefined ? undefined : {
       id: live.sessionId,
       title: undefined,
     },
-    review: round?.review === null || round?.review === undefined ? null : {
-      verdict: round.review.verdict,
-      historicalUnresolved: round.review.historicalUnresolved,
-      verifiedFixed: round.review.verifiedFixed,
-      newThisRound: todo.fresh,
+    review: displayRound?.review === null || displayRound?.review === undefined ? null : {
+      verdict: displayRound.review.verdict,
+      historicalUnresolved: displayRound.review.historicalUnresolved,
+      verifiedFixed: displayRound.review.verifiedFixed,
+      newThisRound: currentReview.fresh,
     },
     gates: {
-      sensitive: round?.sensitive?.verdict ?? null,
-      mandatory: round?.mandatory?.verdict ?? null,
+      sensitive: displayRound?.sensitive?.verdict ?? null,
+      mandatory: displayRound?.mandatory?.verdict ?? null,
     },
     merge: terminalState !== null
       ? {
@@ -244,26 +272,25 @@ function resultOf(record, live, config) {
             // 面板据此提示「这笔提交还没有流水线」，而不是让用户以为评审是插件没解析出来。
             pipeline: pipelineOf(mr),
           },
-    // 问题来自哪一轮：current=false 表示当前轮评审还没出、显示的是上一轮结论（面板要标注）。
+    // 问题列表统一按「首次出现的轮次」归属；problemsRound 是默认视图锚定的那一轮。
     problemsRound: displayRound === null ? null : {
-      n: Number.isSafeInteger(displayRound.n) ? displayRound.n : displayIndex + 1,
+      n: Number.isSafeInteger(displayRound.n) ? displayRound.n : rounds.length,
       sha: typeof displayRound.sha === 'string' ? displayRound.sha : '',
-      current: displayIndex === currentIndex,
+      current: true,
     },
-    // 轮次条：每轮条数与结论（不含问题正文，保证 payload 小到能整包 30s 轮询）。
-    rounds: rounds
-      .slice(roundStart)
-      .map((_, offset) => roundSummaryOf(record, roundStart + offset)),
-    // #9：问题状态与落盘共用 collectFindings，避免面板和 findings 各写一套判定。
-    problems: (displayIndex < 0
-      ? []
-      : resolveFindings(collectFindings(record, { roundIndex: displayIndex }), record, displayIndex)).map((finding) => {
-      const problem = uiProblemOf(finding, unverified)
-      const noteId = problem.instruction?.noteId
-      const comment = noteId === undefined ? undefined : commentMapOf(displayRound).get(noteId)
-      if (comment !== undefined) problem.comment = comment
-      return problem
-    }),
+    waiting,
+    // 唯一问题的状态汇总：面板标题「共 N 个问题 · 已修 X」直接用，不用前端再数一遍。
+    summary: {
+      total: problems.length,
+      open: countOfStatus('open'),
+      fixed: countOfStatus('fixed'),
+      waived: countOfStatus('waived'),
+    },
+    // 轮次条：完整轮次（不截断），每轮只带「首次出现在该轮」的问题正文，
+    // 重复出现的只给摘要（repeats），payload 不会随轮次重复膨胀。
+    rounds: roundSummaries,
+    // 问题唯一索引：每个 FID 只出现一次，带首见轮次 / 出现轮次 / 次数 / 修复轮次。
+    problems,
     // 已结束的 MR 不再报「待处理」：评审问题已成历史，主代理不需要再动手。
     pending: terminalState !== null ? 0 : todo.total,
   }

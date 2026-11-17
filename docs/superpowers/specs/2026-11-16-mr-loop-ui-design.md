@@ -408,3 +408,84 @@ MR !243 已经合并（卡片标签已经是「已合并」「第 9 轮」），
 - 视觉台：`?demo=merged&round=8`（同一个 FID 在两个轮视图里都是已修，且标明是第 9 轮验证的）；
   截图 `specs/assets/mr-loop-ui-round-status-light.jpg`。
 - 真实数据：!243 第 8 轮视图里 `fd56004d1a` 从 `open` 变成 `fixed / fixedAtRound 9`。
+
+## 十六、问题按 FID 去重 + 轮次只算真实评审（2026-11-17，v0.3.0）
+
+### 症状（用户实拍）
+
+!243 一共只发现 6 个问题，但面板上「视觉接收到的远远不止 6 个」：同一个 FID 在它出现的每一轮
+都重复铺开一遍，哪条是这一轮新出的、哪条是历史未收敛（后来还在提）完全看不出来；
+轮次条还出现了「第 7 轮」——那一笔 push 根本没有流水线，评审不会自己来，却照样涨了轮次号。
+
+用户给的 7 条口径：
+
+1. 按 FID 建唯一索引：重复出现只记轮次与次数，**只在第一次出现的轮次里展示**；下一轮及后续
+   不再出现同一 FID 就算已修复。
+2. 轮次 tag 可以展示该轮有几个问题；点进某一轮时，问题的展示要带「首次出现的轮次 + 出现次数」。
+3. 代码提交了但流水线没工作的情况，轮次不要增加。
+4. 没有（新）问题的轮次不要再展示「本轮修复的问题」。
+5. 轮次区域展示完整轮次（不截断）。
+6. FID 下面的代码路径用 tag 展示，完整展示、不显示省略号。
+7. 展开问题区域显示问题源码；没有源码就不显示源码行。
+
+### 根因
+
+- 面板按「轮」取数：`collectFindings(record, { roundIndex })` 每轮各算一份清单，同一个 FID 在
+  第 2、3 轮各出现一次就会在两轮里各渲染一遍；轮次条 `total` 也是「该轮评审报了几条」，
+  于是重复出现被反复计数。
+- 轮次的产生只看 sha 变化：`applySnapshot` 遇到新 sha 就 `n + 1`，不看这笔提交到底有没有流水线。
+  GitLab 的 `head_pipeline` 是「这个 MR 最新的流水线」，新 push 之后它可能还停在上一个 commit 上；
+  这种轮次永远等不到评审，却占了一个轮次号，还留下一条「评审 · 未知」的空壳。
+- 路径行 `.mrl-file` 是 `white-space:nowrap; text-overflow:ellipsis`，长路径被省略号截断。
+- 评审 note 的 `源码:` 字段根本没解析（`parse-review.js` 的 `FIELD_KEY` 漏了它），所以「源码」永远是空的。
+
+### 改法
+
+**数据层（唯一索引）**
+
+- `findings.js` 新增 `collectFindingsIndex(record)`：
+  - 按 FID（大小写不敏感）建唯一索引，Map 插入顺序 = 首次出现顺序；
+  - 每条记 `firstRound` / `firstSha` / `rounds[]` / `count` / `lastRound`，描述取首次出现那一轮的原文；
+  - 状态：仍出现在最近一次评审里 → `open`；最后一次出现之后、第一个**已落地评审**（pass / changes）
+    里没有它 → `fixed`，`fixedAtRound` = 那一轮；unknown / 评审未出都不算修好（fail-closed）；
+  - 处置沿用账本 `decisions`（优先）与**最近一轮** MR 指令；已处置的不判 fixed（它没有「修好」的含义）。
+- `ui.js` 的 `problems` 直接来自唯一索引（每个 FID 只出现一次）；`summary` 给
+  `{ total, open, fixed, waived }` 供标题汇总。
+- 每轮的 `problems` 只放「首次出现在这一轮」的问题；同一 FID 在后续轮再出现只记
+  `repeatCount` + `repeats:[{fid, firstRound, count}]`，不再铺问题卡片。
+  轮次摘要的 `total` = `newCount + repeatCount`（该轮评审报了几条），其中 `newCount` 才是轮次条徽标。
+
+**轮次（只算真实评审）**
+
+- `rounds.js` 新增 `pipelineForHead(mr)`（head_pipeline 的 sha 是否就是当前 sha；拿不到 sha 时按未知=有处理）、
+  `isPhantomRound(round)`（没有评审结论、且没有本提交流水线）、`normalizeRounds(rounds)`
+  （过滤伪轮次并重编号；没有伪轮次时原样返回，保留账本裁剪后的起始轮次）。
+  服务层每次快照把 `pipelineForHead` 写进当轮，作为「这一笔到底算不算一轮」的证据。
+- `service.js`：新 sha 到来时如果上一轮是伪轮次，直接替换它、复用轮次号；`bind` / `restore` 读账本时
+  先 `normalizeRounds`（老账本里没有证据字段的「非末轮 + 无评审」条目按伪轮次处理）。
+  等待评审的当前轮仍保留在内部状态里（watcher 需要它来等评审 / 提醒没流水线），只是不发进 UI 的轮次条。
+- `ui.js` 额外下发 `waiting: { sha, since }`：面板显示「已推送 <sha8>，等待流水线 / 评审」，
+  并在轮次条末尾放一个不带轮次号的 `⏳ 等待评审` 摘要——等待不是一个轮次。
+
+**展示层**
+
+- `client.js`：
+  - 问题：`首见 第 N 轮 · 出现 X 次（第a轮、第b轮）` 元信息；fixed 状态一律写「✓ 第 N 轮已修」；
+  - 路径改为 `.mrl-path` tag，`white-space:normal; word-break:break-all`，完整展示、不省略；
+  - 展开区在 `problem.snippet` 存在时渲染「源码」行（label 改为「源码」），没有就不渲染；
+  - 默认视图标题「问题 · 共 N 条 · 已修 X …」；进入某轮标题「第 N 轮新问题 · X 条 · 历史未收敛 Y」，
+    该轮没有新问题时只写一行摘要（不再有任何「本轮修复」清单）；
+  - 轮次条渲染完整 `rounds`（不再 `slice(-8)`），徽标 = `newCount`，`↻N` = 该轮重复出现的历史未收敛条数。
+
+### 验收
+
+- 测试 **353/353**（新增：唯一索引 5 项、伪轮次 / 流水线归属 3 项、service 轮次复用 2 项、
+  UI 伪轮次 / 完整轮次 2 项、源码解析 1 项；改写 UI / 客户端 6 项旧契约断言）。
+- 真实账本 !243：唯一索引 6 条（`da97a49527` 首见第 2 轮、出现 2 次，第 2、3 轮），
+  伪轮次被过滤后共 8 轮（原第 8、9 轮重编号为 7、8），轮次条 `第3轮 ● 0 ↻1`，
+  6 条全部 `fixed`（验证轮 3/4/5/6/7/8）。
+- 视觉台（`scripts/ui-harness.html`，真实 client bundle + 新契约假数据）：
+  - `?demo=merged`：见 `specs/assets/mr-loop-ui-findings-index-light.jpg`（6 条唯一问题 + 完整 8 轮）；
+  - `?demo=merged&round=3`：`mr-loop-ui-round-repeat-light.jpg`（第 3 轮 0 条新问题 + 历史未收敛 1）；
+  - `?demo=settled&expand=1`：`mr-loop-ui-source-code-light.jpg`（路径 tag 完整 + 展开显示源码）；
+  - `?demo=fallback`：`mr-loop-ui-waiting-light.jpg`（没流水线的那一笔不计轮次，单独「等待评审」）。

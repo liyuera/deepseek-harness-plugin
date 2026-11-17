@@ -79,67 +79,77 @@
   })();
 </script>
 <script>
-  // 假数据：覆盖「回落态」（当前轮评审没出 → 显示上一轮结论）/「当前轮已落地」/「可合」/「已合并」。
+  // 假数据（0.3.0 契约）：问题按 FID 唯一索引，只在首次出现的轮次里展示；
+  // 轮次条只算真实评审轮次（没流水线的那一笔不计），徽标 = 该轮新问题数，↻N = 历史未收敛重复数。
   // ?demo=fallback|settled|mergeable|merged 只挂对应的一个 MR，方便单卡截图。
-  const FALLBACK_MR = {
+  const PATH_UPLOAD = 'src/pages/report-manage/components/ReportUploadModal/index.tsx'
+  const PATH_PANEL = 'src/pages/report-manage/components/ReportInfoPanel.tsx'
+  const PATH_ECHO = 'src/pages/report-manage/utils/loadReportEcho.ts'
+  const PATH_STATUS = 'src/pages/report-manage/utils/reportStatus.tsx'
+
+  const problem = (over) => Object.assign({
+    level: '低', type: '非阻塞建议', status: 'open',
+    firstRound: 1, lastRound: 1, rounds: [1], count: 1,
+  }, over)
+
+  // !243 的 6 个真实 FID：同一 FID 只出现一次，da97a49527 在第 2、3 轮重复出现 → 次数 2。
+  const SIX = [
+    problem({ fid: '2870c3e6c9', file: PATH_UPLOAD, line: 302, firstRound: 2, lastRound: 2, rounds: [2], count: 1, status: 'fixed', fixedAtRound: 3,
+      problem: '同一份 vectorErrorMsg 在两个地方渲染：详情面板用 .vectorFailedTip 处理了长无空格串换行，弹窗里的报错条只给了 marginBottom，缺少换行控制。',
+      suggestion: '在新增的包裹节点上补最小换行样式，例如把 style 改为 { marginBottom: 16, wordBreak: break-all }。',
+      snippet: '<Alert style={{ marginBottom: 16, wordBreak: \'break-all\' }} message={echo.vectorErrorMsg} />' }),
+    problem({ fid: 'da97a49527', file: PATH_PANEL, line: 41, firstRound: 2, lastRound: 3, rounds: [2, 3], count: 2, status: 'fixed', fixedAtRound: 4,
+      problem: '两处报错渲染的条件口径不一致：详情面板按 reportStatus === FAILED 门禁，弹窗只看字段是否存在，非失败态残留时会出现「弹窗显示、详情不显示」。',
+      suggestion: '统一门禁条件：弹窗侧复用同样的状态判断，或在注释中明确以接口契约为唯一来源。',
+      snippet: 'echo?.vectorErrorMsg && reportStatus === REPORT_STATUS.FAILED && !errorDismissed' }),
+    problem({ fid: '3b3b7b9b20', file: PATH_ECHO, line: 130, firstRound: 4, lastRound: 4, rounds: [4], count: 1, status: 'fixed', fixedAtRound: 5,
+      problem: 'reportStatus 只对 null / undefined 兜底，详情接口返回空串时不会回落到列表行的状态。',
+      suggestion: '把空串一并归入回落条件：if (!reportStatus) return listRowStatus。',
+      snippet: 'const status = reportStatus ?? listRowStatus' }),
+    problem({ fid: 'e462d18b0d', file: PATH_STATUS, line: 78, firstRound: 5, lastRound: 5, rounds: [5], count: 1, status: 'fixed', fixedAtRound: 6,
+      problem: 'isVectorFailed 的 String() 兜底并未生效：后端返回数字状态时 String(2) 得到 "2"，与失败态文案比较依旧恒为 false。',
+      suggestion: '以 REPORT_STATUS 的实际定义为唯一口径：String(target?.reportStatus) === String(REPORT_STATUS.FAILED)。',
+      snippet: 'return String(target?.reportStatus) === String(REPORT_STATUS.FAILED)' }),
+    problem({ fid: 'c145950e29', file: PATH_STATUS, line: 78, firstRound: 6, lastRound: 6, rounds: [6], count: 1, status: 'fixed', fixedAtRound: 7,
+      problem: '注释正文里写入了内部评审单号（如「评审 FID e462d18b0d」），属于评审流程元数据，不是代码行为说明；台账归档后引用会失效，反而增加阅读噪音。',
+      suggestion: '保留「两侧都归一成字符串再比」这类行为说明，仅删掉括号内的评审 FID 引用。' }),
+    problem({ fid: 'fd56004d1a', file: PATH_ECHO, line: 41, firstRound: 7, lastRound: 7, rounds: [7], count: 1, status: 'fixed', fixedAtRound: 8,
+      problem: '注释口径与实际门禁不一致：注释写 reportStatus === FAILED，实际门禁是 isVectorFailed。',
+      suggestion: '把注释改成实际门禁口径，并注明失败态来源。' }),
+  ]
+  const roundOf = (n, verdict, newCount, extra) => Object.assign({
+    n, sha: 'c0cfe45f' + String(n).padStart(2, '0'), verdict, newCount, repeatCount: 0, total: newCount,
+    current: false, repeats: [], problems: [],
+  }, extra)
+
+  const MERGED_MR = {
     projectPath: 'wisdom-financial-service-platform/wisdom-financial-credit-platform-web',
     iid: 243, webUrl: 'https://git.example.com/x/-/merge_requests/243',
     sourceBranch: 'feat-V1.7.0.20261119-ly', targetBranch: 'feature-V1.7.0.20261119',
-    state: 'opened', sha: 'b30c43b3d96216de3ba526c16f1ec1c52fc4cb7e', round: 7,
-    updatedAt: '2026-11-17T07:03:08Z', live: true,
+    state: 'merged', sha: 'c0cfe45f8a7d41e69b3c2f1d0a5e8b74c6d9f012', round: 8,
+    updatedAt: '2026-11-17T08:00:00Z', live: true,
     session: { id: 'session-1', title: '财务服务平台 · 报告管理' },
-    review: null,
-    gates: { sensitive: null, mandatory: null },
-    merge: {
-      mergeable: false,
-      missing: ['AI 评审结论未知（未出或解析失败）'],
-      // head_pipeline 还停在上一笔提交：这笔 push 没触发流水线。
-      pipeline: { id: 7358, status: 'success', sha: '081bb374144f8151345d8dd1a337e500b79a351f' },
-    },
-    problemsRound: { n: 6, sha: '081bb374144f8151345d8dd1a337e500b79a351f', current: false },
+    review: { verdict: 'pass', historicalUnresolved: 0, verifiedFixed: 1, newThisRound: 0 },
+    gates: { sensitive: 'pass', mandatory: null },
+    merge: { mergeable: false, missing: [], terminal: 'merged', pipeline: { id: 7364, status: 'success', sha: 'c0cfe45f8a7d41e69b3c2f1d0a5e8b74c6d9f012' } },
+    problemsRound: { n: 8, sha: 'c0cfe45f8a7d41e69b3c2f1d0a5e8b74c6d9f012', current: true },
+    waiting: null,
+    summary: { total: 6, open: 0, fixed: 6, waived: 0 },
     rounds: [
-      { n: 1, verdict: 'pass', total: 0, open: 0, fixed: 0, current: false, problems: [] },
-      { n: 2, verdict: 'pass', total: 2, open: 0, fixed: 0, current: false, problems: [
-        { fid: '2870c3e6c9', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/components/ReportUploadModal/index.tsx', line: 302, problem: '同一份 vectorErrorMsg 在两个地方渲染，弹窗里的报错条缺少换行控制，长无空格串会横向溢出。', status: 'fixed', fixedAtRound: 3 },
-        { fid: 'da97a49527', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/components/ReportInfoPanel.tsx', line: 41, problem: '两处报错渲染的条件口径不一致：详情面板按 reportStatus 门禁，弹窗只看字段是否存在。', status: 'fixed', fixedAtRound: 4 },
-      ] },
-      { n: 3, verdict: 'pass', total: 1, open: 0, fixed: 1, current: false, problems: [
-        { fid: 'da97a49527', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/components/ReportInfoPanel.tsx', line: 41, problem: '两处报错渲染的条件口径不一致：详情面板按 reportStatus 门禁，弹窗只看字段是否存在。', status: 'fixed', fixedAtRound: 4 },
-        { fid: '2870c3e6c9', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/components/ReportUploadModal/index.tsx', line: 302, problem: '弹窗内新增的报错条缺少换行控制，长无空格串会横向溢出。', status: 'fixed', fixedAtRound: 3 },
-      ] },
-      { n: 4, verdict: 'pass', total: 1, open: 0, fixed: 1, current: false, problems: [
-        { fid: '3b3b7b9b20', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/utils/loadReportEcho.ts', line: 130, problem: 'reportStatus 只对 null/undefined 兜底，详情接口返回空串时不会回落到列表行的状态。', status: 'fixed', fixedAtRound: 5 },
-        { fid: 'da97a49527', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/components/ReportInfoPanel.tsx', line: 41, problem: '两处报错渲染的条件口径不一致。', status: 'fixed', fixedAtRound: 4 },
-      ] },
-      { n: 5, verdict: 'pass', total: 1, open: 0, fixed: 1, current: false, problems: [
-        { fid: 'e462d18b0d', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/utils/reportStatus.tsx', line: 78, problem: 'isVectorFailed 的 String() 兜底并未生效：后端返回数字状态时依旧是 false。', status: 'fixed', fixedAtRound: 6 },
-        { fid: '3b3b7b9b20', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/utils/loadReportEcho.ts', line: 130, problem: 'reportStatus 空串未兜底。', status: 'fixed', fixedAtRound: 5 },
-      ] },
-      { n: 6, verdict: 'pass', total: 1, open: 1, fixed: 1, current: false, problems: [
-        { fid: 'c145950e29', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/utils/reportStatus.tsx', line: 78, problem: '注释正文里写入了内部评审单号（如「评审 FID e462d18b0d」），属于评审流程元数据，不是代码行为说明；台账归档后引用会失效，反而增加阅读噪音。', suggestion: '保留「两侧都归一成字符串再比」这类行为说明，仅删掉括号内的评审 FID 引用，需要追溯时记在 MR/提交信息里。', status: 'open', unverified: true },
-        { fid: 'e462d18b0d', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/utils/reportStatus.tsx', line: 78, problem: 'isVectorFailed 的 String() 兜底并未生效。', status: 'fixed', fixedAtRound: 6 },
-      ] },
-      { n: 7, verdict: null, total: 0, open: 0, fixed: 0, current: true, problems: [] },
+      roundOf(1, 'pass', 0),
+      roundOf(2, 'pass', 2, { problems: [SIX[0], SIX[1]] }),
+      roundOf(3, 'pass', 0, { total: 1, repeatCount: 1, repeats: [{ fid: 'da97a49527', firstRound: 2, count: 2 }] }),
+      roundOf(4, 'pass', 1, { problems: [SIX[2]] }),
+      roundOf(5, 'pass', 1, { problems: [SIX[3]] }),
+      roundOf(6, 'pass', 1, { problems: [SIX[4]] }),
+      roundOf(7, 'pass', 1, { problems: [SIX[5]] }),
+      roundOf(8, 'pass', 0, { current: true }),
     ],
     pending: 0,
-    problems: [
-      {
-        fid: 'c145950e29', level: '低', type: '非阻塞建议',
-        file: 'src/pages/report-manage/utils/reportStatus.tsx', line: 78,
-        problem: '注释正文里写入了内部评审单号（如「评审 FID e462d18b0d」），属于评审流程元数据，不是代码行为说明；台账归档后引用会失效，反而增加阅读噪音。',
-        suggestion: '保留「两侧都归一成字符串再比」这类行为说明，仅删掉括号内的评审 FID 引用，需要追溯时记在 MR/提交信息里。',
-        status: 'open', unverified: true,
-      },
-      {
-        fid: 'e462d18b0d', level: '低', type: '非阻塞建议',
-        file: 'src/pages/report-manage/utils/reportStatus.tsx', line: 78,
-        problem: 'isVectorFailed 的 String() 兜底并未生效：后端返回数字状态时 String(2) 得到 "2"，依旧恒为 false。',
-        suggestion: '以 REPORT_STATUS 的实际定义为唯一口径：String(target?.reportStatus) === String(REPORT_STATUS.FAILED)。',
-        status: 'fixed', fixedAtRound: 6,
-      },
-    ],
+    problems: SIX,
   }
 
+  // !241：一个未处理、一个已修、一个已豁免；未处理那条带源码，用来验收展开后的源码行。
   const SETTLED_MR = {
     projectPath: 'wisdom-financial-service-platform/wisdom-financial-credit-platform-web',
     iid: 241, webUrl: 'https://git.example.com/x/-/merge_requests/241',
@@ -149,45 +159,59 @@
     session: { id: 'session-1', title: '财务服务平台 · 报告管理' },
     review: { verdict: 'pass', historicalUnresolved: 0, verifiedFixed: 1, newThisRound: 1 },
     gates: { sensitive: 'pass', mandatory: null },
-    merge: { mergeable: false, missing: ['评审有 1 处需要关注的问题（其中 1 处本轮新增）：FID aea50825a5（低）'], pipeline: { id: 7298, status: 'success', sha: '8a282d1540224ada925e502354b9f5866acec588' } },
+    merge: { mergeable: false, missing: ['评审有 1 处需要关注的问题：FID aea50825a5（低）'], pipeline: { id: 7298, status: 'success', sha: '8a282d1540224ada925e502354b9f5866acec588' } },
     problemsRound: { n: 2, sha: '8a282d1540224ada925e502354b9f5866acec588', current: true },
+    waiting: null,
+    summary: { total: 3, open: 1, fixed: 1, waived: 1 },
     rounds: [
-      { n: 1, verdict: 'pass', total: 2, open: 2, fixed: 0, current: false, problems: [
-        { fid: 'aea50825a5', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/components/ReportUploadModal/index.tsx', line: 81, problem: '回显加载态首帧未挂载字段，打开弹窗先闪一帧空表单', status: 'open' },
-        { fid: 'c3f0e7a1', level: '中', type: '逻辑错误', file: 'src/pages/report-manage/utils/loadReportEcho.ts', line: 44, problem: 'allSettled 后未区分 rejected，失败时把空对象写进表单', status: 'open' },
-      ] },
-      { n: 2, verdict: 'pass', total: 1, open: 1, fixed: 1, current: true, problems: [
-        { fid: 'aea50825a5', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/components/ReportUploadModal/index.tsx', line: 81, problem: '回显加载态首帧未挂载字段，打开弹窗先闪一帧空表单', status: 'open' },
-        { fid: 'c3f0e7a1', level: '中', type: '逻辑错误', file: 'src/pages/report-manage/utils/loadReportEcho.ts', line: 44, problem: 'allSettled 后未区分 rejected，失败时把空对象写进表单', status: 'fixed', fixedAtRound: 2 },
-        { fid: 'b71c9d02', level: '低', type: '非阻塞建议', file: 'src/types/BaoGaoGuanLi.ts', line: 12, problem: '类型字段与后端 DTO 命名不一致', suggestion: '把 orderer 字段对齐后端 DTO。', status: 'waived', instruction: { kind: 'waive', reason: '后端 DTO 已确认，本单不改', noteId: 75200 }, comment: { noteId: 75200, body: '#ai-waive b71c9d02 reason=后端 DTO 已确认，本单不改', author: 'liyu', createdAt: '2026-11-16T10:02:00Z' } },
-      ] },
+      roundOf(1, 'pass', 2, { problems: [
+        problem({ fid: 'aea50825a5', file: PATH_UPLOAD, line: 81, firstRound: 1, problem: '回显加载态首帧未挂载字段，打开弹窗先闪一帧空表单', suggestion: '把加载态与数据就绪度绑定：将 useState(false) 改为 useState(!!record?.id)。', snippet: 'const [loading, setLoading] = useState(false)' }),
+        problem({ fid: 'c3f0e7a1', file: PATH_ECHO, line: 44, firstRound: 1, lastRound: 2, rounds: [1, 2], count: 2, level: '中', type: '逻辑错误', status: 'fixed', fixedAtRound: 2, problem: 'allSettled 后未区分 rejected，失败时把空对象写进表单' }),
+      ] }),
+      roundOf(2, 'pass', 1, { total: 2, repeatCount: 1, current: true, repeats: [{ fid: 'c3f0e7a1', firstRound: 1, count: 2 }], problems: [
+        problem({ fid: 'b71c9d02', file: 'src/types/BaoGaoGuanLi.ts', line: 12, firstRound: 2, level: '低', status: 'waived',
+          problem: '类型字段与后端 DTO 命名不一致', suggestion: '把 orderer 字段对齐后端 DTO。',
+          instruction: { kind: 'waive', reason: '后端 DTO 已确认，本单不改', noteId: 75200 },
+          comment: { noteId: 75200, body: '#ai-waive b71c9d02 reason=后端 DTO 已确认，本单不改', author: 'liyu', createdAt: '2026-11-16T10:02:00Z' } }),
+      ] }),
     ],
     pending: 1,
     problems: [
-      {
-        fid: 'aea50825a5', level: '低', type: '非阻塞建议',
-        file: 'src/pages/report-manage/components/ReportUploadModal/index.tsx', line: 81,
-        problem: '回显加载态首帧未挂载字段，打开弹窗先闪一帧空表单',
-        suggestion: '把加载态与数据就绪度绑定：将 useState(false) 改为 useState(!!record?.id)。',
-        status: 'open',
-      },
-      {
-        fid: 'c3f0e7a1', level: '中', type: '逻辑错误',
-        file: 'src/pages/report-manage/utils/loadReportEcho.ts', line: 44,
-        problem: 'allSettled 后未区分 rejected，失败时把空对象写进表单',
-        suggestion: '区分 rejected 分支并降级。',
-        status: 'fixed', fixedAtRound: 2,
-      },
-      {
-        fid: 'b71c9d02', level: '低', type: '非阻塞建议',
-        file: 'src/types/BaoGaoGuanLi.ts', line: 12,
-        problem: '类型字段与后端 DTO 命名不一致',
-        suggestion: '把 orderer 字段对齐后端 DTO。',
-        snippet: 'export interface BaoGaoGuanLiVO {\n  ordererName: string   // 后端已改为 orderer\n}',
-        status: 'waived',
+      problem({ fid: 'aea50825a5', file: PATH_UPLOAD, line: 81, firstRound: 1, problem: '回显加载态首帧未挂载字段，打开弹窗先闪一帧空表单', suggestion: '把加载态与数据就绪度绑定：将 useState(false) 改为 useState(!!record?.id)。', snippet: 'const [loading, setLoading] = useState(false)' }),
+      problem({ fid: 'c3f0e7a1', file: PATH_ECHO, line: 44, firstRound: 1, lastRound: 2, rounds: [1, 2], count: 2, level: '中', type: '逻辑错误', status: 'fixed', fixedAtRound: 2, problem: 'allSettled 后未区分 rejected，失败时把空对象写进表单' }),
+      problem({ fid: 'b71c9d02', file: 'src/types/BaoGaoGuanLi.ts', line: 12, firstRound: 2, level: '低', status: 'waived',
+        problem: '类型字段与后端 DTO 命名不一致', suggestion: '把 orderer 字段对齐后端 DTO。',
         instruction: { kind: 'waive', reason: '后端 DTO 已确认，本单不改', noteId: 75200 },
-        comment: { noteId: 75200, body: '#ai-waive b71c9d02 reason=后端 DTO 已确认，本单不改', author: 'liyu', createdAt: '2026-11-16T10:02:00Z' },
-      },
+        comment: { noteId: 75200, body: '#ai-waive b71c9d02 reason=后端 DTO 已确认，本单不改', author: 'liyu', createdAt: '2026-11-16T10:02:00Z' } }),
+    ],
+  }
+
+  // 等待态：新提交 b30c43b3 没有流水线（head_pipeline 还停在 081bb374），所以不算一轮——轮次停在 6。
+  const FALLBACK_MR = {
+    projectPath: 'wisdom-financial-service-platform/wisdom-financial-credit-platform-web',
+    iid: 244, webUrl: 'https://git.example.com/x/-/merge_requests/244',
+    sourceBranch: 'feat-V1.7.0.20261119-ly', targetBranch: 'feature-V1.7.0.20261119',
+    state: 'opened', sha: 'b30c43b3d96216de3ba526c16f1ec1c52fc4cb7e', round: 6,
+    updatedAt: '2026-11-17T07:03:08Z', live: true,
+    session: { id: 'session-1', title: '财务服务平台 · 报告管理' },
+    review: { verdict: 'pass', historicalUnresolved: 0, verifiedFixed: 1, newThisRound: 1 },
+    gates: { sensitive: null, mandatory: null },
+    merge: { mergeable: false, missing: ['AI 评审结论未知（未出或解析失败）'], pipeline: { id: 7358, status: 'success', sha: '081bb374144f8151345d8dd1a337e500b79a351f' } },
+    problemsRound: { n: 6, sha: '081bb374144f8151345d8dd1a337e500b79a351f', current: true },
+    waiting: { sha: 'b30c43b3d96216de3ba526c16f1ec1c52fc4cb7e', since: '2026-11-17T07:03:08.000Z' },
+    summary: { total: 2, open: 1, fixed: 1, waived: 0 },
+    rounds: [
+      roundOf(1, 'pass', 0),
+      roundOf(2, 'pass', 1, { problems: [problem({ fid: '626f2bb1c4', file: PATH_STATUS, line: 41, firstRound: 2, status: 'fixed', fixedAtRound: 3, problem: '失败态判断在同一文件里出现两种写法。' })] }),
+      roundOf(3, 'pass', 0),
+      roundOf(4, 'pass', 0),
+      roundOf(5, 'pass', 0),
+      roundOf(6, 'pass', 1, { current: true, problems: [problem({ fid: 'c145950e29', file: PATH_STATUS, line: 78, firstRound: 6, unverified: true, problem: '注释正文里写入了内部评审单号，属于评审流程元数据，不是代码行为说明。', suggestion: '保留行为说明，删掉括号内的评审 FID 引用。', snippet: '// 评审 FID e462d18b0d：两侧都归一成字符串再比' })] }),
+    ],
+    pending: 0,
+    problems: [
+      problem({ fid: '626f2bb1c4', file: PATH_STATUS, line: 41, firstRound: 2, status: 'fixed', fixedAtRound: 3, problem: '失败态判断在同一文件里出现两种写法。' }),
+      problem({ fid: 'c145950e29', file: PATH_STATUS, line: 78, firstRound: 6, unverified: true, problem: '注释正文里写入了内部评审单号，属于评审流程元数据，不是代码行为说明。', suggestion: '保留行为说明，删掉括号内的评审 FID 引用。', snippet: '// 评审 FID e462d18b0d：两侧都归一成字符串再比' }),
     ],
   }
 
@@ -200,35 +224,9 @@
     gates: { sensitive: 'pass', mandatory: null },
     merge: { mergeable: true, missing: [], pipeline: { id: 7181, status: 'success' } },
     problemsRound: { n: 3, sha: '3f1d9c02', current: true },
-    rounds: [
-      { n: 2, verdict: 'pass', total: 2, open: 2, fixed: 0, current: false },
-      { n: 3, verdict: 'pass', total: 0, open: 0, fixed: 2, current: true },
-    ],
-    pending: 0, problems: [],
-  }
-
-  const MERGED_MR = {
-    projectPath: 'group/third', iid: 236, webUrl: 'https://git.example.com/g/p/-/merge_requests/236',
-    sourceBranch: 'feat-V1.7.0.20261112', targetBranch: 'feature-V1.7.0.20261112',
-    state: 'merged', sha: 'aa11bb2233cc', round: 9, updatedAt: '2026-11-17T08:00:00Z',
-    live: true, session: { id: 'session-3', title: '交付率口径' },
-    review: { verdict: 'pass', historicalUnresolved: 0, verifiedFixed: 1, newThisRound: 0 },
-    gates: { sensitive: null, mandatory: null },
-    // 终态：面板显示「已合并」，不再显示「差 N 项」（回归：合并后曾显示「差 1 项：MR 状态是 merged」）。
-    merge: { mergeable: false, missing: [], terminal: 'merged', pipeline: { id: 7364, status: 'success', sha: 'aa11bb2233cc' } },
-    problemsRound: { n: 9, sha: 'aa11bb2233cc', current: true },
-    rounds: [
-      { n: 2, verdict: 'pass', total: 1, open: 0, fixed: 0, current: false, problems: [
-        { fid: 'b1c2d3e4f5', level: '低', type: '非阻塞建议', file: 'src/pages/delivery/utils/rate.ts', line: 42, problem: '交付率口径在列表与详情两处各算一遍，四舍五入方式不一致。', status: 'fixed', fixedAtRound: 8 },
-      ] },
-      { n: 8, verdict: 'pass', total: 1, open: 0, fixed: 1, current: false, problems: [
-        { fid: 'fd56004d1a', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/utils/loadReportEcho.ts', line: 41, problem: '注释口径与实际门禁不一致：注释写 reportStatus === FAILED，实际门禁是 isVectorFailed。', status: 'fixed', fixedAtRound: 9 },
-        { fid: 'b1c2d3e4f5', level: '低', type: '非阻塞建议', file: 'src/pages/delivery/utils/rate.ts', line: 42, problem: '交付率口径两处各算一遍。', status: 'fixed', fixedAtRound: 8 },
-      ] },
-      { n: 9, verdict: 'pass', total: 0, open: 0, fixed: 1, current: true, problems: [
-        { fid: 'fd56004d1a', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/utils/loadReportEcho.ts', line: 41, problem: '注释口径与实际门禁不一致：注释写 reportStatus === FAILED，实际门禁是 isVectorFailed。', status: 'fixed', fixedAtRound: 9 },
-      ] },
-    ],
+    waiting: null,
+    summary: { total: 0, open: 0, fixed: 0, waived: 0 },
+    rounds: [roundOf(2, 'pass', 0), roundOf(3, 'pass', 0, { current: true })],
     pending: 0, problems: [],
   }
 
@@ -297,13 +295,17 @@
       const open = document.querySelector('.mrl-chip-btn') ||
         Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === '看板')
       if (open) open.click()
-      // ?round=2 模拟点开某一轮（历史轮截图用）。
+      // ?round=2 模拟点开某一轮（历史轮截图用）；?expand=1 再展开第一条问题（源码行截图用）。
       const wanted = new URLSearchParams(location.search).get('round')
       if (wanted) setTimeout(function () {
         const chip = Array.from(document.querySelectorAll('.mrl-rounds .mrl-round'))
           .find(function (node) { return node.textContent.indexOf('第' + wanted + '轮') === 0 })
         if (chip) chip.click()
       }, 400)
+      if (new URLSearchParams(location.search).get('expand')) setTimeout(function () {
+        const chev = document.querySelector('.mrl-issue .mrl-chev')
+        if (chev) chev.click()
+      }, 800)
     }, 300)
   }
 </script>

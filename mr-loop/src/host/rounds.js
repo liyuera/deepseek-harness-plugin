@@ -25,6 +25,64 @@ export function reviewShaOf(body) {
   return match ? match[1].toLowerCase() : null
 }
 
+/**
+ * 这笔提交到底有没有流水线：GitLab 的 head_pipeline 是「这个 MR 最新的流水线」，
+ * 新 push 之后它可能还停在上一个 commit 上（sha 不一致）——此时评审不会被自动产出。
+ * 返回 false 表示**已知**没有本提交的流水线；实例没给 sha / 当前 sha 缺失时无法证明，
+ * 按 true（未知）处理，绝不误报。
+ */
+export function pipelineForHead(mr) {
+  if (mr?.head_pipeline === null || mr?.head_pipeline === undefined) return false
+  const headSha = typeof mr.sha === 'string' ? mr.sha : ''
+  const pipelineSha = typeof mr.head_pipeline.sha === 'string' ? mr.head_pipeline.sha : null
+  if (pipelineSha === null || headSha === '') return true
+  return pipelineSha === headSha
+}
+
+/**
+ * 伪轮次：没有任何评审结论、且没有本提交流水线的轮次。
+ *
+ * 用户口径（0.3.0）：**轮次 = 一次评审**。push 了一笔提交但流水线没跑起来时，
+ * 评审不会自己来，这一笔不能把轮次 +1。真实状态仍留在 `state.round` 内部（watcher
+ * 要按它等评审 / 提醒没流水线），只是不进面板轮次条、不占用轮次号。
+ *
+ * 证据字段 `pipelineForHead` 由服务层每次快照写入；老账本没有该字段时：
+ * 非末轮且无评审 → 判定为伪轮次（它从未产出过结论，重编号后不丢信息）；
+ * 末轮保留（可能是旧版本正在等待评审的当前轮，不能静默吞掉）。
+ * @param {object} round
+ * @param {{ last?: boolean }} [options]
+ */
+export function isPhantomRound(round, options = {}) {
+  if (round === null || typeof round !== 'object') return true
+  if (round.review !== null && round.review !== undefined) return false
+  if (round.pipelineForHead === true) return false
+  if (round.pipelineForHead === false) return true
+  // 老账本没有证据字段：末轮保留（可能正是旧版本在等评审的当前轮，不能静默吞掉）；
+  // 非末轮且 `binding` 明确为 null（buildRound 的「没有评审」）才判定伪轮次。
+  // 只带 n / sha 的精简账本（测试或人工回填）不误删。
+  if (options.last === true) return false
+  return round.binding === null
+}
+
+/**
+ * 面板 / 账本恢复用的轮次规范化：去掉伪轮次并重编号，保证「轮次号连续、不因没流水线的
+ * 提交跳号」。没有伪轮次时原样返回（保留账本裁剪后的起始编号，不把历史轮改成第 1 轮）。
+ * @param {object[]} rounds
+ * @returns {object[]}
+ */
+export function normalizeRounds(rounds) {
+  const list = Array.isArray(rounds) ? rounds : []
+  const kept = []
+  for (let index = 0; index < list.length; index += 1) {
+    if (isPhantomRound(list[index], { last: index === list.length - 1 })) continue
+    kept.push(list[index])
+  }
+  if (kept.length === list.length) return list
+  // 以第一个保留轮次的编号为基准往后排：账本裁剪（只留最近 N 轮）时不会把起始轮改成第 1 轮。
+  const base = Number.isSafeInteger(kept[0]?.n) && kept[0].n > 0 ? kept[0].n - 1 : 0
+  return kept.map((round, index) => ({ ...round, n: base + index + 1 }))
+}
+
 const SHA_RE = /^[0-9a-f]{7,64}$/
 
 /**

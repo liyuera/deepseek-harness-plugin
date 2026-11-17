@@ -52,3 +52,12 @@ test('reviewMarker 可配置：标记改名后可解析，默认标记下仍是 
   // 空 marker 不能 fail-open 成「任意结论行都是评审」。
   assert.equal(isReviewBody('结论: 可直接合并', { marker: '' }), false)
 })
+
+test('源码字段 → snippet（展开时显示源码）；没有源码时为空串', () => {
+  const result = parseReview(fixture('review-needs-fix.md'))
+  assert.equal(result.blocking[0].snippet, 'if (isEdit && row.fileList)')
+  assert.equal(result.nonBlocking[0].snippet, 'text-align: right')
+
+  const body = '## AI Code Review (a -> b)\n\n结论：**需要修改**\n\n### 需要关注的问题\n1. **文件**: `x.ts`\n   - FID: `ff`\n   - 级别: 中\n   - 问题: boom\n'
+  assert.equal(parseReview(body).blocking[0].snippet, '')
+})

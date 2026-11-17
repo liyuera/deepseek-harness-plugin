@@ -1505,3 +1505,69 @@ test('stop（不 forget）抹掉账本里的 sessionId：显式停止的 MR 不�
     await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
   }
 })
+
+// ---------------------------------------------------------------------------
+// 0.3.0：轮次 = 一次评审。push 了但流水线没跑起来的那一笔不占轮次号。
+// ---------------------------------------------------------------------------
+
+test('applySnapshot：没有流水线的新 sha 不占轮次号，下一笔有流水线的 sha 复用该编号', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mrloop-service-'))
+  const pipeline = (sha, status = 'success') => ({ id: 7358, status, created_at: '2026-11-13T09:59:00Z', sha })
+  let current = mr()
+  const service = createService({
+    config: resolveConfig({ baseUrl: 'https://git.x.com' }),
+    ledger: createLedger({ dir }),
+    gitlab: { getMergeRequest: async () => current, listNotes: async () => notes(), listDiscussions: async () => [], listPipelines: async () => [] },
+    repoState: async () => ({ root: '/r', host: 'git.x.com', projectPath: 'g/p', branch: 'feat-x' }),
+    now: () => NOW,
+  })
+  await service.bind({ sessionId: 's', url: 'https://git.x.com/g/p/-/merge_requests/240', repoRoot: '/r' })
+
+  // 新 push 到 B，但 head_pipeline 还停在 A：这笔提交没有流水线，评审不会自己来。
+  const B = 'b'.repeat(40)
+  current = mr({ sha: B, head_pipeline: pipeline(SHA) })
+  const second = service.applySnapshot({ sessionId: 's', mr: current, notes: [] })
+  assert.equal(second.newRound, true)
+  assert.equal(second.state.round.n, 2)
+  assert.equal(second.state.round.pipelineForHead, false, '证据：这笔提交没有流水线')
+
+  // 再 push 到 C，流水线跟上了 C：B 不占轮次号，C 复用第 2 轮。
+  const C = 'c'.repeat(40)
+  current = mr({ sha: C, head_pipeline: pipeline(C, 'running') })
+  const third = service.applySnapshot({ sessionId: 's', mr: current, notes: [] })
+  assert.equal(third.newRound, true)
+  assert.equal(third.state.round.n, 2, '没有流水线的 B 不计轮次，C 仍是第 2 轮')
+  assert.equal(third.state.round.pipelineForHead, true)
+  assert.deepEqual(third.state.rounds.map((item) => [item.n, item.sha]), [[1, SHA], [2, C]])
+  await service.stop({ sessionId: 's' })
+  await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
+})
+
+test('applySnapshot：等待中的同一 sha 后来有了流水线 → 该轮转为真轮次', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mrloop-service-'))
+  const pipeline = (sha) => ({ id: 7358, status: 'running', created_at: '2026-11-13T09:59:00Z', sha })
+  let current = mr({ head_pipeline: pipeline(SHA) })
+  const service = createService({
+    config: resolveConfig({ baseUrl: 'https://git.x.com' }),
+    ledger: createLedger({ dir }),
+    gitlab: { getMergeRequest: async () => current, listNotes: async () => notes(), listDiscussions: async () => [], listPipelines: async () => [] },
+    repoState: async () => ({ root: '/r', host: 'git.x.com', projectPath: 'g/p', branch: 'feat-x' }),
+    now: () => NOW,
+  })
+  await service.bind({ sessionId: 's', url: 'https://git.x.com/g/p/-/merge_requests/240', repoRoot: '/r' })
+
+  const B = 'b'.repeat(40)
+  current = mr({ sha: B, head_pipeline: pipeline(SHA) })
+  service.applySnapshot({ sessionId: 's', mr: current, notes: [] })
+  assert.equal(service.getState('s').round.pipelineForHead, false)
+
+  // 同一 sha 的下一 tick：流水线出现了（GitLab 的 head_pipeline 可能延迟）。
+  current = mr({ sha: B, head_pipeline: pipeline(B) })
+  service.applySnapshot({ sessionId: 's', mr: current, notes: [] })
+  const state = service.getState('s')
+  assert.equal(state.round.sha, B)
+  assert.equal(state.round.n, 2, '同一轮只刷新证据，不加轮次')
+  assert.equal(state.round.pipelineForHead, true)
+  await service.stop({ sessionId: 's' })
+  await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
+})
