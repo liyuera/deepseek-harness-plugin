@@ -210,11 +210,24 @@
   const MERGED_MR = {
     projectPath: 'group/third', iid: 236, webUrl: 'https://git.example.com/g/p/-/merge_requests/236',
     sourceBranch: 'feat-V1.7.0.20261112', targetBranch: 'feature-V1.7.0.20261112',
-    state: 'merged', sha: 'aa11bb22', round: 4, updatedAt: '2026-11-13T09:40:00Z',
-    live: false, session: { id: 'session-3', title: '交付率口径' },
-    review: { verdict: 'pass', historicalUnresolved: 0, verifiedFixed: 3, newThisRound: 0 },
-    gates: { sensitive: 'pass', mandatory: null },
-    merge: { mergeable: false, missing: [], pipeline: { id: 7001, status: 'success' } },
+    state: 'merged', sha: 'aa11bb2233cc', round: 9, updatedAt: '2026-11-17T08:00:00Z',
+    live: true, session: { id: 'session-3', title: '交付率口径' },
+    review: { verdict: 'pass', historicalUnresolved: 0, verifiedFixed: 1, newThisRound: 0 },
+    gates: { sensitive: null, mandatory: null },
+    // 终态：面板显示「已合并」，不再显示「差 N 项」（回归：合并后曾显示「差 1 项：MR 状态是 merged」）。
+    merge: { mergeable: false, missing: [], terminal: 'merged', pipeline: { id: 7364, status: 'success', sha: 'aa11bb2233cc' } },
+    problemsRound: { n: 9, sha: 'aa11bb2233cc', current: true },
+    rounds: [
+      { n: 2, verdict: 'pass', total: 2, open: 2, fixed: 0, current: false, problems: [
+        { fid: 'b1c2d3e4f5', level: '低', type: '非阻塞建议', file: 'src/pages/delivery/utils/rate.ts', line: 42, problem: '交付率口径在列表与详情两处各算一遍，四舍五入方式不一致。', status: 'open' },
+        { fid: 'c2d3e4f5a6', level: '中', type: '逻辑错误', file: 'src/pages/delivery/utils/rate.ts', line: 88, problem: '分母为 0 时直接除，NaN 会写进报表。', status: 'open' },
+      ] },
+      { n: 8, verdict: 'pass', total: 1, open: 1, fixed: 1, current: false, problems: [
+        { fid: 'fd56004d1a', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/utils/loadReportEcho.ts', line: 41, problem: '注释仍把两处共用的状态门禁描述为 reportStatus === FAILED，但实际门禁是 isVectorFailed（内部先把 reportStatus 与常量都归一成字符串再比）。同文件的 reportStatus.tsx 注释已明确说明「不归一成字符串时，下发数字的 reportStatus 会让 === FAILED 恒为 false」，注释与实现口径不一致。', status: 'open' },
+        { fid: 'b1c2d3e4f5', level: '低', type: '非阻塞建议', file: 'src/pages/delivery/utils/rate.ts', line: 42, problem: '交付率口径两处各算一遍。', status: 'fixed', fixedAtRound: 8 },
+      ] },
+      { n: 9, verdict: 'pass', total: 0, open: 0, fixed: 1, current: true, problems: [] },
+    ],
     pending: 0, problems: [],
   }
 

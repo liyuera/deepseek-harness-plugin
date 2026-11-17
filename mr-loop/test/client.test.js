@@ -452,3 +452,41 @@ test('看板：重载后刚恢复的活绑定（还没拉到 MR 快照）不能�
   assert.match(texts, /刚恢复监视，正在拉取 MR 状态/)
   assert.doesNotMatch(texts, /历史账本/)
 })
+
+test('看板：已合并 / 已关闭的 MR 不显示「差 N 项」，复制指令同时禁用（回归：合并后显示「差 1 项：MR 状态是 merged」）', async () => {
+  const merged = {
+    ...fallbackMr,
+    state: 'merged',
+    round: 9,
+    sha: 'c0cfe45f12345678',
+    review: { verdict: 'pass', historicalUnresolved: 0, verifiedFixed: 1, newThisRound: 0 },
+    gates: { sensitive: null, mandatory: null },
+    merge: { mergeable: false, missing: [], terminal: 'merged', pipeline: { id: 7364, status: 'success', sha: 'c0cfe45f12345678' } },
+    pending: 0,
+    problemsRound: { n: 9, sha: 'c0cfe45f12345678', current: true },
+    rounds: [
+      { n: 8, verdict: 'pass', total: 1, open: 1, fixed: 0, current: false, problems: fallbackMr.rounds[1].problems },
+      { n: 9, verdict: 'pass', total: 0, open: 0, fixed: 1, current: true, problems: [] },
+    ],
+    problems: [],
+  }
+  const { loaded, panel } = await renderPanel(merged)
+  const texts = textOfTree(panel).join(' | ')
+  assert.match(texts, /已合并（sha c0cfe45f）/)
+  assert.doesNotMatch(texts, /差 [0-9]+ 项/)
+  assert.doesNotMatch(texts, /MR 状态是 merged/)
+  const copy = nodesByClass(panel, 'mrl-btn').find((node) => textOfTree(node)[0] === '复制指令')
+  assert.equal(copy.props.disabled, true)
+
+  const closed = {
+    ...merged,
+    state: 'closed',
+    merge: { mergeable: false, missing: [], terminal: 'closed', pipeline: null },
+    review: null,
+    rounds: merged.rounds.map((round) => ({ ...round, verdict: round.n === 9 ? null : round.verdict })),
+  }
+  const second = await renderPanel(closed)
+  const closedTexts = textOfTree(second.panel).join(' | ')
+  assert.match(closedTexts, /MR 已关闭（未合并）/)
+  assert.doesNotMatch(closedTexts, /差 [0-9]+ 项/)
+})

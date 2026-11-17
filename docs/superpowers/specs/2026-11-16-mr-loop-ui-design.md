@@ -339,3 +339,39 @@ head_pipeline 是「这个 MR 最新的流水线」，新提交没触发流水�
   `mr-loop-ui-round-history-dark.jpg`。
 - 真机验证：绑定 → 重载插件 → 账本 `binding.sessionId` 恢复 → `/mr-loop/ui/state` 里该 MR 仍是 `live: true`
   且合并判定仍在算 → `mr_stop` 后回到「历史账本」。
+
+## 十四、终态不再算「差几项」：合并后显示「已合并」（2026-11-17，v0.2.7）
+
+### 症状（用户实拍）
+
+MR !243 已经合并（卡片标签已经是「已合并」「第 9 轮」），合并条却是红的
+**「差 1 项：MR 状态是 merged」**，右上角还挂着「差 1 项」——已完成的 MR 反而在报「没做完」。
+
+### 根因
+
+`evaluateMergeable` 是「现在能不能合」的判定，`mr.state !== 'opened'` 会进 missing
+（`MR 状态是 ${state}`）。合并/关闭后仍用同一套判定渲染，就出现了这条自相矛盾的缺口；
+`ui.js` 的 `merge` 与 `report.js` 的「合并」行都照抄了它。
+
+### 改法
+
+- `mergeable.js`：`merged / closed` 直接返回
+  `{ mergeable:false, missing:[], degraded:false, terminal:'merged'|'closed' }`，
+  不再走「差 N 项」；`terminal` 让调用方能区分「不可合」与「已结束」。
+- `report.js`：终态时「合并」行写 `✅ 已合并（sha xxx） · 流水线 #…` /
+  `— MR 已关闭（未合并）`。
+- `ui.js`：`merge` 带 `terminal`；终态时 `pending` 归零（已合并的 MR 不该再报「N 待处理」）；
+  live 快照缺失但有账本 `terminal` 时也给终态 merge（不再退回「历史账本（未在跟踪）」）。
+- `client.js`：终态合并条用绿色「已合并（sha …）」/ 灰色「MR 已关闭（未合并）」；
+  右上角标签只显示「已合并 / 已关闭」，不显示「差 N 项」；`复制指令` 禁用。
+- `counts.mergeable` 仍只算 `mergeable === true` 的 MR，终态不会混进去。
+
+### 验收
+
+- 测试 **337/337**（新增：mergeable 终态 1 项、report 终态 1 项、UI 终态 2 项、客户端终态渲染 1 项）。
+- 视觉台：`?demo=merged`（已合并卡片）、`?demo=merged&round=8`（合并后点开历史轮）；
+  截图 `specs/assets/mr-loop-ui-merged-light.jpg`。
+- 真实数据：!243 合并后 merge 为 `{terminal:'merged', missing:[], pipeline:{…}}`（pipeline 只在
+  还有 live 快照时有），pending 0，合并条绿色「已合并（sha c0cfe45f）」，不再出现
+  「差 1 项：MR 状态是 merged」。终态账本不会被 rehydrate 恢复成「监视中」：重载后卡片
+  标「历史账本」+「已合并」，属于预期。

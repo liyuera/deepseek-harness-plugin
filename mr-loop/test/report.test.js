@@ -428,3 +428,26 @@ test('#6：有无效指令时报告加「无效指令 N 条」提示；没有时
   })
   assert.match(legacy, /^指令 {3}⚠️ 无效指令 1 条（格式不对，未生效）$/m)
 })
+
+test('终态报告：merged 写「已合并」而不是「差 N 项」，closed 写「已关闭」', () => {
+  const merged = renderReport({
+    ...base,
+    mr: { ...mr, state: 'merged', head_pipeline: { id: 7364, status: 'success' } },
+    mergeability: evaluateMergeable({
+      mr: { state: 'merged', head_pipeline: { id: 7364, status: 'success' } },
+      round,
+      decisions: {},
+    }),
+  })
+  assert.match(merged, /合并 {3}✅ 已合并（sha 0e2a9007） · 流水线 #7364 success/)
+  assert.doesNotMatch(merged, /差 \d+ 项/)
+  assert.doesNotMatch(merged, /MR 状态是 merged/)
+
+  const closed = renderReport({
+    ...base,
+    mr: { ...mr, state: 'closed', head_pipeline: null },
+    mergeability: evaluateMergeable({ mr: { state: 'closed', head_pipeline: null }, round, decisions: {} }),
+  })
+  assert.match(closed, /合并 {3}— MR 已关闭（未合并） · 无流水线/)
+  assert.doesNotMatch(closed, /差 \d+ 项/)
+})

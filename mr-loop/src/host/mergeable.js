@@ -154,6 +154,12 @@ function historyGap(review) {
 }
 
 export function evaluateMergeable({ mr, round, decisions = {} }) {
+  // MR 已经结束（merged / closed）就不再判「能不能合」：否则 missing 里会出现
+  // 「MR 状态是 merged」这种自相矛盾的缺口（合并完成反而显示「差 1 项」）。
+  const state = mr?.state
+  if (state === 'merged' || state === 'closed') {
+    return { mergeable: false, missing: [], degraded: false, terminal: state }
+  }
   const missing = []
   let degraded = false
 

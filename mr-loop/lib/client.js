@@ -589,14 +589,25 @@ window.__ModuleLoader__.load({
       var problems = Array.isArray(mr.problems) ? mr.problems : [];
       var pending = mr.pending || 0;
       var merge = mr.merge;
-      var mergeKind = merge === null ? "none" : (merge.mergeable === true ? "ok" : "bad");
-      var mergeIcon = merge === null ? "—" : (merge.mergeable === true ? "✅" : "⛔");
+      // 已结束（merged / closed）的 MR 不再显示「差 N 项」：合并完成反而报「差 1 项：MR 状态是 merged」
+      // 自相矛盾，也误导用户以为还要做什么。
+      var mergeTerminal = merge !== null && typeof merge.terminal === "string" ? merge.terminal : null;
+      var mergeKind = merge === null
+        ? "none"
+        : (mergeTerminal === "merged" || merge.mergeable === true ? "ok" : mergeTerminal === "closed" ? "none" : "bad");
+      var mergeIcon = merge === null
+        ? "—"
+        : (mergeTerminal === "merged" || merge.mergeable === true ? "✅" : mergeTerminal === "closed" ? "—" : "⛔");
       var mergeText = merge === null
         // 插件重载后绑定会被自动恢复，但 MR 快照要等第一次 tick 才拉回来：这期间不能说「未在跟踪」。
         ? (mr.live === true ? "刚恢复监视，正在拉取 MR 状态…" : "历史账本（未在跟踪）")
-        : (merge.mergeable === true
-            ? "可合"
-            : "差 " + (merge.missing ? merge.missing.length : 0) + " 项：" + (merge.missing || []).join("；"));
+        : mergeTerminal === "merged"
+          ? "已合并（sha " + String(mr.sha || "").slice(0, 8) + "）"
+          : mergeTerminal === "closed"
+            ? "MR 已关闭（未合并）"
+            : (merge.mergeable === true
+                ? "可合"
+                : "差 " + (merge.missing ? merge.missing.length : 0) + " 项：" + (merge.missing || []).join("；"));
       var pipeline = merge && merge.pipeline
         ? "流水线 #" + merge.pipeline.id + (merge.pipeline.status === "success" ? " ✓" : " " + merge.pipeline.status)
         : null;
@@ -620,11 +631,15 @@ window.__ModuleLoader__.load({
 
       var statusTag = mr.state === "merged"
         ? h("span", { className: "mrl-tag", key: "state" }, "已合并")
-        : merge === null
-          ? null
-          : (merge.mergeable === true
-              ? h("span", { className: "mrl-tag ok", key: "state" }, "可合")
-              : h("span", { className: "mrl-tag err", key: "state" }, "差 " + (merge.missing ? merge.missing.length : 0) + " 项"));
+        : mr.state === "closed"
+          ? h("span", { className: "mrl-tag", key: "state" }, "已关闭")
+          : merge === null
+            ? null
+            : (merge.mergeable === true
+                ? h("span", { className: "mrl-tag ok", key: "state" }, "可合")
+                : mergeTerminal !== null
+                  ? null
+                  : h("span", { className: "mrl-tag err", key: "state" }, "差 " + (merge.missing ? merge.missing.length : 0) + " 项"));
       var tags = [
         h("span", { className: "mrl-tag brand", key: "round" }, "第 " + (mr.round || 0) + " 轮"),
         statusTag,
@@ -645,8 +660,11 @@ window.__ModuleLoader__.load({
       var shownProblems = browsing
         ? (Array.isArray(pickedRound.problems) ? pickedRound.problems : [])
         : problems;
-      // 复制指令只对默认视图开放：翻历史轮时翻到的 FID 可能早就修好了，不能拿来发豁免。
-      var openProblem = browsing ? undefined : problems.filter(function (p) { return p.status === "open"; })[0];
+      // 复制指令只对默认视图开放：翻历史轮时翻到的 FID 可能早就修好了，不能拿来发豁免；
+      // MR 已结束（merged / closed）时也禁用：评审问题已成历史。
+      var openProblem = browsing || mergeTerminal !== null
+        ? undefined
+        : problems.filter(function (p) { return p.status === "open"; })[0];
       var pickRound = function (n) {
         var next = Object.assign({}, state.roundSel);
         if (n === null) delete next[roundKey];

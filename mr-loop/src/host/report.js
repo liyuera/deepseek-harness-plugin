@@ -137,9 +137,15 @@ export function renderReport({ binding, mr, round, decisions = {}, mergeability,
   const pipelineLabel = pipeline === null || pipeline === undefined
     ? '无流水线'
     : `流水线 #${pipeline.id ?? '?'} ${pipeline.status ?? 'unknown'}`
-  const mergeLine = mergeability.mergeable
-    ? `${OK} 可合${degradedSuffix} · ${pipelineLabel}`
-    : `${BAD} 差 ${mergeability.missing.length} 项：${mergeability.missing.join('；')}${degradedSuffix} · ${pipelineLabel}`
+  // 终态（merged / closed）不再写「差 N 项」：已经结束了，没有「还差什么」可讲。
+  const terminal = typeof mergeability?.terminal === 'string' ? mergeability.terminal : null
+  const mergeLine = terminal === 'merged'
+    ? `${OK} 已合并（sha ${String(mr?.sha ?? '').slice(0, 8)}） · ${pipelineLabel}`
+    : terminal === 'closed'
+      ? `${DASH} MR 已关闭（未合并） · ${pipelineLabel}`
+      : mergeability.mergeable
+        ? `${OK} 可合${degradedSuffix} · ${pipelineLabel}`
+        : `${BAD} 差 ${mergeability.missing.length} 项：${mergeability.missing.join('；')}${degradedSuffix} · ${pipelineLabel}`
   lines.push(`${pad('合并')}${mergeLine}`)
 
   if (paused !== null && paused !== undefined) {

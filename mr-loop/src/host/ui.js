@@ -115,6 +115,17 @@ function roundSummaryOf(record, index) {
   }
 }
 
+/** 流水线摘要：head_pipeline 可能还停在上一笔提交，sha 一并给出供面板判断。 */
+function pipelineOf(mr) {
+  const pipeline = mr?.head_pipeline
+  if (pipeline === null || pipeline === undefined) return null
+  return {
+    id: pipeline.id,
+    status: pipeline.status,
+    sha: typeof pipeline.sha === 'string' ? pipeline.sha : null,
+  }
+}
+
 /** MR 地址：用配置的 baseUrl（含可能的子路径）拼，不写死实例 host（M2）。 */
 function webUrlOf(config, binding) {
   let base
@@ -173,6 +184,11 @@ function resultOf(record, live, config) {
   const mergeability = mr === undefined || roundSha === '' || mrSha !== roundSha
     ? null
     : evaluateMergeable({ mr, round, decisions })
+  // 终态（merged / closed）：账本 terminal 是永久的；live 时也可以从 MR 快照看出来。
+  // 已经结束的 MR 不再算「差几项」——之前会把「MR 状态是 merged」当成缺口显示成「差 1 项」。
+  const terminalState = typeof record?.terminal === 'string' && record.terminal !== ''
+    ? record.terminal
+    : (mr?.state === 'merged' || mr?.state === 'closed' ? mr.state : null)
   const roundStart = Math.max(0, rounds.length - UI_ROUNDS)
   return {
     projectPath: binding.projectPath ?? '',
@@ -200,19 +216,23 @@ function resultOf(record, live, config) {
       sensitive: round?.sensitive?.verdict ?? null,
       mandatory: round?.mandatory?.verdict ?? null,
     },
-    merge: mergeability === null ? null : {
-      mergeable: mergeability.mergeable === true,
-      missing: mergeability.missing,
-      // sha 一并给出：head_pipeline 可能还停在上一笔提交（这笔 push 没触发流水线），
-      // 面板据此提示「这笔提交还没有流水线」，而不是让用户以为评审是插件没解析出来。
-      pipeline: mr?.head_pipeline === null || mr?.head_pipeline === undefined
+    merge: terminalState !== null
+      ? {
+          mergeable: false,
+          missing: [],
+          // 终态单独标注：面板显示「已合并 / 已关闭」，不再显示「差 N 项」。
+          terminal: terminalState,
+          pipeline: pipelineOf(mr),
+        }
+      : mergeability === null
         ? null
         : {
-            id: mr.head_pipeline.id,
-            status: mr.head_pipeline.status,
-            sha: typeof mr.head_pipeline.sha === 'string' ? mr.head_pipeline.sha : null,
+            mergeable: mergeability.mergeable === true,
+            missing: mergeability.missing,
+            // sha 一并给出：head_pipeline 可能还停在上一笔提交（这笔 push 没触发流水线），
+            // 面板据此提示「这笔提交还没有流水线」，而不是让用户以为评审是插件没解析出来。
+            pipeline: pipelineOf(mr),
           },
-    },
     // 问题来自哪一轮：current=false 表示当前轮评审还没出、显示的是上一轮结论（面板要标注）。
     problemsRound: displayRound === null ? null : {
       n: Number.isSafeInteger(displayRound.n) ? displayRound.n : displayIndex + 1,
@@ -231,7 +251,8 @@ function resultOf(record, live, config) {
       if (comment !== undefined) problem.comment = comment
       return problem
     }),
-    pending: todo.total,
+    // 已结束的 MR 不再报「待处理」：评审问题已成历史，主代理不需要再动手。
+    pending: terminalState !== null ? 0 : todo.total,
   }
 }
 

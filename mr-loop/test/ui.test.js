@@ -343,3 +343,52 @@ test('面板：每轮摘要都带自己的问题正文（历史轮点开即可�
   // 历史轮的问题不标 unverified（那是「当前视图」的语义）。
   assert.equal('unverified' in r1.problems[0], false)
 })
+
+// ---------------------------------------------------------------------------
+// 终态：merged / closed 的 MR 不再显示「差 N 项：MR 状态是 merged」，也不再报待处理
+// ---------------------------------------------------------------------------
+
+test('面板：已合并的 live MR → merge 带 terminal、missing 为空、pending 归零', async () => {
+  const mergedMr = {
+    state: 'merged',
+    sha: SHA,
+    draft: false,
+    has_conflicts: false,
+    blocking_discussions_resolved: true,
+    merge_status: 'can_be_merged',
+    head_pipeline: { id: 7364, status: 'success', sha: SHA },
+  }
+  const round = { ...roundOf(), review: { ...roundOf().review, verdict: 'changes' }, n: 9 }
+  const record = { ...recordOf({ iid: 251, round }), rounds: [round], terminal: 'merged' }
+  const liveState = {
+    sessionId: 'session-live',
+    binding: { projectPath: 'group/project', iid: 251 },
+    mr: mergedMr,
+    round,
+    rounds: [round],
+    decisions: {},
+    terminal: 'merged',
+  }
+  const snapshot = await snapshotWithLive([record], [liveState])
+  const mr = snapshot.mrs[0]
+  assert.equal(mr.state, 'merged')
+  assert.deepEqual(mr.merge, {
+    mergeable: false,
+    missing: [],
+    terminal: 'merged',
+    pipeline: { id: 7364, status: 'success', sha: SHA },
+  })
+  // 问题照常能看到（历史），但不再计入待处理。
+  assert.equal(mr.problems.length, 1)
+  assert.equal(mr.pending, 0)
+})
+
+test('面板：只有账本的已合并 MR（没有 live 快照）也给 terminal 的 merge', async () => {
+  const snapshot = await snapshotOf([recordOf({ iid: 252, round: roundOf(), terminal: 'merged' })])
+  const mr = snapshot.mrs[0]
+  assert.equal(mr.live, false)
+  assert.deepEqual(mr.merge, { mergeable: false, missing: [], terminal: 'merged', pipeline: null })
+  assert.equal(snapshot.counts.merged, 1)
+  assert.equal(snapshot.counts.mergeable, 0, '已合并不能算进「可合」')
+  assert.equal(mr.pending, 0)
+})

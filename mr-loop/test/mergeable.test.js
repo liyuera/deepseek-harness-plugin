@@ -475,3 +475,12 @@ test('I3：历史未收敛非 0 / 未声明时，changes 不因全豁免而放�
   assert.equal(nullHistory.mergeable, false)
   assert.deepEqual(nullHistory.missing, ['AI 评审结论为需要修改', '历史未收敛问题未声明'])
 })
+
+test('已结束的 MR（merged / closed）不再判「差几项」：missing 为空、带 terminal', () => {
+  const merged = evaluateMergeable({ mr: mr({ state: 'merged' }), round: round(), decisions: {} })
+  assert.deepEqual(merged, { mergeable: false, missing: [], degraded: false, terminal: 'merged' })
+  const closed = evaluateMergeable({ mr: mr({ state: 'closed' }), round: round(), decisions: {} })
+  assert.deepEqual(closed, { mergeable: false, missing: [], degraded: false, terminal: 'closed' })
+  // 回归：以前 merged 会走进 missing 列表，显示「差 1 项：MR 状态是 merged」。
+  assert.equal(merged.missing.includes('MR 状态是 merged'), false)
+})
