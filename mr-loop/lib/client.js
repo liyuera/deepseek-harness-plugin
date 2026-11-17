@@ -64,7 +64,15 @@ window.__ModuleLoader__.load({
       ".mrl-merge-icon{flex:none;font-size:12px;line-height:1}",
       ".mrl-link{color:var(--mrl-accent);font-size:11.5px;font-weight:550;white-space:nowrap;cursor:pointer;background:none;border:0;padding:0}",
       ".mrl-link:hover{text-decoration:underline;text-underline-offset:2px}",
-      ".mrl-issues{border-top:1px solid var(--mrl-line-soft)}",
+      ".mrl-sec{display:flex;align-items:center;gap:6px;padding:8px 12px 6px;font-size:11px;color:var(--dsw-alias-label-secondary);border-top:1px solid var(--mrl-line-soft)}",
+      ".mrl-sec b{font-weight:600;color:var(--dsw-alias-label-primary)}",
+      ".mrl-sec-warn{color:var(--dsw-alias-state-warn-primary)}",
+      ".mrl-merge-sub{font-size:10.5px;color:var(--dsw-alias-label-secondary);margin-top:2px;line-height:1.5}",
+      ".mrl-rounds{display:flex;align-items:center;gap:5px;flex-wrap:wrap;padding:7px 12px;border-top:1px solid var(--mrl-line-soft);font-size:10.5px;color:var(--dsw-alias-label-secondary)}",
+      ".mrl-rounds .lbl{color:var(--dsw-alias-label-tertiary);flex:none;padding-right:1px}",
+      ".mrl-round{display:inline-flex;align-items:center;gap:4px;padding:0 7px;line-height:18px;border-radius:20px;background:var(--mrl-fill);white-space:nowrap}",
+      ".mrl-round[data-wait]{color:var(--dsw-alias-state-warn-primary);background:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 13%,transparent)}",
+      ".mrl-round[data-sel]{box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--dsw-alias-label-primary) 22%,transparent);color:var(--dsw-alias-label-primary)}",
       ".mrl-issue{padding:9px 12px;border-bottom:1px solid var(--mrl-line-soft)}",
       ".mrl-issue:last-child{border-bottom:0}",
       ".mrl-issue[data-open]{background:var(--mrl-fill)}",
@@ -76,6 +84,7 @@ window.__ModuleLoader__.load({
       ".mrl-lv[data-lv=低]{color:var(--mrl-accent)}",
       ".mrl-st{font-size:10.5px;line-height:17px;padding:0 7px;border-radius:20px;white-space:nowrap;margin-left:auto}",
       ".mrl-st[data-st=open]{color:var(--dsw-alias-state-warn-primary);background:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 14%,transparent)}",
+      ".mrl-st[data-st=pending]{color:var(--mrl-accent);background:color-mix(in srgb,var(--mrl-accent) 12%,transparent)}",
       ".mrl-st[data-st=fixed]{color:var(--dsw-alias-state-success-primary);background:color-mix(in srgb,var(--dsw-alias-state-success-primary) 14%,transparent)}",
       ".mrl-st[data-st=waived]{color:var(--dsw-alias-label-tertiary);background:var(--mrl-fill)}",
       ".mrl-chev{font-size:10.5px;color:var(--dsw-alias-label-secondary);cursor:pointer;background:none;border:0;padding:0;margin-left:6px}",
@@ -201,6 +210,8 @@ window.__ModuleLoader__.load({
         if (kind === "wontfix") return { text: "◌ 不修", tone: "waived" };
         return { text: "◌ 已豁免", tone: "waived" };
       }
+      // 当前轮评审还没出时，上一轮的「未处理」不能断言现在还没修，只能算待复验。
+      if (problem.unverified === true) return { text: "◔ 待复验", tone: "pending" };
       return { text: "● 未处理", tone: "open" };
     }
 
@@ -587,6 +598,14 @@ window.__ModuleLoader__.load({
         : null;
       var gates = mr.gates || {};
       var review = mr.review;
+      var rounds = Array.isArray(mr.rounds) ? mr.rounds : [];
+      // 当前轮评审还没出时，problems 来自上一轮：面板要标清是哪一轮，别把旧结论当本轮。
+      var shownRound = mr.problemsRound || null;
+      var fallback = shownRound !== null && shownRound.current === false;
+      // head_pipeline 还停在上一笔提交：这笔 push 没触发流水线，评审不会自己冒出来。
+      var pipelineStale = merge !== null && merge.pipeline !== null && merge.pipeline !== undefined &&
+        typeof merge.pipeline.sha === "string" && merge.pipeline.sha !== "" &&
+        typeof mr.sha === "string" && mr.sha !== "" && merge.pipeline.sha !== mr.sha;
       var openMr = function () { if (mr.webUrl) window.open(mr.webUrl, "_blank", "noopener,noreferrer"); };
       var removeEscaped = function () { /* hooks not used here */ };
       void removeEscaped;
@@ -607,6 +626,57 @@ window.__ModuleLoader__.load({
         h("span", { className: "mrl-tag brand", key: "round" }, "第 " + (mr.round || 0) + " 轮"),
         statusTag,
       ];
+
+      // 问题段落头：写清「这是第几轮的问题」；回落时要一眼看出第 N 轮评审还没出。
+      var issuesHead = shownRound === null
+        ? null
+        : h("div", { className: "mrl-sec" },
+            h("b", null, "第 " + shownRound.n + " 轮问题"),
+            h("span", null, "· " + problems.length + " 条"),
+            h("span", { className: "mrl-sp" }),
+            fallback ? h("span", { className: "mrl-sec-warn" }, "第 " + (mr.round || 0) + " 轮评审未出") : null);
+      var issues = problems.length > 0
+        ? h("div", { className: "mrl-issues" },
+            problems.map(function (problem) {
+              return h(ProblemRow, { key: String(problem.fid), problem: problem });
+            }))
+        : null;
+      var historyHead = issuesHead !== null || issues !== null
+        ? h("div", null, issuesHead, issues)
+        : null;
+
+      // 轮次条：一眼看到每轮的结论与条数（第 1…N 轮都提过几条），问题正文不放进 payload。
+      var roundStrip = null;
+      if (rounds.length > 1) {
+        var shown = rounds.slice(-8);
+        var chips = [];
+        if (rounds.length > shown.length) {
+          chips.push(h("span", { className: "mrl-round", key: "more", title: "更早的 " + (rounds.length - shown.length) + " 轮已省略" },
+            "+" + (rounds.length - shown.length)));
+        }
+        shown.forEach(function (item) {
+          var waiting = item.verdict === null || item.verdict === undefined;
+          var selected = shownRound !== null && shownRound.n === item.n;
+          var label = waiting ? "等待评审" : (item.verdict === "pass" ? "通过" : item.verdict === "changes" ? "需修改" : "未解析");
+          var tip = "第 " + item.n + " 轮 · " + label;
+          if (!waiting) tip += " · " + (item.total || 0) + " 条";
+          if (item.fixed > 0) tip += "，已修 " + item.fixed;
+          if (item.at) tip += " · " + String(item.at).replace("T", " ").slice(0, 16);
+          chips.push(h("span", {
+            className: "mrl-round",
+            key: "r" + item.n,
+            title: tip,
+            "data-sel": selected ? "1" : undefined,
+            "data-wait": waiting ? "1" : undefined,
+          },
+            "第" + item.n + "轮",
+            waiting
+              ? null
+              : h("i", { className: "mrl-dot " + (item.verdict === "pass" ? "ok" : item.verdict === "changes" ? "err" : "warn") }),
+            waiting ? null : String(item.total || 0)));
+        });
+        roundStrip = h("div", { className: "mrl-rounds" }, h("span", { className: "lbl" }, "轮次"), chips);
+      }
 
       return h("div", { className: "mrl-mr" },
         h("div", { className: "mrl-mr-h" },
@@ -640,14 +710,17 @@ window.__ModuleLoader__.load({
             : null),
         h("div", { className: "mrl-merge", "data-kind": mergeKind === "none" ? undefined : mergeKind },
           h("span", { className: "mrl-merge-icon" }, mergeIcon),
-          h("span", { className: "txt" }, mergeText),
+          h("span", { className: "txt" },
+            mergeText,
+            // 只看 missing 文字会以为「评审解析失败」；其实是这笔提交根本没跑流水线。
+            pipelineStale && review === null
+              ? h("div", { className: "mrl-merge-sub" },
+                  "流水线 #" + merge.pipeline.id + " 还停在 " + String(merge.pipeline.sha).slice(0, 8) +
+                  "，这笔提交没有流水线")
+              : null),
           h("button", { className: "mrl-link", type: "button", onClick: openMr }, "打开 MR ↗")),
-        problems.length > 0
-          ? h("div", { className: "mrl-issues" },
-              problems.map(function (problem) {
-                return h(ProblemRow, { key: String(problem.fid), problem: problem });
-              }))
-          : null,
+        historyHead,
+        roundStrip,
         h("div", { className: "mrl-f" },
           h("span", { className: "mrl-mono" }, "sha " + String(mr.sha || "").slice(0, 8)),
           mr.updatedAt ? h("span", null, "· " + relativeTime(mr.updatedAt)) : null,

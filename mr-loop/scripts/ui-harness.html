@@ -79,73 +79,139 @@
   })();
 </script>
 <script>
-  // 假数据：覆盖 未处理 / 已修 / 已豁免（带评论原文）/ 可合 / 已合并
-  const STATE = {
-    scope: 'all',
-    updatedAt: '2026-11-16T10:50:00Z',
-    counts: { total: 3, pending: 1, mergeable: 1, merged: 1 },
-    mrs: [
+  // 假数据：覆盖「回落态」（当前轮评审没出 → 显示上一轮结论）/「当前轮已落地」/「可合」/「已合并」。
+  // ?demo=fallback|settled|mergeable|merged 只挂对应的一个 MR，方便单卡截图。
+  const FALLBACK_MR = {
+    projectPath: 'wisdom-financial-service-platform/wisdom-financial-credit-platform-web',
+    iid: 243, webUrl: 'https://git.example.com/x/-/merge_requests/243',
+    sourceBranch: 'feat-V1.7.0.20261119-ly', targetBranch: 'feature-V1.7.0.20261119',
+    state: 'opened', sha: 'b30c43b3d96216de3ba526c16f1ec1c52fc4cb7e', round: 7,
+    updatedAt: '2026-11-17T07:03:08Z', live: true,
+    session: { id: 'session-1', title: '财务服务平台 · 报告管理' },
+    review: null,
+    gates: { sensitive: null, mandatory: null },
+    merge: {
+      mergeable: false,
+      missing: ['AI 评审结论未知（未出或解析失败）'],
+      // head_pipeline 还停在上一笔提交：这笔 push 没触发流水线。
+      pipeline: { id: 7358, status: 'success', sha: '081bb374144f8151345d8dd1a337e500b79a351f' },
+    },
+    problemsRound: { n: 6, sha: '081bb374144f8151345d8dd1a337e500b79a351f', current: false },
+    rounds: [
+      { n: 1, verdict: 'pass', total: 0, open: 0, fixed: 0, current: false },
+      { n: 2, verdict: 'pass', total: 2, open: 2, fixed: 0, current: false },
+      { n: 3, verdict: 'pass', total: 1, open: 1, fixed: 1, current: false },
+      { n: 4, verdict: 'pass', total: 1, open: 1, fixed: 1, current: false },
+      { n: 5, verdict: 'pass', total: 1, open: 1, fixed: 1, current: false },
+      { n: 6, verdict: 'pass', total: 1, open: 1, fixed: 1, current: false },
+      { n: 7, verdict: null, total: 0, open: 0, fixed: 0, current: true },
+    ],
+    pending: 0,
+    problems: [
       {
-        projectPath: 'wisdom-financial-service-platform/wisdom-financial-credit-platform-web',
-        iid: 241,
-        webUrl: 'https://git.example.com/x/-/merge_requests/241',
-        sourceBranch: 'feat-V1.7.0.20261119-ly',
-        targetBranch: 'feature-V1.7.0.20261119',
-        state: 'opened', sha: '8a282d1540224ada925e502354b9f5866acec588', round: 1,
-        updatedAt: '2026-11-16T10:48:07Z', live: true,
-        session: { id: 'session-1', title: '财务服务平台 · 报告管理' },
-        review: { verdict: 'pass', historicalUnresolved: 0, verifiedFixed: null, newThisRound: 1 },
-        gates: { sensitive: 'pass', mandatory: null },
-        merge: { mergeable: false, missing: ['评审有 1 处需要关注的问题（其中 1 处本轮新增）：FID aea50825a5（低）'], pipeline: { id: 7298, status: 'success' } },
-        pending: 1,
-        problems: [
-          {
-            fid: 'aea50825a5', level: '低', type: '非阻塞建议',
-            file: 'src/pages/report-manage/components/ReportUploadModal/index.tsx', line: 81,
-            problem: '回显加载态首帧未挂载字段，打开弹窗先闪一帧空表单',
-            suggestion: '把加载态与数据就绪度绑定：将 useState(false) 改为 useState(!!record?.id)。',
-            status: 'open',
-          },
-          {
-            fid: 'c3f0e7a1', level: '中', type: '逻辑错误',
-            file: 'src/pages/report-manage/utils/loadReportEcho.ts', line: 44,
-            problem: 'allSettled 后未区分 rejected，失败时把空对象写进表单',
-            suggestion: '区分 rejected 分支并降级。',
-            status: 'fixed', fixedAtRound: 2,
-          },
-          {
-            fid: 'b71c9d02', level: '低', type: '非阻塞建议',
-            file: 'src/types/BaoGaoGuanLi.ts', line: 12,
-            problem: '类型字段与后端 DTO 命名不一致',
-            suggestion: '把 orderer 字段对齐后端 DTO。',
-            snippet: 'export interface BaoGaoGuanLiVO {\n  ordererName: string   // 后端已改为 orderer\n}',
-            status: 'waived',
-            instruction: { kind: 'waive', reason: '后端 DTO 已确认，本单不改', noteId: 75200 },
-            comment: { noteId: 75200, body: '#ai-waive b71c9d02 reason=后端 DTO 已确认，本单不改', author: 'liyu', createdAt: '2026-11-16T10:02:00Z' },
-          },
-        ],
+        fid: 'c145950e29', level: '低', type: '非阻塞建议',
+        file: 'src/pages/report-manage/utils/reportStatus.tsx', line: 78,
+        problem: '注释正文里写入了内部评审单号（如「评审 FID e462d18b0d」），属于评审流程元数据，不是代码行为说明；台账归档后引用会失效，反而增加阅读噪音。',
+        suggestion: '保留「两侧都归一成字符串再比」这类行为说明，仅删掉括号内的评审 FID 引用，需要追溯时记在 MR/提交信息里。',
+        status: 'open', unverified: true,
       },
       {
-        projectPath: 'group/other', iid: 238, webUrl: 'https://git.example.com/g/p/-/merge_requests/238',
-        sourceBranch: 'fix-V1.7.0.20261119', targetBranch: 'feature-V1.7.0.20261119',
-        state: 'opened', sha: '3f1d9c02', round: 3, updatedAt: '2026-11-16T09:40:00Z',
-        live: false, session: { id: 'session-2', title: '报告管理重构' },
-        review: { verdict: 'pass', historicalUnresolved: 0, verifiedFixed: 2, newThisRound: 0 },
-        gates: { sensitive: 'pass', mandatory: null },
-        merge: { mergeable: true, missing: [], pipeline: { id: 7181, status: 'success' } },
-        pending: 0, problems: [],
-      },
-      {
-        projectPath: 'group/third', iid: 236, webUrl: 'https://git.example.com/g/p/-/merge_requests/236',
-        sourceBranch: 'feat-V1.7.0.20261112', targetBranch: 'feature-V1.7.0.20261112',
-        state: 'merged', sha: 'aa11bb22', round: 4, updatedAt: '2026-11-13T09:40:00Z',
-        live: false, session: { id: 'session-3', title: '交付率口径' },
-        review: { verdict: 'pass', historicalUnresolved: 0, verifiedFixed: 3, newThisRound: 0 },
-        gates: { sensitive: 'pass', mandatory: null },
-        merge: { mergeable: false, missing: [], pipeline: { id: 7001, status: 'success' } },
-        pending: 0, problems: [],
+        fid: 'e462d18b0d', level: '低', type: '非阻塞建议',
+        file: 'src/pages/report-manage/utils/reportStatus.tsx', line: 78,
+        problem: 'isVectorFailed 的 String() 兜底并未生效：后端返回数字状态时 String(2) 得到 "2"，依旧恒为 false。',
+        suggestion: '以 REPORT_STATUS 的实际定义为唯一口径：String(target?.reportStatus) === String(REPORT_STATUS.FAILED)。',
+        status: 'fixed', fixedAtRound: 6,
       },
     ],
+  }
+
+  const SETTLED_MR = {
+    projectPath: 'wisdom-financial-service-platform/wisdom-financial-credit-platform-web',
+    iid: 241, webUrl: 'https://git.example.com/x/-/merge_requests/241',
+    sourceBranch: 'feat-V1.7.0.20261119-ly', targetBranch: 'feature-V1.7.0.20261119',
+    state: 'opened', sha: '8a282d1540224ada925e502354b9f5866acec588', round: 2,
+    updatedAt: '2026-11-16T10:48:07Z', live: true,
+    session: { id: 'session-1', title: '财务服务平台 · 报告管理' },
+    review: { verdict: 'pass', historicalUnresolved: 0, verifiedFixed: 1, newThisRound: 1 },
+    gates: { sensitive: 'pass', mandatory: null },
+    merge: { mergeable: false, missing: ['评审有 1 处需要关注的问题（其中 1 处本轮新增）：FID aea50825a5（低）'], pipeline: { id: 7298, status: 'success', sha: '8a282d1540224ada925e502354b9f5866acec588' } },
+    problemsRound: { n: 2, sha: '8a282d1540224ada925e502354b9f5866acec588', current: true },
+    rounds: [
+      { n: 1, verdict: 'pass', total: 2, open: 2, fixed: 0, current: false },
+      { n: 2, verdict: 'pass', total: 1, open: 1, fixed: 1, current: true },
+    ],
+    pending: 1,
+    problems: [
+      {
+        fid: 'aea50825a5', level: '低', type: '非阻塞建议',
+        file: 'src/pages/report-manage/components/ReportUploadModal/index.tsx', line: 81,
+        problem: '回显加载态首帧未挂载字段，打开弹窗先闪一帧空表单',
+        suggestion: '把加载态与数据就绪度绑定：将 useState(false) 改为 useState(!!record?.id)。',
+        status: 'open',
+      },
+      {
+        fid: 'c3f0e7a1', level: '中', type: '逻辑错误',
+        file: 'src/pages/report-manage/utils/loadReportEcho.ts', line: 44,
+        problem: 'allSettled 后未区分 rejected，失败时把空对象写进表单',
+        suggestion: '区分 rejected 分支并降级。',
+        status: 'fixed', fixedAtRound: 2,
+      },
+      {
+        fid: 'b71c9d02', level: '低', type: '非阻塞建议',
+        file: 'src/types/BaoGaoGuanLi.ts', line: 12,
+        problem: '类型字段与后端 DTO 命名不一致',
+        suggestion: '把 orderer 字段对齐后端 DTO。',
+        snippet: 'export interface BaoGaoGuanLiVO {\n  ordererName: string   // 后端已改为 orderer\n}',
+        status: 'waived',
+        instruction: { kind: 'waive', reason: '后端 DTO 已确认，本单不改', noteId: 75200 },
+        comment: { noteId: 75200, body: '#ai-waive b71c9d02 reason=后端 DTO 已确认，本单不改', author: 'liyu', createdAt: '2026-11-16T10:02:00Z' },
+      },
+    ],
+  }
+
+  const MERGEABLE_MR = {
+    projectPath: 'group/other', iid: 238, webUrl: 'https://git.example.com/g/p/-/merge_requests/238',
+    sourceBranch: 'fix-V1.7.0.20261119', targetBranch: 'feature-V1.7.0.20261119',
+    state: 'opened', sha: '3f1d9c02', round: 3, updatedAt: '2026-11-16T09:40:00Z',
+    live: false, session: { id: 'session-2', title: '报告管理重构' },
+    review: { verdict: 'pass', historicalUnresolved: 0, verifiedFixed: 2, newThisRound: 0 },
+    gates: { sensitive: 'pass', mandatory: null },
+    merge: { mergeable: true, missing: [], pipeline: { id: 7181, status: 'success' } },
+    problemsRound: { n: 3, sha: '3f1d9c02', current: true },
+    rounds: [
+      { n: 2, verdict: 'pass', total: 2, open: 2, fixed: 0, current: false },
+      { n: 3, verdict: 'pass', total: 0, open: 0, fixed: 2, current: true },
+    ],
+    pending: 0, problems: [],
+  }
+
+  const MERGED_MR = {
+    projectPath: 'group/third', iid: 236, webUrl: 'https://git.example.com/g/p/-/merge_requests/236',
+    sourceBranch: 'feat-V1.7.0.20261112', targetBranch: 'feature-V1.7.0.20261112',
+    state: 'merged', sha: 'aa11bb22', round: 4, updatedAt: '2026-11-13T09:40:00Z',
+    live: false, session: { id: 'session-3', title: '交付率口径' },
+    review: { verdict: 'pass', historicalUnresolved: 0, verifiedFixed: 3, newThisRound: 0 },
+    gates: { sensitive: 'pass', mandatory: null },
+    merge: { mergeable: false, missing: [], pipeline: { id: 7001, status: 'success' } },
+    pending: 0, problems: [],
+  }
+
+  const DEMO = new URLSearchParams(location.search).get('demo') || 'all'
+  const PICKED = { fallback: FALLBACK_MR, settled: SETTLED_MR, mergeable: MERGEABLE_MR, merged: MERGED_MR }
+  const MRS = DEMO === 'all'
+    ? [FALLBACK_MR, SETTLED_MR, MERGEABLE_MR, MERGED_MR]
+    : [PICKED[DEMO]].filter(Boolean)
+
+  const STATE = {
+    scope: 'all',
+    updatedAt: '2026-11-17T07:31:00Z',
+    counts: {
+      total: MRS.length,
+      pending: MRS.reduce(function (sum, mr) { return sum + (mr.pending || 0) }, 0),
+      mergeable: MRS.filter(function (mr) { return mr.merge && mr.merge.mergeable === true }).length,
+      merged: MRS.filter(function (mr) { return mr.state === 'merged' }).length,
+    },
+    mrs: MRS,
   }
 
   window.fetch = function () {
@@ -190,10 +256,10 @@
   } else {
     ReactDOM.createRoot(document.getElementById('chip-box')).render(React.createElement(chip, { sessionId: 'session-1' }))
     ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(drawer))
-    // 等 fetch 落定后点开看板
+    // 等 fetch 落定后点开看板：窗口窄时 chip 会收成图标，点图标同样能开。
     setTimeout(function () {
-      const buttons = Array.from(document.querySelectorAll('button'))
-      const open = buttons.find(b => b.textContent.trim() === '看板')
+      const open = document.querySelector('.mrl-chip-btn') ||
+        Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === '看板')
       if (open) open.click()
     }, 300)
   }

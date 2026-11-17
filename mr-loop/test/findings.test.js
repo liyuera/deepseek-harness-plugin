@@ -12,7 +12,7 @@ import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { collectFindings, createFindingsStore } from '../src/host/findings.js'
+import { collectFindings, createFindingsStore, displayRoundIndex, settledRoundIndex } from '../src/host/findings.js'
 import { resolveConfig } from '../src/host/config.js'
 import { createLedger } from '../src/host/ledger.js'
 import { createService } from '../src/host/service.js'
@@ -599,4 +599,37 @@ test('service：findings.record 返回 rejected Promise 时同样只 warn，不�
   assert.ok(warnings.filter((line) => line.includes('findings 写入失败')).length >= 2)
   await service.stop({ sessionId: 's1' })
   await rm(dir, { recursive: true, force: true })
+})
+
+// ---------------------------------------------------------------------------
+// 面板回落：collectFindings 可以「看更早的一轮」，但落盘路径永远只看最后一轮
+// ---------------------------------------------------------------------------
+
+test('collectFindings：roundIndex 指定看哪一轮；回落只改展示，不改「fixed 相对哪一轮」', () => {
+  const first = roundOf({ blocking: [finding({ fid: 'AAAA' })] })
+  const second = roundOf({ sha: SHA_B, n: 2, blocking: [], verdict: 'pass' })
+  const pending = { ...roundOf({ sha: 'c'.repeat(40), n: 3 }), review: null }
+  const record = stateOf({ rounds: [first, second, pending] })
+
+  // 缺省 = 最后一轮（评审未出）→ 空，与旧行为一致：落盘走这条，绝不把上一轮当已修。
+  assert.deepEqual(collectFindings(record), [])
+  // 显式看第 2 轮：上一轮的 AAAA 在那一轮已消失 → fixed，并记下 fixedAtRound=2。
+  assert.deepEqual(
+    collectFindings(record, { roundIndex: 1 }).map((item) => [item.fid, item.status, item.fixedAtRound]),
+    [['AAAA', 'fixed', 2]],
+  )
+  // 看第 1 轮：当时 AAAA 还是 open。
+  assert.deepEqual(collectFindings(record, { roundIndex: 0 }).map((item) => [item.fid, item.status]), [['AAAA', 'open']])
+  // 非法下标回落最后一轮，不抛错。
+  assert.deepEqual(collectFindings(record, { roundIndex: 9 }), [])
+  assert.deepEqual(collectFindings(record, { roundIndex: -1 }), [])
+
+  // 「该看哪一轮」：当前轮评审没落地 → 回落到最近一次落地的评审（第 2 轮）。
+  assert.equal(settledRoundIndex(record), 1)
+  assert.equal(displayRoundIndex(record), 1)
+  // 当前轮评审已落地 → 就是当前轮。
+  assert.equal(displayRoundIndex(stateOf({ rounds: [first, second] })), 1)
+  // 一条评审都没落地 → -1（面板显示空，而不是假装有结论）。
+  assert.equal(displayRoundIndex(stateOf({ rounds: [pending] })), -1)
+  assert.equal(settledRoundIndex(stateOf({ rounds: [pending] })), -1)
 })

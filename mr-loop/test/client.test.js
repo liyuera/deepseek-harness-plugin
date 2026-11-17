@@ -290,3 +290,114 @@ test('chipShrinkMode：放得下就用完整形态，放不下才收成图标，
   // 缺 contentWidth 时按容器宽度算 = 已经占满 → 收成图标。
   assert.equal(chipShrinkMode({ containerWidth: 360, chipWidth: 120, fullWidth: 120 }), 'compact')
 })
+
+/**
+ * 展开 h() 桩的元素树并收集文本 / 指定 className 的节点。
+ * 函数组件（MrCard / ProblemRow）在这里被手动调用一次——桩里没有 React 的渲染器。
+ */
+function walkTree(node, visit) {
+  if (node === null || node === undefined || node === false) return
+  if (typeof node === 'string' || typeof node === 'number') { visit(node); return }
+  if (Array.isArray(node)) { node.forEach((child) => walkTree(child, visit)); return }
+  if (typeof node !== 'object') return
+  if (typeof node.type === 'function') { walkTree(node.type(node.props ?? {}), visit); return }
+  visit(node)
+  if (Array.isArray(node.children)) node.children.forEach((child) => walkTree(child, visit))
+}
+
+const textOfTree = (node) => {
+  const out = []
+  walkTree(node, (item) => { if (typeof item === 'string' || typeof item === 'number') out.push(String(item)) })
+  return out
+}
+
+function nodesByClass(node, className) {
+  const out = []
+  walkTree(node, (item) => {
+    if (typeof item === 'object' && item.props !== undefined && item.props.className === className) out.push(item)
+  })
+  return out
+}
+
+/** 回落态 MR：当前轮（第 7 轮）评审还没出，problems 来自第 6 轮。 */
+const fallbackMr = {
+  projectPath: 'g/p', iid: 243, round: 7, pending: 0, state: 'opened', live: true,
+  session: { id: 's1' }, sourceBranch: 'feat-x', targetBranch: 'feature-y', sha: 'b30c43b3d962',
+  review: null,
+  gates: { sensitive: null, mandatory: null },
+  merge: {
+    mergeable: false,
+    missing: ['AI 评审结论未知（未出或解析失败）'],
+    // head_pipeline 还停在上一笔提交：这笔 push 没触发流水线。
+    pipeline: { id: 7358, status: 'success', sha: '081bb37414f8' },
+  },
+  problemsRound: { n: 6, sha: '081bb37414f8', current: false },
+  rounds: [
+    { n: 1, verdict: 'pass', total: 0, open: 0, fixed: 0, current: false },
+    { n: 6, verdict: 'pass', total: 1, open: 1, fixed: 1, current: false },
+    { n: 7, verdict: null, total: 0, open: 0, fixed: 0, current: true },
+  ],
+  problems: [{
+    fid: 'aea50825a5', level: '低', type: '非阻塞建议', file: 'src/report/Index.tsx', line: 81,
+    problem: '首帧会闪一帧空表单', suggestion: '把加载态与数据就绪度绑定', status: 'open', unverified: true,
+  }],
+}
+
+/** 打开看板并渲染一次（chip 紧凑态点一下即可）。 */
+const renderPanel = async (data) => {
+  const loaded = loadBundle({ fetchData: { mrs: [data], counts: { total: 1, pending: 0, mergeable: 0, merged: 0 } } })
+  loaded.sandbox.window.innerWidth = 900
+  loaded.sandbox.__moduleExports.apply(loaded.ctx)
+  renderChip(loaded, 's1')
+  await settle()
+  renderChip(loaded, 's1').props.onClick()
+  return { loaded, panel: drawerOf(loaded)() }
+}
+
+test('看板：当前轮评审没出时显示上一轮结论、标「待复验」，并提示流水线还停在上一笔提交', async () => {
+  const { panel } = await renderPanel(fallbackMr)
+  const texts = textOfTree(panel).join(' | ')
+
+  // 段落头说清是哪一轮 + 为什么不是本轮。
+  assert.match(texts, /第 6 轮问题/)
+  assert.match(texts, /第 7 轮评审未出/)
+  // 上一轮的「未处理」不能写成现在还没修。
+  assert.match(texts, /待复验/)
+  assert.doesNotMatch(texts, /未处理/)
+  // 评审未知的真因：这笔提交没有流水线（不是插件解析失败）。
+  assert.match(texts, /流水线 #7358 还停在 081bb374/)
+  assert.match(texts, /这笔提交没有流水线/)
+
+  // 轮次条：第 6 轮被选中（正在显示），第 7 轮是等待评审。
+  const chips = nodesByClass(panel, 'mrl-round')
+  const selected = chips.filter((node) => node.props['data-sel'] === '1')
+  assert.equal(selected.length, 1)
+  assert.equal(textOfTree(selected[0])[0], '第6轮')
+  const waiting = chips.filter((node) => node.props['data-wait'] === '1')
+  assert.equal(waiting.length, 1)
+  assert.equal(textOfTree(waiting[0])[0], '第7轮')
+  assert.match(waiting[0].props.title, /等待评审/)
+})
+
+test('看板：当前轮评审已落地时标「第 N 轮问题」，问题仍是未处理、不出现回落提示', async () => {
+  const currentMr = {
+    ...fallbackMr,
+    round: 6,
+    sha: '081bb37414f8',
+    review: { verdict: 'pass', historicalUnresolved: 0, verifiedFixed: 1, newThisRound: 1 },
+    merge: { mergeable: false, missing: ['评审有 1 处需要关注的问题：FID aea50825a5（低）'], pipeline: { id: 7358, status: 'success', sha: '081bb37414f8' } },
+    problemsRound: { n: 6, sha: '081bb37414f8', current: true },
+    rounds: [
+      { n: 5, verdict: 'pass', total: 1, open: 1, fixed: 0, current: false },
+      { n: 6, verdict: 'pass', total: 1, open: 1, fixed: 1, current: true },
+    ],
+    problems: [{ ...fallbackMr.problems[0], unverified: undefined }],
+  }
+  const { panel } = await renderPanel(currentMr)
+  const texts = textOfTree(panel).join(' | ')
+  assert.match(texts, /第 6 轮问题/)
+  assert.match(texts, /未处理/)
+  assert.doesNotMatch(texts, /待复验/)
+  assert.doesNotMatch(texts, /评审未出/)
+  assert.doesNotMatch(texts, /没有流水线/)
+})

@@ -118,14 +118,24 @@ test('M3：账本里的 FID 大小写与评审不一致，面板仍是 waived �
   assert.equal(snapshot.mrs[0].pending, 0)
 })
 
-test('C1：新一轮评审还没出时，problems 不能把上一轮的 FID 显示成 fixed', async () => {
+test('C1：新一轮评审还没出时，problems 回落上一轮但不能把上一轮的 FID 显示成 fixed', async () => {
   const first = roundOf()
-  const pendingRound = { ...roundOf({ sha: 'b'.repeat(40), n: 2 }), review: null }
+  const pendingRound = { ...roundOf(), sha: 'b'.repeat(40), n: 2, review: null }
   const record = { ...recordOf({ iid: 244, round: first }) }
   record.rounds = [first, pendingRound]
   const snapshot = await snapshotOf([record])
-  assert.equal(snapshot.mrs[0].problems.length, 0, '评审未出 ≠ 已修')
+  const [problem] = snapshot.mrs[0].problems
+  // 回落：上一轮的问题仍然显示（评审未出 ≠ 空白），但状态只能是「待复验」，绝不能是 fixed。
+  assert.equal(snapshot.mrs[0].problems.length, 1)
+  assert.equal(problem.fid, 'aaaaaaaaaa')
+  assert.equal(problem.status, 'open')
+  assert.equal(problem.unverified, true, '上一轮的未处理只能标「待复验」')
+  assert.equal(snapshot.mrs[0].problemsRound.n, 1)
+  assert.equal(snapshot.mrs[0].problemsRound.current, false)
+  // 待处理计数与可合判定仍只认当前轮：回落只影响展示。
   assert.equal(snapshot.mrs[0].pending, 0)
+  assert.deepEqual(snapshot.mrs[0].rounds.map((round) => [round.n, round.verdict, round.total]), [[1, 'changes', 1], [2, null, 0]])
+  assert.equal(snapshot.mrs[0].rounds[1].current, true)
 })
 
 test('活绑定的 MR 必须给出实时 state 与合并判定（回归：曾读取 live.mr 导致 merge 恒为 null）', async () => {
@@ -241,4 +251,52 @@ test('指令豁免的问题带评论原文（body/author/createdAt/noteId），�
   assert.equal(problem.comment.body, '#ai-waive aaaaaaaaaa reason=风险已评估')
   assert.equal(problem.comment.author, 'liyu')
   assert.equal(problem.comment.createdAt, '2026-11-16T10:00:00Z')
+})
+
+// ---------------------------------------------------------------------------
+// 面板回落 + 轮次摘要：当前轮评审没出时，面板不能整块变空（0.2.5）
+// ---------------------------------------------------------------------------
+
+const passReviewOf = (over = {}) => ({
+  ...roundOf().review,
+  verdict: 'pass',
+  blocking: [],
+  nonBlocking: [],
+  historicalUnresolved: 0,
+  ...over,
+})
+
+test('面板：当前轮评审未出时回落到上一轮结论，rounds 给出逐轮条数与已修数', async () => {
+  const first = { ...roundOf(), n: 1, review: { ...roundOf().review, verdict: 'changes' } }
+  const second = { ...roundOf(), n: 2, sha: 'b'.repeat(40), review: passReviewOf() }
+  const third = { ...roundOf(), n: 3, sha: 'c'.repeat(40), review: null }
+  const record = { ...recordOf({ iid: 247, round: first }), rounds: [first, second, third] }
+  const snapshot = await snapshotOf([record])
+  const mr = snapshot.mrs[0]
+
+  assert.equal(mr.round, 3)
+  assert.deepEqual(mr.problemsRound, { n: 2, sha: 'b'.repeat(40), current: false })
+  // 回落看第 2 轮：第 1 轮的 FID 在那一轮已被评审确认消失 → 已修（不受回落影响）。
+  assert.deepEqual(mr.problems.map((problem) => [problem.fid, problem.status, problem.unverified]), [
+    ['aaaaaaaaaa', 'fixed', undefined],
+  ])
+  // 待处理计数与可合判定仍只认当前轮：回落只改展示。
+  assert.equal(mr.pending, 0)
+  assert.deepEqual(
+    mr.rounds.map((round) => [round.n, round.verdict, round.total, round.open, round.fixed, round.current]),
+    [
+      [1, 'changes', 1, 1, 0, false],
+      [2, 'pass', 0, 0, 1, false],
+      [3, null, 0, 0, 0, true],
+    ],
+  )
+})
+
+test('面板：当前轮评审已落地时 problemsRound 指向当前轮，问题不标「待复验」', async () => {
+  const snapshot = await snapshotOf([recordOf({ iid: 249, round: roundOf() })])
+  const mr = snapshot.mrs[0]
+  assert.deepEqual(mr.problemsRound, { n: 1, sha: SHA, current: true })
+  assert.equal(mr.problems[0].status, 'open')
+  assert.equal('unverified' in mr.problems[0], false)
+  assert.deepEqual(mr.rounds.map((round) => [round.n, round.current]), [[1, true]])
 })

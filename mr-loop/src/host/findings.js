@@ -46,14 +46,50 @@ function text(value, limit) {
 
 const sanitizeId = (value) => (typeof value === 'string' && value.trim() !== '' ? value : undefined)
 
+const roundsOf = (record) => (Array.isArray(record?.rounds) ? record.rounds : [])
+
 const roundOf = (record) => {
-  const rounds = Array.isArray(record?.rounds) ? record.rounds : []
+  const rounds = roundsOf(record)
   return rounds.length === 0 ? null : rounds[rounds.length - 1]
 }
 
-const previousRoundOf = (record) => {
-  const rounds = Array.isArray(record?.rounds) ? record.rounds : []
-  return rounds.length < 2 ? null : rounds[rounds.length - 2]
+/** 只认显式的合法下标，否则回落「最后一轮」——与 0.2.4 之前的行为一致。 */
+const roundIndexOf = (record, requested) => {
+  const rounds = roundsOf(record)
+  if (Number.isSafeInteger(requested) && requested >= 0 && requested < rounds.length) return requested
+  return rounds.length - 1
+}
+
+/** 评审是否已落地：只有 pass / changes 才算，unknown（解析失败）与缺失都不算。 */
+const isSettled = (round) => {
+  const verdict = round?.review?.verdict
+  return verdict === 'pass' || verdict === 'changes'
+}
+
+/**
+ * 最近一个「评审已落地」的轮次下标；一条都没落地返回 -1。
+ * 供 UI 在「刚 push、新一轮评审还没出」时回落到上一轮结论（见 displayRoundIndex）。
+ */
+export function settledRoundIndex(record) {
+  const rounds = roundsOf(record)
+  for (let index = rounds.length - 1; index >= 0; index -= 1) {
+    if (isSettled(rounds[index])) return index
+  }
+  return -1
+}
+
+/**
+ * 面板「该显示哪一轮的问题」：当前轮评审已落地就是当前轮；否则回落到最近一次落地的
+ * 评审轮次。**只改展示来源，不改判定**——pending / 可合结论仍只认当前轮（见 mergeable.js），
+ * 所以「评审未出」不会被当成「已修」，只是不把上一轮的问题一起藏起来。
+ * @returns {number} 轮次下标；没有可用轮次返回 -1
+ */
+export function displayRoundIndex(record) {
+  const rounds = roundsOf(record)
+  const last = rounds.length - 1
+  if (last < 0) return -1
+  if (isSettled(rounds[last])) return last
+  return settledRoundIndex(record)
 }
 
 const findingsOf = (round) => {
@@ -95,14 +131,18 @@ function instructionOf(source) {
  * FID 粒度的当前问题列表（UI 与 JSONL 落盘共用）。
  *
  * @param {object} record service 状态或账本记录（只读 binding / rounds / decisions）
+ * @param {{ roundIndex?: number }} [options] `roundIndex` 指定「看哪一轮」（UI 回落用）；
+ *   缺省 / 非法值一律取最后一轮，落盘路径永远走缺省，不受面板回落影响。
  * @returns {Array<{fid:string,file:string|undefined,line:number|undefined,level:string,
  *   type:string|null,gateCategory:string|null,problem:string,suggestion:string|undefined,
  *   snippet:string|undefined,reverifyCount:number|null,status:'open'|'waived'|'skip'|'wontfix'|'fixed',
  *   instruction:{kind:string,reason:string|null,noteId:number|null}|null,fixedAtRound?:number}>}
  */
-export function collectFindings(record) {
-  const round = roundOf(record)
-  const previous = previousRoundOf(record)
+export function collectFindings(record, options = {}) {
+  const rounds = roundsOf(record)
+  const index = roundIndexOf(record, options?.roundIndex)
+  const round = index < 0 ? null : rounds[index]
+  const previous = index > 0 ? rounds[index - 1] : null
   const decisions = record?.decisions !== null && typeof record.decisions === 'object' ? record.decisions : {}
   const current = findingsOf(round)
   const currentFids = new Set(current.map((item) => String(item?.fid ?? '').toUpperCase()))

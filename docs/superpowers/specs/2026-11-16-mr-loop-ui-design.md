@@ -226,3 +226,61 @@ mode      = needed + 8px 余量 ≤ container.clientWidth ? full : compact
 - 单测：`chipShrinkMode` 的边界（放得下 / 差 8px 内 / 缺字段）+ 形态不变式 + 兜底；窄屏渲染出一个图标按钮且点击能开抽屉（`test/client.test.js`，共 311 项）
 - 视觉台：`scripts/ui-harness.html?chip=cramped` 把 chip 塞进 200px 裁剪行（真实测量路径），`?chip=compact` 模拟窄窗口
 - 截图：`specs/assets/mr-loop-ui-chip-compact.jpg`
+
+## 十二、评审未出时的空看板：回落上一轮结论 + 轮次条（2026-11-17，v0.2.5）
+
+### 症状（用户实拍）
+
+MR !243 看板显示「第 7 轮」「差 1 项：AI 评审结论未知（未出或解析失败）」，
+但问题区整块是空的；而 MR 上第 1–6 轮每轮评审都提了问题（第 2 轮 2 条，第 3–6 轮各 1 条）。
+用户原话：「MR243，每一轮都有问题，但是我在看板上都看不到」。
+
+### 根因（两层）
+
+1. `problems` 只取**当前轮**（`collectFindings(record)` 默认读最后一轮）。第 7 轮的 sha
+   `b30c43b3` 刚 push、评审还没出（`review: null`），所以当前轮 finding 为 0；
+   而固定规则「评审未出 ≠ 已修」被实现成了「什么都不显示」，于是整块空白。
+2. 看板没有任何跨轮视图：`rounds[]` 只是设计稿 §六 里的草图，从未实现。
+   所以用户既看不到当前轮已出的问题（窗口只有几十秒），也看不到「每轮都提过几条」。
+
+另一个观察：那笔 push 没有触发流水线（`head_pipeline #7358` 的 sha 还是上一笔 `081bb374`），
+所以第 7 轮评审其实不会自己来，看板却只说「解析失败」。这条事实现在也展示出来了。
+
+### 改法（只改展示，不改判定）
+
+- `findings.js`：新增 `settledRoundIndex` / `displayRoundIndex`（最近一个 verdict = pass/changes 的轮次）；
+  `collectFindings(record, { roundIndex })` 可指定「看哪一轮」，缺省仍是最后一轮
+  —— findings 落盘 / 报告 / 唤醒的口径完全不变。
+- `ui.js`：
+  - `problems` 用 `displayRoundIndex`（当前轮评审没落地 → 回落上一轮结论）；
+  - 回落后仍为 `open` 的问题带 `unverified: true`（上一轮的「未处理」不能断言现在还没修）；
+  - 新增 `problemsRound: { n, sha, current }`、`rounds: [{ n, sha, verdict, at, total, open, fixed, current }]`（最多 12 轮，只给计数不给正文，payload 保持小）；
+  - `merge.pipeline.sha`：`head_pipeline` 停在上一笔提交时，面板据此说明「这笔提交没有流水线」。
+  - `pending` / 可合结论仍只认当前轮：回落只影响展示，不影响「差 N 项」与待处理计数。
+- `client.js`：
+  - 问题段落头：`第 N 轮问题 · M 条`；回落时右侧标注「第 M+1 轮评审未出」；
+  - 回落问题的状态显示为「◔ 待复验」（accent 色），而不是「● 未处理」；
+  - 轮次条：`轮次 第1轮·0 第2轮·2 … 第6轮·1 第7轮(等待评审)`，最多 8 个 + `+N`；当前显示的那一轮有描边，等待中的一轮用 warn 底色；
+  - 合并条内补一行：`流水线 #7358 还停在 081bb374，这笔提交没有流水线`（仅当 `review === null` 且 sha 不一致）。
+
+### 验收
+
+- 真实账本 !243（第 7 轮等待中）现在输出：`problemsRound = 第 6 轮`、问题 2 条（1 条待复验 + 1 条已修）、
+  `rounds = 0/2/1/1/1/1/等待` 七轮。
+- 测试 **316/316**（新增：`collectFindings` 指定轮次与回落不误判、UI 回落/`unverified`/轮次摘要、
+  看板回落渲染与「当前轮已落地」渲染两种情况）。
+- 视觉台：`scripts/ui-harness.html?demo=fallback`（回落态）、`?demo=settled`（当前轮已落地），
+  `&theme=dark` 暗色；截图 `specs/assets/mr-loop-ui-fallback-light.jpg`、`mr-loop-ui-fallback-dark.jpg`。
+- 已知边界：轮次条只给计数，历史轮的问题正文不随 payload 下发（保持 30s 整包轮询）。
+
+### data 契约增量
+
+```jsonc
+{
+  "problemsRound": { "n": 6, "sha": "081bb374…", "current": false },
+  "rounds": [{ "n": 6, "sha": "…", "verdict": "pass", "at": "2026-11-17T07:02:14Z",
+               "total": 1, "open": 1, "fixed": 1, "current": false }],
+  "problems": [{ "fid": "c145950e29", "status": "open", "unverified": true }],
+  "merge": { "pipeline": { "id": 7358, "status": "success", "sha": "081bb374…" } }
+}
+```
