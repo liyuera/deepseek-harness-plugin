@@ -34,6 +34,49 @@ export function releaseSession({ watcher, service }, sessionId) {
 }
 
 /**
+ * 账本 → 内存：插件重载 / 应用重启后，把「会话还活着」的绑定恢复出来并续盯。
+ * 只看带 sessionId 的账本记录（0.2.6 起才写），终态 / 显式 stop 过的跳过；
+ * 会话没有活 agent 时先不恢复（应用重启后还没被打开），等 agent/created 或用户发言再来。
+ * 纯装配逻辑：ledger / service / watcher / agentOf 全部注入，可直接单测。
+ *
+ * @param {{ ledger: object, service: object, watcher: object, agentOf: (sessionId: string) => boolean,
+ *           onlySessionId?: string, logger?: { warn?: Function } }} deps
+ * @returns {Promise<{ indexed: string[], restored: string[] }>}
+ */
+export async function rehydrateBindings({ ledger, service, watcher, agentOf, onlySessionId = undefined, isActive = () => true, logger = undefined }) {
+  let records
+  try {
+    records = await ledger.list()
+  } catch {
+    return { indexed: [], restored: [] }
+  }
+  const indexed = []
+  const restored = []
+  for (const record of records) {
+    // 插件已经卸载（例如刚 apply 就被重载）：不要恢复出无人清理的定时器。
+    if (isActive() === false) break
+    const sessionId = record?.binding?.sessionId
+    if (typeof sessionId !== 'string' || sessionId === '') continue
+    if (typeof record.terminal === 'string' && record.terminal !== '') continue
+    indexed.push(sessionId)
+    if (onlySessionId !== undefined && sessionId !== onlySessionId) continue
+    if (service.getState(sessionId) !== null) continue
+    // 会话没活（应用重启后还没被打开）：先不恢复，等它被打开时再补。
+    if (agentOf(sessionId) === false) continue
+    const state = service.restore({ record })
+    if (state === null) continue
+    try {
+      watcher.start(sessionId)
+    } catch (error) {
+      logger?.warn?.(`[mr-loop] 恢复 ${sessionId} 的监视失败：${error?.message ?? error}`)
+      continue
+    }
+    restored.push(sessionId)
+  }
+  return { indexed, restored }
+}
+
+/**
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @param {Record<string, unknown>} [rawConfig]
  */
@@ -69,6 +112,8 @@ export function apply(ctx, rawConfig = {}) {
     findings,
     logger: ctx.logger,
     onBound: ({ sessionId }) => {
+      // 新绑定也进索引：会话被重新打开时 agent/created 能据此触发恢复。
+      boundSessions.add(sessionId)
       try {
         watcherRef?.start(sessionId)
       } catch {
@@ -115,11 +160,63 @@ export function apply(ctx, rawConfig = {}) {
   watcherRef = watcher
   ctx.on('session/disposed', (session) => releaseSession({ watcher, service }, session.id))
 
+  // 账本 → 内存的自动恢复：插件重载 / 应用重启后不用重新 /mr。
+  const boundSessions = new Set()
+  const agentOf = (sessionId) => {
+    try {
+      const agents = ctx.get?.('agents')
+      if (agents === null || agents === undefined || typeof agents.get !== 'function') return false
+      return agents.get(sessionId) !== undefined
+    } catch {
+      return false
+    }
+  }
+  let disposed = false
+  ctx.effect(() => () => { disposed = true }, 'mr-loop: rehydrate guard')
+  const hasAgents = () => {
+    try {
+      const agents = ctx.get?.('agents')
+      return agents !== null && agents !== undefined && typeof agents.get === 'function'
+    } catch {
+      return false
+    }
+  }
+  const restoreFor = async (onlySessionId) => {
+    if (disposed === true) return []
+    const { indexed, restored } = await rehydrateBindings({
+      ledger, service, watcher, agentOf, onlySessionId, isActive: () => disposed === false, logger: ctx.logger,
+    })
+    for (const id of indexed) boundSessions.add(id)
+    return restored
+  }
+  // 没有 agents 服务（测试 / 精简宿主）时不做启动扫描：反正也判不出会话是否活着。
+  const ready = hasAgents() ? restoreFor().catch(() => []) : Promise.resolve([])
+  void ready.then((restored) => {
+    if (Array.isArray(restored) && restored.length > 0) {
+      ctx.logger?.info?.(`[mr-loop] 已恢复 ${restored.length} 个会话的 MR 监视`)
+    }
+  })
+
+  // 会话被打开（agent 创建）：应用重启后账本里的绑定在这一刻恢复。
+  ctx.on('agent/created', (payload) => {
+    const sessionId = payload?.agent?.id ?? payload?.id
+    if (typeof sessionId !== 'string' || sessionId === '') return
+    void ready.then(() => {
+      if (boundSessions.has(sessionId) === false) return undefined
+      return restoreFor(sessionId)
+    }).catch(() => {})
+  })
+
   // 用户发言续跑：会话里只要有人说话，就重新开始盯（暂停中的会话除外，等 /mr resume）。
+  // 应用重启后会话第一次被使用时，绑定也在这里补恢复。
   ctx.on('session/event', (session, event) => {
     if (event?.type !== 'user/message' || event.data?.source?.kind !== 'user') return
     const state = service.getState(session.id)
-    if (state !== null && state.paused === null && watcher.isWatching(session.id) === false) {
+    if (state === null) {
+      void ready.then(() => restoreFor(session.id)).catch(() => {})
+      return
+    }
+    if (state.paused === null && watcher.isWatching(session.id) === false) {
       watcher.start(session.id)
     }
   })

@@ -222,6 +222,8 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
         sourceBranch: mr.source_branch,
         targetBranch: mr.target_branch,
         boundAt: new Date(observedAt).toISOString(),
+        // 写进账本：插件重载 / 应用重启后据此把监视恢复回来（见 restore / rehydrateBindings）。
+        sessionId,
       },
       mr,
       round,
@@ -256,6 +258,52 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
       /* 同步抛错同样不影响绑定本身 */
     }
     return { report: report(state), warnings }
+  }
+
+  /**
+   * 从账本恢复一个绑定（插件重载 / 应用重启后自动续盯，见 index.js 的 rehydrateBindings）。
+   * 只恢复内存状态：不写账本、不碰网络；MR 快照不落账本，下一次 watcher tick / status 会补齐。
+   * 拒绝：没有 sessionId（本次版本之前的老账本 / 用户已 stop）、已终态、空轮次、同会话已绑定。
+   * @returns {object|null} 恢复出的 state；拒绝时返回 null
+   */
+  function restore({ record }) {
+    const binding = record?.binding
+    if (binding === null || typeof binding !== 'object') return null
+    if (typeof binding.projectPath !== 'string' || binding.projectPath.trim() === '') return null
+    if (!Number.isSafeInteger(binding.iid) || binding.iid <= 0) return null
+    const sessionId = typeof binding.sessionId === 'string' ? binding.sessionId.trim() : ''
+    if (sessionId === '') return null
+    // 已有同会话绑定（例如用户刚重绑过）：内存状态更新，不覆盖。
+    if (bindings.has(sessionId)) return null
+    // 终态是永久的：账本留给看板，不再恢复监视。
+    if (typeof record.terminal === 'string' && record.terminal !== '') return null
+    const rounds = Array.isArray(record.rounds) ? record.rounds : []
+    const round = rounds.length === 0 ? null : rounds[rounds.length - 1]
+    if (round === null || typeof round !== 'object') return null
+    const observedAt = now()
+    const decisions = record.decisions !== null && typeof record.decisions === 'object' ? record.decisions : {}
+    const state = {
+      sessionId,
+      binding: { ...binding, projectPath: binding.projectPath.trim(), sessionId },
+      // 账本不存 MR 快照：先置空，第一个 tick 会重新拉；期间合并判定保持「未知」。
+      mr: null,
+      round,
+      rounds: rounds.slice(-config.ledgerKeepRounds),
+      mergeableAt: typeof record.mergeableAt === 'string' ? record.mergeableAt : undefined,
+      decisions,
+      mergeability: null,
+      paused: record.paused ?? null,
+      notesCount: null,
+      pipelineStatus: null,
+      // 守卫计时从「恢复」起算：重启不能被当成「停了 12 小时」直接暂停。
+      startedAt: observedAt,
+      lastProgressAt: observedAt,
+      stallStreak: 0,
+      reverifyStreak: 0,
+      stallKey: blockingKey(round),
+    }
+    bindings.set(sessionId, state)
+    return state
   }
 
   async function status({ sessionId }) {
@@ -361,7 +409,9 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
       return { stopped: state !== undefined, forgotten: true }
     }
     bindings.delete(sessionId)
-    if (state !== undefined) await persist(state).catch(() => {})
+    // 显式 stop（不 forget）：账本保留给看板，但要抹掉 sessionId——否则插件重载后
+    // 会被 rehydrateBindings 当成「还要继续盯」自动恢复回来。
+    if (state !== undefined) await persist(state, { binding: { ...state.binding, sessionId: null } }).catch(() => {})
     drafts.delete(sessionId)
     await releaseSessionLock(sessionId)
     return { stopped: state !== undefined, forgotten: false }
@@ -651,5 +701,5 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
     sessionLocks.clear()
   }
 
-  return { bind, status, review, applySnapshot, stop, resume, pause, getState, listStates, dispose, report, ledger, waiverDraft, postWaiver, release, markTerminal }
+  return { bind, restore, status, review, applySnapshot, stop, resume, pause, getState, listStates, dispose, report, ledger, waiverDraft, postWaiver, release, markTerminal }
 }

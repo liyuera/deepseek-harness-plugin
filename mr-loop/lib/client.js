@@ -70,7 +70,8 @@ window.__ModuleLoader__.load({
       ".mrl-merge-sub{font-size:10.5px;color:var(--dsw-alias-label-secondary);margin-top:2px;line-height:1.5}",
       ".mrl-rounds{display:flex;align-items:center;gap:5px;flex-wrap:wrap;padding:7px 12px;border-top:1px solid var(--mrl-line-soft);font-size:10.5px;color:var(--dsw-alias-label-secondary)}",
       ".mrl-rounds .lbl{color:var(--dsw-alias-label-tertiary);flex:none;padding-right:1px}",
-      ".mrl-round{display:inline-flex;align-items:center;gap:4px;padding:0 7px;line-height:18px;border-radius:20px;background:var(--mrl-fill);white-space:nowrap}",
+      ".mrl-round{display:inline-flex;align-items:center;gap:4px;padding:0 7px;line-height:18px;border-radius:20px;border:0;background:var(--mrl-fill);color:var(--dsw-alias-label-secondary);font-family:inherit;font-size:10.5px;white-space:nowrap;cursor:pointer}",
+      ".mrl-round:hover{background:var(--mrl-fill-2)}",
       ".mrl-round[data-wait]{color:var(--dsw-alias-state-warn-primary);background:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 13%,transparent)}",
       ".mrl-round[data-sel]{box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--dsw-alias-label-primary) 22%,transparent);color:var(--dsw-alias-label-primary)}",
       ".mrl-issue{padding:9px 12px;border-bottom:1px solid var(--mrl-line-soft)}",
@@ -134,6 +135,8 @@ window.__ModuleLoader__.load({
       scope: "all",
       sessionId: null,
       expanded: {},
+      // 轮次条点击：projectPath#iid → 看第几轮（缺省看「最近一次落地的评审」）。
+      roundSel: {},
     };
     var subscribers = 0;
 
@@ -589,7 +592,8 @@ window.__ModuleLoader__.load({
       var mergeKind = merge === null ? "none" : (merge.mergeable === true ? "ok" : "bad");
       var mergeIcon = merge === null ? "—" : (merge.mergeable === true ? "✅" : "⛔");
       var mergeText = merge === null
-        ? "历史账本（未在跟踪）"
+        // 插件重载后绑定会被自动恢复，但 MR 快照要等第一次 tick 才拉回来：这期间不能说「未在跟踪」。
+        ? (mr.live === true ? "刚恢复监视，正在拉取 MR 状态…" : "历史账本（未在跟踪）")
         : (merge.mergeable === true
             ? "可合"
             : "差 " + (merge.missing ? merge.missing.length : 0) + " 项：" + (merge.missing || []).join("；"));
@@ -609,7 +613,6 @@ window.__ModuleLoader__.load({
       var openMr = function () { if (mr.webUrl) window.open(mr.webUrl, "_blank", "noopener,noreferrer"); };
       var removeEscaped = function () { /* hooks not used here */ };
       void removeEscaped;
-      var openProblem = problems.filter(function (p) { return p.status === "open"; })[0];
       var copyDraft = function () {
         if (openProblem === undefined) return;
         copyText("#ai-waive " + openProblem.fid + " reason=");
@@ -627,17 +630,51 @@ window.__ModuleLoader__.load({
         statusTag,
       ];
 
-      // 问题段落头：写清「这是第几轮的问题」；回落时要一眼看出第 N 轮评审还没出。
-      var issuesHead = shownRound === null
+      // 默认看「最近一次落地的评审」；用户点轮次条可以翻看任意一轮（历史轮的问题正文随 payload 下发）。
+      var roundKey = String(mr.projectPath || "") + "#" + String(mr.iid || 0);
+      var picked = state.roundSel !== null && state.roundSel !== undefined && Number.isSafeInteger(state.roundSel[roundKey])
+        ? state.roundSel[roundKey]
+        : null;
+      var pickedRound = null;
+      if (picked !== null) {
+        pickedRound = rounds.filter(function (item) { return item.n === picked; })[0] || null;
+      }
+      // browsing = 正在看一轮「不是默认那一轮」的历史轮：段落头要说明并给回退入口。
+      var browsing = pickedRound !== null && (shownRound === null || pickedRound.n !== shownRound.n);
+      var shownN = browsing ? pickedRound.n : (shownRound === null ? null : shownRound.n);
+      var shownProblems = browsing
+        ? (Array.isArray(pickedRound.problems) ? pickedRound.problems : [])
+        : problems;
+      // 复制指令只对默认视图开放：翻历史轮时翻到的 FID 可能早就修好了，不能拿来发豁免。
+      var openProblem = browsing ? undefined : problems.filter(function (p) { return p.status === "open"; })[0];
+      var pickRound = function (n) {
+        var next = Object.assign({}, state.roundSel);
+        if (n === null) delete next[roundKey];
+        else next[roundKey] = n;
+        setStore({ roundSel: next });
+      };
+
+      // 问题段落头：写清「这是第几轮的问题」；回落时标注第 N 轮评审未出，翻历史轮时给「回到最新」。
+      var issuesHead = shownN === null
         ? null
         : h("div", { className: "mrl-sec" },
-            h("b", null, "第 " + shownRound.n + " 轮问题"),
-            h("span", null, "· " + problems.length + " 条"),
+            h("b", null, "第 " + shownN + " 轮问题"),
+            h("span", null, browsing && (pickedRound.verdict === null || pickedRound.verdict === undefined)
+              ? "· 等待评审"
+              : "· " + shownProblems.length + " 条"),
             h("span", { className: "mrl-sp" }),
-            fallback ? h("span", { className: "mrl-sec-warn" }, "第 " + (mr.round || 0) + " 轮评审未出") : null);
-      var issues = problems.length > 0
+            browsing
+              ? h("button", {
+                  className: "mrl-link",
+                  type: "button",
+                  onClick: function () { pickRound(null); },
+                }, shownRound === null ? "回到最新" : "回到第 " + shownRound.n + " 轮")
+              : fallback
+                ? h("span", { className: "mrl-sec-warn" }, "第 " + (mr.round || 0) + " 轮评审未出")
+                : null);
+      var issues = shownProblems.length > 0
         ? h("div", { className: "mrl-issues" },
-            problems.map(function (problem) {
+            shownProblems.map(function (problem) {
               return h(ProblemRow, { key: String(problem.fid), problem: problem });
             }))
         : null;
@@ -645,7 +682,7 @@ window.__ModuleLoader__.load({
         ? h("div", null, issuesHead, issues)
         : null;
 
-      // 轮次条：一眼看到每轮的结论与条数（第 1…N 轮都提过几条），问题正文不放进 payload。
+      // 轮次条：一眼看到每轮的结论与条数；点一轮就看那一轮的问题（默认看最近一次落地的评审）。
       var roundStrip = null;
       if (rounds.length > 1) {
         var shown = rounds.slice(-8);
@@ -656,18 +693,20 @@ window.__ModuleLoader__.load({
         }
         shown.forEach(function (item) {
           var waiting = item.verdict === null || item.verdict === undefined;
-          var selected = shownRound !== null && shownRound.n === item.n;
+          var selected = shownN !== null && shownN === item.n;
           var label = waiting ? "等待评审" : (item.verdict === "pass" ? "通过" : item.verdict === "changes" ? "需修改" : "未解析");
           var tip = "第 " + item.n + " 轮 · " + label;
           if (!waiting) tip += " · " + (item.total || 0) + " 条";
           if (item.fixed > 0) tip += "，已修 " + item.fixed;
           if (item.at) tip += " · " + String(item.at).replace("T", " ").slice(0, 16);
-          chips.push(h("span", {
+          chips.push(h("button", {
             className: "mrl-round",
             key: "r" + item.n,
-            title: tip,
+            type: "button",
+            title: tip + " · 点击查看这一轮的问题",
             "data-sel": selected ? "1" : undefined,
             "data-wait": waiting ? "1" : undefined,
+            onClick: function () { pickRound(item.n); },
           },
             "第" + item.n + "轮",
             waiting

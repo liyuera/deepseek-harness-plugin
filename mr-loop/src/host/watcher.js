@@ -134,7 +134,7 @@ export function createWatcher({ cfg, gitlab, service, notify, logger = undefined
     const sha = String(round?.sha ?? '')
     const existing = roundClocks.get(sessionId)
     if (existing !== undefined && existing.sha === sha) return existing
-    const fresh = { sha, awaitingSince: now(), reviewSettledAt: null, timeoutWoken: false, gateSettleWoken: false }
+    const fresh = { sha, awaitingSince: now(), reviewSettledAt: null, timeoutWoken: false, gateSettleWoken: false, noPipelineWoken: false }
     roundClocks.set(sessionId, fresh)
     return fresh
   }
@@ -276,6 +276,24 @@ export function createWatcher({ cfg, gitlab, service, notify, logger = undefined
     }
 
     const pipelineStatus = mr.head_pipeline?.status ?? null
+    // 这笔提交到底有没有流水线：GitLab 的 head_pipeline 是「这个 MR 最新的流水线」，
+    // 新 push 之后它可能还停在上一个 commit 上（sha 不一致）——此时评审不会被自动产出。
+    // 实例没给 sha / 当前 sha 缺失时无法证明，按「未知」处理，绝不误报。
+    const headSha = typeof mr.sha === 'string' ? mr.sha : ''
+    const pipelineSha = typeof mr.head_pipeline?.sha === 'string' ? mr.head_pipeline.sha : null
+    const pipelineForHead = mr.head_pipeline === null || mr.head_pipeline === undefined
+      ? false
+      : pipelineSha === null || headSha === ''
+        ? true
+        : pipelineSha === headSha
+    // 给唤醒文案用：评审卡在哪条流水线上（或根本没有）。
+    const pipelineLabel = () => {
+      const latest = mr.head_pipeline
+      if (latest === null || latest === undefined) return '无流水线'
+      const short = String(latest.sha ?? '').slice(0, 8)
+      const where = short === '' ? '' : `（${short}）`
+      return `#${latest.id ?? '?'}${where}`
+    }
     // 设计 §5.4：流水线 failed/canceled 立刻唤醒（评审可能根本没产出，不要静默等到超时）。
     if ((pipelineStatus === 'failed' || pipelineStatus === 'canceled') && pipelineStatus !== state.pipelineStatus) {
       wake(sessionId, `流水线 ${pipelineStatus}（#${mr.head_pipeline?.id ?? '?'}）：评审可能没有产出，先看 job 日志或等下一轮。`)
@@ -358,12 +376,33 @@ export function createWatcher({ cfg, gitlab, service, notify, logger = undefined
     if (reviewPresent === false && clock.timeoutWoken === false && tickAt - clock.awaitingSince >= cfg.roundTimeoutMs) {
       const shortSha = String(next.round?.sha ?? '').slice(0, 8)
       const minutes = Math.max(1, Math.round((tickAt - clock.awaitingSince) / 60000))
+      const pipelineText = pipelineForHead
+        ? `流水线 ${pipelineStatus ?? '无'}。`
+        : `这笔提交没有流水线（最新 ${pipelineLabel()} 还停在上一笔提交）。`
       wake(
         sessionId,
-        `评审超时：sha ${shortSha} 已等待 ${minutes} 分钟仍未出结论。流水线 ${pipelineStatus ?? '无'}。`,
+        `评审超时：sha ${shortSha} 已等待 ${minutes} 分钟仍未出结论。${pipelineText}`,
         `roundTimeout:${clock.sha}`,
       )
       clock.timeoutWoken = true
+    }
+
+    // 新提交长时间没有流水线：评审不会自己来，提前叫一次（draw 设计 §5.4 补丁），
+    // 不要让它静默等到 roundTimeoutMs。同一个 sha 只提醒一次。
+    if (
+      pipelineForHead === false
+      && reviewPresent === false
+      && clock.noPipelineWoken === false
+      && tickAt - clock.awaitingSince >= cfg.noPipelineWakeMs
+    ) {
+      const shortSha = String(next.round?.sha ?? headSha).slice(0, 8)
+      const minutes = Math.max(1, Math.round((tickAt - clock.awaitingSince) / 60000))
+      const latest = mr.head_pipeline
+      const text = latest === null || latest === undefined
+        ? `评审不会自己来：sha ${shortSha} 已经 ${minutes} 分钟没有流水线。重新 push 或手动跑一次流水线。`
+        : `评审不会自己来：sha ${shortSha} 已经 ${minutes} 分钟没有流水线，最新流水线 ${pipelineLabel()} 还停在上一笔提交。重新 push 或手动跑一次流水线。`
+      wake(sessionId, text, `noPipeline:${clock.sha}`)
+      clock.noPipelineWoken = true
     }
 
     // 设计 §5.4：评审已到、敏感门禁仍未出时，等满 gateSettleMs 只提醒一次；
@@ -378,7 +417,10 @@ export function createWatcher({ cfg, gitlab, service, notify, logger = undefined
     // 门禁 settle 窗口内用 pollSettleMs。没有流水线时保持 pollNoPipelineMs。
     const gateSettlePending = reviewPresent && clock.gateSettleWoken === false && gatesMissing
     let delay
-    if (pipelineStatus === null) delay = cfg.pollNoPipelineMs
+    // 评审还没出、这笔提交又没流水线：评审不会很快来，放慢到 pollNoPipelineMs；
+    // 评审已经在场时仍按原节拍（流水线 sha 落后可能只是 GitLab 延迟）。
+    if (reviewPresent === false && pipelineForHead === false) delay = cfg.pollNoPipelineMs
+    else if (pipelineStatus === null) delay = cfg.pollNoPipelineMs
     else if (terminal(pipelineStatus) === false || reviewPresent === false) delay = cfg.pollAwaitingMs
     else if (gateSettlePending) delay = cfg.pollSettleMs
     else delay = cfg.pollWatchingMs

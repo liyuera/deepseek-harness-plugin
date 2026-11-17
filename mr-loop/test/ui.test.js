@@ -300,3 +300,46 @@ test('面板：当前轮评审已落地时 problemsRound 指向当前轮，问�
   assert.equal('unverified' in mr.problems[0], false)
   assert.deepEqual(mr.rounds.map((round) => [round.n, round.current]), [[1, true]])
 })
+
+test('面板：每轮摘要都带自己的问题正文（历史轮点开即可查看）', async () => {
+  const first = {
+    ...roundOf(),
+    n: 1,
+    review: {
+      ...roundOf().review,
+      verdict: 'changes',
+      blocking: [{ ...roundOf().review.blocking[0], fid: 'old0000001', problem: '第 1 轮的问题', level: '中' }],
+    },
+  }
+  const second = {
+    ...roundOf(),
+    n: 2,
+    sha: 'b'.repeat(40),
+    review: {
+      ...passReviewOf(),
+      nonBlocking: [{ ...roundOf().review.blocking[0], fid: 'new0000002', problem: '第 2 轮的问题', level: '低' }],
+    },
+  }
+  const third = { ...roundOf(), n: 3, sha: 'c'.repeat(40), review: null }
+  const record = { ...recordOf({ iid: 250, round: first }), rounds: [first, second, third] }
+  const snapshot = await snapshotOf([record])
+  const mr = snapshot.mrs[0]
+
+  // 默认视图 = 最近一次落地的评审（第 2 轮）：本轮问题 + 上一轮被本轮确认修好的。
+  assert.equal(mr.problemsRound.n, 2)
+  assert.deepEqual(mr.problems.map((problem) => [problem.fid, problem.status]), [
+    ['new0000002', 'open'],
+    ['old0000001', 'fixed'],
+  ])
+  // 轮次摘要里每一轮都有自己的正文，客户端点开历史轮直接渲染，不需要再请求。
+  const [r1, r2, r3] = mr.rounds
+  assert.deepEqual(r1.problems.map((problem) => [problem.fid, problem.status]), [['old0000001', 'open']])
+  assert.deepEqual(r2.problems.map((problem) => [problem.fid, problem.status]), [
+    ['new0000002', 'open'],
+    ['old0000001', 'fixed'],
+  ])
+  assert.equal(r2.fixed, 1)
+  assert.deepEqual(r3.problems, [])
+  // 历史轮的问题不标 unverified（那是「当前视图」的语义）。
+  assert.equal('unverified' in r1.problems[0], false)
+})

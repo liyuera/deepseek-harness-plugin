@@ -960,3 +960,82 @@ test('#6：唤醒里提示无效指令条数（只给 count），待处置计数
   assert.match(text, /有 1 处评审问题待处置/)
   assert.match(text, /另有 3 条 #ai-\* 指令格式不对，未生效。/)
 })
+
+// ---------------------------------------------------------------------------
+// noPipelineWakeMs：新提交长时间没有流水线 → 不用等到 roundTimeoutMs 就提醒一次
+// ---------------------------------------------------------------------------
+
+/** 流水线还停在上一笔提交：GitLab 的 head_pipeline 指向旧 sha。 */
+const stalePipeline = { status: 'success', id: 7358, sha: OTHER, created_at: '2026-11-17T07:02:06Z' }
+
+test('noPipelineWakeMs：新 sha 没有流水线（head_pipeline 停在上一笔）→ 到点只提醒一次', async () => {
+  const h = harness({ mr: mrOf({ head_pipeline: stalePipeline }), notes: [], snapshot: pinnedSnapshot })
+
+  await h.watcher.tick('s')
+  // 未到阈值不提醒；轮询按「这笔提交没有流水线」的间隔走。
+  assert.equal(h.notified.filter((text) => /没有流水线/.test(text)).length, 0)
+  assert.equal(h.timers.at(-1).ms, cfg.pollNoPipelineMs)
+
+  h.advance(cfg.noPipelineWakeMs - 1)
+  await h.watcher.tick('s')
+  assert.equal(h.notified.filter((text) => /没有流水线/.test(text)).length, 0)
+
+  h.advance(1)
+  await h.watcher.tick('s')
+  const wakes = h.notified.filter((text) => /没有流水线/.test(text))
+  assert.equal(wakes.length, 1)
+  assert.match(wakes[0], new RegExp(`sha ${SHA.slice(0, 8)}`))
+  assert.match(wakes[0], /#7358/)
+  assert.match(wakes[0], /重新 push/)
+  // 不停表：继续等评审/流水线。
+  assert.equal(h.timers.at(-1).ms, cfg.pollNoPipelineMs)
+
+  // 同一个 sha 不再重复提醒（即使又过了阈值）。
+  h.advance(cfg.noPipelineWakeMs)
+  await h.watcher.tick('s')
+  assert.equal(h.notified.filter((text) => /没有流水线/.test(text)).length, 1)
+})
+
+test('noPipelineWakeMs：head_pipeline 就是当前 sha → 不提醒', async () => {
+  const h = harness({
+    mr: mrOf({ head_pipeline: { status: 'running', id: 7359, sha: SHA } }),
+    notes: [],
+    snapshot: pinnedSnapshot,
+  })
+  await h.watcher.tick('s')
+  h.advance(cfg.noPipelineWakeMs * 2)
+  await h.watcher.tick('s')
+  assert.equal(h.notified.filter((text) => /没有流水线/.test(text)).length, 0)
+})
+
+test('noPipelineWakeMs：整个 MR 没有流水线时提醒「没有流水线」，且不会重复', async () => {
+  const h = harness({ mr: mrOf({ head_pipeline: null }), notes: [], snapshot: pinnedSnapshot })
+  await h.watcher.tick('s')
+  h.advance(cfg.noPipelineWakeMs)
+  await h.watcher.tick('s')
+  const wakes = h.notified.filter((text) => /已经 3 分钟没有流水线/.test(text))
+  assert.equal(wakes.length, 1)
+  assert.doesNotMatch(wakes[0], /#\d+/)
+})
+
+test('noPipelineWakeMs：已有本轮评审时不提醒（流水线 sha 落后可能只是 GitLab 延迟）', async () => {
+  const h = harness({
+    mr: mrOf({ head_pipeline: stalePipeline }),
+    notes: [],
+    stateOver: {
+      round: {
+        sha: SHA, n: 1, observedAt: 1,
+        review: { verdict: 'pass' },
+        sensitive: { verdict: 'pass' },
+        mandatory: { verdict: 'pass' },
+      },
+    },
+    snapshot: pinnedSnapshot,
+  })
+  await h.watcher.tick('s')
+  h.advance(cfg.noPipelineWakeMs)
+  await h.watcher.tick('s')
+  assert.equal(h.notified.filter((text) => /没有流水线/.test(text)).length, 0)
+  // 有评审时轮询间隔也不该被「无流水线」拖慢。
+  assert.equal(h.timers.at(-1).ms, cfg.pollWatchingMs)
+})

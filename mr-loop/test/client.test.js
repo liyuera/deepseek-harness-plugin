@@ -401,3 +401,54 @@ test('看板：当前轮评审已落地时标「第 N 轮问题」，问题仍�
   assert.doesNotMatch(texts, /评审未出/)
   assert.doesNotMatch(texts, /没有流水线/)
 })
+
+test('看板：点轮次条翻看历史轮的问题正文，并能回到默认轮（复制指令同时禁用）', async () => {
+  // 第 1 轮给一条历史问题：点开第 1 轮应显示它，而不是默认第 6 轮的问题。
+  const data = JSON.parse(JSON.stringify(fallbackMr))
+  data.rounds[0] = {
+    ...data.rounds[0], total: 1,
+    problems: [{
+      fid: 'oldold0001', level: '低', type: '非阻塞建议', file: 'src/old.ts', line: 3,
+      problem: '第 1 轮提出的历史问题', status: 'open',
+    }],
+  }
+  const { loaded, panel } = await renderPanel(data)
+
+  // 默认视图 = 第 6 轮（最近一次落地的评审）。
+  const chips = nodesByClass(panel, 'mrl-round')
+  const selected = chips.filter((node) => node.props['data-sel'] === '1')
+  assert.equal(selected.length, 1)
+  assert.equal(textOfTree(selected[0])[0], '第6轮')
+  assert.match(textOfTree(panel).join(' | '), /第 6 轮问题/)
+
+  // 点第 1 轮：段落头切过去，正文换成那一轮的问题。
+  const round1 = chips.find((node) => textOfTree(node)[0] === '第1轮')
+  assert.equal(typeof round1.props.onClick, 'function')
+  round1.props.onClick()
+  const browsing = drawerOf(loaded)()
+  const browsingTexts = textOfTree(browsing).join(' | ')
+  assert.match(browsingTexts, /第 1 轮问题/)
+  assert.match(browsingTexts, /第 1 轮提出的历史问题/)
+  assert.doesNotMatch(browsingTexts, /第 6 轮问题/)
+  // 翻历史轮时「复制指令」必须禁用：那可能是早就修好的 FID。
+  const footerButtons = nodesByClass(browsing, 'mrl-btn').filter((node) => textOfTree(node)[0] === '复制指令')
+  assert.equal(footerButtons.length, 1)
+  assert.equal(footerButtons[0].props.disabled, true)
+
+  // 「回到第 6 轮」回到默认视图。
+  const reset = nodesByClass(browsing, 'mrl-link').find((node) => textOfTree(node).join('').includes('回到第 6 轮'))
+  assert.ok(reset !== undefined)
+  reset.props.onClick()
+  const back = drawerOf(loaded)()
+  const backTexts = textOfTree(back).join(' | ')
+  assert.match(backTexts, /第 6 轮问题/)
+  assert.doesNotMatch(backTexts, /第 1 轮问题/)
+})
+
+test('看板：重载后刚恢复的活绑定（还没拉到 MR 快照）不能说成「历史账本」', async () => {
+  const restored = { ...fallbackMr, merge: null, review: null, problemsRound: null, problems: [] }
+  const { panel } = await renderPanel(restored)
+  const texts = textOfTree(panel).join(' | ')
+  assert.match(texts, /刚恢复监视，正在拉取 MR 状态/)
+  assert.doesNotMatch(texts, /历史账本/)
+})

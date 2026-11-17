@@ -284,3 +284,58 @@ MR !243 看板显示「第 7 轮」「差 1 项：AI 评审结论未知（未出
   "merge": { "pipeline": { "id": 7358, "status": "success", "sha": "081bb374…" } }
 }
 ```
+
+## 十三、三个补丁：没流水线要叫、重载要续盯、历史轮要能点开（2026-11-17，v0.2.6）
+
+### ① 新提交长时间没有流水线 → 主动唤醒一次
+
+实拍 MR !243 第 7 轮：push 了 `b30c43b3`，但 `head_pipeline` 还停在 `081bb374`（GitLab 的
+head_pipeline 是「这个 MR 最新的流水线」，新提交没触发流水线时它指向上一个 commit）。
+原来的行为是静默等到 `roundTimeoutMs`（15 分钟）才说一句「评审超时」，然后继续等。
+
+- 配置：`noPipelineWakeMs`（默认 180000 = 3 分钟，最小 30000）。
+- 判据：`head_pipeline.sha !== mr.sha`（或整个 MR 没有流水线）且本轮评审还没出；
+  实例没给 `head_pipeline.sha` / 当前 sha 缺失时按「未知」处理，**绝不误报**。
+- 同一个 sha 只提醒一次（`noPipeline:<sha>` 去重）；文案直接说清怎么解：
+  `评审不会自己来：sha b30c43b3 已经 3 分钟没有流水线，最新流水线 #7358（081bb374）还停在上一笔提交。重新 push 或手动跑一次流水线。`
+- 评审已到场时不提醒（流水线 sha 落后可能只是 GitLab 延迟），轮询间隔也不受影响；
+  等待中的轮次改用 `pollNoPipelineMs`。
+- `roundTimeoutMs` 的「评审超时」文案也带上这条事实（区分「没有流水线」与「流水线状态」）。
+
+### ② 插件重载 / 应用重启后自动恢复监视
+
+原来绑定只在内存里：每次重载插件（开发期每改一次都会重载）用户的 MR 监视就断了，
+必须回到那个会话重新 `/mr <链接>`。
+
+- 账本 `binding` 增加 `sessionId`（`bind` 时写入）。`mr_stop` 不 forget 时把账本里的
+  `sessionId` 置空——显式停止的 MR 不该被自动恢复；重绑会重新写入。
+- `ledger.list()`：读出账本目录全部记录（坏文件跳过）。
+- `service.restore({ record })`：从账本恢复内存状态（不写账本、不碰网络；MR 快照不落账本，
+  下一个 tick / `/mr status` 会补齐）。拒绝：老账本没有 `sessionId`、已终态、空轮次、同会话已绑定。
+- `index.js` 导出 `rehydrateBindings`：只恢复「会话还有活 agent」的绑定（`ctx.get('agents').get`），
+  恢复后 `watcher.start` 续盯。插件卸载后不再恢复（`isActive`），避免留下无人清理的定时器。
+- 触发点三个：`apply` 时扫一遍、`agent/created`（应用重启后会话被打开）、用户首次发言（`session/event`）。
+- 守卫计时从「恢复」起算，不会被误判成「停了 12 小时」直接暂停。
+- 已知边界：应用重启后，会话没有被打开之前不会恢复（DSH 不给未加载会话建 agent，插进去的消息也无人接收）；
+  会话一被打开就自动接上。0.2.6 之前写下的账本没有 `sessionId`，需要重绑一次才会被自动恢复。
+
+### ③ 面板里点轮次条看历史轮的问题正文
+
+上一版（0.2.5）轮次条只给计数。现在 `rounds[]` 每轮都带 `problems`（与当前轮同一套
+`collectFindings` 口径：本轮评审的问题 + 本轮确认已修的上一轮问题），面板：
+
+- 轮次条变成按钮：点第 N 轮 → 段落头切到 `第 N 轮问题 · X 条`，右侧出现 `回到第 6 轮`；
+  等待中的一轮点开显示 `· 等待评审`。
+- 历史轮是「第 N 轮时的清单」：那一轮还没修的问题就是 `● 未处理`（后来修好的会在后面几轮显示 `✓ 已修`）。
+- 翻历史轮时「复制指令」禁用：翻出来的 FID 可能早就修好了，不能拿来发豁免。
+- payload：最多 12 轮 × 每轮问题正文（`问题` 500 / `建议` 500 / 代码 400 上限已有），面板 30s 整包轮询仍然成立。
+
+### 验收
+
+- 测试 **331/331**（新增：noPipeline 唤醒 4 项、ledger.list 2 项、service.restore/stop 3 项、
+  rehydrateBindings 4 项、每轮问题正文 2 项、客户端历史轮翻看 1 项）。
+- 视觉台：`?demo=fallback`（默认回落视图）、`?demo=fallback&round=2`（点开第 2 轮），
+  `?theme=dark` 暗色；截图 `specs/assets/mr-loop-ui-round-history-light.jpg`、
+  `mr-loop-ui-round-history-dark.jpg`。
+- 真机验证：绑定 → 重载插件 → 账本 `binding.sessionId` 恢复 → `/mr-loop/ui/state` 里该 MR 仍是 `live: true`
+  且合并判定仍在算 → `mr_stop` 后回到「历史账本」。

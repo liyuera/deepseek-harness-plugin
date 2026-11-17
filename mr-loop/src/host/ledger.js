@@ -3,7 +3,7 @@
  * 不用 storageDomain 的原因见设计 ADR-5：免 peer 依赖、可人肉查看。
  * 读坏文件按「没有账本」处理，绝不抛给调用方。
  */
-import { mkdir, readFile, rename, rm, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rename, rm, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join, resolve as resolvePath } from 'node:path'
 
@@ -83,6 +83,31 @@ export function createLedger({ dir, keepRounds = 50, keepDecisions = MAX_DECISIO
     }
   }
 
+  /**
+   * 账本目录里的全部记录（启动恢复 / 多 MR 展示用）。坏文件与数组按「没有」跳过，
+   * 与 load 同口径；读失败返回空数组，绝不把异常抛给启动路径。
+   */
+  const list = async () => {
+    let names
+    try {
+      names = await readdir(root)
+    } catch {
+      return []
+    }
+    const records = []
+    for (const name of names) {
+      if (!name.endsWith('.json')) continue
+      try {
+        const text = await readFile(join(root, name), 'utf8')
+        const parsed = JSON.parse(text)
+        if (parsed !== null && typeof parsed === 'object' && Array.isArray(parsed) === false) records.push(parsed)
+      } catch {
+        /* 单个坏文件不影响其它记录 */
+      }
+    }
+    return records
+  }
+
   const forget = ({ projectPath, iid }) => {
     const file = pathOf({ projectPath, iid })
     // 删除也入队：save 在途时 forget 不会被随后的 rename 写回。
@@ -91,5 +116,5 @@ export function createLedger({ dir, keepRounds = 50, keepDecisions = MAX_DECISIO
     })
   }
 
-  return { pathOf, save, load, forget }
+  return { pathOf, save, load, list, forget }
 }

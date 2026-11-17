@@ -80,8 +80,10 @@ function isoOf(value) {
 }
 
 /**
- * 单轮摘要（面板的轮次条）：只给计数与结论，不给问题正文——payload 要能整包 30s 轮询。
+ * 单轮摘要（面板的轮次条 + 历史轮详情）：计数、结论与**该轮的问题正文**。
  * `total` 是该轮评审自己的 finding 数；`fixed` 是上一轮遗留、本轮评审里已消失的条数。
+ * 「看哪一轮」的口径与当前轮列表同一套（collectFindings），所以历史轮点开看到的是
+ * 「第 N 轮时的清单」：本轮问题 + 本轮确认为已修的上一轮问题。
  */
 function roundSummaryOf(record, index) {
   const rounds = Array.isArray(record?.rounds) ? record.rounds : []
@@ -102,6 +104,14 @@ function roundSummaryOf(record, index) {
     fixed,
     waived,
     current: index === rounds.length - 1,
+    // 历史轮点开时显示的问题列表（与当前轮同口径；unverified 只标给「当前视图」）。
+    problems: findings.map((finding) => {
+      const problem = uiProblemOf(finding)
+      const noteId = problem.instruction?.noteId
+      const comment = noteId === undefined ? undefined : commentMapOf(round).get(noteId)
+      if (comment !== undefined) problem.comment = comment
+      return problem
+    }),
   }
 }
 

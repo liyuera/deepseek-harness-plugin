@@ -1415,3 +1415,93 @@ test('markTerminal：terminal 落账本、state.mr 更新，findings 旁路照�
   assert.equal(recorded.length, 2, 'bind 与 markTerminal 各 record 一次')
   await rm(dir, { recursive: true, force: true })
 })
+
+// ---------------------------------------------------------------------------
+// 坑②：绑定持久化 sessionId + 从账本恢复（插件重载 / 应用重启后继续盯）
+// ---------------------------------------------------------------------------
+
+test('restore：从账本恢复绑定（sessionId 落账本，MR 快照不落账本）', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mrloop-service-'))
+  try {
+    const ledger = createLedger({ dir })
+    const cfg = resolveConfig({ baseUrl: 'https://git.x.com' })
+    const h = harness()
+    const first = createService({ config: cfg, ledger, gitlab: h.gitlab, repoState: h.repoImpl })
+    await first.bind({ sessionId: 's1', url: 'https://git.x.com/g/p/-/merge_requests/240', repoRoot: '/r' })
+
+    const records = await ledger.list()
+    assert.equal(records.length, 1)
+    assert.equal(records[0].binding.sessionId, 's1', 'sessionId 必须写进账本，否则重载后找不到会话')
+
+    // 新进程 / 重载后：内存是空的，restore 从账本把绑定捡回来。
+    const second = createService({ config: cfg, ledger, gitlab: h.gitlab, repoState: h.repoImpl })
+    assert.equal(second.getState('s1'), null)
+    const state = second.restore({ record: records[0] })
+    assert.ok(state !== null)
+    assert.equal(state.sessionId, 's1')
+    assert.equal(state.binding.projectPath, 'g/p')
+    assert.equal(state.binding.iid, 240)
+    assert.equal(state.round.sha, SHA)
+    assert.equal(state.rounds.length, 1)
+    assert.equal(state.mr, null, 'MR 快照不进账本：等下一个 tick 拉')
+    assert.equal(state.mergeability, null)
+    assert.equal(second.getState('s1'), state)
+
+    // 恢复出来的绑定能继续工作：/mr status 先拉 MR 再算可合。
+    const { report } = await second.status({ sessionId: 's1' })
+    assert.match(report, /MR !240/)
+    assert.match(report, /可合/)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('restore：没有 sessionId / 已终态 / 空轮次 / 同会话已绑定 → 不恢复', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mrloop-service-'))
+  try {
+    const ledger = createLedger({ dir })
+    const cfg = resolveConfig({ baseUrl: 'https://git.x.com' })
+    const h = harness()
+    const service = createService({ config: cfg, ledger, gitlab: h.gitlab, repoState: h.repoImpl })
+    const round = { sha: SHA, n: 1, review: null, sensitive: null, mandatory: null }
+    const recordOf = (over = {}) => ({
+      version: 1,
+      binding: { projectPath: 'g/p', iid: 240, sessionId: 's1', ...over.binding },
+      rounds: [round],
+      decisions: {},
+      mergeableAt: null,
+      terminal: null,
+      paused: null,
+      ...over,
+    })
+    assert.equal(service.restore({ record: recordOf({ binding: { sessionId: undefined } }) }), null)
+    assert.equal(service.restore({ record: recordOf({ binding: { sessionId: null } }) }), null)
+    assert.equal(service.restore({ record: recordOf({ terminal: 'merged' }) }), null)
+    assert.equal(service.restore({ record: recordOf({ rounds: [] }) }), null)
+    assert.equal(service.restore({ record: null }), null)
+
+    // 同会话已经有绑定：不覆盖（内存里的状态比账本新）。
+    assert.ok(service.restore({ record: recordOf() }) !== null)
+    assert.equal(service.restore({ record: recordOf() }), null)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('stop（不 forget）抹掉账本里的 sessionId：显式停止的 MR 不会被自动恢复', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mrloop-service-'))
+  try {
+    const ledger = createLedger({ dir })
+    const cfg = resolveConfig({ baseUrl: 'https://git.x.com' })
+    const h = harness()
+    const service = createService({ config: cfg, ledger, gitlab: h.gitlab, repoState: h.repoImpl })
+    await service.bind({ sessionId: 's1', url: 'https://git.x.com/g/p/-/merge_requests/240', repoRoot: '/r' })
+    await service.stop({ sessionId: 's1' })
+
+    const [record] = await ledger.list()
+    assert.equal(record.binding.sessionId, null)
+    assert.equal(record.binding.iid, 240, '账本本身要保留（看板还要看历史）')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})

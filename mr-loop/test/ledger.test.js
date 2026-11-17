@@ -93,3 +93,22 @@ test('keepRounds=0 表示不留历史；数组内容按坏文件处理', async (
   assert.equal(await ledger.load({ projectPath: 'g/p', iid: 9 }), null)
   await rm(dir, { recursive: true, force: true })
 })
+
+test('list：读出目录里全部记录；坏文件 / 数组按没有跳过', async () => {
+  const dir = await tmp()
+  const ledger = createLedger({ dir })
+  await ledger.save(rec({ binding: { projectPath: 'g/p', iid: 240 } }))
+  await ledger.save(rec({ binding: { projectPath: 'g/p', iid: 241 } }))
+  await writeFile(join(dir, 'bad.json'), '{oops', 'utf8')
+  await writeFile(join(dir, 'arr.json'), '[1,2]', 'utf8')
+  await writeFile(join(dir, 'note.txt'), 'ignore me', 'utf8')
+
+  const records = await ledger.list()
+  assert.deepEqual(records.map((item) => item.binding.iid).sort(), [240, 241])
+  await rm(dir, { recursive: true, force: true })
+})
+
+test('list：目录不存在时返回空数组（启动恢复不能因为没账本就报错）', async () => {
+  const ledger = createLedger({ dir: join(tmpdir(), 'mrloop-missing-dir') })
+  assert.deepEqual(await ledger.list(), [])
+})

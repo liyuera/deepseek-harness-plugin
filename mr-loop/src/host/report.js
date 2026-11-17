@@ -74,7 +74,7 @@ export function renderReport({ binding, mr, round, decisions = {}, mergeability,
   const lines = []
   lines.push(`MR !${binding.iid} · ${binding.projectPath}`)
   const bindingLabel = round?.binding === 'strong' ? '强绑定' : round?.binding === 'weak' ? '弱绑定（无 SHA 证明）' : '无评审'
-  lines.push(`${binding.sourceBranch} → ${binding.targetBranch} · 第 ${round?.n ?? 0} 轮 · sha ${String(mr.sha ?? '').slice(0, 8)}（${bindingLabel}）`)
+  lines.push(`${binding.sourceBranch} → ${binding.targetBranch} · 第 ${round?.n ?? 0} 轮 · sha ${String(mr?.sha ?? '').slice(0, 8)}（${bindingLabel}）`)
 
   const review = round?.review ?? null
   // 三个计数与合并判定、唤醒指令同源（reviewTodo）；阻塞行仍取完整条目展示门禁分类。

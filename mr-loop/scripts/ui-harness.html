@@ -98,13 +98,28 @@
     },
     problemsRound: { n: 6, sha: '081bb374144f8151345d8dd1a337e500b79a351f', current: false },
     rounds: [
-      { n: 1, verdict: 'pass', total: 0, open: 0, fixed: 0, current: false },
-      { n: 2, verdict: 'pass', total: 2, open: 2, fixed: 0, current: false },
-      { n: 3, verdict: 'pass', total: 1, open: 1, fixed: 1, current: false },
-      { n: 4, verdict: 'pass', total: 1, open: 1, fixed: 1, current: false },
-      { n: 5, verdict: 'pass', total: 1, open: 1, fixed: 1, current: false },
-      { n: 6, verdict: 'pass', total: 1, open: 1, fixed: 1, current: false },
-      { n: 7, verdict: null, total: 0, open: 0, fixed: 0, current: true },
+      { n: 1, verdict: 'pass', total: 0, open: 0, fixed: 0, current: false, problems: [] },
+      { n: 2, verdict: 'pass', total: 2, open: 2, fixed: 0, current: false, problems: [
+        { fid: '2870c3e6c9', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/components/ReportUploadModal/index.tsx', line: 302, problem: '同一份 vectorErrorMsg 在两个地方渲染，弹窗里的报错条缺少换行控制，长无空格串会横向溢出。', status: 'open' },
+        { fid: 'da97a49527', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/components/ReportInfoPanel.tsx', line: 41, problem: '两处报错渲染的条件口径不一致：详情面板按 reportStatus 门禁，弹窗只看字段是否存在。', status: 'open' },
+      ] },
+      { n: 3, verdict: 'pass', total: 1, open: 1, fixed: 1, current: false, problems: [
+        { fid: 'da97a49527', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/components/ReportInfoPanel.tsx', line: 41, problem: '两处报错渲染的条件口径不一致：详情面板按 reportStatus 门禁，弹窗只看字段是否存在。', status: 'open' },
+        { fid: '2870c3e6c9', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/components/ReportUploadModal/index.tsx', line: 302, problem: '弹窗内新增的报错条缺少换行控制，长无空格串会横向溢出。', status: 'fixed', fixedAtRound: 3 },
+      ] },
+      { n: 4, verdict: 'pass', total: 1, open: 1, fixed: 1, current: false, problems: [
+        { fid: '3b3b7b9b20', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/utils/loadReportEcho.ts', line: 130, problem: 'reportStatus 只对 null/undefined 兜底，详情接口返回空串时不会回落到列表行的状态。', status: 'open' },
+        { fid: 'da97a49527', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/components/ReportInfoPanel.tsx', line: 41, problem: '两处报错渲染的条件口径不一致。', status: 'fixed', fixedAtRound: 4 },
+      ] },
+      { n: 5, verdict: 'pass', total: 1, open: 1, fixed: 1, current: false, problems: [
+        { fid: 'e462d18b0d', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/utils/reportStatus.tsx', line: 78, problem: 'isVectorFailed 的 String() 兜底并未生效：后端返回数字状态时依旧是 false。', status: 'open' },
+        { fid: '3b3b7b9b20', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/utils/loadReportEcho.ts', line: 130, problem: 'reportStatus 空串未兜底。', status: 'fixed', fixedAtRound: 5 },
+      ] },
+      { n: 6, verdict: 'pass', total: 1, open: 1, fixed: 1, current: false, problems: [
+        { fid: 'c145950e29', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/utils/reportStatus.tsx', line: 78, problem: '注释正文里写入了内部评审单号（如「评审 FID e462d18b0d」），属于评审流程元数据，不是代码行为说明；台账归档后引用会失效，反而增加阅读噪音。', suggestion: '保留「两侧都归一成字符串再比」这类行为说明，仅删掉括号内的评审 FID 引用，需要追溯时记在 MR/提交信息里。', status: 'open', unverified: true },
+        { fid: 'e462d18b0d', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/utils/reportStatus.tsx', line: 78, problem: 'isVectorFailed 的 String() 兜底并未生效。', status: 'fixed', fixedAtRound: 6 },
+      ] },
+      { n: 7, verdict: null, total: 0, open: 0, fixed: 0, current: true, problems: [] },
     ],
     pending: 0,
     problems: [
@@ -137,8 +152,15 @@
     merge: { mergeable: false, missing: ['评审有 1 处需要关注的问题（其中 1 处本轮新增）：FID aea50825a5（低）'], pipeline: { id: 7298, status: 'success', sha: '8a282d1540224ada925e502354b9f5866acec588' } },
     problemsRound: { n: 2, sha: '8a282d1540224ada925e502354b9f5866acec588', current: true },
     rounds: [
-      { n: 1, verdict: 'pass', total: 2, open: 2, fixed: 0, current: false },
-      { n: 2, verdict: 'pass', total: 1, open: 1, fixed: 1, current: true },
+      { n: 1, verdict: 'pass', total: 2, open: 2, fixed: 0, current: false, problems: [
+        { fid: 'aea50825a5', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/components/ReportUploadModal/index.tsx', line: 81, problem: '回显加载态首帧未挂载字段，打开弹窗先闪一帧空表单', status: 'open' },
+        { fid: 'c3f0e7a1', level: '中', type: '逻辑错误', file: 'src/pages/report-manage/utils/loadReportEcho.ts', line: 44, problem: 'allSettled 后未区分 rejected，失败时把空对象写进表单', status: 'open' },
+      ] },
+      { n: 2, verdict: 'pass', total: 1, open: 1, fixed: 1, current: true, problems: [
+        { fid: 'aea50825a5', level: '低', type: '非阻塞建议', file: 'src/pages/report-manage/components/ReportUploadModal/index.tsx', line: 81, problem: '回显加载态首帧未挂载字段，打开弹窗先闪一帧空表单', status: 'open' },
+        { fid: 'c3f0e7a1', level: '中', type: '逻辑错误', file: 'src/pages/report-manage/utils/loadReportEcho.ts', line: 44, problem: 'allSettled 后未区分 rejected，失败时把空对象写进表单', status: 'fixed', fixedAtRound: 2 },
+        { fid: 'b71c9d02', level: '低', type: '非阻塞建议', file: 'src/types/BaoGaoGuanLi.ts', line: 12, problem: '类型字段与后端 DTO 命名不一致', suggestion: '把 orderer 字段对齐后端 DTO。', status: 'waived', instruction: { kind: 'waive', reason: '后端 DTO 已确认，本单不改', noteId: 75200 }, comment: { noteId: 75200, body: '#ai-waive b71c9d02 reason=后端 DTO 已确认，本单不改', author: 'liyu', createdAt: '2026-11-16T10:02:00Z' } },
+      ] },
     ],
     pending: 1,
     problems: [
@@ -261,6 +283,13 @@
       const open = document.querySelector('.mrl-chip-btn') ||
         Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === '看板')
       if (open) open.click()
+      // ?round=2 模拟点开某一轮（历史轮截图用）。
+      const wanted = new URLSearchParams(location.search).get('round')
+      if (wanted) setTimeout(function () {
+        const chip = Array.from(document.querySelectorAll('.mrl-rounds .mrl-round'))
+          .find(function (node) { return node.textContent.indexOf('第' + wanted + '轮') === 0 })
+        if (chip) chip.click()
+      }, 400)
     }, 300)
   }
 </script>
