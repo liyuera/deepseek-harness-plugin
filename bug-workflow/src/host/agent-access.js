@@ -7,22 +7,25 @@
  * host state: everything below is deterministic except `Date.now()` and the
  * timeout timer.
  *
- * Live contract (DSH 0.2.2-rc.1; P0 findings Spike D + installed
+ * Live contract (DSH 0.2.2-rc.2; P0 findings Spike D + installed
  * `@deepseek-ai/dsh-subagent` / `dsh-agent` READMEs):
  *
  *   - The public `Agent` is `{ readonly id: SessionId }`: the shared
  *     Agent/Session id is `agent.id` (there is no public `agent.session`
- *     field). `ctx.agents.get/list/roots` return live agents only.
- *   - `ctx.subagents.startActivation(spec)` takes
- *     `{ provider, label, request, signal, delivery }`:
+ *     field). `ctx.agents.get/list` return live agents only.
+ *   - `ctx.subagents.startActivation(spec)` takes one FLAT spec
+ *     `{ provider, label, prompt, parent, cwd?, signal, delivery }`:
  *       - `signal` is REQUIRED and only cancels pre-publication work. Once the
  *         activation is published, `activation.dispose()` is the cancellation
  *         primitive;
- *       - `request.prompt` is a `ContentBlock[]` (not a string), so the prompt
- *         is sent as `[{ type: 'text', text }]`;
- *       - `request.parent` must be the exact live Agent;
+ *       - `prompt` is a `ContentBlock[]` (not a string), so the prompt is sent
+ *         as `[{ type: 'text', text }]` — 0.2.2-rc.1 nested it under
+ *         `request.prompt`, and a spec that still nests everything under
+ *         `request` leaves `parent`/`prompt` undefined inside
+ *         `startActivation()` (the rc.2 implementation reads the flat fields);
+ *       - `parent` must be the exact live Agent;
  *       - `delivery: 'caller'` sends no parent completion notice.
- *   - The activation is `{ childId, messageId?, result, dispose }` and
+ *   - The activation is `{ childId, name, messageId?, result, dispose }` and
  *     `result` resolves to `SubagentResult`
  *     `{ output: ContentBlock[], structured?, diagnostic?, stopReason }`.
  *
@@ -454,8 +457,18 @@ export function createAgentRunner(options = {}) {
       }
     }
 
-    const request = { prompt: [{ type: 'text', text: promptText }], parent };
-    if (workspace !== undefined) request.cwd = workspace;
+    // DSH 0.2.2-rc.2 `startActivation()` takes a FLAT spec:
+    // `{ provider, label, prompt, parent, cwd?, signal, delivery }`. The 0.2.2
+    // rc.1 nested `request` wrapper is gone: the flat fields are the only ones
+    // the implementation reads, and a spec that only carries `request` leaves
+    // `parent` undefined inside startActivation.
+    const activationSpec = {
+      provider: ACTIVATION_PROVIDER,
+      label,
+      prompt: [{ type: 'text', text: promptText }],
+      parent,
+    };
+    if (workspace !== undefined) activationSpec.cwd = workspace;
 
     let activation;
     let finished = false;
@@ -470,9 +483,7 @@ export function createAgentRunner(options = {}) {
       // failures. Racing it also covers a start call that never settles.
       const starting = Promise.resolve().then(() =>
         subagents.startActivation({
-          provider: ACTIVATION_PROVIDER,
-          label,
-          request,
+          ...activationSpec,
           signal: controller.signal,
           delivery: ACTIVATION_DELIVERY,
         }),

@@ -15,7 +15,7 @@
  *
  *   - the public `Agent` is `{ readonly id: SessionId }`, so the session id is
  *     `agent.id` (there is no public `agent.session` property);
- *   - `request.prompt` is a `ContentBlock[]`, not a string;
+ *   - `prompt` is a `ContentBlock[]` on the flat activation spec, not a string;
  *   - `signal` is mandatory and only cancels pre-publication work, so the
  *     runner composes a timeout/caller signal and always calls `dispose()`;
  *   - `activation.result` is a `SubagentResult`
@@ -346,15 +346,19 @@ test('runAnalysis() starts one caller-delivery spawn activation under the matchi
   assert.equal(spec.provider, 'spawn');
   assert.equal(spec.label, 'analysis:BUG-101');
   assert.equal(spec.delivery, 'caller');
+  // DSH 0.2.2-rc.2 takes ONE flat spec; the rc.1 nested `request` wrapper
+  // (request:{prompt,parent,cwd}) is what made startActivation() throw
+  // "Cannot read properties of undefined (reading 'id')" on 2026-11-18.
+  assert.equal(spec.request, undefined, 'activation spec must not nest everything under request');
   assert.ok(spec.signal instanceof AbortSignal, 'signal must be a real AbortSignal');
   assert.equal(spec.signal.aborted, false);
-  assert.equal(spec.request.parent, sessionAgent, 'the exact matching live Agent must be the parent');
-  assert.equal(spec.request.cwd, '/tmp/bug-workflow-workspace');
-  assert.ok(Array.isArray(spec.request.prompt), 'request.prompt must be ContentBlock[]');
-  assert.equal(spec.request.prompt.length, 1);
-  assert.equal(spec.request.prompt[0].type, 'text');
+  assert.equal(spec.parent, sessionAgent, 'the exact matching live Agent must be the parent');
+  assert.equal(spec.cwd, '/tmp/bug-workflow-workspace');
+  assert.ok(Array.isArray(spec.prompt), 'spec.prompt must be ContentBlock[]');
+  assert.equal(spec.prompt.length, 1);
+  assert.equal(spec.prompt[0].type, 'text');
 
-  const prompt = spec.request.prompt[0].text;
+  const prompt = spec.prompt[0].text;
   for (const expected of [
     'BUG-101',
     TICKET.title,
@@ -987,12 +991,12 @@ test('runFix() starts one caller-delivery spawn activation in the worktree and p
   assert.equal(spec.label, 'fix:BUG-101');
   assert.equal(spec.delivery, 'caller');
   assert.ok(spec.signal instanceof AbortSignal);
-  assert.equal(spec.request.parent.id, 'session-root');
-  assert.equal(spec.request.cwd, WORKTREE, 'the child must run inside the worktree');
-  assert.equal(spec.request.prompt.length, 1);
-  assert.equal(spec.request.prompt[0].type, 'text');
+  assert.equal(spec.parent.id, 'session-root');
+  assert.equal(spec.cwd, WORKTREE, 'the child must run inside the worktree');
+  assert.equal(spec.prompt.length, 1);
+  assert.equal(spec.prompt[0].type, 'text');
 
-  const prompt = spec.request.prompt[0].text;
+  const prompt = spec.prompt[0].text;
   for (const expected of [
     WORKTREE,
     FIX_BRANCH,
@@ -1346,13 +1350,13 @@ test('runReviewFix() starts one caller-delivery spawn activation in the worktree
   assert.equal(spec.delivery, 'caller');
   assert.ok(spec.signal instanceof AbortSignal);
   assert.equal(spec.signal.aborted, false);
-  assert.equal(spec.request.parent.id, 'session-root');
-  assert.equal(spec.request.cwd, WORKTREE, 'the child must run inside the ticket worktree');
-  assert.ok(Array.isArray(spec.request.prompt));
-  assert.equal(spec.request.prompt.length, 1);
-  assert.equal(spec.request.prompt[0].type, 'text');
+  assert.equal(spec.parent.id, 'session-root');
+  assert.equal(spec.cwd, WORKTREE, 'the child must run inside the ticket worktree');
+  assert.ok(Array.isArray(spec.prompt));
+  assert.equal(spec.prompt.length, 1);
+  assert.equal(spec.prompt[0].type, 'text');
 
-  const prompt = spec.request.prompt[0].text;
+  const prompt = spec.prompt[0].text;
   for (const expected of [
     WORKTREE,
     FIX_PLAN.summary,

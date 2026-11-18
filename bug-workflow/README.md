@@ -8,6 +8,14 @@ DeepSeek Harness（DSH）的 Bug 工作流看板，内部私有 `0.0.1`。右栏
 >
 > P2 的 live 证据全部来自**本地 mock 平台**。P3 的分析与 P4 的修复都是**真子代理**（真实模型、真实 git worktree；本机样本分别约 7 分钟与 5 分 45 秒），但本机验收工作区都是插件仓库本身、不是工单所属业务仓库。P5 交付链路**已下线**（下文 P5 章节保留为历史实现说明，代码在仓库内但未接线）；平台状态写回、GUI 目视与 Windows 仍未实现。历史 P5 live 验收只做了**只读验收**，没有用真实 GitLab token 推送或创建 MR。
 
+## 变更记录：DSH 0.2.2-rc.2 子代理契约适配（2026-11-18）
+
+- **症状**：看板点「开始分析」后约 0.6 秒内工单直接阻塞，`blockedReason: analysis-failed`，时间线只有 `start_analysis` → `blocked`，没有任何子代理会话；详情页提示「分析失败，可重新分析」。点几次「重新分析」结果都一样，看起来像「一分析就失败」。
+- **根因**：DSH `0.2.2-rc.2` 把 `ctx.subagents.startActivation()` 的 spec 从 rc.1 的嵌套形状 `{provider, label, request:{prompt, parent, cwd}, signal, delivery}` 改成**扁平** `{provider, label, prompt, parent, cwd?, signal, delivery}`。插件仍按 rc.1 传 `request`，rc.2 实现直接读 `spec.parent.id`，于是抛 `TypeError: Cannot read properties of undefined (reading 'id')`；runner 把任何启动异常归一成 `analysis-failed`，对外只剩「分析子代理执行失败」。
+- **修复**：`src/host/agent-access.js` 的 `runChild()` 改为扁平 spec（`prompt`/`parent`/`cwd` 与 `signal`/`delivery` 同级）；模块头部契约注释与 `test/agent-access.test.js` 的断言同步改为扁平字段，测试即可防止再次退化。
+- **为何不是「3 分钟自动刷新」**：自动刷新只做平台同步与 snapshot 轮询，不碰分析任务；阻塞是宿主在 `start_analysis` 之后由子代理启动异常写入的，与刷新无关。
+- **兼容性**：本版本只支持 rc.2 起的扁平 spec；rc.1 及更早的嵌套 `request` 形状不再兼容（若需回退到旧运行时，需把 `runChild()` 的 `activationSpec` 改回嵌套形状）。
+
 ## 变更记录：GitLab 交付链路下线（2026-11-17）
 
 - **下线范围**：看板设置里的 GitLab 连接（地址/token/项目路径/Reviewer）与交付字段（Lint 命令/测试命令/启动命令/预览地址）不再显示；`submitting` 详情页不再有「提交并创建 MR」；不再创建/推送个人分支与 MR，不再轮询 AI Code Review，不再自动 `mergeable`/`merged`/`dismiss`；`POST /api/deliver` 与 `POST /api/gitlab-token` 不再接线（返回 503）。人工测试通过后工单直接归档为 `done`。
@@ -357,7 +365,7 @@ P2 **未对真实平台执行**同步/导入（无真实 token，用户不在场
 - **设置「必填」**：`branchUser` / `commitType` 的必填校验只在 `client.js`（`validateSettings`）；宿主 `settingsSchema` 为 `z.string().default(...)`，`POST /api/settings` 会接受空串（修复服务对 `branchUser` 有 `|| 'ly'` 兜底，delivery 的 `commitType` 也有默认）。P6 若要求服务端保证，需在 host 补校验与测试。
 - **lint/test（历史）**：`lintCommand` / `testCommand` 原来只在 P5 delivery 的 commit 前执行；交付链路下线后这两个设置不再生效/显示，`devCommand`/`previewUrl` 未被使用。代码保留在 `delivery-service.js`，恢复交付链路时需重新接上。
 - **宿主级权限仍未强制**：P3 分析只读、P4 修复写范围、P5 Review 修复写范围都只是 prompt 约束，子代理继承父 Agent 工具；P5 未补 preset/工具 allowlist（或等价沙箱）测试，不能把「prompt 说了」当执行保证。
-- **子代理契约**：P0 已确认 `ctx.subagents.startActivation({ provider:'spawn', label, delivery:'caller', signal, request:{ prompt, parent, cwd } })`；父 Agent 用 `ctx.agents.roots()`（live Agent），不要依赖 `agent/created`。P3 分析、P4 修复（`runFix`，cwd = worktree）和 P5 Review 修复（`runReviewFix`，cwd = worktree）都用该 seam；Review 修复仍依赖 `delivery.context.sessionId` 解析父 Agent，会话销毁/非 live 时按 `resolveParent()` 语义回退到最后一个 live root（见「已知限制」）。
+- **子代理契约**：DSH 0.2.2-rc.2 起是**扁平 spec** `ctx.subagents.startActivation({ provider:'spawn', label, prompt, parent, cwd?, signal, delivery })`（rc.1 的 `request:{ prompt, parent, cwd }` 嵌套已移除；混用会得到 `analysis-failed`，2026-11-18 已适配）。父 Agent 由 `ctx.agents.list()` 按 `agent.id === sessionId` 精确解析（rc.2 已无 `agents.roots()`，旧的 `roots()` 回退分支只会静默跳过）。P3 分析、P4 修复（`runFix`，cwd = worktree）和 P5 Review 修复（`runReviewFix`，cwd = worktree）都用该 seam。
 - **demo 动作已收口**：`submit_mr` / `mr_created` / `review_requests_changes` / `review_fix_done` / `review_pass` / `mr_merged` / `dismiss` 已从 `ACTION_BY_STATE` 删除（P5 下线前由真实服务写这些动作，现在没有服务再写；历史工单用「标记完成」收尾）；`analysis_done` / `fix_done` 仍保留在 `ACTION_BY_STATE` 字面量，但看板对所有 `analyzing`/`fixing` 工单隐藏按钮，且宿主在对应真实任务运行期间对裸 `POST /api/action` 返回 409 `service-job-running`。`test/client-action-map.test.js` 已同步映射。
 - **沿用条件写**：P4 的 `fix_done`/`block`、P5 的 `mr_created`/`review_requests_changes`/`review_fix_done`/`review_pass`/`mr_merged`/`dismiss` 都用 `expectedWorkflow` 在 store 写队列内复核；迟到结果不会回退已推进的工单。
 - **取消语义**：P4 修复、P5 delivery/review-fix 的 dispose 都先标 `cancelled` 再 abort，**不写** `block`/错误 meta；工单保持原状态供下次启动恢复。P5 的 60s timer 在 dispose 时清 interval。
