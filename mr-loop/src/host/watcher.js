@@ -267,9 +267,10 @@ export function createWatcher({ cfg, gitlab, service, notify, logger = undefined
       // 终态是永久的：同一个 (state, sha) 只唤醒一次，避免用户下一句话又把 watcher 拉起来重复唤醒。
       // 终态后没有下一个 tick：立即送达。文案只说事实，合并收尾不写评论（决策 §2.4 / 用户决策 5）。
       const iid = state.binding.iid
+      // 账号层面的收尾：终态后不要再调 mr_stop（更不要 forget）——账本要留给看板。
       const text = mr.state === 'merged'
-        ? `MR !${iid} 已合并（sha ${String(mr.sha ?? '?')}），监视结束；不需要发评论。`
-        : 'MR 已关闭（未合并），监视结束。'
+        ? `MR !${iid} 已合并（sha ${String(mr.sha ?? '?')}），监视结束；不需要发评论，账本已保留在看板，不要调 mr_stop。`
+        : 'MR 已关闭（未合并），监视结束；账本已保留在看板，不要调 mr_stop。'
       wake(sessionId, text, `mr:${mr.state}:${String(mr.sha ?? '')}`, true)
       clear(sessionId)
       return

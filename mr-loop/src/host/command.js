@@ -27,7 +27,11 @@ export function createCommand({ service, watcher = undefined }) {
           watcher?.stop(sessionId)
           const result = await service.stop({ sessionId, forget })
           if (!result.stopped) return { kind: 'success', text: '当前会话没有绑定 MR。' }
-          return { kind: 'success', text: forget ? '已停止跟踪并删除账本。' : '已停止跟踪该 MR（账本保留）。' }
+          if (result.kept === true) {
+            const what = result.terminal === 'merged' ? '已合并' : '已关闭'
+            return { kind: 'success', text: `已停止跟踪。MR ${what}，账本是看板历史，已保留（未删除）。` }
+          }
+          return { kind: 'success', text: result.forgotten ? '已停止跟踪并删除账本。' : '已停止跟踪该 MR（账本保留）。' }
         }
         if (!/^https?:\/\//i.test(input)) return { kind: 'error', text: USAGE }
         const { report, warnings } = await service.bind({ sessionId, url: input, repoRoot: agent?.session?.header?.cwd })

@@ -526,3 +526,74 @@ MR !243 已经合并（卡片标签已经是「已合并」「第 9 轮」），
   - `?demo=all&theme=dark`：`specs/assets/mr-loop-ui-workspace-dark.jpg` —— 暗色下三级色仍可读。
 - DOM 级核对：4 张卡的 `.mrl-mr-ws` 依次为 `wisdom-financial-credit-platform-web ×3` + `other`，
   每个节点的 `title` 是对应的完整 `projectPath`。
+
+## 十八、合并后 MR 从看板消失：终态账本被 forget 删了（2026-11-18，v0.3.2）
+
+### 症状（用户实拍）
+
+!246 今天合并，loop 阶段在「MR 看板」里看得到；合并之后卡片**从看板消失**，
+`全部 3` 只剩 `!243`、`!241` 两条，`已合并` 从 2 掉回 1。
+
+### 取证
+
+- 账本目录 `~/.dsh/mr-loop/ledger/` **没有任何 !246 的 JSON**；目录 mtime = `18:04:53`，
+  正好是 merge commit `865ce5b3` 落到 `feature-V1.7.0.20261119` 的时刻。
+- !246 跟踪会话的 transcript（`session-232435b6…`，seq 2012）在「已合并」唤醒后调了
+  `mr_stop({ forget: true })`，reasoning 原文：「I'd use forget=true to unbind and delete ledger
+  since the MR is done.」→ 账本被 `ledger.forget()` 删除，而看板**唯一数据源就是账本**
+  （`/mr-loop/ui/state` = 内存绑定 + 账本文件；绑定随会话/重载消失，账本才是历史）。
+- `findings` 侧车文件（`~/.dsh/workspace/…/…__246.jsonl`）还在，证明第 3/4 轮的评审确实被跟过：
+  这不是「没绑定」，是**历史被自己删了**。
+
+### 根因
+
+1. **缺守卫**：`service.stop({forget:true})` 不区分 MR 是否终态，一律 `ledger.forget()` 删文件；
+   「合并后收尾」这种最自然的时刻，反而最容易把历史删掉。
+2. **指导反了**：`mr_stop` 工具描述、`/mr stop --forget` 用法、`mr-loop` 技能表格都把
+   「forget=true 解绑并删账本」并列成常规收尾手段，没有一句说「合并后不要 stop」。
+   主代理在合并唤醒后按「收尾」语义选了 forget，插件自己把人引到了坑里。
+3. 合并唤醒文案只写「监视结束」，没提「账本留给看板」，收尾动作全靠代理自由发挥。
+
+### 改法
+
+**判定层**
+
+- `service.js` 新增 `terminalOf(state)`：账本 `terminal` 优先，其次实时 `mr.state`。
+- `stop({forget:true})` 命中终态时**只解绑**：`bindings.delete` + 落盘
+  `binding.sessionId = null`（重载后不会被当成「还要继续盯」恢复），账本原样保留；
+  返回值 `{ stopped:true, forgotten:false, kept:true, terminal }`。
+  未结束的 MR 仍然是旧语义（人工放弃跟踪 → 删账本），行为不变。
+- `mr_stop` 工具 / `/mr stop` 按返回值出对应文案：
+  「MR 已合并，账本是看板历史，已保留（未删除）」。
+- watcher 的终态唤醒文案补一句「账本已保留在看板，不要调 mr_stop」。
+
+**指导层**
+
+- `skill.js` 工具表：`mr_stop` 描述改成「账本默认保留；forget 只删未结束的 MR，终态账本永不删」；
+  新增 `mr_recover` 一行。
+- 技能正文「插件盯到合并才停」段落补：合并 / 关闭后自动收尾，**不要 mr_stop、更不要 forget**；
+  误删用 `mr_recover({url})` 补录回来。
+
+**补录（新工具 `mr_recover`）**
+
+- `rounds.rebuildRounds({ mr, notes, cfg })`（纯函数）：只认评审 note 里的 `AI_REVIEW_SHA`，
+  一个 sha 一轮、同 sha 取 note.id 最大的一条；无标记的评审 note 丢弃（`dropped: no-sha`），
+  补录宁可少一轮也不张冠李戴。门禁 note 没有 sha 证据不重建（`sensitive`/`mandatory = null`）；
+  指令与普通评论在整条 MR 上扫一次、挂最后一轮。
+- `service.recover({ url })`：`mr_bind` 只接受 opened，补录专门处理 merged/closed；
+  已有非空账本原样不动（`existing: true`）；写 `binding.sessionId = null`、
+  `terminal = mr.state`、`recoveredAt`；不启动监视、不碰会话。
+- 工具面注册第 7 个工具 `mr_recover({ url })`。
+- 轮次 / FID 唯一索引 / 首见轮次 / 修复轮次全部复用 0.3.0 的同一套聚合，不做补录专用视图。
+
+### 验收
+
+- 测试 **362/362**（新增 7 项：终态 forget 守卫 2、recover 成功 / 错误 / 幂等 2、
+  `rebuildRounds` 分组 / no-sha / 空结果 3；改写 index 工具数 7、watcher / integration 唤醒文案 3 处）。
+- 真实补录 !246：GitLab 4 条评审 note（`23ea91af` / `8434e965` / `26e43a83` / `a7d09c89`）→ 4 轮；
+  1 个 FID `0d40d9d2bf`（第 3 轮首见，第 4 轮已验证修复），
+  `/mr-loop/ui/state`：`!246 merged round 4`、`summary {total:1, fixed:1}`，看板 `全部 3 / 已合并 2`。
+- 真实 payload + 真实 client bundle 渲染（`mr-loop-ui-recovered-246-light.jpg`）：
+  !246 回到列表顶部，「第 4 轮 / 已合并 / 历史账本」，问题 `0d40d9d2bf` 标 `✓ 第 4 轮已修`、
+  `首见 第 3 轮`，轮次条 `第1轮 ●0 / 第2轮 ●0 / 第3轮 ●1 / 第4轮 ●0`，
+  路径 tag 完整换行、源码行来自补录解析（卡片图 `mr-loop-ui-recovered-246-card-light.jpg`）。

@@ -4,7 +4,7 @@
  */
 import { parseMrUrl } from './url.js'
 import { readRepoState } from './repo.js'
-import { buildRound, isPhantomRound, normalizeRounds, pipelineForHead } from './rounds.js'
+import { buildRound, isPhantomRound, normalizeRounds, pipelineForHead, rebuildRounds } from './rounds.js'
 import { evaluateMergeable, isDisposed, isDisposedFinding, directiveFor, decisionFor, reviewFindings } from './mergeable.js'
 import { clipText, FID_RE, parseDirectives, REASON_LIMIT } from './parse-directives.js'
 import { GitlabError } from './gitlab.js'
@@ -57,6 +57,18 @@ const WRITE_ERROR_CODES = Object.freeze({
   'bad-response': 'bad-response',
 })
 
+/** 一组轮次里出现过的唯一 FID 数（补录结果的摘要用）。 */
+function uniqueFindings(rounds) {
+  const seen = new Set()
+  for (const round of rounds ?? []) {
+    for (const item of [...(round?.review?.blocking ?? []), ...(round?.review?.nonBlocking ?? [])]) {
+      const fid = String(item?.fid ?? '').toLowerCase()
+      if (fid !== '') seen.add(fid)
+    }
+  }
+  return seen.size
+}
+
 // 集合键：排序 + 去重，顺序与重复项都不影响「阻塞集合是否相同」的判定。
 const blockingKey = (round) => [...new Set((round?.review?.blocking ?? []).map((item) => item?.fid))].sort().join(',')
 
@@ -75,6 +87,13 @@ function reverifyIncreased(previousRound, round) {
     const current = item?.reverifyCount ?? 0
     return previous !== undefined && current > previous && current >= 2
   })
+}
+
+/** 终态（merged / closed）判定：账本 terminal 永久优先，其次实时 MR 快照。 */
+function terminalOf(state) {
+  if (typeof state?.terminal === 'string' && state.terminal !== '') return state.terminal
+  const live = state?.mr?.state
+  return live === 'merged' || live === 'closed' ? live : null
 }
 
 /**
@@ -414,10 +433,87 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
     return { released: existed }
   }
 
+  /**
+   * 历史补录：把已合并 / 已关闭的 MR 放回看板（账本被误删、或合并前根本没跟过）。
+   * 只读 GitLab 重建：轮次来自评审 note 的 AI_REVIEW_SHA，门禁没有证据就不补。
+   * 不启动监视、不绑定会话（binding.sessionId = null）；已有非空账本时原样不动。
+   */
+  async function recover({ url }) {
+    const parsed = parseMrUrl(url, config.baseUrl)
+    if (parsed === null) throw new ServiceError('invalid-url', `MR 地址不属于 ${config.baseUrl} 或格式不对`)
+    const mr = await gitlab.getMergeRequest({ project: parsed.project, iid: parsed.iid })
+    if (mr.state === 'opened') {
+      throw new ServiceError('mr-open', 'MR 还在评审中：用 mr_bind 绑定跟踪；补录只用于已合并 / 已关闭的 MR')
+    }
+    const previous = await ledger.load({ projectPath: parsed.project, iid: parsed.iid })
+    if (Array.isArray(previous?.rounds) && previous.rounds.length > 0) {
+      return {
+        recovered: false,
+        existing: true,
+        iid: parsed.iid,
+        state: previous.terminal ?? mr.state,
+        rounds: previous.rounds.length,
+        problems: uniqueFindings(previous.rounds),
+      }
+    }
+    const notes = await gitlab.listNotes({ project: parsed.project, iid: parsed.iid })
+    const rounds = rebuildRounds({ mr, notes, cfg: config })
+    if (rounds.length === 0) {
+      throw new ServiceError('no-history', 'GitLab 里没有可重建的评审记录（评审 note 缺少 AI_REVIEW_SHA 标记）')
+    }
+    const observedAt = now()
+    const iso = new Date(observedAt).toISOString()
+    const record = {
+      version: 1,
+      binding: {
+        projectPath: parsed.project,
+        iid: parsed.iid,
+        repoRoot: '',
+        sourceBranch: mr.source_branch,
+        targetBranch: mr.target_branch,
+        boundAt: iso,
+        // 补录不是绑定：插件重载时 rehydrateBindings 会按 sessionId 跳过它。
+        sessionId: null,
+      },
+      rounds,
+      decisions: {},
+      mergeableAt: null,
+      terminal: mr.state,
+      paused: null,
+      recoveredAt: iso,
+      updatedAt: iso,
+    }
+    try {
+      await ledger.save(record)
+    } catch {
+      throw new ServiceError('storage-failed', '账本写入失败，检查 ~/.dsh/mr-loop 的磁盘权限')
+    }
+    return {
+      recovered: true,
+      existing: false,
+      iid: parsed.iid,
+      state: mr.state,
+      rounds: rounds.length,
+      problems: uniqueFindings(rounds),
+      webUrl: typeof mr.web_url === 'string' ? mr.web_url : null,
+    }
+  }
+
   async function stop({ sessionId, forget = false }) {
     const state = bindings.get(sessionId)
     if (forget) {
       if (state !== undefined) {
+        // 终态（merged / closed）账本是看板历史：停止跟踪时只解绑，绝不删账本。
+        // 0.3.1 之前这里按 forget 直接删，合并后一次「清清账本」的误操作就把 MR 从看板抹掉了。
+        const terminal = terminalOf(state)
+        if (terminal !== null) {
+          bindings.delete(sessionId)
+          drafts.delete(sessionId)
+          // 抹掉 sessionId：插件重载后不会再把它当成「还要继续盯」自动恢复。
+          await persist(state, { binding: { ...state.binding, sessionId: null } }).catch(() => {})
+          await releaseSessionLock(sessionId)
+          return { stopped: true, forgotten: false, kept: true, terminal }
+        }
         try {
           await ledger.forget({ projectPath: state.binding.projectPath, iid: state.binding.iid })
         } catch {
@@ -723,5 +819,5 @@ export function createService({ config, ledger, gitlab, repoState = readRepoStat
     sessionLocks.clear()
   }
 
-  return { bind, restore, status, review, applySnapshot, stop, resume, pause, getState, listStates, dispose, report, ledger, waiverDraft, postWaiver, release, markTerminal }
+  return { bind, restore, recover, status, review, applySnapshot, stop, resume, pause, getState, listStates, dispose, report, ledger, waiverDraft, postWaiver, release, markTerminal }
 }

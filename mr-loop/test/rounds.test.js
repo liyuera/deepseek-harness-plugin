@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { baselineOf, classifyReviewNote, isPhantomRound, normalizeRounds, pipelineForHead, reviewShaOf, buildRound } from '../src/host/rounds.js'
+import { baselineOf, classifyReviewNote, isPhantomRound, normalizeRounds, pipelineForHead, reviewShaOf, buildRound, rebuildRounds } from '../src/host/rounds.js'
 import { resolveConfig } from '../src/host/config.js'
 
 const cfg = resolveConfig({})
@@ -412,4 +412,61 @@ test('normalizeRounds：去掉伪轮次并连续重编号，保留账本裁剪�
   // 中间夹伪轮次时以首个保留轮次为基准往后排。
   const trimmedWithPhantom = [real(5, SHA), phantom(6, OTHER), real(7, 'c'.repeat(40))]
   assert.deepEqual(normalizeRounds(trimmedWithPhantom).map((item) => item.n), [5, 6])
+})
+
+// ---------------------------------------------------------------------------
+// 0.3.1：历史补录（已合并 MR 的账本被误删后，按评审 note 重建轮次）
+// ---------------------------------------------------------------------------
+
+const reviewWithSha = (id, sha, when) => note({ id, created_at: when, body: reviewBody(`\n<!-- AI_REVIEW_SHA ${sha} -->`) })
+
+test('rebuildRounds：一个 sha 一轮，按时间排序编号，同 sha 取 note.id 最大的一条', () => {
+  const A = 'a'.repeat(40)
+  const B = 'b'.repeat(40)
+  const rounds = rebuildRounds({
+    mr: { sha: B },
+    notes: [
+      reviewWithSha(2, B, '2026-11-13T10:20:00Z'),
+      reviewWithSha(1, A, '2026-11-13T10:00:00Z'),
+      // 同一 sha 重跑一次评审：取最新那条作为该轮结论。
+      reviewWithSha(3, A, '2026-11-13T10:05:00Z'),
+    ],
+    cfg,
+  })
+  assert.deepEqual(rounds.map((round) => [round.n, round.sha]), [[1, A], [2, B]])
+  assert.equal(rounds[0].review.noteId, 3)
+  assert.equal(rounds[1].review.noteId, 2)
+  // 补录轮次有评审 → 不是伪轮次；门禁没有证据就不编。
+  assert.equal(rounds[0].pipelineForHead, true)
+  assert.equal(rounds[0].sensitive, null)
+  assert.equal(rounds[0].mandatory, null)
+  assert.equal(rounds[0].observedAt, Date.parse('2026-11-13T10:05:00Z'))
+})
+
+test('rebuildRounds：没有 AI_REVIEW_SHA 的评审 note 丢掉，指令只挂最后一轮', () => {
+  const A = 'a'.repeat(40)
+  const B = 'b'.repeat(40)
+  const rounds = rebuildRounds({
+    mr: { sha: B },
+    notes: [
+      reviewWithSha(1, A, '2026-11-13T10:00:00Z'),
+      reviewWithSha(2, B, '2026-11-13T10:20:00Z'),
+      // 无标记：无法证明属于哪一轮，补录不猜。
+      note({ id: 5, created_at: '2026-11-13T10:30:00Z' }),
+      // 豁免指令：属于整条 MR 的当前处置，挂最后一轮（合并判定只看当前轮）。
+      { id: 6, system: false, created_at: '2026-11-13T10:31:00Z', body: '#ai-waive a1b2c3d4 reason=风险已评估' },
+    ],
+    cfg,
+  })
+  assert.equal(rounds.length, 2)
+  assert.deepEqual(rounds[0].dropped, [])
+  assert.deepEqual(rounds[1].dropped.map((item) => [item.noteId, item.detail]), [[5, 'no-sha']])
+  assert.equal(rounds[0].directives.directives.length, 0)
+  assert.equal(rounds[1].directives.directives.length, 1)
+  assert.equal(rounds[1].directives.directives[0].fid, 'a1b2c3d4')
+})
+
+test('rebuildRounds：没有任何带标记的评审 → 空数组（补录方据此报 no-history）', () => {
+  const rounds = rebuildRounds({ mr: { sha: SHA }, notes: [note({ id: 1 })], cfg })
+  assert.deepEqual(rounds, [])
 })

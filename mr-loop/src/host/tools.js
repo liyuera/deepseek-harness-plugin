@@ -215,7 +215,7 @@ export function createTools({ service, watcher = undefined }) {
 
   const stop = {
     name: 'mr_stop',
-    description: '停止跟踪当前 MR（保留账本）；forget=true 同时解绑并删除账本。',
+    description: '停止跟踪当前 MR（账本保留给看板）。已合并 / 已关闭的 MR 会自动结束，不需要调用本工具；forget=true 只删尚未结束的 MR 的账本——终态账本是看板历史，永远不会被删。',
     parameters: objectSchema({ forget: { type: 'boolean', description: '默认 false' } }),
     output: { schema: {}, render: (_args, value) => text(value) },
     async execute(args, exec) {
@@ -226,7 +226,12 @@ export function createTools({ service, watcher = undefined }) {
         // 先停定时器再解绑：避免解绑后还有一 tick 在途。
         watcher?.stop(sessionId)
         const result = await service.stop({ sessionId, forget: args?.forget === true })
-        return ok(result.stopped ? '已停止跟踪。' : '当前会话没有绑定 MR。', result)
+        if (!result.stopped) return ok('当前会话没有绑定 MR。', result)
+        if (result.kept === true) {
+          const what = result.terminal === 'merged' ? '已合并' : '已关闭'
+          return ok(`已停止跟踪。MR ${what}，账本是看板历史，已保留（未删除）。`, result)
+        }
+        return ok(result.forgotten ? '已停止跟踪并删除账本。' : '已停止跟踪该 MR（账本保留）。', result)
       } catch (error) {
         return fail(errorOf(error), String(error?.message ?? error))
       }
@@ -252,5 +257,28 @@ export function createTools({ service, watcher = undefined }) {
     },
   }
 
-  return [bind, status, review, waive, stop, resume]
+  const recover = {
+    name: 'mr_recover',
+    description: '把已合并 / 已关闭、但 MR 看板里没有的 MR 补录回看板：按 GitLab 评审 note 的 AI_REVIEW_SHA 重建轮次，不启动监视。已有账本时原样不动。',
+    parameters: objectSchema({ url: MR_URL }, ['url']),
+    output: { schema: {}, render: (_args, value) => text(value) },
+    async execute(args) {
+      const unknown = unknownArgument(recover.parameters, args)
+      if (unknown !== null) return fail('invalid-arguments', `未知参数：${unknown}`)
+      const url = typeof args?.url === 'string' ? args.url.trim() : ''
+      if (url === '') return fail('invalid-arguments', 'url 必填')
+      try {
+        const result = await service.recover({ url })
+        if (result.recovered === false) {
+          return ok(`MR !${result.iid} 已经在看板里（${result.rounds} 轮、${result.problems} 个问题），不需要补录。`, result)
+        }
+        const what = result.state === 'merged' ? '已合并' : '已关闭'
+        return ok(`已补录 MR !${result.iid}（${what}）：${result.rounds} 轮评审、${result.problems} 个问题；看板里现在能看到它。`, result)
+      } catch (error) {
+        return fail(errorOf(error), String(error?.message ?? error))
+      }
+    },
+  }
+
+  return [bind, status, review, waive, stop, resume, recover]
 }

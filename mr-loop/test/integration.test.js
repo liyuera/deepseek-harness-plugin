@@ -138,7 +138,7 @@ test('service + watcher：评审先到 → 门禁翻面唤醒 → 新 sha 可合
   const timersBefore = timers.length
   await watcher.tick('s')
   assert.equal(notified.length, 3)
-  assert.equal(notified[2], `MR !240 已合并（sha ${SHA_B}），监视结束；不需要发评论。`)
+  assert.equal(notified[2], `MR !240 已合并（sha ${SHA_B}），监视结束；不需要发评论，账本已保留在看板，不要调 mr_stop。`)
   assert.equal(watcher.isWatching('s'), false)
   assert.equal(timers.length, timersBefore) // 终态不再排下一次
   assert.ok(cleared.length > 0)

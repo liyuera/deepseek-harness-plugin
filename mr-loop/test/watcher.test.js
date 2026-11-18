@@ -444,7 +444,7 @@ test('可合后 MR 变 merged → 唤醒「已合并」一次并停表', async (
   h.advance(31000)
   await h.watcher.tick('s')
   assert.equal(h.notified.length, 2)
-  assert.equal(h.notified[1], `MR !240 已合并（sha ${SHA}），监视结束；不需要发评论。`)
+  assert.equal(h.notified[1], `MR !240 已合并（sha ${SHA}），监视结束；不需要发评论，账本已保留在看板，不要调 mr_stop。`)
   assert.equal(h.timers.length, timersBefore) // 终态不再排下一次
   assert.equal(h.watcher.isWatching('s'), false)
   // I1：终态必须落账本，否则 UI 永远看不到「已合并」。
@@ -457,7 +457,7 @@ test('closed → 唤醒「未合并关闭」一次并停表；同一 (state, sha
   const h = harness({ mr: mrOf({ state: 'closed' }) })
   await h.watcher.tick('s')
   assert.equal(h.notified.length, 1)
-  assert.equal(h.notified[0], 'MR 已关闭（未合并），监视结束。')
+  assert.equal(h.notified[0], 'MR 已关闭（未合并），监视结束；账本已保留在看板，不要调 mr_stop。')
   assert.equal(h.timers.length, 0)
   assert.equal(h.watcher.isWatching('s'), false)
   // I1：closed 同样要落账本 terminal。

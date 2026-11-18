@@ -1571,3 +1571,99 @@ test('applySnapshot：等待中的同一 sha 后来有了流水线 → 该轮转
   await service.stop({ sessionId: 's' })
   await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
 })
+
+// ---------------------------------------------------------------------------
+// 0.3.1：终态账本是看板历史，不能被 forget 删掉；误删了用 recover 补录回来。
+// ---------------------------------------------------------------------------
+
+test('终态保护：合并后 forget 不删账本，只解绑并抹掉 sessionId', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mrloop-service-'))
+  try {
+    const ledger = createLedger({ dir })
+    const service = createService({ config: resolveConfig({ baseUrl: 'https://git.x.com' }), ledger, gitlab: harness().gitlab, repoState: harness().repoImpl })
+    await service.bind({ sessionId: 's', url: 'https://git.x.com/g/p/-/merge_requests/240', repoRoot: '/r' })
+    await service.markTerminal({ sessionId: 's', mr: mr({ state: 'merged' }) })
+
+    const result = await service.stop({ sessionId: 's', forget: true })
+    assert.deepEqual(result, { stopped: true, forgotten: false, kept: true, terminal: 'merged' })
+    assert.equal(service.getState('s'), null)
+    const [record] = await ledger.list()
+    assert.equal(record.terminal, 'merged', '终态账本必须留下（看板历史）')
+    assert.equal(record.binding.sessionId, null, '解绑要落盘，否则重载会被自动恢复成继续盯')
+    assert.equal(record.rounds.length, 1)
+  } finally {
+    await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
+  }
+})
+
+test('未结束的 MR：forget 仍然删除账本（人工放弃跟踪）', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mrloop-service-'))
+  try {
+    const ledger = createLedger({ dir })
+    const service = createService({ config: resolveConfig({ baseUrl: 'https://git.x.com' }), ledger, gitlab: harness().gitlab, repoState: harness().repoImpl })
+    await service.bind({ sessionId: 's', url: 'https://git.x.com/g/p/-/merge_requests/240', repoRoot: '/r' })
+    const result = await service.stop({ sessionId: 's', forget: true })
+    assert.equal(result.forgotten, true)
+    assert.equal((await ledger.list()).length, 0)
+  } finally {
+    await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
+  }
+})
+
+test('recover：补录已合并 MR，按评审 note 重建轮次并写终态账本', async () => {
+  const A = 'a'.repeat(40)
+  const B = 'b'.repeat(40)
+  const h = harness({
+    mrImpl: async () => mr({ sha: B, state: 'merged', merged_at: '2026-11-18T10:04:00Z' }),
+    notesImpl: async () => ([
+      { id: 11, system: false, created_at: '2026-11-13T10:02:00Z', body: reviewPass(A) },
+      { id: 12, system: false, created_at: '2026-11-13T10:20:00Z', body: reviewPass(B) },
+    ]),
+  })
+  const dir = await mkdtemp(join(tmpdir(), 'mrloop-service-'))
+  try {
+    const ledger = createLedger({ dir })
+    const cfg = resolveConfig({ baseUrl: 'https://git.x.com', ledgerDir: dir })
+    const service = createService({ config: cfg, ledger, gitlab: h.gitlab, repoState: h.repoImpl })
+    const result = await service.recover({ url: 'https://git.x.com/g/p/-/merge_requests/246' })
+    assert.equal(result.recovered, true)
+    assert.equal(result.state, 'merged')
+    assert.equal(result.rounds, 2)
+    const record = await ledger.load({ projectPath: 'g/p', iid: 246 })
+    assert.equal(record.terminal, 'merged')
+    assert.equal(record.binding.sessionId, null, '补录不是绑定：重载后不能被自动恢复成继续盯')
+    assert.equal(typeof record.recoveredAt, 'string')
+    assert.deepEqual(record.rounds.map((item) => item.sha), [A, B])
+
+    // 看板（账本 + 内存绑定）能读到这条历史记录。
+    const { createUiState } = await import('../src/host/ui.js')
+    const snapshot = await createUiState({ config: cfg, service: { listStates: () => [] } }).snapshot({ scope: 'all' })
+    assert.deepEqual(snapshot.mrs.map((item) => [item.iid, item.state, item.round]), [[246, 'merged', 2]])
+  } finally {
+    await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
+  }
+})
+
+test('recover：MR 还开着 / 已有账本 / 无评审可重建 → 各自报错或原样不动', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'mrloop-service-'))
+  const url = 'https://git.x.com/g/p/-/merge_requests/246'
+  try {
+    const cfg = resolveConfig({ baseUrl: 'https://git.x.com', ledgerDir: dir })
+    const mkService = (opts = {}) => {
+      const h = harness(opts)
+      return createService({ config: cfg, ledger: createLedger({ dir }), gitlab: h.gitlab, repoState: h.repoImpl })
+    }
+    await assert.rejects(mkService({ mrImpl: async () => mr({ state: 'opened' }) }).recover({ url }), (e) => e instanceof ServiceError && e.code === 'mr-open')
+    await assert.rejects(mkService({ mrImpl: async () => mr({ state: 'merged' }), notesImpl: async () => ([{ id: 1, system: false, created_at: '2026-11-13T10:00:00Z', body: 'no marker here' }]) }).recover({ url }), (e) => e.code === 'no-history')
+
+    const ledger = createLedger({ dir })
+    const service = createService({ config: cfg, ledger, gitlab: harness({ mrImpl: async () => mr({ state: 'merged' }), notesImpl: async () => ([{ id: 2, system: false, created_at: '2026-11-13T10:20:00Z', body: reviewPass('b'.repeat(40)) }]) }).gitlab, repoState: harness().repoImpl })
+    await service.recover({ url })
+    const again = await service.recover({ url })
+    assert.equal(again.recovered, false)
+    assert.equal(again.existing, true)
+    assert.equal(again.rounds, 1)
+  } finally {
+    await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 })
+  }
+})

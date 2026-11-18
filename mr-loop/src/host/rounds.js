@@ -272,3 +272,75 @@ function durationOf(body) {
   const match = /Job耗时\s*:\s*`?([^`\n|]+)`?/.exec(String(body ?? ''))
   return match ? match[1].trim() : null
 }
+
+/**
+ * 已合并 / 已关闭 MR 的**历史补录**：只按评审 note 里的 `AI_REVIEW_SHA` 重建轮次。
+ *
+ * 一个 sha 一轮；同 sha 多条评审取 note.id 最大的一条（重跑一次评审取最新结论）。
+ * 没有 sha 标记的评审 note 无法证明归属——丢弃并记进 `dropped`，补录宁可少一轮也不张冠李戴。
+ * 门禁 note 没有 sha 证据，补录不重建（`sensitive` / `mandatory` = null，面板显示 `—`）；
+ * 指令 / 普通评论只在整条 MR 上扫一次、挂在最后一轮，不假装它们属于历史上某一轮。
+ * 纯函数：不碰网络 / 时钟，数据全部来自调用方传入的 MR 快照与 notes。
+ * @param {{ mr: object, notes: object[], cfg: object }} input
+ */
+export function rebuildRounds({ mr, notes, cfg }) {
+  const reviewOptions = { marker: cfg?.reviewMarker }
+  const dropped = []
+  const groups = new Map()
+  for (const note of notes ?? []) {
+    if (!note || typeof note !== 'object' || note.system === true) continue
+    const body = String(note.body ?? '')
+    if (!isReviewBody(body, reviewOptions)) continue
+    const sha = reviewShaOf(body)
+    if (sha === null) { dropped.push({ noteId: note.id ?? null, reason: 'stale', detail: 'no-sha' }); continue }
+    const bucket = groups.get(sha) ?? []
+    bucket.push(note)
+    groups.set(sha, bucket)
+  }
+  const timeOf = (note) => {
+    const parsed = Date.parse(note?.created_at ?? '')
+    return Number.isFinite(parsed) ? parsed : Number.POSITIVE_INFINITY
+  }
+  // 轮次顺序 = 该组第一条评审 note 的时间；同一时间用 note.id 兜底（GitLab id 单调递增）。
+  const ordered = [...groups.entries()].sort((left, right) => {
+    const delta = Math.min(...left[1].map(timeOf)) - Math.min(...right[1].map(timeOf))
+    if (delta !== 0) return delta
+    return (left[1][0]?.id ?? 0) - (right[1][0]?.id ?? 0)
+  })
+  const parsedDirectives = parseDirectives(directiveCandidates({ notes, reviewOptions, cfg }))
+  const { directiveNotes, ...directivePayload } = parsedDirectives
+  const comments = otherComments({ notes, reviewOptions, cfg })
+  const emptyDirectives = { directives: [], invalid: { count: 0, samples: [] }, truncated: { directives: 0, directiveNotes: 0, notes: 0, lines: 0 } }
+  return ordered.map(([sha, bucket], index) => {
+    const latest = latestBy(bucket.map((note) => ({ note })))?.note ?? bucket[bucket.length - 1]
+    const parsed = parseReview(latest?.body, reviewOptions)
+    const observedAt = timeOf(latest)
+    const isLast = index === ordered.length - 1
+    return {
+      sha,
+      n: index + 1,
+      observedAt: Number.isFinite(observedAt) ? observedAt : null,
+      baselineAt: null,
+      // 强绑定有证据（sha 标记就是这一轮的 sha）；门禁没有证据就不编。
+      binding: 'strong',
+      review: {
+        noteId: latest?.id ?? null,
+        binding: 'strong',
+        verdict: parsed.verdict,
+        blocking: parsed.blocking,
+        nonBlocking: parsed.nonBlocking,
+        historicalUnresolved: countOf(latest?.body, /历史未收敛\s*[:：]\s*`?(\d+)/),
+        verifiedFixed: countOf(latest?.body, /本轮已验证修复\s*[:：]\s*`?(\d+)/),
+        jobDuration: durationOf(latest?.body),
+      },
+      sensitive: null,
+      mandatory: null,
+      // 补录的轮次都有评审，不可能是「提了但没流水线」的伪轮次。
+      pipelineForHead: true,
+      directives: isLast ? directivePayload : emptyDirectives,
+      directiveNotes: isLast ? directiveNotes : [],
+      comments: isLast ? comments : [],
+      dropped: isLast ? dropped : [],
+    }
+  })
+}
