@@ -11,6 +11,7 @@ import { createServer } from 'node:net'
 import { afterAll, describe, expect, it } from 'vitest'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { CdpBackend } from '../src/backend.ts'
+import { BackendRegistry } from '../src/backend-registry.ts'
 import { Chrome, resolveChromeConfig } from '../src/chrome.ts'
 import { ConsoleLog } from '../src/console-log.ts'
 import { HelpChannel } from '../src/help.ts'
@@ -69,7 +70,7 @@ describe.skipIf(!isSmoke)('chrome-browser smoke (real headless Chrome)', () => {
       consoleLog,
       new HelpChannel(),
     )
-    expect(definitions.length).toBe(15)
+    expect(definitions.length).toBe(17)
     const page = '<html><head><title>Smoke</title></head><body>'
       + '<h1>hello smoke</h1>'
       + '<button id="go" onclick="document.getElementById(\'out\').textContent=\'clicked\'">go</button>'
@@ -339,4 +340,40 @@ describe.skipIf(!isSmoke)('chrome-browser smoke (real headless Chrome)', () => {
       userChrome.dispose()
     }
   }, 120_000)
+
+  it('sandbox backends are isolated per agent', async () => {
+    // Two agent ids resolve to two distinct owned CDP instances (distinct
+    // ports + profiles). A tab opened in one must never appear in the other's
+    // listTabs — the whole point of the per-agent sandbox.
+    const sandboxConfig = resolveChromeConfig({
+      backend: 'sandbox',
+      port: await freePort(),
+      sandboxMaxConcurrent: 2,
+      sandboxIdleMs: 0, // no mid-test reclamation; deterministic
+      sandboxHeadless: true,
+    })
+    // The shared backend is never reached in sandbox mode for an agent-scoped
+    // call; a real CdpBackend over a never-ensured Chrome keeps dispose() honest.
+    const shared = new CdpBackend(new Chrome(resolveChromeConfig({ backend: 'cdp', port: await freePort() })))
+    const registry = new BackendRegistry(
+      sandboxConfig,
+      shared,
+      cfg => new CdpBackend(new Chrome(cfg, { pollIntervalMs: 200 })),
+    )
+    try {
+      const backendA = registry.resolve({ agent: { id: 'smoke-a' } })
+      const backendB = registry.resolve({ agent: { id: 'smoke-b' } })
+      expect(backendA).not.toBe(backendB)
+      // The same agent keeps its instance across calls.
+      expect(registry.resolve({ agent: { id: 'smoke-a' } })).toBe(backendA)
+
+      const tabA = await backendA.openTab('data:text/html,<title>A</title>')
+      const tabsA = await backendA.listTabs()
+      const tabsB = await backendB.listTabs()
+      expect(tabsA.some(tab => tab.id === tabA.id)).toBe(true)
+      expect(tabsB.some(tab => tab.id === tabA.id)).toBe(false)
+    } finally {
+      registry.dispose()
+    }
+  }, 60_000)
 })

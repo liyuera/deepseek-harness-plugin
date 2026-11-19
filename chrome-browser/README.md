@@ -26,6 +26,7 @@ Chrome 浏览器控制插件(host + 浏览器半边):通过 Chrome 扩展桥(默
 | `@` 标签页分组 | 在输入框敲 `@` 时列出实时标签页(行内是「标题 + URL」),选中插入一个引用芯片;发送后消息里只有这个引用,标签页的 URL 与 tabId 由宿主注入一条上下文消息给模型 |
 | **活动状态条** | 会话标题栏末尾**常驻**的淡色胶囊:空闲显示「Chrome 就绪」,调用中显示当前动作与标签页,失败短暂变红 |
 | `/chrome-browser` skill | 注册一个 agent skill:讲清什么时候用、调用顺序、失败怎么办、有哪些边界。模型通过 `skill` 工具读它,你也可以直接敲 `/chrome-browser`。宿主没有 skill 服务时静默跳过,工具照常可用 |
+| **沙箱后端**(`backend: 'sandbox'`) | 每个 agent 一个**独立**的 owned CDP 实例:按 `agent.id` 键控复用、并行隔离(各自的标签页/窗口/profile 互不可见)、空闲回收、`headless` 默认 false;`@` 标签页分组与扩展桥仍走真实 Chrome。详见[配置](#配置) |
 
 ### 活动状态条:让用户看见 Agent 在干什么
 
@@ -402,9 +403,9 @@ $DSH_HOME/profiles/<profile>/node_modules/@liyuera/dsh-chrome-browser/extension/
     - id: chrome-browser
       name: '@liyuera/dsh-chrome-browser'
       config:
-        backend: extension    # extension(默认,真实 Chrome 通过扩展桥);cdp = DevTools 协议
+        backend: extension    # extension(默认,真实 Chrome 通过扩展桥);cdp = DevTools 协议;sandbox = 每 agent 一个隔离沙箱
         bridgePort: 21987     # 插件自有的扩展桥固定端口(避开 dsh 旧版的 19387);0 = 系统分配(测试/诊断)
-        port: 9222            # DevTools 端口(cdp 后端)
+        port: 9222            # DevTools 端口(cdp 后端;sandbox 从此端口起逐个 +1 分配)
         mode: owned           # 仅 cdp:owned = 插件专用 Chrome;user = profile 副本接管
         autoRelaunch: false   # user 模式:默认 false,绝不自动重启你的浏览器
         attachOnly: false     # true = 只连已有调试端口,不启动/不关闭
@@ -415,9 +416,14 @@ $DSH_HOME/profiles/<profile>/node_modules/@liyuera/dsh-chrome-browser/extension/
         timeoutMs: 15000      # 单命令/就绪超时
         screenshotDir: null   # 默认 <tmp>/dsh-chrome-shots
         consoleIdleMs: 300000 # chrome_console 无读取自动释放调试器的时限(毫秒;0 = 不自动释放)
+        sandboxMaxConcurrent: 4 # 沙箱同时存活上限(backend:'sandbox');满且无空闲可回收时抛错
+        sandboxIdleMs: 600000   # 沙箱空闲回收时限(毫秒;默认 10 分钟;0 = 永不回收)
+        sandboxHeadless: false  # 沙箱 Chrome 是否无头(默认 false = 可见窗口)
 ```
 
 `bridgePort` 是扩展要拨的固定回环端口(默认 **21987**,插件自有端口,理由见[浏览器连接模式](#浏览器连接模式)):dsh web server 的实际监听端口与它不同时,插件在这个端口上另起一个只服务扩展的 HTTP/WS 服务;相同时不另起 listener,由 dsh web server 应答。`bridgePort: 0` 交给系统分配,扩展不知道实际端口,只用于测试/诊断。`backend: 'cdp'` 不启动固定桥,扩展面路由只在 dsh web server 上。
+
+`backend: 'sandbox'` 给每个 agent 一个**独立**的 owned CDP 实例:按 `agent.id` 键控创建与复用,不同 agent 的标签页、窗口与 profile 彼此隔离(调试端口从 `port` 起逐个 +1 分配),互不可见——适合并行子代理各自开浏览器互不干扰。实例空闲超过 `sandboxIdleMs`(默认 **10 分钟**)自动回收并释放端口,`0` 表示永不回收;`sandboxMaxConcurrent`(默认 **4**)是同时存活的沙箱上限,满且没有空闲实例可回收时,新 agent 会抛错(提示等待其它会话空闲回收,或调大该值);`sandboxHeadless`(默认 **false**)控制沙箱 Chrome 是否无头运行。session/子代理结束时(`agent/disposed`)对应沙箱自动释放;没有 agent 上下文的调用与扩展桥/`@` 标签页分组仍走 `shared`(真实 Chrome),不随沙箱走。
 
 ## Model Experience
 
