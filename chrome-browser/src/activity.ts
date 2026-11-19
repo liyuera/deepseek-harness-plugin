@@ -10,6 +10,8 @@
 
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 
+import { sessionIdOf } from './caller.ts'
+
 /**
  * How long a settled call stays on screen before the chip returns to idle.
  * Short enough not to linger, long enough that a call finishing between two
@@ -155,13 +157,6 @@ export class ActivityTracker {
 function tabIdOf(args: unknown): string | undefined {
   const value = (args as { tabId?: unknown } | null | undefined)?.tabId
   return typeof value === 'string' && value !== '' ? value : undefined
-}
-
-/** The executing session id, as the tracker reads it from the execution. */
-function sessionIdOf(exec: unknown): string | undefined {
-  const session = (exec as { agent?: { session?: { id?: unknown } } } | null | undefined)?.agent?.session
-  const id = session?.id
-  return typeof id === 'string' && id !== '' ? id : undefined
 }
 
 /** A thrown value as one line of text for the chip. */
