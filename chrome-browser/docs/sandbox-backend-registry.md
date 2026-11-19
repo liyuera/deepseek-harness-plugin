@@ -42,7 +42,7 @@
 
 ## 2. 核心接口
 
-> **评审后调整：** 键按 `agent.id`（每个子代理独立）而非 `sessionId`；`sandboxHeadless` 默认 `false`。下面代码块里的 `sessionIdOf`/`sessionId` 请读作 `agentIdOf`/`agentId`；最终代码以 [实现计划](sandbox-backend-registry-plan.md) 为准。**隔离是并发语义，不是顺序语义**：并发租约各有独立实例与 profile；租约释放后端口回用，而同一端口的 profile 按设计持久，后来者会继承先前的 cookies/localStorage——需要干净身份就删除 profile 目录或改端口。
+> **评审后调整：** 键按 `agent.id`（每个子代理独立）而非 `sessionId`；`sandboxHeadless` 默认 `true`（后续用户改为默认无头、不弹窗）。下面代码块里的 `sessionIdOf`/`sessionId` 请读作 `agentIdOf`/`agentId`；最终代码以 [实现计划](sandbox-backend-registry-plan.md) 为准。**隔离是并发语义，不是顺序语义**：并发租约各有独立实例与 profile；租约释放后端口回用，而同一端口的 profile 按设计持久，后来者会继承先前的 cookies/localStorage——需要干净身份就删除 profile 目录或改端口。
 
 新增 `src/backend-registry.ts`。命名沿用现有文件风格（小写 + 连字符）。
 
@@ -182,7 +182,7 @@ backend: z.union([z.const('extension'), z.const('cdp'), z.const('sandbox')]).def
 // 仅 backend === 'sandbox' 时生效：
 sandboxMaxConcurrent: z.number().step(1).min(1).default(4)
 sandboxIdleMs: z.number().step(1).min(0).default(10 * 60_000) // 0 = 永不空闲回收
-sandboxHeadless: z.boolean().default(false)
+sandboxHeadless: z.boolean().default(true)
 ```
 
 `resolveChromeConfig` 需补这些默认值，并在 `chromeArgs` 里当 `sandboxHeadless` 时追加 `--headless=new`（当前 [chrome.ts:754](src/chrome.ts#L754) 无 headless 分支）。
@@ -281,4 +281,4 @@ smoke（`DSH_CHROME_SMOKE=1`）：两个伪造 sessionId 并发 `resolve` → �
 | 后端选择模型 | **A 配置开关**：`backend` 新增 `'sandbox'`；`@` 菜单/标签页路由始终走扩展 |
 | 配置字段命名 | **扁平**：`sandboxMaxConcurrent` / `sandboxIdleMs` / `sandboxHeadless` |
 | 子代理键 | **按 agent 身份**：键用 `agent.id`（每个子代理独立沙箱） |
-| headless 默认 | **`false`**（沙箱默认有窗口，可被用户看到） |
+| headless 默认 | **`true`**（默认无头、不弹窗；设 `false` 才出现可见窗口） |

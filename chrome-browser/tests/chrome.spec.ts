@@ -575,7 +575,7 @@ describe('sandbox config defaults', () => {
     const cfg = resolveChromeConfig({ backend: 'sandbox' })
     expect(cfg.sandboxMaxConcurrent).toBe(4)
     expect(cfg.sandboxIdleMs).toBe(10 * 60_000)
-    expect(cfg.sandboxHeadless).toBe(false)
+    expect(cfg.sandboxHeadless).toBe(true)
   })
 
   it('honours explicit sandbox values', () => {
@@ -591,7 +591,7 @@ describe('sandbox config defaults', () => {
   })
 
   it('omits --headless=new when sandboxHeadless is false', () => {
-    const cfg = resolveChromeConfig({ backend: 'sandbox' })
+    const cfg = resolveChromeConfig({ backend: 'sandbox', sandboxHeadless: false })
     expect(buildChromeArgs(cfg, '/p', [], undefined)).not.toContain('--headless=new')
   })
 })

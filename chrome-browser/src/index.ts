@@ -81,7 +81,7 @@ export interface ChromePluginConfig {
   sandboxMaxConcurrent?: number
   /** Idle reclamation bound in ms for a sandbox; 0 = never. */
   sandboxIdleMs?: number
-  /** Run sandbox Chrome headless (default false = visible window). */
+  /** Run sandbox Chrome headless (default true = no window). */
   sandboxHeadless?: boolean
 }
 
@@ -102,7 +102,7 @@ export const Config: z<ChromePluginConfig> = z.object({
   bridgePort: z.number().step(1).min(0).max(65535).default(DEFAULT_BRIDGE_PORT),
   sandboxMaxConcurrent: z.number().step(1).min(1).default(4),
   sandboxIdleMs: z.number().step(1).min(0).default(10 * 60_000),
-  sandboxHeadless: z.boolean().default(false),
+  sandboxHeadless: z.boolean().default(true),
 })
 
 /**

@@ -15,7 +15,7 @@
 - **零新运行时依赖**：只用 Node 内建（`node:child_process` / `node:fs` / `node:path`）与现有 `@deepseek-ai/*` peer/dev 依赖。README「零浏览器自动化运行时依赖」承诺不变。
 - **配置扁平命名**：`sandboxMaxConcurrent` / `sandboxIdleMs` / `sandboxHeadless`（不嵌套）。
 - **键 = `agent.id`**（每个子代理独立沙箱），不是 `sessionId`。
-- **`sandboxHeadless` 默认 `false`**（沙箱有窗口，用户可见）。
+- **`sandboxHeadless` 默认 `true`**（默认无头、不弹窗；设 `false` 才出现可见窗口）。
 - 现有文件命名约定：`src/*.ts` 小写连字符，vitest 单测 `tests/*.spec.ts`，构建 `tsc -b`。
 - TDD：每个任务先写失败测试，再实现，再跑绿，再 commit。commit message 用 `feat:` 前缀。
 - 所有时间相关逻辑用 `vi.useFakeTimers()`，不依赖真实时钟。
@@ -535,7 +535,7 @@ describe('sandbox config defaults', () => {
     const cfg = resolveChromeConfig({ backend: 'sandbox' })
     expect(cfg.sandboxMaxConcurrent).toBe(4)
     expect(cfg.sandboxIdleMs).toBe(10 * 60_000)
-    expect(cfg.sandboxHeadless).toBe(false)
+    expect(cfg.sandboxHeadless).toBe(true)
   })
 
   it('honours explicit sandbox values', () => {
@@ -581,7 +581,7 @@ Expected: FAIL — `cfg.sandboxMaxConcurrent` 为 `undefined`（或 `buildChrome
 ```ts
     sandboxMaxConcurrent: config.sandboxMaxConcurrent ?? 4,
     sandboxIdleMs: config.sandboxIdleMs ?? 10 * 60_000,
-    sandboxHeadless: config.sandboxHeadless ?? false,
+    sandboxHeadless: config.sandboxHeadless ?? true,
 ```
 
 把 `chromeArgs`（原 754-766）抽成导出纯函数，并加 headless 分支：
@@ -627,7 +627,7 @@ export function buildChromeArgs(
 ```ts
   sandboxMaxConcurrent: z.number().step(1).min(1).default(4),
   sandboxIdleMs: z.number().step(1).min(0).default(10 * 60_000),
-  sandboxHeadless: z.boolean().default(false),
+  sandboxHeadless: z.boolean().default(true),
 ```
 
 并把 `backend` 联合（第 82 行）加 `'sandbox'`：

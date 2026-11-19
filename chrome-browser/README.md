@@ -418,12 +418,12 @@ $DSH_HOME/profiles/<profile>/node_modules/@liyuera/dsh-chrome-browser/extension/
         consoleIdleMs: 300000 # chrome_console 无读取自动释放调试器的时限(毫秒;0 = 不自动释放)
         sandboxMaxConcurrent: 4 # 沙箱同时存活上限(backend:'sandbox');满且无空闲可回收时抛错
         sandboxIdleMs: 600000   # 沙箱空闲回收时限(毫秒;默认 10 分钟;0 = 永不回收)
-        sandboxHeadless: false  # 沙箱 Chrome 是否无头(默认 false = 可见窗口)
+        sandboxHeadless: true   # 沙箱 Chrome 是否无头(默认 true = 不弹窗; 设 false 才弹可见窗口)
 ```
 
 `bridgePort` 是扩展要拨的固定回环端口(默认 **21987**,插件自有端口,理由见[浏览器连接模式](#浏览器连接模式)):dsh web server 的实际监听端口与它不同时,插件在这个端口上另起一个只服务扩展的 HTTP/WS 服务;相同时不另起 listener,由 dsh web server 应答。`bridgePort: 0` 交给系统分配,扩展不知道实际端口,只用于测试/诊断。`backend: 'cdp'` 不启动固定桥,扩展面路由只在 dsh web server 上。
 
-`backend: 'sandbox'` 给每个 agent 一个**独立**的 owned CDP 实例:按 `agent.id` 键控创建与复用,不同 agent 的标签页、窗口与 profile 彼此隔离(调试端口从 `port` 起**首次分配时逐个 +1 递增,释放后的端口会回用**),互不可见——适合并行子代理各自开浏览器互不干扰。实例空闲超过 `sandboxIdleMs`(默认 **10 分钟**)自动回收并释放端口,`0` 表示永不回收;`sandboxMaxConcurrent`(默认 **4**)是同时存活的沙箱上限,满且没有空闲实例可回收时,新 agent 会抛错(提示等待其它会话空闲回收,或调大该值);`sandboxHeadless`(默认 **false**)控制沙箱 Chrome 是否无头运行。session/子代理结束时(`agent/disposed`)对应沙箱自动释放。**此模式不安装扩展桥,`@` 标签页分组不可用**——`/chrome-browser/tabs` 与 `@` 菜单读的是真实 Chrome,桥不在就连不上;要控制用户真实浏览器、用 `@` 分组引用标签页,请切回 `backend: 'extension'`。
+`backend: 'sandbox'` 给每个 agent 一个**独立**的 owned CDP 实例:按 `agent.id` 键控创建与复用,不同 agent 的标签页、窗口与 profile 彼此隔离(调试端口从 `port` 起**首次分配时逐个 +1 递增,释放后的端口会回用**),互不可见——适合并行子代理各自开浏览器互不干扰。实例空闲超过 `sandboxIdleMs`(默认 **10 分钟**)自动回收并释放端口,`0` 表示永不回收;`sandboxMaxConcurrent`(默认 **4**)是同时存活的沙箱上限,满且没有空闲实例可回收时,新 agent 会抛错(提示等待其它会话空闲回收,或调大该值);`sandboxHeadless`(默认 **true**)控制沙箱 Chrome 是否无头运行(默认不弹窗,设 `false` 才出现可见窗口)。session/子代理结束时(`agent/disposed`)对应沙箱自动释放。**此模式不安装扩展桥,`@` 标签页分组不可用**——`/chrome-browser/tabs` 与 `@` 菜单读的是真实 Chrome,桥不在就连不上;要控制用户真实浏览器、用 `@` 分组引用标签页,请切回 `backend: 'extension'`。
 
 ## Model Experience
 

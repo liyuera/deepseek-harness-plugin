@@ -79,7 +79,7 @@ export interface ResolvedChromeConfig {
   sandboxMaxConcurrent: number
   /** Idle reclamation bound in ms for a sandbox; 0 = never. */
   sandboxIdleMs: number
-  /** Run sandbox Chrome headless. */
+  /** Run sandbox Chrome headless (default true). */
   sandboxHeadless: boolean
 }
 
@@ -360,7 +360,7 @@ export function resolveChromeConfig(
     bridgePort: config.bridgePort ?? DEFAULT_BRIDGE_PORT,
     sandboxMaxConcurrent: config.sandboxMaxConcurrent ?? 4,
     sandboxIdleMs: config.sandboxIdleMs ?? 10 * 60_000,
-    sandboxHeadless: config.sandboxHeadless ?? false,
+    sandboxHeadless: config.sandboxHeadless ?? true,
   }
 }
 
