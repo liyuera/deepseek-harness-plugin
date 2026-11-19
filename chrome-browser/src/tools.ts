@@ -69,14 +69,17 @@ const render = (_args: unknown, value: JsonValue): Array<{ type: 'text'; text: s
 
 /**
  * Per-call backend preference shared by every backend-using tool: the agent's
- * own sandbox (default) or the user's real browser.
+ * own sandbox (default) or the user's real browser. The description states
+ * that the parameter is inert outside sandbox config, so a model never assumes
+ * isolation it does not have.
  */
 const BACKEND_PARAM = {
   backend: {
     type: 'string',
     enum: ['sandbox', 'user'],
     description: 'Which browser to drive: "sandbox" (default) is this agent\'s isolated owned browser; '
-      + '"user" is the real Chrome (the extension bridge), for logged-in pages or the user\'s own tabs.',
+      + '"user" is the real Chrome (the extension bridge), for logged-in pages or the user\'s own tabs. '
+      + 'In "extension" or "cdp" config mode this parameter has no effect — every call drives the real Chrome.',
   },
 } as const
 
@@ -235,7 +238,9 @@ function imagePath(path: string, ext: string): string {
 
 /**
  * Resolve the tab a tool operates on: an explicit id wins, and anything else —
- * an omitted id or the literal `active` — means the tab the user is looking at.
+ * an omitted id or the literal `active` — means the active tab of the backend
+ * this call drives (the sandbox's own page by default, the user's real tab
+ * with `backend: 'user'`).
  *
  * There is no session binding to fall back to: the `@` menu inserts a reference
  * chip and binds nothing, and the chip's `tabId` arrives in the injected context.
@@ -311,9 +316,10 @@ export function chromeToolDefinitions(
     defineTool({
       name: 'chrome_tabs',
       description:
-        'List the tabs currently open in the Chrome instance the browser plugin controls: id, title, url, active and '
-        + 'favicon. Get a tab id first, then pass it to every other chrome_* tool; omitting tabId (or passing '
-        + '"active") means the tab the user is looking at, which is rarely the one a request names.',
+        'List the tabs in the browser this call drives: the agent\'s own sandbox by default, the user\'s real Chrome '
+        + 'with backend "user". Reports id, title, url, active and favicon. Get a tab id first, then pass it to every '
+        + 'other chrome_* tool; omitting tabId (or passing "active") means the active tab of that same backend, which '
+        + 'is rarely the one a request names.',
       parameters: { ...BACKEND_PARAM },
       output: { schema: { type: 'json' }, render },
       isConcurrencySafe: () => true,
@@ -337,7 +343,7 @@ export function chromeToolDefinitions(
         + 'it is far smaller than the page text and answers "what can I act on, and will it work".',
       parameters: {
         ...BACKEND_PARAM,
-        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the tab the user is looking at; omitting it means 'active' too." },
+        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the chosen backend's active tab (the user's own tab only with backend: 'user'); omitting it means 'active' too." },
         mode: {
           type: 'string',
           enum: ['text', 'interactive'],
@@ -402,7 +408,7 @@ export function chromeToolDefinitions(
           description: 'Target URL, e.g. https://example.com. http(s) and file only; a file: URL also needs the '
             + 'extension to be granted file access in chrome://extensions.',
         },
-        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the tab the user is looking at; omitting it means 'active' too." },
+        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the chosen backend's active tab (the user's own tab only with backend: 'user'); omitting it means 'active' too." },
         waitLoad: { type: 'boolean', description: 'Wait for load completion (default true).' },
       },
       output: { schema: { type: 'json' }, render },
@@ -492,7 +498,7 @@ export function chromeToolDefinitions(
         + 'could not be honoured. If that fallback fails too, the call throws with both causes.',
       parameters: {
         ...BACKEND_PARAM,
-        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the tab the user is looking at; omitting it means 'active' too." },
+        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the chosen backend's active tab (the user's own tab only with backend: 'user'); omitting it means 'active' too." },
         path: { type: 'string', description: 'Optional output file path; defaults to <screenshotDir>/<timestamp>-<tabId>.png.' },
         fullPage: {
           type: 'boolean',
@@ -569,7 +575,7 @@ export function chromeToolDefinitions(
       parameters: {
         ...BACKEND_PARAM,
         selector: { type: 'string', required: true, description: 'CSS selector, e.g. "#submit" or "a.download".' },
-        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the tab the user is looking at; omitting it means 'active' too." },
+        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the chosen backend's active tab (the user's own tab only with backend: 'user'); omitting it means 'active' too." },
         all: { type: 'boolean', description: 'Click every matching element (default false: first match only).' },
       },
       output: { schema: { type: 'json' }, render },
@@ -607,7 +613,7 @@ export function chromeToolDefinitions(
       parameters: {
         ...BACKEND_PARAM,
         selector: { type: 'string', required: true, description: 'CSS selector to hover, e.g. "#menu" or "[aria-label=More]".' },
-        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the tab the user is looking at; omitting it means 'active' too." },
+        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the chosen backend's active tab (the user's own tab only with backend: 'user'); omitting it means 'active' too." },
       },
       output: { schema: { type: 'json' }, render },
       presentCall: args => hoverCall(args),
@@ -631,7 +637,7 @@ export function chromeToolDefinitions(
         ...BACKEND_PARAM,
         selector: { type: 'string', required: true, description: 'CSS selector of the input/textarea/editable element.' },
         text: { type: 'string', required: true, description: 'Text to insert.' },
-        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the tab the user is looking at; omitting it means 'active' too." },
+        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the chosen backend's active tab (the user's own tab only with backend: 'user'); omitting it means 'active' too." },
         clear: { type: 'boolean', description: 'Select existing content first so the text replaces it (default true).' },
       },
       output: { schema: { type: 'json' }, render },
@@ -657,7 +663,7 @@ export function chromeToolDefinitions(
         ...BACKEND_PARAM,
         key: { type: 'string', required: true, description: 'KeyboardEvent.key value, e.g. "Enter", "Escape", "Tab", "ArrowDown".' },
         selector: { type: 'string', description: 'Focus this element first; omit to press on whatever currently has focus.' },
-        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the tab the user is looking at; omitting it means 'active' too." },
+        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the chosen backend's active tab (the user's own tab only with backend: 'user'); omitting it means 'active' too." },
       },
       output: { schema: { type: 'json' }, render },
       presentCall: args => pressCall(args),
@@ -689,7 +695,7 @@ export function chromeToolDefinitions(
         ...BACKEND_PARAM,
         selector: { type: 'string', required: true, description: 'CSS selector for the <select> element.' },
         value: { type: 'string', required: true, description: 'Option value to select (the value attribute, not the label).' },
-        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the tab the user is looking at; omitting it means 'active' too." },
+        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the chosen backend's active tab (the user's own tab only with backend: 'user'); omitting it means 'active' too." },
       },
       output: { schema: { type: 'json' }, render },
       presentCall: args => selectCall(args),
@@ -726,7 +732,7 @@ export function chromeToolDefinitions(
       parameters: {
         ...BACKEND_PARAM,
         expression: { type: 'string', required: true, description: 'JavaScript expression to evaluate in the page.' },
-        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the tab the user is looking at; omitting it means 'active' too." },
+        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the chosen backend's active tab (the user's own tab only with backend: 'user'); omitting it means 'active' too." },
       },
       output: { schema: { type: 'json' }, render },
       presentCall: args => evalCall(args),
@@ -756,7 +762,7 @@ export function chromeToolDefinitions(
         + '`available: true` with an empty `tools` array means the page has the API but registers no tools right now.',
       parameters: {
         ...BACKEND_PARAM,
-        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the tab the user is looking at; omitting it means 'active' too." },
+        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the chosen backend's active tab (the user's own tab only with backend: 'user'); omitting it means 'active' too." },
       },
       output: { schema: { type: 'json' }, render },
       isConcurrencySafe: () => true,
@@ -789,7 +795,7 @@ export function chromeToolDefinitions(
         ...BACKEND_PARAM,
         name: { type: 'string', required: true, description: '工具名,来自 chrome_webmcp_list 的 name。' },
         input: { type: 'object', additionalProperties: true, description: '该工具 inputSchema 对应的参数对象;不需要参数时省略。' },
-        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the tab the user is looking at; omitting it means 'active' too." },
+        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the chosen backend's active tab (the user's own tab only with backend: 'user'); omitting it means 'active' too." },
       },
       output: { schema: { type: 'json' }, render },
       presentCall: args => webmcpCallCall(args),
@@ -839,7 +845,7 @@ export function chromeToolDefinitions(
           description: '"visible" (default): present with a layout box and not hidden. "hidden": absent or not shown. "attached"/"detached": presence only.',
         },
         timeoutMs: { type: 'integer', description: 'How long to wait (default 10000ms; max 300000).' },
-        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the tab the user is looking at; omitting it means 'active' too." },
+        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the chosen backend's active tab (the user's own tab only with backend: 'user'); omitting it means 'active' too." },
       },
       output: { schema: { type: 'json' }, render },
       presentCall: args => waitCall(args),
@@ -912,7 +918,7 @@ export function chromeToolDefinitions(
           enum: ['start', 'stop', 'read'],
           description: 'start capture, read entries, or stop and drop the buffer.',
         },
-        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the tab the user is looking at; omitting it means 'active' too." },
+        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the chosen backend's active tab (the user's own tab only with backend: 'user'); omitting it means 'active' too." },
         since: { type: 'integer', description: 'Read: return entries whose sequence number is greater than this cursor (default 0 = everything retained).' },
         limit: { type: 'integer', description: 'Read: keep only the most recent N matching entries.' },
       },

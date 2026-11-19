@@ -20,11 +20,11 @@ export const SKILL_DESCRIPTION: string =
 
 /** Body loaded only when the skill is invoked. Annotated `string` so the emitted
  * declarations carry the type and not a 6 KB literal. */
-export const SKILL_CONTENT: string = `# Chrome 浏览器(用户真实标签页)
+export const SKILL_CONTENT: string = `# Chrome 浏览器(沙箱优先,真实浏览器按需)
 
 \`chrome_*\` 工具驱动的浏览器由 \`backend\` 参数选择(见下「后端选择」):默认是这个 agent 自己的隔离浏览器;
-传 \`backend: 'user'\` 时直接操作用户正在使用的 Chrome——不新开窗口、不复制 profile。
-用户打开什么,你就能看什么;登录态、内网、后台系统都能用。
+只有传 \`backend: 'user'\` 时才操作你用户正在使用的真实 Chrome——不新开窗口、不复制 profile。
+也只有这条通道能看到用户打开什么、登录态、内网与后台系统。
 
 ## 工具一览
 
@@ -50,7 +50,7 @@ export const SKILL_CONTENT: string = `# Chrome 浏览器(用户真实标签页)
 
 ## 后端选择:沙箱优先,真实浏览器备选
 
-每个 \`chrome_*\` 工具都有一个可选的 \`backend\` 参数:
+16 个**操作浏览器**的工具都有这个可选参数(\`chrome_request_help\` 不驱动浏览器,没有该参数):
 
 - \`backend: 'sandbox'\`(**默认**):驱动这个 agent **自己的隔离浏览器**(owned Chrome),并行子代理互不干扰;没有你的登录态。
 - \`backend: 'user'\`:驱动**用户真实 Chrome**(扩展桥),用于已登录的内网/后台页面、用户正在看的 \`@\` 标签页。
@@ -62,8 +62,9 @@ export const SKILL_CONTENT: string = `# Chrome 浏览器(用户真实标签页)
 
 - 用户提到"这个页面""我现在开着的标签页""帮我填一下这个表单"。
 - 用户消息里带 \`@"页面标题"\` 引用——宿主随后注入一条 \`## Referenced Chrome tabs\`,
-  里面有该标签页的 \`tabId\` 与 URL,照着用即可。
-- 需要读取用户已登录、你抓不到的页面。
+  里面有该标签页的 \`tabId\` 与 URL。**这个 id 属于用户真实浏览器,调用时必须带 \`backend: 'user'\`**;
+  \`chrome_tabs\` 返回的 id 只在当次选择的那个浏览器里有效,切后端后要重新列。
+- 需要读取用户已登录、你抓不到的页面——这类页面只在用户真实浏览器里,调用时带 \`backend: 'user'\`。
 
 不需要浏览器时不要调用这些工具。
 
@@ -72,7 +73,7 @@ export const SKILL_CONTENT: string = `# Chrome 浏览器(用户真实标签页)
 0. **先看有没有 WebMCP**——页面若实现了 WebMCP(需要 Chrome 启用 WebMCP),先 \`chrome_webmcp_list\`;
    有工具时优先 \`chrome_webmcp_call\`,比点 DOM 稳。\`pending: true\` 表示工具已激活但还在等用户操作
    (常见于声明式表单),不要重复调用,先请用户确认。
-1. **拿到 tabId**——引用已注入时直接用;否则先 \`chrome_tabs\`。
+1. **拿到 tabId**——引用已注入时直接用(并带 \`backend: 'user'\`);否则先 \`chrome_tabs\` 列当前后端的标签页。
 2. **先感知再操作**——要动手时用 \`chrome_read { mode: 'interactive' }\`:它直接给出每个可交互元素的
    \`selector\` 以及 \`disabled\` / \`covered\` / \`inView\`,比读正文小得多,而且读完就能点。
    只是要理解页面内容时才用默认的 \`mode: 'text'\`。
@@ -91,10 +92,15 @@ export const SKILL_CONTENT: string = `# Chrome 浏览器(用户真实标签页)
 ## tabId 从哪来
 
 - **显式 id**——来自 \`chrome_tabs\`,或用户引用某标签页时宿主注入的上下文。**优先用这个。**
-- 省略 \`tabId\`、或写 \`"active"\`——都是**用户当前正在看的那个标签页**。
+- 省略 \`tabId\`、或写 \`"active"\`——指**你当前所选后端(默认沙箱)的活动标签页**;
+  默认沙箱时它是沙箱自己的活动页,不是你用户正在看的那一页。要操作用户真实浏览器里的活动页,
+  显式传 \`backend: 'user'\`。
 
 \`@\` 菜单插入的是引用芯片,**不绑定会话**;所以没有「本会话选中的标签页」这回事。
 用户明确要你操作某个页面时,不要省略 \`tabId\`:那时活动标签页很可能已经是别的了。
+
+**id 只在产生它的浏览器里有效。** \`chrome_tabs\` 拿到的 id 属于当次选择的那个后端;
+切换 \`backend\` 后要重新列,不要拿沙箱的 id 去操作真实浏览器(反之亦然)。
 
 **模型侧看到的是 id,不是标题。** 标题只能用来在 \`chrome_tabs\` 的结果里认出目标。
 
@@ -169,9 +175,9 @@ export const SKILL_CONTENT: string = `# Chrome 浏览器(用户真实标签页)
 - **按键、悬停、下拉的事件是合成的**:送达页面监听器,但不产生浏览器默认行为。
   Enter 提交靠显式 \`requestSubmit()\` 兜底(\`chrome_press\` 会报告 \`submitted\`);依赖真实按键序列
   (组合键、输入法)或真实指针的组件仍可能不响应,这些场景退回 \`chrome_eval\`。
-- **操作的是用户真实标签页**:用户可能同时在操作同一个页面;
-  写操作前确认目标,不要在用户正在输入的页面上抢焦点。截图优先走调试通道,不会切换标签页,
-  但会在该标签页显示「正在调试」提示条。
+- **默认操作的是你自己的沙箱(隔离)**:只有传 \`backend: 'user'\` 才碰用户真实页面——那时用户可能
+  同时在操作同一个页面,写操作前确认目标,不要在用户正在输入的页面上抢焦点。截图优先走调试通道,
+  不会切换标签页,但会在该标签页显示「正在调试」提示条。
 - **截图自带降级**:调试通道失败(DevTools 占用、页面拒绝渲染、clip 测量失败等)时,
   \`chrome_screenshot\` 自动退回 \`chrome.tabs.captureVisibleTab\` 的可视区域截图,结果带
   \`fallback: "visible-tab"\` + \`warning\`(含失败原因),\`fullPage\`/\`selector\` 不生效时还带

@@ -27,7 +27,7 @@ Chrome 浏览器控制插件(host + 浏览器半边):通过 Chrome 扩展桥(默
 | **活动状态条** | 会话标题栏末尾**常驻**的淡色胶囊:空闲显示「Chrome 就绪」,调用中显示当前动作与标签页,失败短暂变红 |
 | `/chrome-browser` skill | 注册一个 agent skill:讲清什么时候用、调用顺序、失败怎么办、有哪些边界。模型通过 `skill` 工具读它,你也可以直接敲 `/chrome-browser`。宿主没有 skill 服务时静默跳过,工具照常可用 |
 | **沙箱后端**(`backend: 'sandbox'`) | 每个 agent 一个**独立**的 owned CDP 实例,并且是工具的**默认**后端:按 `agent.id` 键控复用、并行隔离(各自的标签页/窗口/profile 互不可见)、空闲回收、`headless` 默认 true;**此模式仍安装扩展桥**,所以用户真实 Chrome 始终可达(`@` 标签页分组也可用)。详见[配置](#配置) |
-| **按调用选择后端**(`backend` 参数) | 每个 `chrome_*` 工具有可选的 `backend`:`'sandbox'`(**默认**)= 这个 agent 自己的隔离浏览器;`'user'` = **用户真实 Chrome**(扩展桥),用于已登录页面、用户正在看的标签页。`backend: 'extension'` / `'cdp'` 配置下没有沙箱,两种取值都走真实浏览器(参数无效果) |
+| **按调用选择后端**(`backend` 参数) | 每个**操作浏览器**的工具(除 `chrome_request_help`)有可选的 `backend`:`'sandbox'`(**默认**)= 这个 agent 自己的隔离浏览器;`'user'` = **用户真实 Chrome**(扩展桥),用于已登录页面、用户正在看的标签页。`backend: 'extension'` / `'cdp'` 配置下没有沙箱,两种取值都走真实浏览器(参数无效果) |
 
 ### 活动状态条:让用户看见 Agent 在干什么
 
@@ -426,7 +426,7 @@ $DSH_HOME/profiles/<profile>/node_modules/@liyuera/dsh-chrome-browser/extension/
 
 `backend: 'sandbox'` 给每个 agent 一个**独立**的 owned CDP 实例:按 `agent.id` 键控创建与复用,不同 agent 的标签页、窗口与 profile 彼此隔离(调试端口从 `port` 起**首次分配时逐个 +1 递增,释放后的端口会回用**),互不可见——适合并行子代理各自开浏览器互不干扰。它是**工具的默认后端**:不传 `backend` 时调用走这个沙箱。实例空闲超过 `sandboxIdleMs`(默认 **10 分钟**)自动回收并释放端口,`0` 表示永不回收;`sandboxMaxConcurrent`(默认 **4**)是同时存活的沙箱上限,满且没有空闲实例可回收时,新 agent 会抛错(提示等待其它会话空闲回收,或调大该值);`sandboxHeadless`(默认 **true**)控制沙箱 Chrome 是否无头运行(默认不弹窗,设 `false` 才出现可见窗口)。session/子代理结束时(`agent/disposed`)对应沙箱自动释放。
 
-**per-call 选择**:每个 `chrome_*` 工具接受一个可选的 `backend` 参数——`'sandbox'`(**默认**,该 agent 自己的沙箱)或 `'user'`(**用户真实 Chrome**,走扩展桥,有登录态和你正开着的标签页)。需要读已登录的内网/后台,或操作用户 `@` 引用的真实标签页时,在那一次调用里传 `backend: 'user'` 即可;**同一次会话里可以在沙箱和真实浏览器之间逐调用切换**。`backend: 'extension'` / `'cdp'` 配置下没有沙箱可走,两种取值都落到真实浏览器(`cdp` 后端没有扩展桥;`extension` 与 `sandbox` 都会安装扩展桥,`sandbox` 下 `@` 标签页分组仍然可用)。
+**per-call 选择**:16 个操作浏览器的工具(除 `chrome_request_help`)都接受一个可选的 `backend` 参数——`'sandbox'`(**默认**,该 agent 自己的沙箱)或 `'user'`(**用户真实 Chrome**,走扩展桥,有登录态和你正开着的标签页)。需要读已登录的内网/后台,或操作用户 `@` 引用的真实标签页时,在那一次调用里传 `backend: 'user'` 即可;**同一次会话里可以在沙箱和真实浏览器之间逐调用切换**。`backend: 'extension'` / `'cdp'` 配置下没有沙箱可走,两种取值都落到真实浏览器(`cdp` 后端没有扩展桥;`extension` 与 `sandbox` 都会安装扩展桥,`sandbox` 下 `@` 标签页分组仍然可用)。
 
 ## Model Experience
 

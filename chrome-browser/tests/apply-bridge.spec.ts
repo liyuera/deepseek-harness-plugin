@@ -4,6 +4,9 @@
  * needs the user's real Chrome, which is the shared extension backend. The cdp
  * backend has no extension face and must not start the bridge.
  */
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import { apply } from '../src/index.ts'
@@ -30,10 +33,14 @@ function fakeHost(): { ctx: Context; labels: string[]; disposers: Array<() => vo
 }
 
 let cleanup: Array<() => void> = []
+/** Temp profile dirs this file created, removed after each test. */
+let temporaryDirs: string[] = []
 
 afterEach(async () => {
   for (const dispose of cleanup.reverse()) dispose()
   cleanup = []
+  for (const dir of temporaryDirs) rmSync(dir, { recursive: true, force: true })
+  temporaryDirs = []
   // Let a bridge bind that was in flight when the disposer ran settle and close.
   await new Promise(resolve => setTimeout(resolve, 20))
 })
@@ -54,8 +61,13 @@ describe('apply() extension bridge installation', () => {
   })
 
   it('does not install the bridge for the cdp backend', () => {
+    // cdp apply() reads the owned profile's pid file and can terminate a Chrome
+    // it recognises there: keep it off the developer's shared default profile
+    // and off the usual debug port.
+    const profileDir = mkdtempSync(join(tmpdir(), 'dsh-chrome-apply-cdp-'))
+    temporaryDirs.push(profileDir)
     const host = fakeHost()
-    apply(host.ctx, { backend: 'cdp', bridgePort: 0 })
+    apply(host.ctx, { backend: 'cdp', bridgePort: 0, port: 19222, profileDir })
     cleanup = host.disposers
     expect(host.labels).not.toContain(BRIDGE_EFFECT)
   })

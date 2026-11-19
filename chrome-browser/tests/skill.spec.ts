@@ -218,6 +218,13 @@ describe('tabId documentation', () => {
     expect(tools).not.toMatch(/session-selected|session\.tabs/u)
     // The denial itself is wanted; only the instruction to rely on it is not.
     expect(SKILL_CONTENT).not.toMatch(/用本会话选中的标签页/u)
-    expect(SKILL_CONTENT).toContain('用户当前正在看的那个标签页')
+  })
+
+  it('says the active tab belongs to the chosen backend, not always to the user', () => {
+    // Sandbox is the default backend, so omitting tabId means the sandbox's
+    // active tab; the old blanket "the user is looking at it" would mislead a
+    // model into operating the sandbox's own page thinking it was the user's.
+    expect(SKILL_CONTENT).toContain('当前所选后端(默认沙箱)的活动标签页')
+    expect(SKILL_CONTENT).not.toContain('都是**用户当前正在看的那个标签页**')
   })
 })
