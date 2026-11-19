@@ -1,92 +1,18 @@
 {
-  "extends": "../../tsconfig.base.client.json",
   "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022", "DOM"],
+    "jsx": "react-jsx",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
     "rootDir": "src",
     "outDir": "lib",
-    "types": [
-      "node"
-    ],
-    "paths": {
-      "@deepseek-ai/cordis": [
-        "./../../vendor/cordis/src/index.ts"
-      ],
-      "@deepseek-ai/schemastery": [
-        "./../../vendor/schemastery/src/index.ts"
-      ],
-      "@deepseek-ai/dsh-invariants": [
-        "./../../packages/runtime-diagnostics/invariants/src/index.ts"
-      ],
-      "@deepseek-ai/dsh-tools": [
-        "./../../packages/core/tools/src/index.ts"
-      ],
-      "@deepseek-ai/dsh-agent": [
-        "./../../packages/core/agent/src/index.ts"
-      ],
-      "@deepseek-ai/dsh-skill": [
-        "./../../packages/skill/skill/src/index.ts"
-      ],
-      "@deepseek-ai/dsh-llm": [
-        "./../../packages/llm/llm/src/index.ts"
-      ],
-      "@deepseek-ai/dsh-llm/message": [
-        "./../../packages/llm/llm/src/message.ts"
-      ],
-      "@deepseek-ai/dsh-util-values": [
-        "./../../packages/util/values/src/index.ts"
-      ],
-      "@deepseek-ai/dsh-tools/types": [
-        "./../../packages/core/tools/src/types.ts"
-      ],
-      "@deepseek-ai/dsh-client-ui-renderer/client": [
-        "./../../packages/client/ui-renderer/src/client/index.ts"
-      ],
-      "@deepseek-ai/dsh-client-ui-slots": [
-        "./../../packages/client/ui-slots/src/index.ts"
-      ],
-      "@deepseek-ai/dsh-client-ui-conversation/client": [
-        "./../../packages/client/ui-conversation/src/client/index.ts"
-      ],
-      "@deepseek-ai/dsh-client-ui-input-trigger/client": [
-        "./../../packages/client/ui-input-trigger/src/client/index.ts"
-      ]
-    }
+    "declaration": true,
+    "sourceMap": true
   },
-  "include": [
-    "src"
-  ],
-  "references": [
-    {
-      "path": "../../vendor/cordis"
-    },
-    {
-      "path": "../../vendor/schemastery"
-    },
-    {
-      "path": "../../packages/runtime-diagnostics/invariants"
-    },
-    {
-      "path": "../../packages/core/tools"
-    },
-    {
-      "path": "../../packages/core/agent"
-    },
-    {
-      "path": "../../packages/llm/llm"
-    },
-    {
-      "path": "../../packages/util/values"
-    },
-    {
-      "path": "../../packages/client/ui-renderer"
-    },
-    {
-      "path": "../../packages/client/ui-slots"
-    },
-    {
-      "path": "../../packages/client/ui-conversation"
-    },
-    {
-      "path": "../../packages/client/ui-input-trigger"
-    }
-  ]
+  "include": ["src"]
 }
