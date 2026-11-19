@@ -79,7 +79,7 @@ function backend(): { backend: BrowserBackend; calls: Calls } {
 function tool(name: string): { definition: ToolDefinition; calls: Calls } {
   const fixture = backend()
   const found = chromeToolDefinitions(
-    fixture.backend, resolveChromeConfig({}), new ConsoleLog(), new HelpChannel(),
+    () => fixture.backend, resolveChromeConfig({}), new ConsoleLog(), new HelpChannel(),
   ).find(definition => definition.name === name)
   if (found === undefined) throw new Error(`${name} is not registered`)
   return { definition: found, calls: fixture.calls }
@@ -114,19 +114,19 @@ describe('chrome_screenshot', () => {
     const source = join(mkdtempSync(join(tmpdir(), 'dsh-fallback-')), 'shot.jpg')
     writeFileSync(source, Buffer.from([0xff, 0xd8, 0xff]))
     const fixture = backend()
+    const fallbackBackend = {
+      ...fixture.backend,
+      screenshot: async () => ({
+        data: '',
+        path: source,
+        mime: 'image/jpeg',
+        fallback: 'visible-tab' as const,
+        viewportOnly: true,
+        fallbackReason: 'Unable to capture screenshot',
+      }),
+    } as unknown as BrowserBackend
     const found = chromeToolDefinitions(
-      {
-        ...fixture.backend,
-        screenshot: async () => ({
-          data: '',
-          path: source,
-          mime: 'image/jpeg',
-          fallback: 'visible-tab' as const,
-          viewportOnly: true,
-          fallbackReason: 'Unable to capture screenshot',
-        }),
-      } as unknown as BrowserBackend,
-      resolveChromeConfig({}), new ConsoleLog(), new HelpChannel(),
+      () => fallbackBackend, resolveChromeConfig({}), new ConsoleLog(), new HelpChannel(),
     ).find(definition => definition.name === 'chrome_screenshot')
     if (found === undefined) throw new Error('chrome_screenshot is not registered')
     const value = await found.execute({ tabId: '7', fullPage: true }, {} as never) as {
@@ -260,7 +260,7 @@ describe('the status chip sees a close', () => {
     const activity = new ActivityTracker()
     const fixture = backend()
     const definition = chromeToolDefinitions(
-      fixture.backend, resolveChromeConfig({}), new ConsoleLog(), new HelpChannel(),
+      () => fixture.backend, resolveChromeConfig({}), new ConsoleLog(), new HelpChannel(),
     ).find(entry => entry.name === 'chrome_close')
     const wrapped = withActivity(definition as ToolDefinition, activity)
     let during: ReturnType<ActivityTracker['snapshot']> | undefined

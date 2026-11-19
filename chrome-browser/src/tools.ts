@@ -228,15 +228,17 @@ async function resolveTabId(
 }
 
 /**
- * Build every chrome-browser tool definition bound to one backend.
- * @param backend - the live browser backend.
+ * Build every chrome-browser tool definition. Each tool resolves its backend
+ * from the executing agent on every call, so a sandbox backend stays scoped to
+ * one agent while the extension/cdp backends keep a shared singleton.
+ * @param resolve - maps an execution context to the browser backend it drives.
  * @param config - the resolved plugin configuration.
  * @param consoleLog - the bounded console buffer `chrome_console` reads.
  * @param help - the human-help channel `chrome_request_help` speaks to.
  * @returns the tool definitions in registration order.
  */
 export function chromeToolDefinitions(
-  backend: BrowserBackend,
+  resolve: (exec: unknown) => BrowserBackend,
   config: ResolvedChromeConfig,
   consoleLog: ConsoleLog,
   help: HelpChannel,
@@ -265,7 +267,7 @@ export function chromeToolDefinitions(
     }
   }
 
-  const armIdleTimer = (tabId: string): void => {
+  const armIdleTimer = (backend: BrowserBackend, tabId: string): void => {
     clearIdleTimer(tabId)
     if (!(config.consoleIdleMs > 0)) return
     const timer = setTimeout(() => {
@@ -292,6 +294,7 @@ export function chromeToolDefinitions(
       presentCall: () => tabsCall(),
       presentResult: (_args, outcome) => tabsResult(outcome),
       execute: async (_args: unknown, _exec: unknown): Promise<JsonValue> => {
+        const backend = resolve(_exec)
         const tabs = await backend.listTabs()
         return { tabs } as unknown as JsonValue
       },
@@ -324,6 +327,7 @@ export function chromeToolDefinitions(
         args: { tabId?: string; mode?: string; offset?: number; includeHtml?: boolean },
         _exec: unknown,
       ): Promise<JsonValue> => {
+        const backend = resolve(_exec)
         const tabId = await resolveTabId(backend, _exec, args.tabId)
         if (args.mode === 'interactive') {
           const inventory = await backend.inventory(tabId)
@@ -377,6 +381,7 @@ export function chromeToolDefinitions(
       presentCall: args => navigateCall(args),
       presentResult: (_args, outcome) => navigateResult(outcome),
       execute: async (args: { url: string; tabId?: string; waitLoad?: boolean }, _exec: unknown): Promise<JsonValue> => {
+        const backend = resolve(_exec)
         assertOperableUrl('chrome_navigate', args.url, false)
         const tabId = await resolveTabId(backend, _exec, args.tabId)
         await backend.navigate(tabId, args.url, args.waitLoad !== false, config.waitLoadMs)
@@ -403,6 +408,7 @@ export function chromeToolDefinitions(
       presentCall: args => openCall(args),
       presentResult: (_args, outcome) => openResult(outcome),
       execute: async (args: { url?: string; waitLoad?: boolean }, _exec: unknown): Promise<JsonValue> => {
+        const backend = resolve(_exec)
         const target = args.url ?? 'about:blank'
         assertOperableUrl('chrome_open', target, true)
         const opened = await backend.openTab(target)
@@ -432,6 +438,7 @@ export function chromeToolDefinitions(
       presentCall: args => closeCall(args),
       presentResult: (_args, outcome) => closeResult(outcome),
       execute: async (args: { tabId?: string }, _exec: unknown): Promise<JsonValue> => {
+        const backend = resolve(_exec)
         const tabId = args.tabId
         if (tabId === undefined || tabId === '' || tabId === 'active') {
           throw new Error(
@@ -474,6 +481,7 @@ export function chromeToolDefinitions(
         args: { tabId?: string; path?: string; fullPage?: boolean; selector?: string },
         _exec: unknown,
       ): Promise<JsonValue> => {
+        const backend = resolve(_exec)
         const tabId = await resolveTabId(backend, _exec, args.tabId)
         const shot = await backend.screenshot(tabId, {
           fullPage: args.fullPage === true,
@@ -536,6 +544,7 @@ export function chromeToolDefinitions(
       presentCall: args => clickCall(args),
       presentResult: (_args, outcome) => clickResult(outcome),
       execute: async (args: { selector: string; tabId?: string; all?: boolean }, _exec: unknown): Promise<JsonValue> => {
+        const backend = resolve(_exec)
         const tabId = await resolveTabId(backend, _exec, args.tabId)
         const outcome = await backend.click(tabId, args.selector, args.all === true)
         if (outcome.matched === 0) throw new Error(`chrome_click: no element matched selector "${args.selector}"`)
@@ -571,6 +580,7 @@ export function chromeToolDefinitions(
       presentCall: args => hoverCall(args),
       presentResult: (_args, outcome) => hoverResult(outcome),
       execute: async (args: { selector: string; tabId?: string }, _exec: unknown): Promise<JsonValue> => {
+        const backend = resolve(_exec)
         const tabId = await resolveTabId(backend, _exec, args.tabId)
         const outcome = await backend.hover(tabId, args.selector)
         if (outcome.matched === 0) throw new Error(`chrome_hover: no element matched selector "${args.selector}"`)
@@ -594,6 +604,7 @@ export function chromeToolDefinitions(
       presentCall: args => typeCall(args),
       presentResult: (_args, outcome) => typeResult(outcome),
       execute: async (args: { selector: string; text: string; tabId?: string; clear?: boolean }, _exec: unknown): Promise<JsonValue> => {
+        const backend = resolve(_exec)
         const tabId = await resolveTabId(backend, _exec, args.tabId)
         const cleared = args.clear !== false
         await backend.type(tabId, args.selector, args.text, cleared)
@@ -617,6 +628,7 @@ export function chromeToolDefinitions(
       presentCall: args => pressCall(args),
       presentResult: (_args, outcome) => pressResult(outcome),
       execute: async (args: { key: string; selector?: string; tabId?: string }, _exec: unknown): Promise<JsonValue> => {
+        const backend = resolve(_exec)
         const tabId = await resolveTabId(backend, _exec, args.tabId)
         const outcome = await backend.press(tabId, args.key, args.selector)
         if (!outcome.found) {
@@ -647,6 +659,7 @@ export function chromeToolDefinitions(
       presentCall: args => selectCall(args),
       presentResult: (_args, outcome) => selectResult(outcome),
       execute: async (args: { selector: string; value: string; tabId?: string }, _exec: unknown): Promise<JsonValue> => {
+        const backend = resolve(_exec)
         const tabId = await resolveTabId(backend, _exec, args.tabId)
         const outcome = await backend.select(tabId, args.selector, args.value)
         if (outcome.matched === 0) {
@@ -682,6 +695,7 @@ export function chromeToolDefinitions(
       presentCall: args => evalCall(args),
       presentResult: (_args, outcome) => evalResult(outcome),
       execute: async (args: { expression: string; tabId?: string }, _exec: unknown): Promise<JsonValue> => {
+        const backend = resolve(_exec)
         const tabId = await resolveTabId(backend, _exec, args.tabId)
         const value = await backend.evaluate(tabId, args.expression)
         return {
@@ -711,6 +725,7 @@ export function chromeToolDefinitions(
       presentCall: args => webmcpListCall(args),
       presentResult: (_args, outcome) => webmcpListResult(outcome),
       execute: async (args: { tabId?: string }, _exec: unknown): Promise<JsonValue> => {
+        const backend = resolve(_exec)
         const tabId = await resolveTabId(backend, _exec, args.tabId)
         const listing = await backend.webmcpTools(tabId)
         return {
@@ -744,6 +759,7 @@ export function chromeToolDefinitions(
         args: { name: string; input?: Record<string, unknown>; tabId?: string },
         _exec: unknown,
       ): Promise<JsonValue> => {
+        const backend = resolve(_exec)
         const tabId = await resolveTabId(backend, _exec, args.tabId)
         const input = typeof args.input === 'object' && args.input !== null && !Array.isArray(args.input) ? args.input : {}
         const outcome = await backend.webmcpCall(tabId, args.name, input)
@@ -792,6 +808,7 @@ export function chromeToolDefinitions(
         args: { selector: string; state?: string; timeoutMs?: number; tabId?: string },
         _exec: unknown,
       ): Promise<JsonValue> => {
+        const backend = resolve(_exec)
         const tabId = await resolveTabId(backend, _exec, args.tabId)
         const state: WaitState = args.state === 'hidden' || args.state === 'attached' || args.state === 'detached'
           ? args.state
@@ -862,12 +879,13 @@ export function chromeToolDefinitions(
       presentCall: args => consoleCall(args),
       presentResult: (_args, outcome) => consoleResult(outcome),
       execute: async (args: { action: string; tabId?: string; since?: number; limit?: number }, _exec: unknown): Promise<JsonValue> => {
+        const backend = resolve(_exec)
         const tabId = await resolveTabId(backend, _exec, args.tabId)
         if (args.action === 'start') {
           await backend.startConsole(tabId)
           consoleLog.track(tabId)
           idleReleased.delete(tabId)
-          armIdleTimer(tabId)
+          armIdleTimer(backend, tabId)
           return { tabId, capturing: true, capturingTabs: consoleLog.tracked() } as unknown as JsonValue
         }
         if (args.action === 'stop') {
@@ -890,7 +908,7 @@ export function chromeToolDefinitions(
         // An idle-released capture keeps its entries but no longer forwards new
         // ones; the read says so instead of looking like a live capture.
         const idle = idleReleased.has(tabId)
-        if (!idle) armIdleTimer(tabId)
+        if (!idle) armIdleTimer(backend, tabId)
         return {
           tabId,
           entries: page.entries,

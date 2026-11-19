@@ -15,8 +15,10 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { PreStepDecision } from '@deepseek-ai/dsh-agent'
 import z from '@deepseek-ai/schemastery'
 import { ActivityTracker, withActivity } from './activity.ts'
-import { buildBackend } from './backend.ts'
-import { DEFAULT_BRIDGE_PORT, DEFAULT_CONSOLE_IDLE_MS, resolveChromeConfig } from './chrome.ts'
+import { buildBackend, CdpBackend } from './backend.ts'
+import { BackendRegistry } from './backend-registry.ts'
+import type { SandboxFactory } from './backend-registry.ts'
+import { Chrome, DEFAULT_BRIDGE_PORT, DEFAULT_CONSOLE_IDLE_MS, resolveChromeConfig } from './chrome.ts'
 import type { ChromeMode, ResolvedChromeConfig } from './chrome.ts'
 import { ConsoleLog } from './console-log.ts'
 import { installExtensionBridge } from './bridge.ts'
@@ -115,40 +117,47 @@ export function apply(ctx: Context, config: ChromePluginConfig = {}): void {
   // The console buffer lives here, in the long-lived host: the extension's
   // service worker is suspended by Chrome and would lose it silently.
   const consoleLog = new ConsoleLog()
-  const { backend, chrome } = buildBackend(resolved, (tabId, message) => {
+  const { backend: shared, chrome } = buildBackend(resolved, (tabId, message) => {
     consoleLog.append(tabId, message)
   })
   if (chrome !== undefined) chrome.reclaimOwnedLeftover()
-  // The help channel reaches the user through the harness's question service;
-  // it stays unwired (and says so) when this composition has none.
+
+  // 沙箱工厂：每个 agent 一个 owned CDP 实例，console 汇入共享缓冲。
+  const factory: SandboxFactory = (cfg) => {
+    const instance = new Chrome(cfg)
+    return new CdpBackend(instance, (tabId, message) => consoleLog.append(tabId, message))
+  }
+  const registry = new BackendRegistry(resolved, shared, factory)
+
   const help = new HelpChannel()
-  // Every tool execution is recorded here so the browser half can show what the
-  // agent is doing without reading the session stream itself.
   const activity = new ActivityTracker()
-  for (const definition of chromeToolDefinitions(backend, resolved, consoleLog, help)) {
+  for (const definition of chromeToolDefinitions(exec => registry.resolve(exec), resolved, consoleLog, help)) {
     ctx.tools.register(withActivity(definition, activity))
   }
   registerHelpChannel(ctx, help)
-  // Only the extension backend has a bridge to keep on its fixed port.
+  // 扩展桥与路由仍针对「用户真实浏览器」（shared），不是 per-agent 沙箱。
   const bridge = resolved.backend === 'extension'
-    ? installExtensionBridge(ctx, backend, resolved.screenshotDir, resolved.bridgePort)
+    ? installExtensionBridge(ctx, shared, resolved.screenshotDir, resolved.bridgePort)
     : undefined
-  registerChromeRoutes(ctx, backend, resolved.screenshotDir, activity, bridge)
+  registerChromeRoutes(ctx, shared, resolved.screenshotDir, activity, bridge)
   registerChromeSkill(ctx)
 
-  // A message citing tabs gains one context message carrying their URLs and
-  // ids. Only the messages this step admits are scanned, and the context
-  // message's own source keeps it out of the next scan.
+  // 会话/子代理结束 → 释放其沙箱。
+  ctx.on('agent/disposed', (payload) => {
+    const id = (payload as { agent?: { id?: unknown } }).agent?.id
+    if (typeof id === 'string' && id !== '') registry.release(id)
+  })
+
   ctx.on('agent/pre-step', async (_payload, next): Promise<PreStepDecision> => {
     const decision = await next()
     if (decision.kind === 'reject') return decision
-    const messages = await expandTabMentions(decision.messages, () => backend.listTabs())
+    const messages = await expandTabMentions(decision.messages, () => shared.listTabs())
     return messages === undefined ? decision : { ...decision, messages }
   }, { prepend: true })
 
   ctx.effect(() => () => {
     consoleLog.releaseAll()
     activity.clear()
-    backend.dispose()
+    registry.dispose()
   }, 'chrome-browser: backend lifecycle')
 }

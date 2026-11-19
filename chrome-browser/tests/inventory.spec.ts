@@ -66,7 +66,7 @@ function host(): Host {
 
 function tools(backend: BrowserBackend, limit = 30_000): Map<string, ToolDefinition> {
   return new Map(
-    chromeToolDefinitions(backend, resolveChromeConfig({ readTextLimit: limit }), new ConsoleLog(), new HelpChannel())
+    chromeToolDefinitions(() => backend, resolveChromeConfig({ readTextLimit: limit }), new ConsoleLog(), new HelpChannel())
       .map(definition => [definition.name, definition]),
   )
 }

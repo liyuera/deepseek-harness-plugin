@@ -64,7 +64,7 @@ describe.skipIf(!isSmoke)('chrome-browser smoke (real headless Chrome)', () => {
     // The console buffer is host-side; the CDP backend feeds it from a
     // long-lived session, so this exercises the real capture path.
     definitions = chromeToolDefinitions(
-      new CdpBackend(chrome, (tabId, message) => { consoleLog.append(tabId, message) }),
+      () => new CdpBackend(chrome, (tabId, message) => { consoleLog.append(tabId, message) }),
       config,
       consoleLog,
       new HelpChannel(),
