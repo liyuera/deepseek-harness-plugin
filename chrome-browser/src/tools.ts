@@ -68,6 +68,32 @@ const render = (_args: unknown, value: JsonValue): Array<{ type: 'text'; text: s
 ]
 
 /**
+ * Per-call backend preference shared by every backend-using tool: the agent's
+ * own sandbox (default) or the user's real browser. The description states
+ * that the parameter is inert outside sandbox config, so a model never assumes
+ * isolation it does not have.
+ */
+const BACKEND_PARAM = {
+  backend: {
+    type: 'string',
+    enum: ['sandbox', 'user'],
+    description: 'Which browser to drive: "sandbox" (default) is this agent\'s isolated owned browser; '
+      + '"user" is the real Chrome (the extension bridge), for logged-in pages or the user\'s own tabs. '
+      + 'In "extension" or "cdp" config mode this parameter has no effect — every call drives the real Chrome.',
+  },
+} as const
+
+/**
+ * Narrow one validated `backend` argument to the registry's preference union.
+ * Omission and anything the schema does not allow leave the choice to the
+ * registry, which defaults to the agent's sandbox.
+ * @param backend - the raw per-call argument.
+ * @returns `'user'`, `'sandbox'`, or `undefined` for "no explicit preference".
+ */
+const backendPreference = (backend: string | undefined): 'sandbox' | 'user' | undefined =>
+  backend === 'user' ? 'user' : backend === 'sandbox' ? 'sandbox' : undefined
+
+/**
  * The executing agent itself, for routing a human question to its own UI. A
  * delegated child cannot ask (the question service rejects it), so the value is
  * forwarded as-is rather than guessed at.
@@ -212,7 +238,9 @@ function imagePath(path: string, ext: string): string {
 
 /**
  * Resolve the tab a tool operates on: an explicit id wins, and anything else —
- * an omitted id or the literal `active` — means the tab the user is looking at.
+ * an omitted id or the literal `active` — means the active tab of the backend
+ * this call drives (the sandbox's own page by default, the user's real tab
+ * with `backend: 'user'`).
  *
  * There is no session binding to fall back to: the `@` menu inserts a reference
  * chip and binds nothing, and the chip's `tabId` arrives in the injected context.
@@ -228,15 +256,20 @@ async function resolveTabId(
 }
 
 /**
- * Build every chrome-browser tool definition bound to one backend.
- * @param backend - the live browser backend.
+ * Build every chrome-browser tool definition. Each tool resolves its backend
+ * from the executing agent on every call, so a sandbox backend stays scoped to
+ * one agent while the extension/cdp backends keep a shared singleton. An
+ * explicit per-call `backend: 'user'` opts out of the sandbox and drives the
+ * shared backend (the user's real browser) instead.
+ * @param resolve - maps an execution context and an optional backend preference
+ *   to the browser backend the call drives.
  * @param config - the resolved plugin configuration.
  * @param consoleLog - the bounded console buffer `chrome_console` reads.
  * @param help - the human-help channel `chrome_request_help` speaks to.
  * @returns the tool definitions in registration order.
  */
 export function chromeToolDefinitions(
-  backend: BrowserBackend,
+  resolve: (exec: unknown, backend?: 'sandbox' | 'user') => BrowserBackend,
   config: ResolvedChromeConfig,
   consoleLog: ConsoleLog,
   help: HelpChannel,
@@ -265,7 +298,7 @@ export function chromeToolDefinitions(
     }
   }
 
-  const armIdleTimer = (tabId: string): void => {
+  const armIdleTimer = (backend: BrowserBackend, tabId: string): void => {
     clearIdleTimer(tabId)
     if (!(config.consoleIdleMs > 0)) return
     const timer = setTimeout(() => {
@@ -283,15 +316,17 @@ export function chromeToolDefinitions(
     defineTool({
       name: 'chrome_tabs',
       description:
-        'List the tabs currently open in the Chrome instance the browser plugin controls: id, title, url, active and '
-        + 'favicon. Get a tab id first, then pass it to every other chrome_* tool; omitting tabId (or passing '
-        + '"active") means the tab the user is looking at, which is rarely the one a request names.',
-      parameters: {},
+        'List the tabs in the browser this call drives: the agent\'s own sandbox by default, the user\'s real Chrome '
+        + 'with backend "user". Reports id, title, url, active and favicon. Get a tab id first, then pass it to every '
+        + 'other chrome_* tool; omitting tabId (or passing "active") means the active tab of that same backend, which '
+        + 'is rarely the one a request names.',
+      parameters: { ...BACKEND_PARAM },
       output: { schema: { type: 'json' }, render },
       isConcurrencySafe: () => true,
       presentCall: () => tabsCall(),
       presentResult: (_args, outcome) => tabsResult(outcome),
-      execute: async (_args: unknown, _exec: unknown): Promise<JsonValue> => {
+      execute: async (args: { backend?: string }, _exec: unknown): Promise<JsonValue> => {
+        const backend = resolve(_exec, backendPreference(args.backend))
         const tabs = await backend.listTabs()
         return { tabs } as unknown as JsonValue
       },
@@ -307,7 +342,8 @@ export function chromeToolDefinitions(
         + '`inView`, `disabled` or `covered` by something else. Prefer mode="interactive" before clicking or typing: '
         + 'it is far smaller than the page text and answers "what can I act on, and will it work".',
       parameters: {
-        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the tab the user is looking at; omitting it means 'active' too." },
+        ...BACKEND_PARAM,
+        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the chosen backend's active tab (the user's own tab only with backend: 'user'); omitting it means 'active' too." },
         mode: {
           type: 'string',
           enum: ['text', 'interactive'],
@@ -321,9 +357,10 @@ export function chromeToolDefinitions(
       presentCall: args => readCall(args),
       presentResult: (_args, outcome) => readResult(outcome),
       execute: async (
-        args: { tabId?: string; mode?: string; offset?: number; includeHtml?: boolean },
+        args: { tabId?: string; mode?: string; offset?: number; includeHtml?: boolean; backend?: string },
         _exec: unknown,
       ): Promise<JsonValue> => {
+        const backend = resolve(_exec, backendPreference(args.backend))
         const tabId = await resolveTabId(backend, _exec, args.tabId)
         if (args.mode === 'interactive') {
           const inventory = await backend.inventory(tabId)
@@ -364,19 +401,21 @@ export function chromeToolDefinitions(
       description:
         'Navigate one tab to a URL. By default waits until the page reaches readyState "complete" (up to waitLoadMs).',
       parameters: {
+        ...BACKEND_PARAM,
         url: {
           type: 'string',
           required: true,
           description: 'Target URL, e.g. https://example.com. http(s) and file only; a file: URL also needs the '
             + 'extension to be granted file access in chrome://extensions.',
         },
-        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the tab the user is looking at; omitting it means 'active' too." },
+        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the chosen backend's active tab (the user's own tab only with backend: 'user'); omitting it means 'active' too." },
         waitLoad: { type: 'boolean', description: 'Wait for load completion (default true).' },
       },
       output: { schema: { type: 'json' }, render },
       presentCall: args => navigateCall(args),
       presentResult: (_args, outcome) => navigateResult(outcome),
-      execute: async (args: { url: string; tabId?: string; waitLoad?: boolean }, _exec: unknown): Promise<JsonValue> => {
+      execute: async (args: { url: string; tabId?: string; waitLoad?: boolean; backend?: string }, _exec: unknown): Promise<JsonValue> => {
+        const backend = resolve(_exec, backendPreference(args.backend))
         assertOperableUrl('chrome_navigate', args.url, false)
         const tabId = await resolveTabId(backend, _exec, args.tabId)
         await backend.navigate(tabId, args.url, args.waitLoad !== false, config.waitLoadMs)
@@ -391,6 +430,7 @@ export function chromeToolDefinitions(
         + 'before returning, so the returned title is the loaded page\'s and a following chrome_read sees the '
         + 'document; pass waitLoad=false to return as soon as the tab exists.',
       parameters: {
+        ...BACKEND_PARAM,
         url: {
           type: 'string',
           description: 'URL to open; defaults to about:blank. http(s) and file only — a file: URL also needs '
@@ -402,7 +442,8 @@ export function chromeToolDefinitions(
       output: { schema: { type: 'json' }, render },
       presentCall: args => openCall(args),
       presentResult: (_args, outcome) => openResult(outcome),
-      execute: async (args: { url?: string; waitLoad?: boolean }, _exec: unknown): Promise<JsonValue> => {
+      execute: async (args: { url?: string; waitLoad?: boolean; backend?: string }, _exec: unknown): Promise<JsonValue> => {
+        const backend = resolve(_exec, backendPreference(args.backend))
         const target = args.url ?? 'about:blank'
         assertOperableUrl('chrome_open', target, true)
         const opened = await backend.openTab(target)
@@ -426,12 +467,14 @@ export function chromeToolDefinitions(
         + 'must be a real id from chrome_tabs: this never falls back to the active tab, because the tab the '
         + 'user is looking at is rarely the one worth closing. Close what you opened.',
       parameters: {
+        ...BACKEND_PARAM,
         tabId: { type: 'string', required: true, description: 'Exact tab id from chrome_tabs.' },
       },
       output: { schema: { type: 'json' }, render },
       presentCall: args => closeCall(args),
       presentResult: (_args, outcome) => closeResult(outcome),
-      execute: async (args: { tabId?: string }, _exec: unknown): Promise<JsonValue> => {
+      execute: async (args: { tabId?: string; backend?: string }, _exec: unknown): Promise<JsonValue> => {
+        const backend = resolve(_exec, backendPreference(args.backend))
         const tabId = args.tabId
         if (tabId === undefined || tabId === '' || tabId === 'active') {
           throw new Error(
@@ -454,7 +497,8 @@ export function chromeToolDefinitions(
         + 'result then carries `fallback: "visible-tab"`, a `warning`, and `viewportOnly` when `fullPage`/`selector` '
         + 'could not be honoured. If that fallback fails too, the call throws with both causes.',
       parameters: {
-        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the tab the user is looking at; omitting it means 'active' too." },
+        ...BACKEND_PARAM,
+        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the chosen backend's active tab (the user's own tab only with backend: 'user'); omitting it means 'active' too." },
         path: { type: 'string', description: 'Optional output file path; defaults to <screenshotDir>/<timestamp>-<tabId>.png.' },
         fullPage: {
           type: 'boolean',
@@ -471,9 +515,10 @@ export function chromeToolDefinitions(
       presentCall: args => screenshotCall(args),
       presentResult: (_args, outcome) => screenshotResult(outcome),
       execute: async (
-        args: { tabId?: string; path?: string; fullPage?: boolean; selector?: string },
+        args: { tabId?: string; path?: string; fullPage?: boolean; selector?: string; backend?: string },
         _exec: unknown,
       ): Promise<JsonValue> => {
+        const backend = resolve(_exec, backendPreference(args.backend))
         const tabId = await resolveTabId(backend, _exec, args.tabId)
         const shot = await backend.screenshot(tabId, {
           fullPage: args.fullPage === true,
@@ -528,14 +573,16 @@ export function chromeToolDefinitions(
         + 'covered by another element, or marked aria-disabled. Throws when nothing matches, or when every match is '
         + 'natively disabled. Prefer this for buttons/links; use chrome_eval for interactions that need more.',
       parameters: {
+        ...BACKEND_PARAM,
         selector: { type: 'string', required: true, description: 'CSS selector, e.g. "#submit" or "a.download".' },
-        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the tab the user is looking at; omitting it means 'active' too." },
+        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the chosen backend's active tab (the user's own tab only with backend: 'user'); omitting it means 'active' too." },
         all: { type: 'boolean', description: 'Click every matching element (default false: first match only).' },
       },
       output: { schema: { type: 'json' }, render },
       presentCall: args => clickCall(args),
       presentResult: (_args, outcome) => clickResult(outcome),
-      execute: async (args: { selector: string; tabId?: string; all?: boolean }, _exec: unknown): Promise<JsonValue> => {
+      execute: async (args: { selector: string; tabId?: string; all?: boolean; backend?: string }, _exec: unknown): Promise<JsonValue> => {
+        const backend = resolve(_exec, backendPreference(args.backend))
         const tabId = await resolveTabId(backend, _exec, args.tabId)
         const outcome = await backend.click(tabId, args.selector, args.all === true)
         if (outcome.matched === 0) throw new Error(`chrome_click: no element matched selector "${args.selector}"`)
@@ -564,13 +611,15 @@ export function chromeToolDefinitions(
         + 'but do not set the browser\'s own hover state: a control revealed purely by a CSS :hover rule may stay '
         + 'hidden. Follow it with chrome_read mode="interactive" to see what appeared.',
       parameters: {
+        ...BACKEND_PARAM,
         selector: { type: 'string', required: true, description: 'CSS selector to hover, e.g. "#menu" or "[aria-label=More]".' },
-        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the tab the user is looking at; omitting it means 'active' too." },
+        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the chosen backend's active tab (the user's own tab only with backend: 'user'); omitting it means 'active' too." },
       },
       output: { schema: { type: 'json' }, render },
       presentCall: args => hoverCall(args),
       presentResult: (_args, outcome) => hoverResult(outcome),
-      execute: async (args: { selector: string; tabId?: string }, _exec: unknown): Promise<JsonValue> => {
+      execute: async (args: { selector: string; tabId?: string; backend?: string }, _exec: unknown): Promise<JsonValue> => {
+        const backend = resolve(_exec, backendPreference(args.backend))
         const tabId = await resolveTabId(backend, _exec, args.tabId)
         const outcome = await backend.hover(tabId, args.selector)
         if (outcome.matched === 0) throw new Error(`chrome_hover: no element matched selector "${args.selector}"`)
@@ -585,15 +634,17 @@ export function chromeToolDefinitions(
         + 'content (clear=true, the default, so the text replaces it), then sets the value with a native-setter '
         + 'input/change dispatch so React-style controlled fields update.',
       parameters: {
+        ...BACKEND_PARAM,
         selector: { type: 'string', required: true, description: 'CSS selector of the input/textarea/editable element.' },
         text: { type: 'string', required: true, description: 'Text to insert.' },
-        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the tab the user is looking at; omitting it means 'active' too." },
+        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the chosen backend's active tab (the user's own tab only with backend: 'user'); omitting it means 'active' too." },
         clear: { type: 'boolean', description: 'Select existing content first so the text replaces it (default true).' },
       },
       output: { schema: { type: 'json' }, render },
       presentCall: args => typeCall(args),
       presentResult: (_args, outcome) => typeResult(outcome),
-      execute: async (args: { selector: string; text: string; tabId?: string; clear?: boolean }, _exec: unknown): Promise<JsonValue> => {
+      execute: async (args: { selector: string; text: string; tabId?: string; clear?: boolean; backend?: string }, _exec: unknown): Promise<JsonValue> => {
+        const backend = resolve(_exec, backendPreference(args.backend))
         const tabId = await resolveTabId(backend, _exec, args.tabId)
         const cleared = args.clear !== false
         await backend.type(tabId, args.selector, args.text, cleared)
@@ -609,14 +660,16 @@ export function chromeToolDefinitions(
         + 'action — for Enter the owning form is submitted explicitly and `submitted: true` says that happened. A key '
         + 'that only moves focus or closes an overlay reports `submitted: false` and changes nothing else.',
       parameters: {
+        ...BACKEND_PARAM,
         key: { type: 'string', required: true, description: 'KeyboardEvent.key value, e.g. "Enter", "Escape", "Tab", "ArrowDown".' },
         selector: { type: 'string', description: 'Focus this element first; omit to press on whatever currently has focus.' },
-        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the tab the user is looking at; omitting it means 'active' too." },
+        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the chosen backend's active tab (the user's own tab only with backend: 'user'); omitting it means 'active' too." },
       },
       output: { schema: { type: 'json' }, render },
       presentCall: args => pressCall(args),
       presentResult: (_args, outcome) => pressResult(outcome),
-      execute: async (args: { key: string; selector?: string; tabId?: string }, _exec: unknown): Promise<JsonValue> => {
+      execute: async (args: { key: string; selector?: string; tabId?: string; backend?: string }, _exec: unknown): Promise<JsonValue> => {
+        const backend = resolve(_exec, backendPreference(args.backend))
         const tabId = await resolveTabId(backend, _exec, args.tabId)
         const outcome = await backend.press(tabId, args.key, args.selector)
         if (!outcome.found) {
@@ -639,14 +692,16 @@ export function chromeToolDefinitions(
         + 'prototype setter and fires input/change so controlled components update. Throws when the value is not one '
         + 'of the options, listing the values that are — read them from the error rather than guessing again.',
       parameters: {
+        ...BACKEND_PARAM,
         selector: { type: 'string', required: true, description: 'CSS selector for the <select> element.' },
         value: { type: 'string', required: true, description: 'Option value to select (the value attribute, not the label).' },
-        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the tab the user is looking at; omitting it means 'active' too." },
+        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the chosen backend's active tab (the user's own tab only with backend: 'user'); omitting it means 'active' too." },
       },
       output: { schema: { type: 'json' }, render },
       presentCall: args => selectCall(args),
       presentResult: (_args, outcome) => selectResult(outcome),
-      execute: async (args: { selector: string; value: string; tabId?: string }, _exec: unknown): Promise<JsonValue> => {
+      execute: async (args: { selector: string; value: string; tabId?: string; backend?: string }, _exec: unknown): Promise<JsonValue> => {
+        const backend = resolve(_exec, backendPreference(args.backend))
         const tabId = await resolveTabId(backend, _exec, args.tabId)
         const outcome = await backend.select(tabId, args.selector, args.value)
         if (outcome.matched === 0) {
@@ -675,13 +730,15 @@ export function chromeToolDefinitions(
         + '(bounded to 200k characters). Expression runs in the page\'s main world; returned values are '
         + 'serialized by value. Example: document.querySelectorAll("a").length.',
       parameters: {
+        ...BACKEND_PARAM,
         expression: { type: 'string', required: true, description: 'JavaScript expression to evaluate in the page.' },
-        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the tab the user is looking at; omitting it means 'active' too." },
+        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the chosen backend's active tab (the user's own tab only with backend: 'user'); omitting it means 'active' too." },
       },
       output: { schema: { type: 'json' }, render },
       presentCall: args => evalCall(args),
       presentResult: (_args, outcome) => evalResult(outcome),
-      execute: async (args: { expression: string; tabId?: string }, _exec: unknown): Promise<JsonValue> => {
+      execute: async (args: { expression: string; tabId?: string; backend?: string }, _exec: unknown): Promise<JsonValue> => {
+        const backend = resolve(_exec, backendPreference(args.backend))
         const tabId = await resolveTabId(backend, _exec, args.tabId)
         const value = await backend.evaluate(tabId, args.expression)
         return {
@@ -704,13 +761,15 @@ export function chromeToolDefinitions(
         + '--enable-features=WebMCP or an origin trial) or listing failed — fall back to the DOM tools. '
         + '`available: true` with an empty `tools` array means the page has the API but registers no tools right now.',
       parameters: {
-        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the tab the user is looking at; omitting it means 'active' too." },
+        ...BACKEND_PARAM,
+        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the chosen backend's active tab (the user's own tab only with backend: 'user'); omitting it means 'active' too." },
       },
       output: { schema: { type: 'json' }, render },
       isConcurrencySafe: () => true,
       presentCall: args => webmcpListCall(args),
       presentResult: (_args, outcome) => webmcpListResult(outcome),
-      execute: async (args: { tabId?: string }, _exec: unknown): Promise<JsonValue> => {
+      execute: async (args: { tabId?: string; backend?: string }, _exec: unknown): Promise<JsonValue> => {
+        const backend = resolve(_exec, backendPreference(args.backend))
         const tabId = await resolveTabId(backend, _exec, args.tabId)
         const listing = await backend.webmcpTools(tabId)
         return {
@@ -733,17 +792,19 @@ export function chromeToolDefinitions(
         + 'Respect consequentialHint: confirm with the user '
         + '(chrome_request_help) before high-stakes tools.',
       parameters: {
+        ...BACKEND_PARAM,
         name: { type: 'string', required: true, description: '工具名,来自 chrome_webmcp_list 的 name。' },
         input: { type: 'object', additionalProperties: true, description: '该工具 inputSchema 对应的参数对象;不需要参数时省略。' },
-        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the tab the user is looking at; omitting it means 'active' too." },
+        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the chosen backend's active tab (the user's own tab only with backend: 'user'); omitting it means 'active' too." },
       },
       output: { schema: { type: 'json' }, render },
       presentCall: args => webmcpCallCall(args),
       presentResult: (_args, outcome) => webmcpCallResult(outcome),
       execute: async (
-        args: { name: string; input?: Record<string, unknown>; tabId?: string },
+        args: { name: string; input?: Record<string, unknown>; tabId?: string; backend?: string },
         _exec: unknown,
       ): Promise<JsonValue> => {
+        const backend = resolve(_exec, backendPreference(args.backend))
         const tabId = await resolveTabId(backend, _exec, args.tabId)
         const input = typeof args.input === 'object' && args.input !== null && !Array.isArray(args.input) ? args.input : {}
         const outcome = await backend.webmcpCall(tabId, args.name, input)
@@ -776,6 +837,7 @@ export function chromeToolDefinitions(
         + 'element that is absent. The result says `satisfied`: **false means the timeout passed, not that the wait '
         + 'succeeded** — check it before assuming the page is ready.',
       parameters: {
+        ...BACKEND_PARAM,
         selector: { type: 'string', required: true, description: 'CSS selector to wait for.' },
         state: {
           type: 'string',
@@ -783,15 +845,16 @@ export function chromeToolDefinitions(
           description: '"visible" (default): present with a layout box and not hidden. "hidden": absent or not shown. "attached"/"detached": presence only.',
         },
         timeoutMs: { type: 'integer', description: 'How long to wait (default 10000ms; max 300000).' },
-        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the tab the user is looking at; omitting it means 'active' too." },
+        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the chosen backend's active tab (the user's own tab only with backend: 'user'); omitting it means 'active' too." },
       },
       output: { schema: { type: 'json' }, render },
       presentCall: args => waitCall(args),
       presentResult: (_args, outcome) => waitResult(outcome),
       execute: async (
-        args: { selector: string; state?: string; timeoutMs?: number; tabId?: string },
+        args: { selector: string; state?: string; timeoutMs?: number; tabId?: string; backend?: string },
         _exec: unknown,
       ): Promise<JsonValue> => {
+        const backend = resolve(_exec, backendPreference(args.backend))
         const tabId = await resolveTabId(backend, _exec, args.tabId)
         const state: WaitState = args.state === 'hidden' || args.state === 'attached' || args.state === 'detached'
           ? args.state
@@ -848,26 +911,28 @@ export function chromeToolDefinitions(
         + 'included — a wrapper around console() would miss them. The buffer is bounded per tab and never written to '
         + 'the session log; `dropped` counts entries evicted before you read them.',
       parameters: {
+        ...BACKEND_PARAM,
         action: {
           type: 'string',
           required: true,
           enum: ['start', 'stop', 'read'],
           description: 'start capture, read entries, or stop and drop the buffer.',
         },
-        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the tab the user is looking at; omitting it means 'active' too." },
+        tabId: { type: 'string', description: "Tab id from chrome_tabs, or 'active' for the chosen backend's active tab (the user's own tab only with backend: 'user'); omitting it means 'active' too." },
         since: { type: 'integer', description: 'Read: return entries whose sequence number is greater than this cursor (default 0 = everything retained).' },
         limit: { type: 'integer', description: 'Read: keep only the most recent N matching entries.' },
       },
       output: { schema: { type: 'json' }, render },
       presentCall: args => consoleCall(args),
       presentResult: (_args, outcome) => consoleResult(outcome),
-      execute: async (args: { action: string; tabId?: string; since?: number; limit?: number }, _exec: unknown): Promise<JsonValue> => {
+      execute: async (args: { action: string; tabId?: string; since?: number; limit?: number; backend?: string }, _exec: unknown): Promise<JsonValue> => {
+        const backend = resolve(_exec, backendPreference(args.backend))
         const tabId = await resolveTabId(backend, _exec, args.tabId)
         if (args.action === 'start') {
           await backend.startConsole(tabId)
           consoleLog.track(tabId)
           idleReleased.delete(tabId)
-          armIdleTimer(tabId)
+          armIdleTimer(backend, tabId)
           return { tabId, capturing: true, capturingTabs: consoleLog.tracked() } as unknown as JsonValue
         }
         if (args.action === 'stop') {
@@ -890,7 +955,7 @@ export function chromeToolDefinitions(
         // An idle-released capture keeps its entries but no longer forwards new
         // ones; the read says so instead of looking like a live capture.
         const idle = idleReleased.has(tabId)
-        if (!idle) armIdleTimer(tabId)
+        if (!idle) armIdleTimer(backend, tabId)
         return {
           tabId,
           entries: page.entries,

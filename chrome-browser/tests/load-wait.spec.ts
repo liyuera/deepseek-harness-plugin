@@ -78,7 +78,7 @@ function recorder(): Recorder {
 
 function tools(backend: BrowserBackend): Map<string, ToolDefinition> {
   const config = resolveChromeConfig({})
-  return new Map(chromeToolDefinitions(backend, config, new ConsoleLog(), new HelpChannel()).map(entry => [entry.name, entry]))
+  return new Map(chromeToolDefinitions(() => backend, config, new ConsoleLog(), new HelpChannel()).map(entry => [entry.name, entry]))
 }
 
 /** The listed tab for id 9, as a post-load listing would report it. */

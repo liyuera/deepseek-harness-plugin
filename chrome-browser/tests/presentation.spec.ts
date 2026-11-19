@@ -111,7 +111,7 @@ function definitions(
 ): Map<string, ToolDefinition> {
   const resolved = resolveChromeConfig(config)
   return new Map(
-    chromeToolDefinitions(backend, resolved, new ConsoleLog(), new HelpChannel())
+    chromeToolDefinitions(() => backend, resolved, new ConsoleLog(), new HelpChannel())
       .map(definition => [definition.name, definition]),
   )
 }
@@ -486,7 +486,7 @@ describe('chrome_screenshot output path', () => {
       dispose: () => {},
     } as unknown as BrowserBackend
     const found = chromeToolDefinitions(
-      backend, resolveChromeConfig({}), new ConsoleLog(), new HelpChannel(),
+      () => backend, resolveChromeConfig({}), new ConsoleLog(), new HelpChannel(),
     ).find(definition => definition.name === 'chrome_screenshot')
     if (found === undefined) throw new Error('chrome_screenshot is not registered')
     return found

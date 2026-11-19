@@ -80,6 +80,14 @@ describe('tab context rendering', () => {
     expect(text).toContain('- tabId: 7 — http://192.168.2.84/task/list')
   })
 
+  it('tells the model the cited tabs live in the real Chrome, not the default sandbox', () => {
+    // Citations resolve against `shared` (the user's real browser) while tool
+    // calls default to the agent's sandbox. Without this line the model passes
+    // the cited tabId to a sandbox that has never seen it and gets an error.
+    const text = renderTabContext(resolveTabMentions(['任务管理-列表'], TABS))
+    expect(text).toContain("backend: 'user'")
+  })
+
   it('asks which tab a shared title means instead of guessing', () => {
     const text = renderTabContext(resolveTabMentions(['星瞰河山一体化平台'], TABS))
     expect(text).toContain('2 open tabs share this title')

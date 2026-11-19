@@ -1,35 +1,24 @@
 /**
- * chrome-browser plugin test configuration: standalone vitest project that
- * resolves workspace imports through explicit aliases (the plugin repo has no
- * node_modules links to workspace packages; tsconfig-paths proved unreliable
- * for direct cordis imports under vitest 4).
+ * chrome-browser plugin test configuration: standalone vitest project.
+ *
+ * The plugin was originally developed inside the DSH monorepo, whose
+ * `packages/*` / `vendor/*` source paths this config aliased. In this
+ * standalone repo those packages are installed under node_modules and resolve
+ * normally, so only one workspace package needs a test double: the browser-only
+ * UI primitives. `@deepseek-ai/dsh-skill` is installed and loads under Node, so
+ * `skill.spec.ts` drives the real registry instead of a stand-in.
  */
 import { fileURLToPath } from 'node:url'
 import { defineConfig } from 'vitest/config'
 
-const root = fileURLToPath(new URL('../../', import.meta.url))
-
-/** Alias the workspace packages this plugin's code and tests import. */
-const ALIASES: Array<[string, string]> = [
-  ['@deepseek-ai/cordis$', 'vendor/cordis/src/index.ts'],
-  ['@deepseek-ai/cordis/', 'vendor/cordis/src/'],
-  ['@deepseek-ai/schemastery$', 'vendor/schemastery/src/index.ts'],
-  ['@deepseek-ai/dsh-invariants$', 'packages/runtime-diagnostics/invariants/src/index.ts'],
-  ['@deepseek-ai/dsh-tools$', 'packages/core/tools/src/index.ts'],
-  ['@deepseek-ai/dsh-tools/', 'packages/core/tools/src/'],
-  // The real skill registry, so a test can exercise registration AND loading
-  // rather than a stub that accepts whatever it is handed.
-  ['@deepseek-ai/dsh-skill$', 'packages/skill/skill/src/index.ts'],
-  // Browser-only package whose Node entry cannot load; see the stub's own note.
-  ['@deepseek-ai/dsh-client-ui-primitives$', 'deepseek-harness-plugin/chrome-browser/tests/support/ui-primitives.ts'],
-]
+const here = (path: string): string => fileURLToPath(new URL(path, import.meta.url))
 
 export default defineConfig({
   resolve: {
-    alias: ALIASES.map(([find, replacement]) => ({
-      find: new RegExp(`^${find}`),
-      replacement: `${root}${replacement}`,
-    })),
+    alias: [
+      // Browser-only package whose Node entry cannot load; see the stub's note.
+      { find: /^@deepseek-ai\/dsh-client-ui-primitives$/, replacement: here('./tests/support/ui-primitives.ts') },
+    ],
   },
   test: {
     include: ['tests/**/*.spec.ts'],

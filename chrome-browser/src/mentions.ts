@@ -26,7 +26,8 @@ const HEADER = '## Referenced Chrome tabs'
 
 /** Why the model is reading this, and what to do with what it carries. */
 const NOTE = "The user's message references tabs open in their Chrome. Pass a tabId straight to the "
-  + 'chrome_* tools; a tab title is not an id.'
+  + 'chrome_* tools; a tab title is not an id. These tabs live in the user\'s real Chrome: call them with '
+  + "backend: 'user'; the default sandbox cannot address these ids."
 
 /** One live tab, as the context message lists it. */
 export interface TabSummary {

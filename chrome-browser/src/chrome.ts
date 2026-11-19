@@ -42,8 +42,8 @@ export const DEFAULT_CONSOLE_IDLE_MS = 5 * 60_000
 
 /** Fully-resolved plugin configuration (schema defaults already applied). */
 export interface ResolvedChromeConfig {
-  /** Backend: `extension` (real Chrome via the extension bridge, default) or `cdp`. */
-  backend: 'extension' | 'cdp'
+  /** Backend: `extension` (real Chrome via the extension bridge, default), `cdp`, or `sandbox`. */
+  backend: 'extension' | 'cdp' | 'sandbox'
   /** DevTools HTTP port. */
   port: number
   /** Explicit Chrome executable path; detection is skipped when set. `undefined` = auto-detect. */
@@ -75,6 +75,12 @@ export interface ResolvedChromeConfig {
    * one (tests and diagnostics only — the shipped extension cannot find it).
    */
   bridgePort: number
+  /** Max concurrent sandbox instances (backend:'sandbox' only). */
+  sandboxMaxConcurrent: number
+  /** Idle reclamation bound in ms for a sandbox; 0 = never. */
+  sandboxIdleMs: number
+  /** Run sandbox Chrome headless (default true). */
+  sandboxHeadless: boolean
 }
 
 /** One page target as the model sees it (internal ws url kept private). */
@@ -352,7 +358,36 @@ export function resolveChromeConfig(
     screenshotDir: config.screenshotDir ?? defaultScreenshotDir(),
     consoleIdleMs: config.consoleIdleMs ?? DEFAULT_CONSOLE_IDLE_MS,
     bridgePort: config.bridgePort ?? DEFAULT_BRIDGE_PORT,
+    sandboxMaxConcurrent: config.sandboxMaxConcurrent ?? 4,
+    sandboxIdleMs: config.sandboxIdleMs ?? 10 * 60_000,
+    sandboxHeadless: config.sandboxHeadless ?? true,
   }
+}
+
+/**
+ * Shared argv: debug port, profile, origin allowlist, the headless flag when
+ * `sandboxHeadless`, per-spawn extras, the constructor-injected extra args,
+ * and the optional startup URL.
+ */
+export function buildChromeArgs(
+  config: ResolvedChromeConfig,
+  profileDir: string,
+  extra: readonly string[],
+  startupUrl?: string,
+  extraArgs: readonly string[] = [],
+): string[] {
+  const args = [
+    `--remote-debugging-port=${config.port}`,
+    `--user-data-dir=${profileDir}`,
+    '--remote-allow-origins=*',
+    '--no-first-run',
+    '--no-default-browser-check',
+    ...(config.sandboxHeadless ? ['--headless=new'] : []),
+    ...extra,
+    ...extraArgs,
+  ]
+  if (startupUrl !== undefined) args.push(startupUrl)
+  return args
 }
 
 /** Injectable seams for tests. */
@@ -431,6 +466,13 @@ export class Chrome {
   private readonly spawnProcess: (path: string, args: readonly string[]) => ChildProcess
   private proc: ChildProcess | undefined
   private stderrTail: string[] = []
+  /**
+   * In-flight `ensure()` body. The tool layer runs concurrency-safe ops in
+   * parallel, so a cold owned instance would otherwise spawn Chrome twice
+   * (the loser exits, clearing `proc`, and the next `ensure()` then refuses
+   * its own port as foreign). One promise per flight makes that impossible.
+   */
+  private ensurePromise: Promise<void> | undefined
 
   constructor(readonly config: ResolvedChromeConfig, options: ChromeOptions = {}) {
     this.httpFetch = options.httpFetch ?? fetch
@@ -462,19 +504,47 @@ export class Chrome {
    * `attachOnly`, reuse an existing endpoint, relaunch the user's Chrome
    * with a debug port in `user` mode, or spawn a dedicated instance in
    * `owned` mode.
+   *
+   * Single-flight: concurrent callers (the host batches concurrency-safe
+   * tool calls) share one in-flight attempt instead of racing to spawn.
    */
   async ensure(): Promise<void> {
+    const pending = (this.ensurePromise ??= this.doEnsure().finally(() => {
+      this.ensurePromise = undefined
+    }))
+    return pending
+  }
+
+  /** The one `ensure()` implementation; concurrent callers share it via `ensure()`. */
+  private async doEnsure(): Promise<void> {
+    if (this.config.mode === 'owned' && !this.config.attachOnly) {
+      // A browser this instance already spawned owns its port; nothing to
+      // arbitrate. This also keeps `ensure()` idempotent on every later call.
+      if (this.proc !== undefined && this.proc.exitCode === null) {
+        await this.waitForEndpoint()
+        return
+      }
+      // Never adopt whatever answers on an owned port: a leftover instance
+      // from a previous run is reclaimed first, then a foreign endpoint is
+      // refused rather than silently driven.
+      this.reclaimOwnedLeftover()
+      if (await this.hasEndpoint()) await this.waitForEndpointToClose(2000)
+      if (await this.hasEndpoint()) {
+        throw new Error(
+          `chrome-browser: 端口 ${this.config.port} 被一个不属于本插件的 Chrome 占用（reclaim 后仍应答）；`
+          + '拒绝附着，以免接管你的浏览器。请释放该端口或改 sandbox 基础端口。',
+        )
+      }
+      this.spawnOwnedChrome()
+      await this.waitForEndpoint()
+      return
+    }
     if (await this.hasEndpoint()) return
     if (this.config.attachOnly) {
       throw new Error(
         `no Chrome DevTools endpoint at ${this.baseUrl}; start Chrome with --remote-debugging-port=${this.config.port} `
         + '(e.g. "--remote-debugging-port=9222 --user-data-dir=<dir>"), or set attachOnly false',
       )
-    }
-    if (this.config.mode === 'owned') {
-      this.spawnOwnedChrome()
-      await this.waitForEndpoint()
-      return
     }
     if (!this.config.autoRelaunch) {
       throw new Error(
@@ -750,25 +820,14 @@ export class Chrome {
     }
   }
 
-  /** Shared argv: debug port, profile, origin allowlist, extras, optional startup URL. */
-  private chromeArgs(profileDir: string, extra: readonly string[], startupUrl?: string): string[] {
-    const args = [
-      `--remote-debugging-port=${this.config.port}`,
-      `--user-data-dir=${profileDir}`,
-      '--remote-allow-origins=*',
-      '--no-first-run',
-      '--no-default-browser-check',
-      ...extra,
-      ...this.extraArgs,
-    ]
-    if (startupUrl !== undefined) args.push(startupUrl)
-    return args
-  }
-
   private spawnOwnedChrome(): void {
     this.spawnChrome(this.config.profileDir, [], 'about:blank')
     try {
-      writeFileSync(join(this.config.profileDir, '.dsh-owner.pid'), String(process.pid), 'utf8')
+      // Record the Chrome pid, not ours: `reclaimOwnedLeftover` uses the pid
+      // file to find the process whose command line carries our profile
+      // marker. Writing the dsh host pid made the leftover Chrome unfindable
+      // after a host crash.
+      writeFileSync(join(this.config.profileDir, '.dsh-owner.pid'), String(this.proc?.pid ?? process.pid), 'utf8')
     } catch {
       // marker file is best-effort
     }
@@ -784,7 +843,7 @@ export class Chrome {
     const chromePath = resolveChromePath(this.config.chromePath)
     mkdirSync(profileDir, { recursive: true })
     this.stderrTail = []
-    const proc = this.spawnProcess(chromePath, this.chromeArgs(profileDir, extra, startupUrl))
+    const proc = this.spawnProcess(chromePath, buildChromeArgs(this.config, profileDir, extra, startupUrl, this.extraArgs))
     this.proc = proc
     proc.stderr?.on('data', (chunk: Buffer) => {
       this.stderrTail.push(chunk.toString('utf8').trimEnd())
@@ -811,6 +870,21 @@ export class Chrome {
       await sleep(this.pollIntervalMs)
     }
     throw new Error(`Chrome DevTools endpoint at ${this.baseUrl} did not become ready within ${this.config.timeoutMs}ms`)
+  }
+
+  /**
+   * Wait (bounded) for a DevTools endpoint to stop answering. A disposed owned
+   * Chrome lets go of its port a moment after its process is signaled, so a
+   * port that was just released to the allocator may still answer briefly.
+   * Never throws: the caller re-checks and decides.
+   * @param maxMs - upper bound for the wait, milliseconds.
+   */
+  private async waitForEndpointToClose(maxMs: number): Promise<void> {
+    const deadline = Date.now() + maxMs
+    while (Date.now() < deadline) {
+      if (!(await this.hasEndpoint())) return
+      await sleep(100)
+    }
   }
 
   private async httpJson(path: string, init: { method: string }): Promise<unknown> {

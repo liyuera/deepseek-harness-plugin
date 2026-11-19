@@ -30,7 +30,7 @@ function setup(consoleIdleMs: number): {
   } as unknown as BrowserBackend
   const consoleLog = new ConsoleLog()
   const found = chromeToolDefinitions(
-    backend,
+    () => backend,
     resolveChromeConfig({ consoleIdleMs }),
     consoleLog,
     new HelpChannel(),

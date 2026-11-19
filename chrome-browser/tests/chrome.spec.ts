@@ -1,10 +1,12 @@
 import { EventEmitter } from 'node:events'
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
+import { spawn } from 'node:child_process'
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import {
   Chrome,
+  buildChromeArgs,
   DEFAULT_BRIDGE_PORT,
   chromeCandidates,
   copyUserProfileTo,
@@ -25,10 +27,10 @@ type CdpTabTarget = ReturnType<typeof parseTabList>[number]
  * A fake spawned Chrome: an emitter with the members `spawnChrome`/`dispose`
  * touch. `exitCode: null` is what makes `dispose` reach `kill`.
  */
-function fakeProc(): { pid: number; exitCode: number | null; kill: (signal?: string) => void; stderr: EventEmitter } {
+function fakeProc(pid = 42): { pid: number; exitCode: number | null; kill: (signal?: string) => void; stderr: EventEmitter } {
   const emitter = new EventEmitter()
   return Object.assign(emitter, {
-    pid: 42,
+    pid,
     exitCode: null as number | null,
     kill: vi.fn(),
     stderr: new EventEmitter(),
@@ -256,8 +258,191 @@ describe('Chrome owned mode', () => {
     expect(args).toContain(`--user-data-dir=${config.profileDir}`)
     expect(config.profileDir).toContain('profile-59326')
 
+    // Later calls must not treat the browser we spawned as a foreign endpoint.
+    await expect(chrome.ensure()).resolves.toBeUndefined()
+    expect(spawnProcess).toHaveBeenCalledTimes(1)
+
     chrome.dispose()
     expect(signals).toContain('SIGTERM')
+  })
+
+  it('spawns once when ensure() runs concurrently on a cold instance', async () => {
+    // The host batches concurrency-safe ops, so several tool calls can call
+    // ensure() at once. Two cold flights used to spawn two Chromes: the loser
+    // exited, cleared `proc`, and the next ensure() then refused its own port.
+    const profileDir = mkdtempSync(join(tmpdir(), 'dsh-owned-concurrent-'))
+    let spawned = false
+    const spawnProcess = vi.fn(() => {
+      spawned = true
+      return fakeProc() as never
+    })
+    const config = resolveChromeConfig({ port: 59329, mode: 'owned', profileDir })
+    const chrome = new Chrome(config, {
+      httpFetch: async () => {
+        if (!spawned) throw new Error('ECONNREFUSED')
+        return { ok: true, json: async () => ({ browser: 'Chrome' }) } as never
+      },
+      spawnProcess,
+      pollIntervalMs: 5,
+    })
+
+    const results = await Promise.allSettled([chrome.ensure(), chrome.ensure()])
+    expect(results.map(result => result.status)).toEqual(['fulfilled', 'fulfilled'])
+    expect(spawnProcess).toHaveBeenCalledTimes(1)
+
+    // A later call still reuses the browser it spawned.
+    await expect(chrome.ensure()).resolves.toBeUndefined()
+    expect(spawnProcess).toHaveBeenCalledTimes(1)
+  })
+
+  it('refuses to adopt an endpoint already answering on its owned port', async () => {
+    // A sandbox used to run `if (await hasEndpoint()) return`, so it adopted
+    // whatever answered on its port — including a user-launched Chrome. An
+    // owned backend must reclaim its own leftovers, then refuse the port.
+    const profileDir = mkdtempSync(join(tmpdir(), 'dsh-owned-foreign-'))
+    const spawnProcess = vi.fn(() => fakeProc() as never)
+    const config = resolveChromeConfig({ port: 59327, mode: 'owned', profileDir })
+    const chrome = new Chrome(config, {
+      // Keeps answering: waitForEndpointToClose must give up, not adopt.
+      httpFetch: async () => ({ ok: true, json: async () => ({ browser: 'Chrome' }) }) as never,
+      spawnProcess,
+      pollIntervalMs: 5,
+    })
+
+    const error = await chrome.ensure().then(() => undefined, (reason: unknown) => reason as Error)
+    expect(error).toBeInstanceOf(Error)
+    expect(error?.message).toContain('59327')
+    expect(error?.message).toContain('占用')
+    expect(spawnProcess).not.toHaveBeenCalled()
+  })
+
+  it.skipIf(process.platform === 'win32')('reclaims a leftover owned Chrome before spawning', async () => {
+    // A pid file naming a live process whose command line carries our profile
+    // is exactly the leftover `reclaimOwnedLeftover` may terminate; `ensure()`
+    // must run that reclaim before it decides the port is foreign.
+    const profileDir = mkdtempSync(join(tmpdir(), 'dsh-owned-leftover-'))
+    const pidFile = join(profileDir, '.dsh-owner.pid')
+    const leftover = spawn(
+      '/bin/sh',
+      ['-c', 'sleep 30; true', `--user-data-dir=${profileDir}`],
+      { stdio: 'ignore' },
+    )
+    const exited = new Promise<void>(resolve => { leftover.once('exit', () => { resolve() }) })
+    writeFileSync(pidFile, String(leftover.pid), 'utf8')
+
+    let spawned = false
+    const spawnProcess = vi.fn(() => {
+      spawned = true
+      return fakeProc() as never
+    })
+    const config = resolveChromeConfig({ port: 59328, mode: 'owned', profileDir })
+    const chrome = new Chrome(config, {
+      httpFetch: async () => {
+        if (!spawned) throw new Error('ECONNREFUSED')
+        return { ok: true, json: async () => ({ browser: 'Chrome' }) } as never
+      },
+      spawnProcess,
+      pollIntervalMs: 5,
+    })
+
+    try {
+      await chrome.ensure()
+      expect(spawnProcess).toHaveBeenCalledTimes(1)
+      await Promise.race([
+        exited,
+        new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, 3000)
+          ;(timer as { unref?: () => void }).unref?.()
+        }),
+      ])
+      // The leftover was signaled; the new owned Chrome then took the port.
+      expect(leftover.exitCode !== null || leftover.signalCode !== null).toBe(true)
+      // The marker now names the spawned Chrome, never the host: a host pid is
+      // useless to `reclaimOwnedLeftover`, which matches by command line.
+      expect(readFileSync(pidFile, 'utf8')).toBe('42')
+    } finally {
+      if (leftover.exitCode === null && leftover.signalCode === null) leftover.kill('SIGKILL')
+      await exited
+    }
+  })
+
+  it('records the spawned Chrome pid in the owner marker, not the host pid', async () => {
+    // Production reclaim reads `.dsh-owner.pid` and expects a pid whose
+    // command line carries our `--user-data-dir`: that is a Chrome pid. A host
+    // pid there can never be matched, so a crashed dsh leaked its Chrome.
+    const profileDir = mkdtempSync(join(tmpdir(), 'dsh-owned-pid-'))
+    const pidFile = join(profileDir, '.dsh-owner.pid')
+    let spawned = false
+    const spawnProcess = vi.fn(() => {
+      spawned = true
+      return fakeProc(4242) as never
+    })
+    const config = resolveChromeConfig({ port: 59330, mode: 'owned', profileDir })
+    const chrome = new Chrome(config, {
+      httpFetch: async () => {
+        if (!spawned) throw new Error('ECONNREFUSED')
+        return { ok: true, json: async () => ({ browser: 'Chrome' }) } as never
+      },
+      spawnProcess,
+      pollIntervalMs: 5,
+    })
+
+    await chrome.ensure()
+    expect(readFileSync(pidFile, 'utf8')).toBe('4242')
+    expect(readFileSync(pidFile, 'utf8')).not.toBe(String(process.pid))
+  })
+
+  it('reclaims the marker value spawnOwnedChrome actually wrote (the Chrome pid)', async () => {
+    // End-to-end proof that the marker production writes is the marker
+    // reclaim consumes: spawn, read the real file back, feed it to
+    // `reclaimOwnedLeftover` without hand-writing a pid.
+    const profileDir = mkdtempSync(join(tmpdir(), 'dsh-owned-marker-'))
+    const pidFile = join(profileDir, '.dsh-owner.pid')
+    let spawned = false
+    const spawnProcess = vi.fn(() => {
+      spawned = true
+      return fakeProc(4242) as never
+    })
+    const config = resolveChromeConfig({ port: 59331, mode: 'owned', profileDir })
+    const chrome = new Chrome(config, {
+      httpFetch: async () => {
+        if (!spawned) throw new Error('ECONNREFUSED')
+        return { ok: true, json: async () => ({ browser: 'Chrome' }) } as never
+      },
+      spawnProcess,
+      pollIntervalMs: 5,
+    })
+    await chrome.ensure()
+    expect(readFileSync(pidFile, 'utf8')).toBe('4242')
+
+    const seen: number[] = []
+    const kill = vi.fn((_pid: number, _signal: string): boolean => true)
+    const unlink = vi.fn((path: string) => { rmSync(path, { force: true }) })
+    const result = reclaimOwnedLeftover({
+      pidFile,
+      profileDir,
+      currentPid: process.pid,
+      deps: {
+        readPidFile: (path) => {
+          const parsed = Number(readFileSync(path, 'utf8').trim())
+          seen.push(parsed)
+          return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined
+        },
+        processAlive: (pid) => {
+          seen.push(pid)
+          return true
+        },
+        commandLineOf: (pid) => `Google Chrome --user-data-dir=${profileDir} (pid ${pid})`,
+        kill,
+        unlink,
+      },
+    })
+
+    expect(seen).toEqual([4242, 4242])
+    expect(result).toBe(true)
+    expect(kill).toHaveBeenCalledWith(4242, 'SIGTERM')
+    expect(unlink).toHaveBeenCalledWith(pidFile)
+    expect(existsSync(pidFile)).toBe(false)
   })
 })
 
@@ -382,5 +567,31 @@ describe('reclaimOwnedLeftover', () => {
     })
     expect(result).toBe(false)
     expect(kill).not.toHaveBeenCalled()
+  })
+})
+
+describe('sandbox config defaults', () => {
+  it('resolves sandbox pool defaults', () => {
+    const cfg = resolveChromeConfig({ backend: 'sandbox' })
+    expect(cfg.sandboxMaxConcurrent).toBe(4)
+    expect(cfg.sandboxIdleMs).toBe(10 * 60_000)
+    expect(cfg.sandboxHeadless).toBe(true)
+  })
+
+  it('honours explicit sandbox values', () => {
+    const cfg = resolveChromeConfig({ backend: 'sandbox', sandboxMaxConcurrent: 8, sandboxIdleMs: 0, sandboxHeadless: true })
+    expect(cfg.sandboxMaxConcurrent).toBe(8)
+    expect(cfg.sandboxIdleMs).toBe(0)
+    expect(cfg.sandboxHeadless).toBe(true)
+  })
+
+  it('appends --headless=new when sandboxHeadless', () => {
+    const cfg = resolveChromeConfig({ backend: 'sandbox', sandboxHeadless: true })
+    expect(buildChromeArgs(cfg, '/p', [], undefined)).toContain('--headless=new')
+  })
+
+  it('omits --headless=new when sandboxHeadless is false', () => {
+    const cfg = resolveChromeConfig({ backend: 'sandbox', sandboxHeadless: false })
+    expect(buildChromeArgs(cfg, '/p', [], undefined)).not.toContain('--headless=new')
   })
 })

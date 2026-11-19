@@ -156,7 +156,7 @@ function host(): {
     dispose: () => {},
   }
   const tools = new Map(
-    chromeToolDefinitions(backend, resolveChromeConfig({}), log, new HelpChannel())
+    chromeToolDefinitions(() => backend, resolveChromeConfig({}), log, new HelpChannel())
       .map(definition => [definition.name, definition]),
   )
   return { calls, log, tools }

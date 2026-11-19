@@ -611,7 +611,7 @@ function host(): Host {
 
 function tools(backend: BrowserBackend): Map<string, ToolDefinition> {
   return new Map(
-    chromeToolDefinitions(backend, resolveChromeConfig({}), new ConsoleLog(), new HelpChannel())
+    chromeToolDefinitions(() => backend, resolveChromeConfig({}), new ConsoleLog(), new HelpChannel())
       .map(definition => [definition.name, definition]),
   )
 }

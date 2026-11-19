@@ -106,7 +106,7 @@ function fakeBackend(overrides: Partial<BrowserBackend> = {}): BrowserBackend {
 /** The plugin's definitions over one backend. */
 function tools(backend: BrowserBackend): Map<string, ToolDefinition> {
   return new Map(
-    chromeToolDefinitions(backend, resolveChromeConfig({}), new ConsoleLog(), new HelpChannel())
+    chromeToolDefinitions(() => backend, resolveChromeConfig({}), new ConsoleLog(), new HelpChannel())
       .map(definition => [definition.name, definition]),
   )
 }

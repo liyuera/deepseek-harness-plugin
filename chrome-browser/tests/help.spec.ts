@@ -183,7 +183,7 @@ function backend(): BrowserBackend {
 
 function tool(channel: HelpChannel): ToolDefinition {
   const definitions = chromeToolDefinitions(
-    backend(), resolveChromeConfig({}), new ConsoleLog(), channel,
+    () => backend(), resolveChromeConfig({}), new ConsoleLog(), channel,
   )
   const found = definitions.find(definition => definition.name === 'chrome_request_help')
   if (found === undefined) throw new Error('chrome_request_help is not registered')
