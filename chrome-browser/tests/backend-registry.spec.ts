@@ -125,6 +125,32 @@ describe('BackendRegistry', () => {
     expect(created.some(backend => backend.disposed)).toBe(true)
   })
 
+  it('never reclaims when sandboxIdleMs is 0', () => {
+    vi.useFakeTimers()
+    const shared = fakeBackend()
+    const reg = new BackendRegistry(sandboxConfig({ sandboxMaxConcurrent: 1, sandboxIdleMs: 0 }), shared, () => fakeBackend())
+    reg.resolve(execOf('a1'))
+    vi.advanceTimersByTime(10 * 60_000)
+    expect(() => reg.resolve(execOf('a2'))).toThrow(/上限/)
+  })
+
+  it('synchronously sweeps idle leases instead of relying on the timer', () => {
+    vi.useFakeTimers()
+    const shared = fakeBackend()
+    const created: Array<BrowserBackend & { disposed: boolean }> = []
+    const reg = new BackendRegistry(sandboxConfig({ sandboxMaxConcurrent: 2, sandboxIdleMs: 1000 }), shared, () => {
+      const backend = fakeBackend()
+      created.push(backend)
+      return backend
+    })
+    reg.resolve(execOf('a1'))
+    reg.resolve(execOf('a2'))
+    vi.setSystemTime(Date.now() + 2000)
+    const a3 = reg.resolve(execOf('a3'))
+    expect(a3).toBeDefined()
+    expect(created.some(backend => backend.disposed)).toBe(true)
+  })
+
   it('dispose releases every sandbox and the shared backend', () => {
     const shared = fakeBackend()
     const reg = new BackendRegistry(sandboxConfig({ sandboxMaxConcurrent: 4 }), shared, () => fakeBackend())

@@ -107,6 +107,7 @@ export class BackendRegistry {
   }
 
   private evictIdle(): void {
+    if (!(this.config.sandboxIdleMs > 0)) return
     const now = Date.now()
     for (const [agentId, lease] of this.leases) {
       if (now - lease.lastUsedAt >= this.config.sandboxIdleMs) this.release(agentId)
