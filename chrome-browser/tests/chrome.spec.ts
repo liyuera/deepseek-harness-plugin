@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events'
+import { spawn } from 'node:child_process'
 import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -257,8 +258,81 @@ describe('Chrome owned mode', () => {
     expect(args).toContain(`--user-data-dir=${config.profileDir}`)
     expect(config.profileDir).toContain('profile-59326')
 
+    // Later calls must not treat the browser we spawned as a foreign endpoint.
+    await expect(chrome.ensure()).resolves.toBeUndefined()
+    expect(spawnProcess).toHaveBeenCalledTimes(1)
+
     chrome.dispose()
     expect(signals).toContain('SIGTERM')
+  })
+
+  it('refuses to adopt an endpoint already answering on its owned port', async () => {
+    // A sandbox used to run `if (await hasEndpoint()) return`, so it adopted
+    // whatever answered on its port — including a user-launched Chrome. An
+    // owned backend must reclaim its own leftovers, then refuse the port.
+    const profileDir = mkdtempSync(join(tmpdir(), 'dsh-owned-foreign-'))
+    const spawnProcess = vi.fn(() => fakeProc() as never)
+    const config = resolveChromeConfig({ port: 59327, mode: 'owned', profileDir })
+    const chrome = new Chrome(config, {
+      // Keeps answering: waitForEndpointToClose must give up, not adopt.
+      httpFetch: async () => ({ ok: true, json: async () => ({ browser: 'Chrome' }) }) as never,
+      spawnProcess,
+      pollIntervalMs: 5,
+    })
+
+    const error = await chrome.ensure().then(() => undefined, (reason: unknown) => reason as Error)
+    expect(error).toBeInstanceOf(Error)
+    expect(error?.message).toContain('59327')
+    expect(error?.message).toContain('占用')
+    expect(spawnProcess).not.toHaveBeenCalled()
+  })
+
+  it.skipIf(process.platform === 'win32')('reclaims a leftover owned Chrome before spawning', async () => {
+    // A pid file naming a live process whose command line carries our profile
+    // is exactly the leftover `reclaimOwnedLeftover` may terminate; `ensure()`
+    // must run that reclaim before it decides the port is foreign.
+    const profileDir = mkdtempSync(join(tmpdir(), 'dsh-owned-leftover-'))
+    const pidFile = join(profileDir, '.dsh-owner.pid')
+    const leftover = spawn(
+      '/bin/sh',
+      ['-c', 'sleep 30; true', `--user-data-dir=${profileDir}`],
+      { stdio: 'ignore' },
+    )
+    const exited = new Promise<void>(resolve => { leftover.once('exit', () => { resolve() }) })
+    writeFileSync(pidFile, String(leftover.pid), 'utf8')
+
+    let spawned = false
+    const spawnProcess = vi.fn(() => {
+      spawned = true
+      return fakeProc() as never
+    })
+    const config = resolveChromeConfig({ port: 59328, mode: 'owned', profileDir })
+    const chrome = new Chrome(config, {
+      httpFetch: async () => {
+        if (!spawned) throw new Error('ECONNREFUSED')
+        return { ok: true, json: async () => ({ browser: 'Chrome' }) } as never
+      },
+      spawnProcess,
+      pollIntervalMs: 5,
+    })
+
+    try {
+      await chrome.ensure()
+      expect(spawnProcess).toHaveBeenCalledTimes(1)
+      await Promise.race([
+        exited,
+        new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, 3000)
+          ;(timer as { unref?: () => void }).unref?.()
+        }),
+      ])
+      // The leftover was signaled; the new owned Chrome then took the port.
+      expect(leftover.exitCode !== null || leftover.signalCode !== null).toBe(true)
+      expect(require('node:fs').readFileSync(pidFile, 'utf8')).toBe(String(process.pid))
+    } finally {
+      if (leftover.exitCode === null && leftover.signalCode === null) leftover.kill('SIGKILL')
+      await exited
+    }
   })
 })
 

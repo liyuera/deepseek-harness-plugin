@@ -85,12 +85,19 @@ export class BackendRegistry {
     return lease
   }
 
-  /** Per-instance config: owned mode + independent profile keyed by port. */
+  /**
+   * Per-instance config: owned mode + independent profile keyed by port.
+   *
+   * `attachOnly`/`autoRelaunch` are pinned off: a sandbox must spawn its own
+   * Chrome, never attach to (or relaunch) whatever already answers on its port.
+   */
   private sandboxConfig(port: number): ResolvedChromeConfig {
     return {
       ...this.config,
       backend: 'cdp',
       mode: 'owned',
+      attachOnly: false,
+      autoRelaunch: false,
       port,
       profileDir: defaultProfileDir(port),
     }

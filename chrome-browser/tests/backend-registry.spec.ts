@@ -100,6 +100,35 @@ describe('BackendRegistry', () => {
     reg.release('a1') // no throw
   })
 
+  it('release disposes only the named agent sandbox', () => {
+    const shared = fakeBackend()
+    const reg = new BackendRegistry(sandboxConfig({ sandboxMaxConcurrent: 4 }), shared, () => fakeBackend())
+    const a1 = reg.resolve(execOf('a1')) as ReturnType<typeof fakeBackend>
+    const a2 = reg.resolve(execOf('a2')) as ReturnType<typeof fakeBackend>
+    reg.release('a1')
+    expect(a1.disposed).toBe(true)
+    expect(a2.disposed).toBe(false)
+    expect(shared.disposed).toBe(false)
+  })
+
+  it('pins each sandbox to a fresh owned backend, never attaching to the port', () => {
+    const shared = fakeBackend()
+    const configs: ResolvedChromeConfig[] = []
+    // A user-facing config that would attach/relaunch must not leak into a sandbox.
+    const reg = new BackendRegistry(sandboxConfig({ attachOnly: true, autoRelaunch: true }), shared, (cfg) => {
+      configs.push(cfg)
+      return fakeBackend()
+    })
+    reg.resolve(execOf('a1'))
+    const cfg = configs[0]
+    expect(cfg?.backend).toBe('cdp')
+    expect(cfg?.mode).toBe('owned')
+    expect(cfg?.attachOnly).toBe(false)
+    expect(cfg?.autoRelaunch).toBe(false)
+    expect(cfg?.port).toBe(9222)
+    expect(cfg?.profileDir).toContain('profile-9222')
+  })
+
   it('rejects when at capacity with no idle lease to reclaim', () => {
     const shared = fakeBackend()
     const reg = new BackendRegistry(sandboxConfig({ sandboxMaxConcurrent: 2 }), shared, () => fakeBackend())

@@ -499,17 +499,34 @@ export class Chrome {
    * `owned` mode.
    */
   async ensure(): Promise<void> {
+    if (this.config.mode === 'owned' && !this.config.attachOnly) {
+      // A browser this instance already spawned owns its port; nothing to
+      // arbitrate. This also keeps `ensure()` idempotent on every later call.
+      if (this.proc !== undefined && this.proc.exitCode === null) {
+        await this.waitForEndpoint()
+        return
+      }
+      // Never adopt whatever answers on an owned port: a leftover instance
+      // from a previous run is reclaimed first, then a foreign endpoint is
+      // refused rather than silently driven.
+      this.reclaimOwnedLeftover()
+      if (await this.hasEndpoint()) await this.waitForEndpointToClose(2000)
+      if (await this.hasEndpoint()) {
+        throw new Error(
+          `chrome-browser: 端口 ${this.config.port} 被一个不属于本插件的 Chrome 占用（reclaim 后仍应答）；`
+          + '拒绝附着，以免接管你的浏览器。请释放该端口或改 sandbox 基础端口。',
+        )
+      }
+      this.spawnOwnedChrome()
+      await this.waitForEndpoint()
+      return
+    }
     if (await this.hasEndpoint()) return
     if (this.config.attachOnly) {
       throw new Error(
         `no Chrome DevTools endpoint at ${this.baseUrl}; start Chrome with --remote-debugging-port=${this.config.port} `
         + '(e.g. "--remote-debugging-port=9222 --user-data-dir=<dir>"), or set attachOnly false',
       )
-    }
-    if (this.config.mode === 'owned') {
-      this.spawnOwnedChrome()
-      await this.waitForEndpoint()
-      return
     }
     if (!this.config.autoRelaunch) {
       throw new Error(
@@ -831,6 +848,21 @@ export class Chrome {
       await sleep(this.pollIntervalMs)
     }
     throw new Error(`Chrome DevTools endpoint at ${this.baseUrl} did not become ready within ${this.config.timeoutMs}ms`)
+  }
+
+  /**
+   * Wait (bounded) for a DevTools endpoint to stop answering. A disposed owned
+   * Chrome lets go of its port a moment after its process is signaled, so a
+   * port that was just released to the allocator may still answer briefly.
+   * Never throws: the caller re-checks and decides.
+   * @param maxMs - upper bound for the wait, milliseconds.
+   */
+  private async waitForEndpointToClose(maxMs: number): Promise<void> {
+    const deadline = Date.now() + maxMs
+    while (Date.now() < deadline) {
+      if (!(await this.hasEndpoint())) return
+      await sleep(100)
+    }
   }
 
   private async httpJson(path: string, init: { method: string }): Promise<unknown> {
