@@ -466,6 +466,13 @@ export class Chrome {
   private readonly spawnProcess: (path: string, args: readonly string[]) => ChildProcess
   private proc: ChildProcess | undefined
   private stderrTail: string[] = []
+  /**
+   * In-flight `ensure()` body. The tool layer runs concurrency-safe ops in
+   * parallel, so a cold owned instance would otherwise spawn Chrome twice
+   * (the loser exits, clearing `proc`, and the next `ensure()` then refuses
+   * its own port as foreign). One promise per flight makes that impossible.
+   */
+  private ensurePromise: Promise<void> | undefined
 
   constructor(readonly config: ResolvedChromeConfig, options: ChromeOptions = {}) {
     this.httpFetch = options.httpFetch ?? fetch
@@ -497,8 +504,19 @@ export class Chrome {
    * `attachOnly`, reuse an existing endpoint, relaunch the user's Chrome
    * with a debug port in `user` mode, or spawn a dedicated instance in
    * `owned` mode.
+   *
+   * Single-flight: concurrent callers (the host batches concurrency-safe
+   * tool calls) share one in-flight attempt instead of racing to spawn.
    */
   async ensure(): Promise<void> {
+    const pending = (this.ensurePromise ??= this.doEnsure().finally(() => {
+      this.ensurePromise = undefined
+    }))
+    return pending
+  }
+
+  /** The one `ensure()` implementation; concurrent callers share it via `ensure()`. */
+  private async doEnsure(): Promise<void> {
     if (this.config.mode === 'owned' && !this.config.attachOnly) {
       // A browser this instance already spawned owns its port; nothing to
       // arbitrate. This also keeps `ensure()` idempotent on every later call.
@@ -805,7 +823,11 @@ export class Chrome {
   private spawnOwnedChrome(): void {
     this.spawnChrome(this.config.profileDir, [], 'about:blank')
     try {
-      writeFileSync(join(this.config.profileDir, '.dsh-owner.pid'), String(process.pid), 'utf8')
+      // Record the Chrome pid, not ours: `reclaimOwnedLeftover` uses the pid
+      // file to find the process whose command line carries our profile
+      // marker. Writing the dsh host pid made the leftover Chrome unfindable
+      // after a host crash.
+      writeFileSync(join(this.config.profileDir, '.dsh-owner.pid'), String(this.proc?.pid ?? process.pid), 'utf8')
     } catch {
       // marker file is best-effort
     }
