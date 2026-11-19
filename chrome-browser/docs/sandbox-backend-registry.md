@@ -210,9 +210,9 @@ sandboxHeadless: z.boolean().default(true)
 
 ## 5. 集成点改动（关键步骤，按序）
 
-1. **`tools.ts` 的后端解析**：把 `chromeToolDefinitions(backend, config, consoleLog, help)` 的第 1 个参数换成 `registry: BackendRegistry`。每个工具 execute 里，`resolveTabId` 之前先 `const backend = registry.resolve(exec)`，再用该 `backend` 做 `listTabs/read/click/...`。17 个工具的 execute 都是「先拿 backend 再操作」，改动机械但量大——用一次 `sed` 级重构：把闭包里的 `backend` 改成 `exec` 处解析。
+1. **`tools.ts` 的后端解析**：把 `chromeToolDefinitions(backend, config, consoleLog, help)` 的第 1 个参数换成 `registry: BackendRegistry`。每个工具 execute 里，`resolveTabId` 之前先 `const backend = registry.resolve(exec)`，再用该 `backend` 做 `listTabs/read/click/...`。16 个操作浏览器的工具（`chrome_request_help` 除外）的 execute 都是「先拿 backend 再操作」，改动机械但量大——用一次 `sed` 级重构：把闭包里的 `backend` 改成 `exec` 处解析。
 
-   更稳的替代：保留工具闭包签名不变，只把「闭包捕获的 backend」从常量换成 `resolve: (exec: unknown, backend?: 'sandbox' | 'user') => BrowserBackend` 函数。这样 17 个工具体不用逐个改，只要 `resolveTabId` 改成接收 `backend` 并在调用点先解析。**最终实现即此形态**：`index.ts` 传 `(exec, pref) => registry.resolve(exec, pref)`；每个 backend 工具把参数 `args.backend` 归一成 `'sandbox' | 'user' | undefined` 再交给 `resolve`（`registry.resolve` 里 `'user'` → shared，其余按配置决定）。
+   更稳的替代：保留工具闭包签名不变，只把「闭包捕获的 backend」从常量换成 `resolve: (exec: unknown, backend?: 'sandbox' | 'user') => BrowserBackend` 函数。这样 16 个操作浏览器的工具（`chrome_request_help` 除外）的 execute 不用逐个改，只要 `resolveTabId` 改成接收 `backend` 并在调用点先解析。**最终实现即此形态**：`index.ts` 传 `(exec, pref) => registry.resolve(exec, pref)`；每个 backend 工具把参数 `args.backend` 归一成 `'sandbox' | 'user' | undefined` 再交给 `resolve`（`registry.resolve` 里 `'user'` → shared，其余按配置决定）。
 
 2. **`index.ts`**：`const registry = new BackendRegistry(resolved, consoleLog, buildBackend(resolved, sink).backend)`；工具注册传 `registry`；新增：
    ```ts

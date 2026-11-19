@@ -15,8 +15,8 @@ export const SKILL_NAME = 'chrome-browser'
 
 /** Routing line the catalog shows while the body stays unloaded. */
 export const SKILL_DESCRIPTION: string =
-  '控制用户当前打开的 Chrome 标签页:列标签页、读页面、导航、点击、输入、截图、执行 JS。'
-  + '适用于用户提到"这个页面/我开着的标签页",或需要读取已登录的内网/后台页面。'
+  '控制浏览器(默认是每个 agent 自己的沙箱;传 backend: "user" 改用用户真实 Chrome):列标签页、读页面、'
+  + '导航、点击、输入、截图、执行 JS。适用于用户提到"这个页面/我开着的标签页",或需要读取已登录的内网/后台页面。'
 
 /** Body loaded only when the skill is invoked. Annotated `string` so the emitted
  * declarations carry the type and not a 6 KB literal. */

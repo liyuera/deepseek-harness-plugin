@@ -430,7 +430,7 @@ $DSH_HOME/profiles/<profile>/node_modules/@liyuera/dsh-chrome-browser/extension/
 
 ## Model Experience
 
-模型可见的输入/输出只有 17 个工具 JSON 结果,加上被引用标签页的上下文:每次 `chrome_read` 最多携带约 `readTextLimit` 字符的页面文本;`chrome_screenshot` 只返回文件路径与元数据,页面视觉内容需通过 `read_image` 再读取;`chrome_eval` 结果上限 200k 字符;`chrome_webmcp_list` 把页面声明的工具名、说明、JSON Schema 与安全注解带进模型上下文,`chrome_webmcp_call` 的结果同样按 200k 字符截断;对象结果以 JSON 字符串返回,模型要自己 parse,`pending` / `navigated` 是状态标记而不是执行结果,页面报错按工具错误返回。从 `@` 菜单选中标签页时,客户端在草稿里插入一个引用芯片,它序列化成 `@"标题"`——用户消息里只有这个引用(宿主按文本形状投影成引用芯片),宿主随后在用户消息后注入一条本插件的上下文消息(`## Referenced Chrome tabs`),逐个列出被引用标签页的 `tabId` 与 URL,模型照着 id 调 `chrome_*` 即可。同名标签页会列出全部候选并提示向用户确认;引用没有匹配到任何在开的标签页(已关闭,或那其实是带空格的文件路径)时不注入任何东西。插件不做会话级标签页绑定,一次选择只影响它所在的那条消息。本插件不发任何 provider 请求,无 LLM/KV-cache 影响。
+模型可见的输入/输出只有 17 个工具 JSON 结果,加上被引用标签页的上下文:每次 `chrome_read` 最多携带约 `readTextLimit` 字符的页面文本;`chrome_screenshot` 只返回文件路径与元数据,页面视觉内容需通过 `read_image` 再读取;`chrome_eval` 结果上限 200k 字符;`chrome_webmcp_list` 把页面声明的工具名、说明、JSON Schema 与安全注解带进模型上下文,`chrome_webmcp_call` 的结果同样按 200k 字符截断;对象结果以 JSON 字符串返回,模型要自己 parse,`pending` / `navigated` 是状态标记而不是执行结果,页面报错按工具错误返回。从 `@` 菜单选中标签页时,客户端在草稿里插入一个引用芯片,它序列化成 `@"标题"`——用户消息里只有这个引用(宿主按文本形状投影成引用芯片),宿主随后在用户消息后注入一条本插件的上下文消息(`## Referenced Chrome tabs`),逐个列出被引用标签页的 `tabId` 与 URL,模型照着 id 调 `chrome_*` 即可(`@` 引用的是用户真实浏览器,调用时带 `backend: 'user'`)。同名标签页会列出全部候选并提示向用户确认;引用没有匹配到任何在开的标签页(已关闭,或那其实是带空格的文件路径)时不注入任何东西。插件不做会话级标签页绑定,一次选择只影响它所在的那条消息。本插件不发任何 provider 请求,无 LLM/KV-cache 影响。
 
 工具卡片与并发分类是**宿主 + 客户端**的呈现信息,不进入模型请求:模型拿到的是 17 个工具 JSON 结果与 tool schema。skill 正文只在被调用时加载,目录里常驻的只有一行 description。
 
