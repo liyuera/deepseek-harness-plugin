@@ -62,7 +62,7 @@ describe.skipIf(!isSmoke)('sandbox acceptance', () => {
       port: 9431,
       sandboxMaxConcurrent: 2,
       sandboxIdleMs: 0,
-      sandboxHeadless: true,
+      sandboxHeadless: process.env.DSH_CHROME_HEADFUL !== '1',
       timeoutMs: 20000,
     })
     const registry = new BackendRegistry(
@@ -97,6 +97,11 @@ describe.skipIf(!isSmoke)('sandbox acceptance', () => {
       await backendB.waitForLoad(tabB.id, 20000)
       const pageB = await backendB.read(tabB.id, false)
       expect(pageB.title).toBe('沙箱验收页')
+
+      if (process.env.DSH_CHROME_HEADFUL === '1') {
+        // Keep both isolated windows on screen so a human can see them.
+        await new Promise(resolve => setTimeout(resolve, 20_000))
+      }
     } finally {
       registry.dispose()
       await new Promise<void>(resolve => server.close(() => resolve()))
