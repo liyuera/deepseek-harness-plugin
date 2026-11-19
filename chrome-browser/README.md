@@ -26,7 +26,7 @@ Chrome 浏览器控制插件(host + 浏览器半边):通过 Chrome 扩展桥(默
 | `@` 标签页分组 | 在输入框敲 `@` 时列出实时标签页(行内是「标题 + URL」),选中插入一个引用芯片;发送后消息里只有这个引用,标签页的 URL 与 tabId 由宿主注入一条上下文消息给模型 |
 | **活动状态条** | 会话标题栏末尾**常驻**的淡色胶囊:空闲显示「Chrome 就绪」,调用中显示当前动作与标签页,失败短暂变红 |
 | `/chrome-browser` skill | 注册一个 agent skill:讲清什么时候用、调用顺序、失败怎么办、有哪些边界。模型通过 `skill` 工具读它,你也可以直接敲 `/chrome-browser`。宿主没有 skill 服务时静默跳过,工具照常可用 |
-| **沙箱后端**(`backend: 'sandbox'`) | 每个 agent 一个**独立**的 owned CDP 实例:按 `agent.id` 键控复用、并行隔离(各自的标签页/窗口/profile 互不可见)、空闲回收、`headless` 默认 false;`@` 标签页分组与扩展桥仍走真实 Chrome。详见[配置](#配置) |
+| **沙箱后端**(`backend: 'sandbox'`) | 每个 agent 一个**独立**的 owned CDP 实例:按 `agent.id` 键控复用、并行隔离(各自的标签页/窗口/profile 互不可见)、空闲回收、`headless` 默认 false;**此模式不安装扩展桥,`@` 标签页分组不可用**(用 `backend: 'extension'` 才有)。详见[配置](#配置) |
 
 ### 活动状态条:让用户看见 Agent 在干什么
 
@@ -405,12 +405,12 @@ $DSH_HOME/profiles/<profile>/node_modules/@liyuera/dsh-chrome-browser/extension/
       config:
         backend: extension    # extension(默认,真实 Chrome 通过扩展桥);cdp = DevTools 协议;sandbox = 每 agent 一个隔离沙箱
         bridgePort: 21987     # 插件自有的扩展桥固定端口(避开 dsh 旧版的 19387);0 = 系统分配(测试/诊断)
-        port: 9222            # DevTools 端口(cdp 后端;sandbox 从此端口起逐个 +1 分配)
-        mode: owned           # 仅 cdp:owned = 插件专用 Chrome;user = profile 副本接管
+        port: 9222            # DevTools 端口(cdp 后端;sandbox 从此端口起逐个 +1 分配,释放后回用)
+        mode: owned           # 仅 cdp:owned = 插件专用 Chrome;user = profile 副本接管;sandbox 下被 registry 强制为 owned
         autoRelaunch: false   # user 模式:默认 false,绝不自动重启你的浏览器
         attachOnly: false     # true = 只连已有调试端口,不启动/不关闭
         chromePath: null      # 显式 Chrome 路径;缺省自动检测(macOS/Windows/Linux)
-        profileDir: null      # owned 默认 $DSH_HOME/chrome-browser/profile-<port>;user 默认真实 profile
+        profileDir: null      # owned 默认 $DSH_HOME/chrome-browser/profile-<port>;user 默认真实 profile;sandbox 下被 registry 按 port 重算
         readTextLimit: 30000  # chrome_read 文本字符预算
         waitLoadMs: 8000      # chrome_navigate 加载等待
         timeoutMs: 15000      # 单命令/就绪超时
@@ -423,7 +423,7 @@ $DSH_HOME/profiles/<profile>/node_modules/@liyuera/dsh-chrome-browser/extension/
 
 `bridgePort` 是扩展要拨的固定回环端口(默认 **21987**,插件自有端口,理由见[浏览器连接模式](#浏览器连接模式)):dsh web server 的实际监听端口与它不同时,插件在这个端口上另起一个只服务扩展的 HTTP/WS 服务;相同时不另起 listener,由 dsh web server 应答。`bridgePort: 0` 交给系统分配,扩展不知道实际端口,只用于测试/诊断。`backend: 'cdp'` 不启动固定桥,扩展面路由只在 dsh web server 上。
 
-`backend: 'sandbox'` 给每个 agent 一个**独立**的 owned CDP 实例:按 `agent.id` 键控创建与复用,不同 agent 的标签页、窗口与 profile 彼此隔离(调试端口从 `port` 起逐个 +1 分配),互不可见——适合并行子代理各自开浏览器互不干扰。实例空闲超过 `sandboxIdleMs`(默认 **10 分钟**)自动回收并释放端口,`0` 表示永不回收;`sandboxMaxConcurrent`(默认 **4**)是同时存活的沙箱上限,满且没有空闲实例可回收时,新 agent 会抛错(提示等待其它会话空闲回收,或调大该值);`sandboxHeadless`(默认 **false**)控制沙箱 Chrome 是否无头运行。session/子代理结束时(`agent/disposed`)对应沙箱自动释放;没有 agent 上下文的调用与扩展桥/`@` 标签页分组仍走 `shared`(真实 Chrome),不随沙箱走。
+`backend: 'sandbox'` 给每个 agent 一个**独立**的 owned CDP 实例:按 `agent.id` 键控创建与复用,不同 agent 的标签页、窗口与 profile 彼此隔离(调试端口从 `port` 起**首次分配时逐个 +1 递增,释放后的端口会回用**),互不可见——适合并行子代理各自开浏览器互不干扰。实例空闲超过 `sandboxIdleMs`(默认 **10 分钟**)自动回收并释放端口,`0` 表示永不回收;`sandboxMaxConcurrent`(默认 **4**)是同时存活的沙箱上限,满且没有空闲实例可回收时,新 agent 会抛错(提示等待其它会话空闲回收,或调大该值);`sandboxHeadless`(默认 **false**)控制沙箱 Chrome 是否无头运行。session/子代理结束时(`agent/disposed`)对应沙箱自动释放。**此模式不安装扩展桥,`@` 标签页分组不可用**——`/chrome-browser/tabs` 与 `@` 菜单读的是真实 Chrome,桥不在就连不上;要控制用户真实浏览器、用 `@` 分组引用标签页,请切回 `backend: 'extension'`。
 
 ## Model Experience
 
@@ -484,6 +484,7 @@ workflow 在 `chrome-browser/` 里跑 `npm publish --access public`,tag 与 `pac
 - **插件只调用页面自己的工具,不注册工具**:`chrome_webmcp_*` 暴露的是页面实现的动作;页面不实现 WebMCP 就没有可调用的工具,插件不改写工具定义。
 - **owned 模式重启 dsh 后需首次调用恢复窗口**:专用 Chrome 的窗口在 dsh 重启后不会自动弹出,第一次使用工具/选择器时拉起(profile 持久化,标签页都在)。
 - **user 模式只支持手动带调试端口启动的 Chrome**:插件不自动接管、不重启;`autoRelaunch` 打开时仍建议先把 dsh 界面移到别的浏览器再使用。
+- **`backend: 'sandbox'` 不安装扩展桥,`@` 标签页分组不可用**:沙箱模式是「AI 自己的隔离浏览」,不接管也不连接用户真实浏览器;扩展桥只在 `backend: 'extension'` 下安装,而 `/chrome-browser/tabs` 与 `@` 菜单读的是真实 Chrome,桥不在就连不上。要用 `@` 分组引用用户标签页、控制用户真实浏览器,请切回 `backend: 'extension'`。
 - **点击/输入是 DOM 事件 + CDP Input**:不模拟真实指针/MIME 手势,对依赖真实 pointer 事件或 iframe/shadow DOM 深层结构的页面不完全可靠;这些场景可用 `chrome_eval` 绕过。`chrome_click` 已把「派发了但真实用户点不到」的情形报进 `warnings`,但**警告是启发式**:命中测试在 shadow DOM 内按元素自己的 root 进行,闭合 shadow root 与 iframe 内部无法判定。
 - **等加载有上限,超时不报错**:`chrome_open` / `chrome_navigate` 默认等 `readyState=complete`,但最多等 `waitLoadMs`(默认 8000)。长轮询页面、挂住的资源不会等到底——到点就返回当前状态,由模型读一次再决定。要等**某个元素**出现就用 `chrome_wait`(同样超时不报错,靠 `satisfied` 判断)。
 - **`chrome_hover` 是合成事件**:送达页面监听器,但不设置浏览器自身的 hover 状态,纯 CSS `:hover` 显示的元素可能仍不出现。
