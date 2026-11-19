@@ -28,7 +28,7 @@
 
 ## 1. 后端选择模型（Decision Point #1，需拍板）
 
-扩展后端是「用户真实浏览器」：单租户、含登录态/已打开标签页。沙箱是「AI 自己的浏览」：隔离、可并行、无登录态。二者是**正交能力，不是主备**。落地有三种选择：
+扩展后端是「用户真实浏览器」：单租户、含登录态/已打开标签页。沙箱是「AI 自己的浏览」：**并发**隔离、可并行；profile 按端口持久，**顺序复用同一端口的后来者会继承前一个沙箱的登录态**（隔离是并发语义，不是顺序语义；见 README 已知限制）。二者是**正交能力，不是主备**。落地有三种选择：
 
 | 方案 | 说明 | 代价 |
 | --- | --- | --- |
@@ -42,7 +42,7 @@
 
 ## 2. 核心接口
 
-> **评审后调整：** 键按 `agent.id`（每个子代理独立）而非 `sessionId`；`sandboxHeadless` 默认 `false`。下面代码块里的 `sessionIdOf`/`sessionId` 请读作 `agentIdOf`/`agentId`；最终代码以 [实现计划](sandbox-backend-registry-plan.md) 为准。
+> **评审后调整：** 键按 `agent.id`（每个子代理独立）而非 `sessionId`；`sandboxHeadless` 默认 `false`。下面代码块里的 `sessionIdOf`/`sessionId` 请读作 `agentIdOf`/`agentId`；最终代码以 [实现计划](sandbox-backend-registry-plan.md) 为准。**隔离是并发语义，不是顺序语义**：并发租约各有独立实例与 profile；租约释放后端口回用，而同一端口的 profile 按设计持久，后来者会继承先前的 cookies/localStorage——需要干净身份就删除 profile 目录或改端口。
 
 新增 `src/backend-registry.ts`。命名沿用现有文件风格（小写 + 连字符）。
 

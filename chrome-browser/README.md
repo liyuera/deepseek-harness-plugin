@@ -485,6 +485,8 @@ workflow 在 `chrome-browser/` 里跑 `npm publish --access public`,tag 与 `pac
 - **owned 模式重启 dsh 后需首次调用恢复窗口**:专用 Chrome 的窗口在 dsh 重启后不会自动弹出,第一次使用工具/选择器时拉起(profile 持久化,标签页都在)。
 - **user 模式只支持手动带调试端口启动的 Chrome**:插件不自动接管、不重启;`autoRelaunch` 打开时仍建议先把 dsh 界面移到别的浏览器再使用。
 - **`backend: 'sandbox'` 不安装扩展桥,`@` 标签页分组不可用**:沙箱模式是「AI 自己的隔离浏览」,不接管也不连接用户真实浏览器;扩展桥只在 `backend: 'extension'` 下安装,而 `/chrome-browser/tabs` 与 `@` 菜单读的是真实 Chrome,桥不在就连不上。要用 `@` 分组引用用户标签页、控制用户真实浏览器,请切回 `backend: 'extension'`。
+- **沙箱 profile 按端口持久,顺序复用同一端口会继承登录态**:`defaultProfileDir(port)` 是 `$DSH_HOME/chrome-browser/profile-<port>`,跨租约复用——沙箱是**长期身份**而不是一次性容器。并发时各沙箱彼此隔离;但某个 agent 结束后端口被回收、下一个 agent 拿到同一端口时,会继承前一个沙箱的 cookies/localStorage/登录态。需要干净身份时,删除对应 profile 目录(或改 `port`/基础端口)再让新沙箱启动。
+- **`lib/` 构建产物未随本分支重新生成**:本分支新增的 `backend-registry.js`/`caller.js`/`ports.js` 等不在提交的 `lib/` 里(tsc/tsdown 在独立仓库未恢复)。发布前必须 `npm run build` 并提交 `lib/`,否则发布的包不含沙箱功能。
 - **点击/输入是 DOM 事件 + CDP Input**:不模拟真实指针/MIME 手势,对依赖真实 pointer 事件或 iframe/shadow DOM 深层结构的页面不完全可靠;这些场景可用 `chrome_eval` 绕过。`chrome_click` 已把「派发了但真实用户点不到」的情形报进 `warnings`,但**警告是启发式**:命中测试在 shadow DOM 内按元素自己的 root 进行,闭合 shadow root 与 iframe 内部无法判定。
 - **等加载有上限,超时不报错**:`chrome_open` / `chrome_navigate` 默认等 `readyState=complete`,但最多等 `waitLoadMs`(默认 8000)。长轮询页面、挂住的资源不会等到底——到点就返回当前状态,由模型读一次再决定。要等**某个元素**出现就用 `chrome_wait`(同样超时不报错,靠 `satisfied` 判断)。
 - **`chrome_hover` 是合成事件**:送达页面监听器,但不设置浏览器自身的 hover 状态,纯 CSS `:hover` 显示的元素可能仍不出现。
