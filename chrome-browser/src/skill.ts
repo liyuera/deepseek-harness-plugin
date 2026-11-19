@@ -22,7 +22,8 @@ export const SKILL_DESCRIPTION: string =
  * declarations carry the type and not a 6 KB literal. */
 export const SKILL_CONTENT: string = `# Chrome 浏览器(用户真实标签页)
 
-\`chrome_*\` 工具直接操作用户正在使用的 Chrome——不新开窗口、不复制 profile。
+\`chrome_*\` 工具驱动的浏览器由 \`backend\` 参数选择(见下「后端选择」):默认是这个 agent 自己的隔离浏览器;
+传 \`backend: 'user'\` 时直接操作用户正在使用的 Chrome——不新开窗口、不复制 profile。
 用户打开什么,你就能看什么;登录态、内网、后台系统都能用。
 
 ## 工具一览
@@ -46,6 +47,16 @@ export const SKILL_CONTENT: string = `# Chrome 浏览器(用户真实标签页)
 | \`chrome_wait\` | 等元素达到 visible / hidden / attached / detached;\`satisfied: false\` 表示超时,不是成功 |
 | \`chrome_console\` | 采集/读取控制台(start / read / stop),含浏览器自己抛的错误。**start 会占用调试器,用完必须 stop**;5 分钟无读取会自动释放调试器(日志保留,read 返回 \`detached: "idle"\`) |
 | \`chrome_request_help\` | 请用户做只有人能做的事(登录/验证码),等答复;\`completed: false\` 表示用户跳过,不要重试 |
+
+## 后端选择:沙箱优先,真实浏览器备选
+
+每个 \`chrome_*\` 工具都有一个可选的 \`backend\` 参数:
+
+- \`backend: 'sandbox'\`(**默认**):驱动这个 agent **自己的隔离浏览器**(owned Chrome),并行子代理互不干扰;没有你的登录态。
+- \`backend: 'user'\`:驱动**用户真实 Chrome**(扩展桥),用于已登录的内网/后台页面、用户正在看的 \`@\` 标签页。
+
+默认用 sandbox;只有当你需要用户的登录态、或要操作引用/打开的真实标签页时,才传 \`backend: 'user'\`。
+如果插件以 \`backend: 'extension'\` 或 \`backend: 'cdp'\` 配置运行(没有沙箱),所有工具都走真实浏览器,\`backend\` 参数无效果。
 
 ## 什么时候用
 

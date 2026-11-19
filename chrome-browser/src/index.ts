@@ -131,12 +131,15 @@ export function apply(ctx: Context, config: ChromePluginConfig = {}): void {
 
   const help = new HelpChannel()
   const activity = new ActivityTracker()
-  for (const definition of chromeToolDefinitions(exec => registry.resolve(exec), resolved, consoleLog, help)) {
+  for (const definition of chromeToolDefinitions((exec, pref) => registry.resolve(exec, pref), resolved, consoleLog, help)) {
     ctx.tools.register(withActivity(definition, activity))
   }
   registerHelpChannel(ctx, help)
   // 扩展桥与路由仍针对「用户真实浏览器」（shared），不是 per-agent 沙箱。
-  const bridge = resolved.backend === 'extension'
+  // sandbox 模式下也安装：工具默认走沙箱，但 `backend: 'user'` 需要 shared 可
+  // 达（以及 `@` 菜单/标签页路由读的是真实 Chrome）。cdp 后端没有扩展后端，
+  // 因此不安装。
+  const bridge = resolved.backend !== 'cdp'
     ? installExtensionBridge(ctx, shared, resolved.screenshotDir, resolved.bridgePort)
     : undefined
   registerChromeRoutes(ctx, shared, resolved.screenshotDir, activity, bridge)

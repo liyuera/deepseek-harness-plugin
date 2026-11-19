@@ -61,6 +61,32 @@ describe('BackendRegistry', () => {
     expect(reg.resolve({})).toBe(shared)
   })
 
+  it('honours a per-call user preference over the agent sandbox', () => {
+    const shared = fakeBackend()
+    const made: BrowserBackend[] = []
+    const reg = new BackendRegistry(sandboxConfig(), shared, () => {
+      const backend = fakeBackend()
+      made.push(backend)
+      return backend
+    })
+    expect(reg.resolve(execOf('a1'), 'user')).toBe(shared)
+    // Choosing the real browser must not build a sandbox the call never used.
+    expect(made).toHaveLength(0)
+    const sandbox = reg.resolve(execOf('a1'))
+    expect(sandbox).not.toBe(shared)
+    expect(made).toHaveLength(1)
+    // An explicit `sandbox` preference and omission both drive the same lease.
+    expect(reg.resolve(execOf('a1'), 'sandbox')).toBe(sandbox)
+    expect(reg.resolve(execOf('a1'))).toBe(sandbox)
+  })
+
+  it('ignores both preferences when the config is not sandbox', () => {
+    const shared = fakeBackend()
+    const reg = new BackendRegistry(sandboxConfig({ backend: 'extension' }), shared, () => fakeBackend())
+    expect(reg.resolve(execOf('a1'), 'sandbox')).toBe(shared)
+    expect(reg.resolve(execOf('a1'), 'user')).toBe(shared)
+  })
+
   it('creates one sandbox per agent and reuses it', () => {
     const shared = fakeBackend()
     const made: string[] = []

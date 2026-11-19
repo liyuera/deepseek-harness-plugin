@@ -39,8 +39,19 @@ export class BackendRegistry {
     this.ports = new PortAllocator(config.port)
   }
 
-  /** The backend one tool call should drive. Sandbox mode resolves per agent id. */
-  resolve(exec: unknown): BrowserBackend {
+  /**
+   * The backend one tool call should drive.
+   *
+   * An explicit `'user'` preference always means the shared backend (the user's
+   * real Chrome via the extension bridge). Otherwise — in sandbox mode, with an
+   * agent — the call drives that agent's own sandbox; outside sandbox mode
+   * there is no sandbox to drive, so the preference is effectively ignored and
+   * the shared backend answers.
+   * @param exec - execution context carrying the calling agent's id.
+   * @param backend - optional per-call preference; omitted means `'sandbox'`.
+   */
+  resolve(exec: unknown, backend?: 'sandbox' | 'user'): BrowserBackend {
+    if (backend === 'user') return this.shared
     if (this.config.backend !== 'sandbox') return this.shared
     const agentId = agentIdOf(exec)
     if (agentId === undefined) return this.shared

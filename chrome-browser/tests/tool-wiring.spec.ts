@@ -66,4 +66,35 @@ describe('chromeToolDefinitions backend resolution', () => {
     expect(resolve.mock.calls[0]?.[0]).toMatchObject({ agent: { id: 'a1' } })
     expect(resolve.mock.calls[1]?.[0]).toMatchObject({ agent: { id: 'a2' } })
   })
+
+  it('forwards the per-call backend preference to resolve', async () => {
+    const sandbox = stubBackend('sandbox')
+    const shared = stubBackend('shared')
+    // The registry semantics under test: `user` means shared; everything else
+    // keeps the agent's sandbox.
+    const resolve = vi.fn((exec: unknown, backend?: 'sandbox' | 'user'): BrowserBackend => {
+      void exec
+      return backend === 'user' ? shared.backend : sandbox.backend
+    })
+    const tools = chromeToolDefinitions(
+      resolve,
+      config(),
+      {} as ConsoleLog,
+      { request: async () => ({ completed: false }) } as unknown as HelpChannel,
+    )
+    const tabsTool = tools.find(tool => tool.name === 'chrome_tabs')
+    expect(tabsTool, 'chrome_tabs is not registered').toBeDefined()
+    const exec = { agent: { id: 'a1' } } as never
+
+    await tabsTool?.execute({}, exec)
+    await tabsTool?.execute({ backend: 'sandbox' }, exec)
+    expect(sandbox.listTabs).toHaveBeenCalledTimes(2)
+    expect(shared.listTabs).not.toHaveBeenCalled()
+
+    const value = await tabsTool?.execute({ backend: 'user' }, exec)
+    expect(shared.listTabs).toHaveBeenCalledTimes(1)
+    expect((value as { tabs: Array<{ id: string }> }).tabs.map(tab => tab.id)).toEqual(['shared-tab'])
+
+    expect(resolve.mock.calls.map(call => call[1])).toEqual([undefined, 'sandbox', 'user'])
+  })
 })

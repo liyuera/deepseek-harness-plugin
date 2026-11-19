@@ -1,6 +1,6 @@
 # 沙箱浏览器后端注册表（BackendRegistry）设计方案
 
-> **状态：** 已评审，决策已锁定（见 §9）。最终实现代码见 [sandbox-backend-registry-plan.md](sandbox-backend-registry-plan.md)。
+> **状态：** 已评审，决策已锁定（见 §9）。v1（配置开关 + 按 agent 沙箱）与 v2（逐调用 `backend` 选择）均已实现，见 §1 / §9。最终实现代码见 [sandbox-backend-registry-plan.md](sandbox-backend-registry-plan.md)。
 > **目标：** 让插件从「单例后端」升级为「按会话分配沙箱实例」，使多个 agent 能**并行**驱动各自隔离的浏览器；扩展后端保留为「用户真实浏览器」通道。
 
 **Architecture:** 在 `apply()` 的单例 `buildBackend()` 之上加一层 `BackendRegistry`：扩展后端仍是共享单例，沙箱后端按 `sessionId` 懒建、池化、空闲回收、会话结束释放。工具 execute 用 `exec.agent.session.id` 解析后端，其余（activity / routes / help）不动或仅微调。
@@ -32,11 +32,11 @@
 
 | 方案 | 说明 | 代价 |
 | --- | --- | --- |
-| **A. 配置开关（推荐 v1）** | `backend` 新增 `'sandbox'`；开启后工具默认走按会话沙箱，`@` 菜单/标签页路由始终走扩展 | 最小、正确；v1 内工具无法按调用切到用户浏览器 |
-| B. 逐调用参数 | 每个 `chrome_*` 加 `backend: 'sandbox' | 'user'` | 灵活但 17 个工具都改、模型要学何时选 |
+| **A. 配置开关（v1，已实现）** | `backend` 新增 `'sandbox'`；开启后工具默认走按会话沙箱，`@` 菜单/标签页路由始终走扩展 | 最小、正确；单靠 A 时工具无法按调用切到用户浏览器 |
+| B. 逐调用参数（v2，已实现） | 每个 `chrome_*` 加可选 `backend: 'sandbox' \| 'user'`（默认 `'sandbox'`） | 17 个工具都加参数；模型按需在两种浏览器间切换，A 的缺口由此补齐 |
 | C. 混合自动 | 默认沙箱；`@` 引用注入上下文带「用户浏览器」标记时路由到扩展 | 最贴合语义，但要在 mentions 上下文里加标记 + 解析，改动最大 |
 
-**推荐 A（v1）+ B/C 作为 v2 的逐任务选择**。理由：先交付并行能力，用户浏览器通道不丢（`backend: 'extension'` 保留原行为），per-call 选择留到并行跑通后再加。
+**落地：A（配置开关）+ B（逐调用参数）都已实现，C 未采用。** 沙箱是配置了 `backend: 'sandbox'` 时工具的**默认**后端；同一次会话里可用 `backend: 'user'` 单次切到用户真实浏览器。`backend: 'extension'` / `'cdp'` 配置下没有沙箱，`'user'` 与 `'sandbox'` 都落到 shared（参数无效果）。为了让 `'user'` 在 sandbox 模式下真的可达，`apply()` 在 `extension` 与 `sandbox` 两种配置下都安装扩展桥（`cdp` 没有扩展后端，不安装）。
 
 ---
 
@@ -212,7 +212,7 @@ sandboxHeadless: z.boolean().default(true)
 
 1. **`tools.ts` 的后端解析**：把 `chromeToolDefinitions(backend, config, consoleLog, help)` 的第 1 个参数换成 `registry: BackendRegistry`。每个工具 execute 里，`resolveTabId` 之前先 `const backend = registry.resolve(exec)`，再用该 `backend` 做 `listTabs/read/click/...`。17 个工具的 execute 都是「先拿 backend 再操作」，改动机械但量大——用一次 `sed` 级重构：把闭包里的 `backend` 改成 `exec` 处解析。
 
-   更稳的替代：保留工具闭包签名不变，只把「闭包捕获的 backend」从常量换成 `exec => registry.resolve(exec)`，即给 `chromeToolDefinitions` 传一个 `resolve: (exec: unknown) => BrowserBackend` 函数。这样 17 个工具体不用逐个改，只要 `resolveTabId` 改成接收 `backend` 并在调用点先解析。
+   更稳的替代：保留工具闭包签名不变，只把「闭包捕获的 backend」从常量换成 `resolve: (exec: unknown, backend?: 'sandbox' | 'user') => BrowserBackend` 函数。这样 17 个工具体不用逐个改，只要 `resolveTabId` 改成接收 `backend` 并在调用点先解析。**最终实现即此形态**：`index.ts` 传 `(exec, pref) => registry.resolve(exec, pref)`；每个 backend 工具把参数 `args.backend` 归一成 `'sandbox' | 'user' | undefined` 再交给 `resolve`（`registry.resolve` 里 `'user'` → shared，其余按配置决定）。
 
 2. **`index.ts`**：`const registry = new BackendRegistry(resolved, consoleLog, buildBackend(resolved, sink).backend)`；工具注册传 `registry`；新增：
    ```ts
@@ -239,7 +239,9 @@ sandboxHeadless: z.boolean().default(true)
 | 沙箱池满且无空闲可回收 | 抛明确错误，提示等空闲或调大 `sandboxMaxConcurrent`（**绝不回收活动中的租约**） |
 | 会话结束但未触发事件 | `sandboxIdleMs` 空闲回收兜底 |
 | 会话结束事件 payload 形状 | 用 `agent/disposed`（payload `{ agent }`，读 `agent.session.id`）；实现时验证根上下文能否收到 scope-filtered 事件（现有 `agent/pre-step` 已从根 `ctx.on` 生效，大概率可行；不行则换 `session/disposed`） |
-| 子代理（subagent / agent team） | **Decision Point #3**：当前按 `sessionId` 键，同 session 的子代理共享一个沙箱。若要求「每个子代理一个沙箱」，键改成 agent 身份（`agent.id` 或 agent 对象引用）。v1 先用 sessionId，标记待定 |
+| 子代理（subagent / agent team） | 键已按 **agent 身份**（`agent.id`）：每个子代理一个独立沙箱，并行互不干扰 |
+| 逐调用切到真实浏览器 | `resolve(exec, 'user')` 恒返回 shared（扩展桥）；sandbox 模式下扩展桥照常安装，所以 `'user'` 真的可达；`extension`/`cdp` 配置下 `'sandbox'` 也返回 shared（无沙箱可走） |
+| sandbox 模式下的 `@` 菜单/标签页路由 | 走 shared（用户真实 Chrome），与 `backend: 'user'` 同一条通道；扩展桥在 `sandbox` 配置下也安装，因此菜单可用 |
 | 端口耗尽（大量会话） | `PortAllocator` 只会 `next++`，不设上界；由 `sandboxMaxConcurrent` 约束实际实例数，端口与实例 1:1，不会无限增长 |
 | `chrome_open` 幂等去重跨沙箱 | 每个 `CdpBackend` 各自有「同 URL 复用已有 tab」逻辑（[backend.ts:1131](src/backend.ts#L1131)），跨实例不共享、互不干扰，符合预期 |
 
@@ -249,7 +251,10 @@ sandboxHeadless: z.boolean().default(true)
 
 `tests/backend-registry.spec.ts`（纯单测，注入假 backend / 假 Chrome，不碰真浏览器）：
 
-- `resolve`：`backend:'extension'` → 恒 shared；`backend:'sandbox'` 且无 sessionId → shared；有 sessionId → 同 session 返回同一实例、不同 session 返回不同实例。
+- `resolve`：`backend:'extension'` → 恒 shared；`backend:'sandbox'` 且无 agentId → shared；有 agentId → 同 agent 返回同一实例、不同 agent 返回不同实例。
+- `resolve` 的 per-call 偏好：sandbox 配置下 `'user'` → shared 且**不**创建沙箱，`'sandbox'`/省略 → 该 agent 的沙箱租约；`extension` 配置下两种偏好都 → shared。
+- 工具接线（`tests/tool-wiring.spec.ts`）：`chrome_tabs` 带 `{ backend: 'user' }` 走 shared，`{}` / `{ backend: 'sandbox' }` 走 agent 沙箱，且 `resolve` 收到对应第二个参数。
+- `apply()` 装桥（`tests/apply-bridge.spec.ts`）：`backend:'sandbox'` 与 `'extension'` 注册扩展桥 effect，`'cdp'` 不注册。
 - `PortAllocator`：递增、释放回用、不重号。
 - 空闲回收：假时钟推进 `sandboxIdleMs` 后 release（用 `vi.useFakeTimers`）。
 - 池上限：造满 `maxConcurrent` 个活跃会话后，再建抛错且不回收活跃租约。
@@ -278,7 +283,8 @@ smoke（`DSH_CHROME_SMOKE=1`）：两个伪造 sessionId 并发 `resolve` → �
 
 | 决策点 | 结论 |
 | --- | --- |
-| 后端选择模型 | **A 配置开关**：`backend` 新增 `'sandbox'`；`@` 菜单/标签页路由始终走扩展 |
+| 后端选择模型 | **A 配置开关 + B 逐调用参数（均已实现）**：`backend` 新增 `'sandbox'` 并成为该模式下工具的默认后端；每个工具另有可选 `backend: 'sandbox' \| 'user'`，`'user'` 单次改走用户真实浏览器（shared/扩展桥）。`@` 菜单/标签页路由始终走扩展 |
+| 扩展桥安装范围 | `extension` 与 `sandbox` 都安装扩展桥（两者 shared 都是 `ExtensionBackend`），`cdp` 不安装；sandbox 模式下真实浏览器因此可作为 `backend: 'user'` 的兜底 |
 | 配置字段命名 | **扁平**：`sandboxMaxConcurrent` / `sandboxIdleMs` / `sandboxHeadless` |
 | 子代理键 | **按 agent 身份**：键用 `agent.id`（每个子代理独立沙箱） |
 | headless 默认 | **`true`**（默认无头、不弹窗；设 `false` 才出现可见窗口） |
