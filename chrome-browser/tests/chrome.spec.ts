@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import {
   Chrome,
+  buildChromeArgs,
   DEFAULT_BRIDGE_PORT,
   chromeCandidates,
   copyUserProfileTo,
@@ -382,5 +383,31 @@ describe('reclaimOwnedLeftover', () => {
     })
     expect(result).toBe(false)
     expect(kill).not.toHaveBeenCalled()
+  })
+})
+
+describe('sandbox config defaults', () => {
+  it('resolves sandbox pool defaults', () => {
+    const cfg = resolveChromeConfig({ backend: 'sandbox' })
+    expect(cfg.sandboxMaxConcurrent).toBe(4)
+    expect(cfg.sandboxIdleMs).toBe(10 * 60_000)
+    expect(cfg.sandboxHeadless).toBe(false)
+  })
+
+  it('honours explicit sandbox values', () => {
+    const cfg = resolveChromeConfig({ backend: 'sandbox', sandboxMaxConcurrent: 8, sandboxIdleMs: 0, sandboxHeadless: true })
+    expect(cfg.sandboxMaxConcurrent).toBe(8)
+    expect(cfg.sandboxIdleMs).toBe(0)
+    expect(cfg.sandboxHeadless).toBe(true)
+  })
+
+  it('appends --headless=new when sandboxHeadless', () => {
+    const cfg = resolveChromeConfig({ backend: 'sandbox', sandboxHeadless: true })
+    expect(buildChromeArgs(cfg, '/p', [], undefined)).toContain('--headless=new')
+  })
+
+  it('omits --headless=new when sandboxHeadless is false', () => {
+    const cfg = resolveChromeConfig({ backend: 'sandbox' })
+    expect(buildChromeArgs(cfg, '/p', [], undefined)).not.toContain('--headless=new')
   })
 })

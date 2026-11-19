@@ -41,8 +41,8 @@ export const inject = ['tools', 'webServer']
 
 /** Plugin configuration (all fields optional; schema supplies defaults). */
 export interface ChromePluginConfig {
-  /** Browser backend: `extension` (default, the user's real Chrome via the extension bridge) or `cdp`. */
-  backend?: 'extension' | 'cdp'
+  /** Browser backend: `extension` (default, the user's real Chrome via the extension bridge), `cdp`, or `sandbox`. */
+  backend?: 'extension' | 'cdp' | 'sandbox'
   /** DevTools HTTP port (9222; cdp backends only). */
   port?: number
   /** Explicit Chrome executable path; automatic detection when omitted. */
@@ -75,11 +75,17 @@ export interface ChromePluginConfig {
    * port (tests and diagnostics only).
    */
   bridgePort?: number
+  /** Max concurrent sandbox instances (backend:'sandbox' only). */
+  sandboxMaxConcurrent?: number
+  /** Idle reclamation bound in ms for a sandbox; 0 = never. */
+  sandboxIdleMs?: number
+  /** Run sandbox Chrome headless (default false = visible window). */
+  sandboxHeadless?: boolean
 }
 
 /** Runtime configuration schema for the plugin. */
 export const Config: z<ChromePluginConfig> = z.object({
-  backend: z.union([z.const('extension'), z.const('cdp')]).default('extension'),
+  backend: z.union([z.const('extension'), z.const('cdp'), z.const('sandbox')]).default('extension'),
   port: z.number().step(1).min(1).max(65535).default(9222),
   chromePath: z.string(),
   profileDir: z.string(),
@@ -92,6 +98,9 @@ export const Config: z<ChromePluginConfig> = z.object({
   screenshotDir: z.string(),
   consoleIdleMs: z.number().step(1).min(0).default(DEFAULT_CONSOLE_IDLE_MS),
   bridgePort: z.number().step(1).min(0).max(65535).default(DEFAULT_BRIDGE_PORT),
+  sandboxMaxConcurrent: z.number().step(1).min(1).default(4),
+  sandboxIdleMs: z.number().step(1).min(0).default(10 * 60_000),
+  sandboxHeadless: z.boolean().default(false),
 })
 
 /**

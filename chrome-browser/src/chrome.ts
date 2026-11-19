@@ -42,8 +42,8 @@ export const DEFAULT_CONSOLE_IDLE_MS = 5 * 60_000
 
 /** Fully-resolved plugin configuration (schema defaults already applied). */
 export interface ResolvedChromeConfig {
-  /** Backend: `extension` (real Chrome via the extension bridge, default) or `cdp`. */
-  backend: 'extension' | 'cdp'
+  /** Backend: `extension` (real Chrome via the extension bridge, default), `cdp`, or `sandbox`. */
+  backend: 'extension' | 'cdp' | 'sandbox'
   /** DevTools HTTP port. */
   port: number
   /** Explicit Chrome executable path; detection is skipped when set. `undefined` = auto-detect. */
@@ -75,6 +75,12 @@ export interface ResolvedChromeConfig {
    * one (tests and diagnostics only — the shipped extension cannot find it).
    */
   bridgePort: number
+  /** Max concurrent sandbox instances (backend:'sandbox' only). */
+  sandboxMaxConcurrent: number
+  /** Idle reclamation bound in ms for a sandbox; 0 = never. */
+  sandboxIdleMs: number
+  /** Run sandbox Chrome headless. */
+  sandboxHeadless: boolean
 }
 
 /** One page target as the model sees it (internal ws url kept private). */
@@ -352,7 +358,36 @@ export function resolveChromeConfig(
     screenshotDir: config.screenshotDir ?? defaultScreenshotDir(),
     consoleIdleMs: config.consoleIdleMs ?? DEFAULT_CONSOLE_IDLE_MS,
     bridgePort: config.bridgePort ?? DEFAULT_BRIDGE_PORT,
+    sandboxMaxConcurrent: config.sandboxMaxConcurrent ?? 4,
+    sandboxIdleMs: config.sandboxIdleMs ?? 10 * 60_000,
+    sandboxHeadless: config.sandboxHeadless ?? false,
   }
+}
+
+/**
+ * Shared argv: debug port, profile, origin allowlist, the headless flag when
+ * `sandboxHeadless`, per-spawn extras, the constructor-injected extra args,
+ * and the optional startup URL.
+ */
+export function buildChromeArgs(
+  config: ResolvedChromeConfig,
+  profileDir: string,
+  extra: readonly string[],
+  startupUrl?: string,
+  extraArgs: readonly string[] = [],
+): string[] {
+  const args = [
+    `--remote-debugging-port=${config.port}`,
+    `--user-data-dir=${profileDir}`,
+    '--remote-allow-origins=*',
+    '--no-first-run',
+    '--no-default-browser-check',
+    ...(config.sandboxHeadless ? ['--headless=new'] : []),
+    ...extra,
+    ...extraArgs,
+  ]
+  if (startupUrl !== undefined) args.push(startupUrl)
+  return args
 }
 
 /** Injectable seams for tests. */
@@ -750,21 +785,6 @@ export class Chrome {
     }
   }
 
-  /** Shared argv: debug port, profile, origin allowlist, extras, optional startup URL. */
-  private chromeArgs(profileDir: string, extra: readonly string[], startupUrl?: string): string[] {
-    const args = [
-      `--remote-debugging-port=${this.config.port}`,
-      `--user-data-dir=${profileDir}`,
-      '--remote-allow-origins=*',
-      '--no-first-run',
-      '--no-default-browser-check',
-      ...extra,
-      ...this.extraArgs,
-    ]
-    if (startupUrl !== undefined) args.push(startupUrl)
-    return args
-  }
-
   private spawnOwnedChrome(): void {
     this.spawnChrome(this.config.profileDir, [], 'about:blank')
     try {
@@ -784,7 +804,7 @@ export class Chrome {
     const chromePath = resolveChromePath(this.config.chromePath)
     mkdirSync(profileDir, { recursive: true })
     this.stderrTail = []
-    const proc = this.spawnProcess(chromePath, this.chromeArgs(profileDir, extra, startupUrl))
+    const proc = this.spawnProcess(chromePath, buildChromeArgs(this.config, profileDir, extra, startupUrl, this.extraArgs))
     this.proc = proc
     proc.stderr?.on('data', (chunk: Buffer) => {
       this.stderrTail.push(chunk.toString('utf8').trimEnd())
