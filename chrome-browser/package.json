@@ -1,7 +1,7 @@
 {
   "name": "@liyuera/dsh-chrome-browser",
   "description": "Chrome browser control for dsh: list the user's tabs, read page text or the actionable elements, navigate, click/hover/type, wait for elements, evaluate JS, capture screenshots and read console output through the extension bridge or the Chrome DevTools Protocol, plus an @ menu source listing the live tabs and a browser skill",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -37,7 +37,7 @@
     }
   },
   "scripts": {
-    "build": "tsc -b --force && tsdown --env.DSH_BUILD_FACE=client --config-loader tsx",
+    "build": "tsc -p tsconfig.json && tsdown --config-loader tsx",
     "bundle": "tsdown --config-loader tsx",
     "watch": "tsdown --watch --config-loader tsx",
     "test": "vitest run",
@@ -80,7 +80,11 @@
     "react-dom": "^18.3.1",
     "jsdom": "^31.0.1",
     "vite": "^8.3.8",
-    "vitest": "^5.1.1"
+    "vitest": "^5.1.1",
+    "@types/node": "^22.0.0",
+    "tsdown": "^0.15.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.9.0"
   },
   "files": [
     "lib",

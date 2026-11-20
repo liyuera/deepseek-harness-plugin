@@ -4,9 +4,9 @@
  * pooled with a cap, idle-reclaimed, and released when the agent disposes.
  * @module @liyuera/dsh-chrome-browser/backend-registry
  */
-import { defaultProfileDir } from './chrome.js';
-import { agentIdOf } from './caller.js';
-import { PortAllocator } from './ports.js';
+import { defaultProfileDir } from "./chrome.js";
+import { agentIdOf } from "./caller.js";
+import { PortAllocator } from "./ports.js";
 /**
  * Owns the lifecycle of every browser backend the plugin drives. `shared` is
  * built once (extension or single cdp); sandboxes are pooled per agent id.

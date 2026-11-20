@@ -10,7 +10,7 @@ import { execFile, execFileSync, spawn } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { cdpEndpoint, websocketSocket, } from './cdp.js';
+import { cdpEndpoint, websocketSocket, } from "./cdp.js";
 /**
  * Loopback port the shipped Chrome extension dials (`ws://127.0.0.1:21987/...`).
  * The extension's service worker cannot discover a port, so the bridge keeps

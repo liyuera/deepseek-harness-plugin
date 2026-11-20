@@ -8,12 +8,12 @@
  *   used as a fallback when config selects `cdp`.
  * @module @liyuera/dsh-chrome-browser/backend
  */
-import { consoleMessageFrom } from './console-events.js';
-import { clickExpression, focusAndSelectExpression, focusExpression, hoverExpression, inventoryExpression, pressExpression, readPageExpression, readyStateExpression, selectExpression, waitExpression, webmcpCallExpression, webmcpListExpression, } from './expressions.js';
-import { Chrome } from './chrome.js';
-import { WsConnection, wsHandshake } from './ws.js';
-import { pageSizeExpression, rectExpression } from './expressions.js';
-import { extensionStamp, extensionVersion } from './extension-package.js';
+import { consoleMessageFrom } from "./console-events.js";
+import { clickExpression, focusAndSelectExpression, focusExpression, hoverExpression, inventoryExpression, pressExpression, readPageExpression, readyStateExpression, selectExpression, waitExpression, webmcpCallExpression, webmcpListExpression, } from "./expressions.js";
+import { Chrome } from "./chrome.js";
+import { WsConnection, wsHandshake } from "./ws.js";
+import { pageSizeExpression, rectExpression } from "./expressions.js";
+import { extensionStamp, extensionVersion } from "./extension-package.js";
 /**
  * Longest edge a capture may produce, in device pixels.
  *

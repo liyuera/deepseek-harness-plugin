@@ -7,7 +7,7 @@
  * Nothing is persisted, and nothing crosses into the model's request.
  * @module @liyuera/dsh-chrome-browser/activity
  */
-import { sessionIdOf } from './caller.js';
+import { sessionIdOf } from "./caller.js";
 /**
  * How long a settled call stays on screen before the chip returns to idle.
  * Short enough not to linger, long enough that a call finishing between two

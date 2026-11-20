@@ -12,7 +12,7 @@
  * @module @liyuera/dsh-chrome-browser/mentions
  */
 import { createUserMessage } from '@deepseek-ai/dsh-llm/message';
-import { tabReferenceSource } from './message-source.js';
+import { tabReferenceSource } from "./message-source.js";
 /** Most tab mentions expanded from one message. */
 export const MAX_TABS_PER_MESSAGE = 5;
 /** Quoted mention, at the word boundary the transcript's reference decorator uses. */

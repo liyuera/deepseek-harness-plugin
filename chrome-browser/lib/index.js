@@ -11,17 +11,17 @@
  * @module @liyuera/dsh-chrome-browser
  */
 import z from '@deepseek-ai/schemastery';
-import { ActivityTracker, withActivity } from './activity.js';
-import { buildBackend, CdpBackend } from './backend.js';
-import { BackendRegistry } from './backend-registry.js';
-import { Chrome, DEFAULT_BRIDGE_PORT, DEFAULT_CONSOLE_IDLE_MS, resolveChromeConfig } from './chrome.js';
-import { ConsoleLog } from './console-log.js';
-import { installExtensionBridge } from './bridge.js';
-import { HelpChannel, registerHelpChannel } from './help.js';
-import { expandTabMentions } from './mentions.js';
-import { registerChromeRoutes } from './routes.js';
-import { registerChromeSkill } from './skill.js';
-import { chromeToolDefinitions } from './tools.js';
+import { ActivityTracker, withActivity } from "./activity.js";
+import { buildBackend, CdpBackend } from "./backend.js";
+import { BackendRegistry } from "./backend-registry.js";
+import { Chrome, DEFAULT_BRIDGE_PORT, DEFAULT_CONSOLE_IDLE_MS, resolveChromeConfig } from "./chrome.js";
+import { ConsoleLog } from "./console-log.js";
+import { installExtensionBridge } from "./bridge.js";
+import { HelpChannel, registerHelpChannel } from "./help.js";
+import { expandTabMentions } from "./mentions.js";
+import { registerChromeRoutes } from "./routes.js";
+import { registerChromeSkill } from "./skill.js";
+import { chromeToolDefinitions } from "./tools.js";
 /** Plugin identity. */
 export const name = 'chrome-browser';
 /**

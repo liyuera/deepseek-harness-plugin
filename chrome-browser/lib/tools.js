@@ -7,8 +7,8 @@
 import { copyFileSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { defineTool } from '@deepseek-ai/dsh-tools';
-import { clickCall, clickResult, closeCall, closeResult, consoleCall, consoleResult, evalCall, evalResult, helpCall, helpResult, hoverCall, hoverResult, navigateCall, navigateResult, openCall, openResult, pressCall, pressResult, readCall, readResult, screenshotCall, screenshotResult, selectCall, selectResult, tabsCall, tabsResult, typeCall, typeResult, waitCall, waitResult, webmcpCallCall, webmcpCallResult, webmcpListCall, webmcpListResult, } from './presentation.js';
-import { clipJson, clipText, normalizePageText, windowText } from './text.js';
+import { clickCall, clickResult, closeCall, closeResult, consoleCall, consoleResult, evalCall, evalResult, helpCall, helpResult, hoverCall, hoverResult, navigateCall, navigateResult, openCall, openResult, pressCall, pressResult, readCall, readResult, screenshotCall, screenshotResult, selectCall, selectResult, tabsCall, tabsResult, typeCall, typeResult, waitCall, waitResult, webmcpCallCall, webmcpCallResult, webmcpListCall, webmcpListResult, } from "./presentation.js";
+import { clipJson, clipText, normalizePageText, windowText } from "./text.js";
 /** chrome_eval result serialization budget, characters. */
 const EVAL_RESULT_LIMIT = 200_000;
 /** `chrome_wait` bound when the caller names none. */
