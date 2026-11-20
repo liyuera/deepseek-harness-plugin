@@ -498,4 +498,3 @@ export declare function buildBackend(config: ResolvedChromeConfig, onConsole?: C
 export declare function extensionUpgradeHandler(backend: BrowserBackend): (req: {
     headers: Record<string, string | string[] | undefined>;
 }, socket: Duplex, head: Buffer) => void;
-//# sourceMappingURL=backend.d.ts.map

@@ -11,11 +11,11 @@
  * port and cannot discover an OS-assigned one.
  * @module @liyuera/dsh-chrome-browser/routes
  */
-import { ExtensionBackend } from "./backend.js";
+import { ExtensionBackend } from './backend.js';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { createExtensionZip, extensionDir } from "./extension-package.js";
-import { wsHandshake } from "./ws.js";
+import { createExtensionZip, extensionDir } from './extension-package.js';
+import { wsHandshake } from './ws.js';
 /** JSON response writer. */
 export function writeJson(res, status, value) {
     const body = JSON.stringify(value);

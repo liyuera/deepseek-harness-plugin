@@ -40,4 +40,3 @@ export declare class WsConnection {
     /** Parse one frame off the buffer; null when incomplete. */
     private readFrame;
 }
-//# sourceMappingURL=ws.d.ts.map

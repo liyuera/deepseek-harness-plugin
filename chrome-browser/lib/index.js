@@ -11,16 +11,17 @@
  * @module @liyuera/dsh-chrome-browser
  */
 import z from '@deepseek-ai/schemastery';
-import { ActivityTracker, withActivity } from "./activity.js";
-import { buildBackend } from "./backend.js";
-import { DEFAULT_BRIDGE_PORT, DEFAULT_CONSOLE_IDLE_MS, resolveChromeConfig } from "./chrome.js";
-import { ConsoleLog } from "./console-log.js";
-import { installExtensionBridge } from "./bridge.js";
-import { HelpChannel, registerHelpChannel } from "./help.js";
-import { expandTabMentions } from "./mentions.js";
-import { registerChromeRoutes } from "./routes.js";
-import { registerChromeSkill } from "./skill.js";
-import { chromeToolDefinitions } from "./tools.js";
+import { ActivityTracker, withActivity } from './activity.js';
+import { buildBackend, CdpBackend } from './backend.js';
+import { BackendRegistry } from './backend-registry.js';
+import { Chrome, DEFAULT_BRIDGE_PORT, DEFAULT_CONSOLE_IDLE_MS, resolveChromeConfig } from './chrome.js';
+import { ConsoleLog } from './console-log.js';
+import { installExtensionBridge } from './bridge.js';
+import { HelpChannel, registerHelpChannel } from './help.js';
+import { expandTabMentions } from './mentions.js';
+import { registerChromeRoutes } from './routes.js';
+import { registerChromeSkill } from './skill.js';
+import { chromeToolDefinitions } from './tools.js';
 /** Plugin identity. */
 export const name = 'chrome-browser';
 /**
@@ -34,7 +35,7 @@ export const name = 'chrome-browser';
 export const inject = ['tools', 'webServer'];
 /** Runtime configuration schema for the plugin. */
 export const Config = z.object({
-    backend: z.union([z.const('extension'), z.const('cdp')]).default('extension'),
+    backend: z.union([z.const('extension'), z.const('cdp'), z.const('sandbox')]).default('extension'),
     port: z.number().step(1).min(1).max(65535).default(9222),
     chromePath: z.string(),
     profileDir: z.string(),
@@ -47,6 +48,9 @@ export const Config = z.object({
     screenshotDir: z.string(),
     consoleIdleMs: z.number().step(1).min(0).default(DEFAULT_CONSOLE_IDLE_MS),
     bridgePort: z.number().step(1).min(0).max(65535).default(DEFAULT_BRIDGE_PORT),
+    sandboxMaxConcurrent: z.number().step(1).min(1).default(4),
+    sandboxIdleMs: z.number().step(1).min(0).default(10 * 60_000),
+    sandboxHeadless: z.boolean().default(true),
 });
 /**
  * Register the chrome-browser plugin: eight model tools, the browser-half
@@ -60,41 +64,49 @@ export function apply(ctx, config = {}) {
     // The console buffer lives here, in the long-lived host: the extension's
     // service worker is suspended by Chrome and would lose it silently.
     const consoleLog = new ConsoleLog();
-    const { backend, chrome } = buildBackend(resolved, (tabId, message) => {
+    const { backend: shared, chrome } = buildBackend(resolved, (tabId, message) => {
         consoleLog.append(tabId, message);
     });
     if (chrome !== undefined)
         chrome.reclaimOwnedLeftover();
-    // The help channel reaches the user through the harness's question service;
-    // it stays unwired (and says so) when this composition has none.
+    // 沙箱工厂：每个 agent 一个 owned CDP 实例，console 汇入共享缓冲。
+    const factory = (cfg) => {
+        const instance = new Chrome(cfg);
+        return new CdpBackend(instance, (tabId, message) => consoleLog.append(tabId, message));
+    };
+    const registry = new BackendRegistry(resolved, shared, factory);
     const help = new HelpChannel();
-    // Every tool execution is recorded here so the browser half can show what the
-    // agent is doing without reading the session stream itself.
     const activity = new ActivityTracker();
-    for (const definition of chromeToolDefinitions(backend, resolved, consoleLog, help)) {
+    for (const definition of chromeToolDefinitions((exec, pref) => registry.resolve(exec, pref), resolved, consoleLog, help)) {
         ctx.tools.register(withActivity(definition, activity));
     }
     registerHelpChannel(ctx, help);
-    // Only the extension backend has a bridge to keep on its fixed port.
-    const bridge = resolved.backend === 'extension'
-        ? installExtensionBridge(ctx, backend, resolved.screenshotDir, resolved.bridgePort)
+    // 扩展桥与路由仍针对「用户真实浏览器」（shared），不是 per-agent 沙箱。
+    // sandbox 模式下也安装：工具默认走沙箱，但 `backend: 'user'` 需要 shared 可
+    // 达（以及 `@` 菜单/标签页路由读的是真实 Chrome）。cdp 后端没有扩展后端，
+    // 因此不安装。
+    const bridge = resolved.backend !== 'cdp'
+        ? installExtensionBridge(ctx, shared, resolved.screenshotDir, resolved.bridgePort)
         : undefined;
-    registerChromeRoutes(ctx, backend, resolved.screenshotDir, activity, bridge);
+    registerChromeRoutes(ctx, shared, resolved.screenshotDir, activity, bridge);
     registerChromeSkill(ctx);
-    // A message citing tabs gains one context message carrying their URLs and
-    // ids. Only the messages this step admits are scanned, and the context
-    // message's own source keeps it out of the next scan.
+    // 会话/子代理结束 → 释放其沙箱。
+    ctx.on('agent/disposed', (payload) => {
+        const id = payload.agent?.id;
+        if (typeof id === 'string' && id !== '')
+            registry.release(id);
+    });
     ctx.on('agent/pre-step', async (_payload, next) => {
         const decision = await next();
         if (decision.kind === 'reject')
             return decision;
-        const messages = await expandTabMentions(decision.messages, () => backend.listTabs());
+        const messages = await expandTabMentions(decision.messages, () => shared.listTabs());
         return messages === undefined ? decision : { ...decision, messages };
     }, { prepend: true });
     ctx.effect(() => () => {
         consoleLog.releaseAll();
         activity.clear();
-        backend.dispose();
+        registry.dispose();
     }, 'chrome-browser: backend lifecycle');
 }
 //# sourceMappingURL=index.js.map

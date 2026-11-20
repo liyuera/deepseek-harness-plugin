@@ -54,4 +54,3 @@ export declare function registerExtensionRoutes(carrier: RouteCarrier, backend: 
  * @param bridge - fixed-port bridge state reported by the extension status route.
  */
 export declare function registerChromeRoutes(ctx: Context, backend: BrowserBackend, screenshotDir: string, activity: ActivityTracker, bridge?: BridgeReport): void;
-//# sourceMappingURL=routes.d.ts.map

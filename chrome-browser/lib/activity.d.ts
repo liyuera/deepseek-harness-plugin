@@ -75,4 +75,3 @@ export declare class ActivityTracker {
  * @returns an equivalent definition that reports the call.
  */
 export declare function withActivity(definition: ToolDefinition, activity: ActivityTracker): ToolDefinition;
-//# sourceMappingURL=activity.d.ts.map

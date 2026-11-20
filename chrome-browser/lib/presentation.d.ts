@@ -140,4 +140,3 @@ export declare function consoleCall(args: {
 }): GenericCallView;
 /** `chrome_console` completed card: the lifecycle result, or the entries read. */
 export declare function consoleResult(outcome: ToolResult): GenericResultView | undefined;
-//# sourceMappingURL=presentation.d.ts.map

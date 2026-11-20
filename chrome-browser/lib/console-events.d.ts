@@ -29,4 +29,3 @@ export interface CapturedMessage {
  * @returns the message, or undefined for an event this plugin does not keep.
  */
 export declare function consoleMessageFrom(method: string, params: Record<string, unknown>): CapturedMessage | undefined;
-//# sourceMappingURL=console-events.d.ts.map

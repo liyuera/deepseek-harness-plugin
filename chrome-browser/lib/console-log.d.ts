@@ -104,4 +104,3 @@ export declare class ConsoleLog {
     /** Drop the oldest entries until both the count and the text budget hold. */
     private evict;
 }
-//# sourceMappingURL=console-log.d.ts.map

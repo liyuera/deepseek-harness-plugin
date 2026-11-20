@@ -136,4 +136,3 @@ export declare function webmcpListExpression(): string;
  * @returns a self-contained async IIFE returning the `__dshWebmcp` envelope.
  */
 export declare function webmcpCallExpression(name: string, input: Record<string, unknown>): string;
-//# sourceMappingURL=expressions.d.ts.map

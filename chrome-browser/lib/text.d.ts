@@ -43,4 +43,3 @@ export declare function windowText(text: string, offset: number, limit: number):
  * @returns bounded JSON text.
  */
 export declare function clipJson(value: unknown, maxChars: number): string;
-//# sourceMappingURL=text.d.ts.map

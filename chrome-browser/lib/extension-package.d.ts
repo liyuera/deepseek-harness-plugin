@@ -79,4 +79,3 @@ export declare function extensionStampedValue(moduleUrl: string): string;
  * @returns the complete zip archive.
  */
 export declare function createExtensionZip(directory: string): Buffer;
-//# sourceMappingURL=extension-package.d.ts.map

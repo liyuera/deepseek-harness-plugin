@@ -20,12 +20,16 @@ import type { HelpChannel } from './help.ts';
  */
 export declare function clickWarnings(outcome: ClickOutcome): string[];
 /**
- * Build every chrome-browser tool definition bound to one backend.
- * @param backend - the live browser backend.
+ * Build every chrome-browser tool definition. Each tool resolves its backend
+ * from the executing agent on every call, so a sandbox backend stays scoped to
+ * one agent while the extension/cdp backends keep a shared singleton. An
+ * explicit per-call `backend: 'user'` opts out of the sandbox and drives the
+ * shared backend (the user's real browser) instead.
+ * @param resolve - maps an execution context and an optional backend preference
+ *   to the browser backend the call drives.
  * @param config - the resolved plugin configuration.
  * @param consoleLog - the bounded console buffer `chrome_console` reads.
  * @param help - the human-help channel `chrome_request_help` speaks to.
  * @returns the tool definitions in registration order.
  */
-export declare function chromeToolDefinitions(backend: BrowserBackend, config: ResolvedChromeConfig, consoleLog: ConsoleLog, help: HelpChannel): ToolDefinition[];
-//# sourceMappingURL=tools.d.ts.map
+export declare function chromeToolDefinitions(resolve: (exec: unknown, backend?: 'sandbox' | 'user') => BrowserBackend, config: ResolvedChromeConfig, consoleLog: ConsoleLog, help: HelpChannel): ToolDefinition[];

@@ -86,4 +86,3 @@ export declare class HelpChannel {
  * @param channel - the channel `chrome_request_help` reads.
  */
 export declare function registerHelpChannel(ctx: Context, channel: HelpChannel): void;
-//# sourceMappingURL=help.d.ts.map

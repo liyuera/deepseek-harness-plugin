@@ -30,8 +30,8 @@ export declare const DEFAULT_BRIDGE_PORT = 21987;
 export declare const DEFAULT_CONSOLE_IDLE_MS: number;
 /** Fully-resolved plugin configuration (schema defaults already applied). */
 export interface ResolvedChromeConfig {
-    /** Backend: `extension` (real Chrome via the extension bridge, default) or `cdp`. */
-    backend: 'extension' | 'cdp';
+    /** Backend: `extension` (real Chrome via the extension bridge, default), `cdp`, or `sandbox`. */
+    backend: 'extension' | 'cdp' | 'sandbox';
     /** DevTools HTTP port. */
     port: number;
     /** Explicit Chrome executable path; detection is skipped when set. `undefined` = auto-detect. */
@@ -63,6 +63,12 @@ export interface ResolvedChromeConfig {
      * one (tests and diagnostics only — the shipped extension cannot find it).
      */
     bridgePort: number;
+    /** Max concurrent sandbox instances (backend:'sandbox' only). */
+    sandboxMaxConcurrent: number;
+    /** Idle reclamation bound in ms for a sandbox; 0 = never. */
+    sandboxIdleMs: number;
+    /** Run sandbox Chrome headless (default true). */
+    sandboxHeadless: boolean;
 }
 /** One page target as the model sees it (internal ws url kept private). */
 export interface ChromeTab {
@@ -134,6 +140,12 @@ export declare function copyUserProfileTo(source: string, dest: string, copy: (f
 export declare function defaultScreenshotDir(): string;
 /** Apply config defaults for fields whose schema left them optional. */
 export declare function resolveChromeConfig(config: Partial<ResolvedChromeConfig>, _platform?: NodeJS.Platform): ResolvedChromeConfig;
+/**
+ * Shared argv: debug port, profile, origin allowlist, the headless flag when
+ * `sandboxHeadless`, per-spawn extras, the constructor-injected extra args,
+ * and the optional startup URL.
+ */
+export declare function buildChromeArgs(config: ResolvedChromeConfig, profileDir: string, extra: readonly string[], startupUrl?: string, extraArgs?: readonly string[]): string[];
 /** Injectable seams for tests. */
 export interface ChromeOptions {
     /** fetch implementation (defaults to the Node global). */
@@ -195,6 +207,13 @@ export declare class Chrome {
     private readonly spawnProcess;
     private proc;
     private stderrTail;
+    /**
+     * In-flight `ensure()` body. The tool layer runs concurrency-safe ops in
+     * parallel, so a cold owned instance would otherwise spawn Chrome twice
+     * (the loser exits, clearing `proc`, and the next `ensure()` then refuses
+     * its own port as foreign). One promise per flight makes that impossible.
+     */
+    private ensurePromise;
     constructor(config: ResolvedChromeConfig, options?: ChromeOptions);
     /** DevTools HTTP base url. */
     get baseUrl(): string;
@@ -205,8 +224,13 @@ export declare class Chrome {
      * `attachOnly`, reuse an existing endpoint, relaunch the user's Chrome
      * with a debug port in `user` mode, or spawn a dedicated instance in
      * `owned` mode.
+     *
+     * Single-flight: concurrent callers (the host batches concurrency-safe
+     * tool calls) share one in-flight attempt instead of racing to spawn.
      */
     ensure(): Promise<void>;
+    /** The one `ensure()` implementation; concurrent callers share it via `ensure()`. */
+    private doEnsure;
     /**
      * Copy the user's real profile to the custom location Chrome will run from:
      * its standard-location profile cannot carry a debug port in Chrome 136+.
@@ -262,13 +286,18 @@ export declare class Chrome {
      */
     reclaimOwnedLeftover(): void;
     private removeOwnerPidFile;
-    /** Shared argv: debug port, profile, origin allowlist, extras, optional startup URL. */
-    private chromeArgs;
     private spawnOwnedChrome;
     private spawnUserChrome;
     private spawnChrome;
     private waitForEndpoint;
+    /**
+     * Wait (bounded) for a DevTools endpoint to stop answering. A disposed owned
+     * Chrome lets go of its port a moment after its process is signaled, so a
+     * port that was just released to the allocator may still answer briefly.
+     * Never throws: the caller re-checks and decides.
+     * @param maxMs - upper bound for the wait, milliseconds.
+     */
+    private waitForEndpointToClose;
     private httpJson;
 }
 export {};
-//# sourceMappingURL=chrome.d.ts.map

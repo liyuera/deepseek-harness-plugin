@@ -23,4 +23,3 @@ import type { BridgeReport } from './routes.ts';
  * @returns the state the extension status route reports, mutated when the bind settles.
  */
 export declare function installExtensionBridge(ctx: Context, backend: BrowserBackend, screenshotDir: string, bridgePort: number): BridgeReport;
-//# sourceMappingURL=bridge.d.ts.map

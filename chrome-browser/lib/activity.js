@@ -7,6 +7,7 @@
  * Nothing is persisted, and nothing crosses into the model's request.
  * @module @liyuera/dsh-chrome-browser/activity
  */
+import { sessionIdOf } from './caller.js';
 /**
  * How long a settled call stays on screen before the chip returns to idle.
  * Short enough not to linger, long enough that a call finishing between two
@@ -109,12 +110,6 @@ export class ActivityTracker {
 function tabIdOf(args) {
     const value = args?.tabId;
     return typeof value === 'string' && value !== '' ? value : undefined;
-}
-/** The executing session id, as the tracker reads it from the execution. */
-function sessionIdOf(exec) {
-    const session = exec?.agent?.session;
-    const id = session?.id;
-    return typeof id === 'string' && id !== '' ? id : undefined;
 }
 /** A thrown value as one line of text for the chip. */
 function messageOf(error) {

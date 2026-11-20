@@ -26,8 +26,8 @@ export declare const name = "chrome-browser";
 export declare const inject: string[];
 /** Plugin configuration (all fields optional; schema supplies defaults). */
 export interface ChromePluginConfig {
-    /** Browser backend: `extension` (default, the user's real Chrome via the extension bridge) or `cdp`. */
-    backend?: 'extension' | 'cdp';
+    /** Browser backend: `extension` (default, the user's real Chrome via the extension bridge), `cdp`, or `sandbox`. */
+    backend?: 'extension' | 'cdp' | 'sandbox';
     /** DevTools HTTP port (9222; cdp backends only). */
     port?: number;
     /** Explicit Chrome executable path; automatic detection when omitted. */
@@ -60,6 +60,12 @@ export interface ChromePluginConfig {
      * port (tests and diagnostics only).
      */
     bridgePort?: number;
+    /** Max concurrent sandbox instances (backend:'sandbox' only). */
+    sandboxMaxConcurrent?: number;
+    /** Idle reclamation bound in ms for a sandbox; 0 = never. */
+    sandboxIdleMs?: number;
+    /** Run sandbox Chrome headless (default true = no window). */
+    sandboxHeadless?: boolean;
 }
 /** Runtime configuration schema for the plugin. */
 export declare const Config: z<ChromePluginConfig>;
@@ -71,4 +77,3 @@ export declare const Config: z<ChromePluginConfig>;
  * @param config - the plugin configuration (schema defaults applied by the loader).
  */
 export declare function apply(ctx: Context, config?: ChromePluginConfig): void;
-//# sourceMappingURL=index.d.ts.map

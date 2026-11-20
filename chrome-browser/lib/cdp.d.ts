@@ -54,4 +54,3 @@ export declare function cdpEndpoint(socket: CdpSocket, options: CdpEndpointOptio
  * @returns the socket; `ready` rejects on error, close, or timeout.
  */
 export declare function websocketSocket(wsUrl: string, timeoutMs: number): CdpSocket;
-//# sourceMappingURL=cdp.d.ts.map

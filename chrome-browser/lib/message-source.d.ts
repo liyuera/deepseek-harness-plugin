@@ -28,4 +28,3 @@ export interface ChromeBrowserSource {
  * @returns the source field of the message.
  */
 export declare function tabReferenceSource(labels: readonly string[]): ChromeBrowserSource;
-//# sourceMappingURL=message-source.d.ts.map

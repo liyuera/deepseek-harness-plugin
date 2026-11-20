@@ -75,4 +75,3 @@ export declare class BridgeServer implements RouteCarrier {
     private dispatchHttp;
     private dispatchUpgrade;
 }
-//# sourceMappingURL=local-server.d.ts.map

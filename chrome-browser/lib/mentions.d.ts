@@ -54,4 +54,3 @@ export declare function renderTabContext(cited: readonly CitedTab[]): string;
  *   no message cited a tab this listing can resolve.
  */
 export declare function expandTabMentions(messages: readonly UserMessage[], listTabs: () => Promise<readonly TabSummary[]>): Promise<UserMessage[] | undefined>;
-//# sourceMappingURL=mentions.d.ts.map

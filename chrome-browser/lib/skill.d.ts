@@ -47,4 +47,3 @@ export declare function chromeSkill(): SkillRegistrationLike;
  * @param ctx - the plugin's Cordis context.
  */
 export declare function registerChromeSkill(ctx: Context): void;
-//# sourceMappingURL=skill.d.ts.map

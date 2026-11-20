@@ -9,8 +9,8 @@
  * listener starts.
  * @module @liyuera/dsh-chrome-browser/bridge
  */
-import { BridgeServer } from "./local-server.js";
-import { registerExtensionRoutes } from "./routes.js";
+import { BridgeServer } from './local-server.js';
+import { registerExtensionRoutes } from './routes.js';
 /**
  * Start the plugin's own bridge server when the dsh web server does not already
  * listen on the port the extension dials.

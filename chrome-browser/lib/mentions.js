@@ -12,7 +12,7 @@
  * @module @liyuera/dsh-chrome-browser/mentions
  */
 import { createUserMessage } from '@deepseek-ai/dsh-llm/message';
-import { tabReferenceSource } from "./message-source.js";
+import { tabReferenceSource } from './message-source.js';
 /** Most tab mentions expanded from one message. */
 export const MAX_TABS_PER_MESSAGE = 5;
 /** Quoted mention, at the word boundary the transcript's reference decorator uses. */
@@ -21,7 +21,8 @@ const MENTION_RE = /(^|\s)@"([^"\n]+)"/gu;
 const HEADER = '## Referenced Chrome tabs';
 /** Why the model is reading this, and what to do with what it carries. */
 const NOTE = "The user's message references tabs open in their Chrome. Pass a tabId straight to the "
-    + 'chrome_* tools; a tab title is not an id.';
+    + 'chrome_* tools; a tab title is not an id. These tabs live in the user\'s real Chrome: call them with '
+    + "backend: 'user'; the default sandbox cannot address these ids.";
 /** The label one tab is cited by: its title, or its URL for an untitled page. */
 function tabLabel(tab) {
     const title = tab.title.trim();
