@@ -121,7 +121,7 @@ describe('resolveChromeConfig', () => {
   it('defaults to owned mode with a persistent dedicated profile and no auto relaunch', () => {
     const config = resolveChromeConfig({})
     expect(config.mode).toBe('owned')
-    expect(config.backend).toBe('extension')
+    expect(config.backend).toBe('sandbox')
     expect(config.port).toBe(9222)
     expect(config.autoRelaunch).toBe(false)
     expect(config.attachOnly).toBe(false)

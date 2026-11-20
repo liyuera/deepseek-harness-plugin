@@ -1,4 +1,20 @@
-# dsh bundle layer: mount the chrome-browser plugin (host CDP tools).
+# dsh bundle layer: mount the chrome-browser plugin (host tools).
+#
+# Ships `backend: sandbox` as the default so a fresh install drives each
+# agent's own isolated owned Chrome (parallel-safe, no login state). This is a
+# bundle layer applied under the profile patch: to drive the user's real Chrome
+# instead, override it in the profile's cordis.patch.yml:
+#
+#   - id: chrome-browser
+#     name: '@liyuera/dsh-chrome-browser'
+#     config:
+#       backend: extension
+#
 - insert:
     - id: chrome-browser
       name: '@liyuera/dsh-chrome-browser'
+      config:
+        backend: sandbox
+        sandboxMaxConcurrent: 4
+        sandboxIdleMs: 600000
+        sandboxHeadless: true

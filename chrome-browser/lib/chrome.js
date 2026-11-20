@@ -253,7 +253,7 @@ export function resolveChromeConfig(config, _platform = process.platform) {
     // dedicated Chrome, never the browser that hosts the dsh UI.
     const mode = config.mode ?? 'owned';
     return {
-        backend: config.backend ?? 'extension',
+        backend: config.backend ?? 'sandbox',
         port,
         chromePath: config.chromePath,
         profileDir: config.profileDir ?? (mode === 'user' ? defaultUserCopyProfileDir(port) : defaultProfileDir(port)),

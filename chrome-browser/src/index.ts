@@ -87,7 +87,7 @@ export interface ChromePluginConfig {
 
 /** Runtime configuration schema for the plugin. */
 export const Config: z<ChromePluginConfig> = z.object({
-  backend: z.union([z.const('extension'), z.const('cdp'), z.const('sandbox')]).default('extension'),
+  backend: z.union([z.const('extension'), z.const('cdp'), z.const('sandbox')]).default('sandbox'),
   port: z.number().step(1).min(1).max(65535).default(9222),
   chromePath: z.string(),
   profileDir: z.string(),
